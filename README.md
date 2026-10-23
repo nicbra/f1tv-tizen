@@ -12,16 +12,22 @@ way the official apps do it; this app does not break or bypass any DRM.
 - Sign in by code: the TV shows a code and a QR code, you confirm it on your phone at
   `f1tv.formula1.com/tv`. No passwords are typed or stored on the TV, and the TV renews its
   session on its own.
-- Browse F1 TV's own pages (home, live now, archive) as rails, controlled with the remote.
-- Live sessions and replays, including the extra feeds (onboard cameras, F1 Live, data channel).
+- Browse F1 TV's own pages (home, archive, shows, documentaries, my list) as rails.
+- "This weekend" rail and a Schedule tab: the season calendar and every broadcast of a race
+  weekend (sessions, pre/post shows, F1 Academy) in local time, with live and countdown badges.
+- Live sessions and replays, including the extra feeds (onboard cameras, F1 Live, tracker, data).
+  Live sessions can be joined live or from the start of the broadcast.
+- YouTube-style seeking: the arrows move a preview marker (steps grow while you keep pressing) that
+  shows the position and the real clock time; it jumps on OK or after a short pause.
+- Switching feed (▲ ▼ or CH +/-) continues at the same moment of the session.
 
 ## Remote
 
 | Key | Browse | Player |
 | --- | --- | --- |
-| Arrows | move | ◀ ▶ seek 10 s, ▲ ▼ switch feed |
-| OK | open | pause / play |
-| ⏪ ⏩ | | seek 60 s |
+| Arrows | move | ◀ ▶ preview a jump, ▲ ▼ switch feed |
+| OK | open | jump to the previewed time, otherwise pause / play |
+| ⏪ ⏩ | | preview jumps of 60 s |
 | CH +/- | | switch feed |
 | Back | back / exit | stop |
 

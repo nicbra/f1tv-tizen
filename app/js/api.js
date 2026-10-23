@@ -13,7 +13,7 @@ var F1Api = (function () {
   // TV's web engine (Chromium 76) in the web player's format; a 'device=tv' value is refused.
   var DEVICE_INFO = 'device=web;screen=browser;os=tizen;browser=chrome;browserVersion=76;' +
     'osVersion=6.0;appVersion=55.0.3;playerVersion=8.212.0;p=false;tms=1';
-  // Home page id as used by the web app; overridable once verified against the live config.
+  // Fallback page ids; the live menu (menu()) is preferred.
   var HOME_PAGE_ID = 395;
   var ARCHIVE_PAGE_ID = 493;
 
@@ -194,6 +194,121 @@ var F1Api = (function () {
     });
   }
 
+  /** F1 TV's navigation menu: [{ title, uri }] (Home, 2026 Season, Archive, Shows, ...). */
+  function menu() {
+    var l = loc();
+    var url = [BASE, '2.0', loginStatus(), LANG, PAGE_PLATFORM, 'ALL/MENU', l.entitlement, l.groupId].join('/');
+    return http(url, { headers: authHeaders() }).then(function (data) {
+      var out = [];
+      (function walk(o) {
+        if (!o || typeof o !== 'object') return;
+        if (Array.isArray(o)) return o.forEach(walk);
+        var m = o.metadata || {}, a = (o.actions || [])[0];
+        if ((m.label || m.title) && a && /\/PAGE\//.test(a.uri || '')) out.push({ title: m.label || m.title, uri: a.uri });
+        Object.keys(o).forEach(function (k) { if (k !== 'metadata' && k !== 'actions') walk(o[k]); });
+      })(data && data.resultObj);
+      return out;
+    });
+  }
+
+  function toMs(v) {
+    if (v == null || v === '') return null;
+    if (typeof v === 'number') return v;
+    if (/^\d+$/.test(v)) return +v;
+    var t = Date.parse(v);
+    return isNaN(t) ? null : t;
+  }
+
+  /**
+   * The broadcast schedule of a race weekend, from a page's interactive_schedule container:
+   * [{ contentId, title, series, start, end, pictureUrl, meeting }] sorted by start time.
+   */
+  function scheduleFrom(containers) {
+    var box = (containers || []).filter(function (c) { return c.layout === 'interactive_schedule'; })[0];
+    var groups = box && box.retrieveItems && box.retrieveItems.resultObj && box.retrieveItems.resultObj.containers;
+    if (!groups || !groups.length) return null;
+    var all = groups.filter(function (g) { return g.eventName === 'ALL'; })[0] || groups[0];
+    var events = (all.events || []).map(function (ev) {
+      var m = ev.metadata || {}, e = m.emfAttributes || {};
+      return {
+        contentId: m.contentId || ev.id,
+        title: m.titleBrief || m.title || '',
+        series: e.Series || m.uiSeries || '',
+        start: toMs(e.sessionStartDate) || m.contractStartDate || null,
+        end: toMs(e.sessionEndDate) || toMs(e.sessionEndTime),
+        pictureUrl: m.pictureUrl,
+        meeting: e.Meeting_Name || e.Global_Meeting_Name || ''
+      };
+    }).filter(function (ev) { return ev.start; });
+    events.sort(function (a, b) { return a.start - b.start; });
+    return { meeting: events.length ? events[0].meeting : '', events: events };
+  }
+
+  /** Meetings of a season page (the "2026 Season" menu entry), in calendar order. */
+  function seasonFrom(containers) {
+    var out = [];
+    (containers || []).forEach(function (c) {
+      var items = (c.retrieveItems && c.retrieveItems.resultObj && c.retrieveItems.resultObj.containers) || [];
+      items.forEach(function (it) {
+        var m = it.metadata || {}, e = m.emfAttributes || {}, a = (it.actions || [])[0] || {};
+        if (!e.MeetingKey || !/\/PAGE\//.test(a.uri || '')) return;
+        out.push({
+          key: e.MeetingKey,
+          name: e.Meeting_Name || e.Global_Meeting_Name || m.title || '',
+          country: e.Meeting_Country_Name || e.Global_Meeting_Country_Name || '',
+          round: e.Championship_Meeting_Ordinal || '',
+          test: String(e.IsTestEvent).toLowerCase() === 'true' || /TESTING/i.test(m.title || ''),
+          start: toMs(e.Meeting_Start_Date),
+          end: toMs(e.Meeting_End_Date),
+          pictureUrl: m.pictureUrl,
+          uri: a.uri
+        });
+      });
+    });
+    out.sort(function (a, b) { return (a.start || 0) - (b.start || 0); });
+    return out;
+  }
+
+  function isoSeconds(d) {
+    var m = /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?$/.exec(d || '');
+    return m ? (+(m[1] || 0)) * 86400 + (+(m[2] || 0)) * 3600 + (+(m[3] || 0)) * 60 + (+(m[4] || 0)) : 0;
+  }
+
+  /**
+   * Timing facts from a DASH manifest, in player-position seconds:
+   * { dynamic, windowStart, windowEnd, epochAtZero (unix seconds at position 0), delay }.
+   * F1's media timeline counts Unix time, so positions map to real clock time.
+   */
+  function dashInfo(url) {
+    return fetch(url).then(function (r) { return r.text(); }).then(function (mpd) {
+      var attr = function (re) { var m = re.exec(mpd); return m ? m[1] : null; };
+      var dynamic = attr(/<MPD\b[^>]*\stype="(\w+)"/) === 'dynamic';
+      var periodStart = isoSeconds(attr(/<Period\b[^>]*\sstart="([^"]+)"/));
+      var ts = +attr(/<SegmentTemplate\b[^>]*\stimescale="(\d+)"/) || 1;
+      var pto = +attr(/<SegmentTemplate\b[^>]*\spresentationTimeOffset="(\d+)"/) || 0;
+      var t0 = +attr(/<S\s+t="(\d+)"/) || pto;
+      var span = 0, re = /<S\b([^>]*)\/>/g, m, first = mpd.indexOf('</SegmentTimeline>');
+      while ((m = re.exec(mpd)) && (first < 0 || m.index < first)) {
+        var d = /\sd="(\d+)"/.exec(m[1]), r = /\sr="(\d+)"/.exec(m[1]);
+        span += (d ? +d[1] : 0) * (1 + (r ? +r[1] : 0));
+      }
+      var windowStart = periodStart + (t0 - pto) / ts;
+      var ast = Date.parse(attr(/availabilityStartTime="([^"]+)"/) || '') / 1000 || 0;
+      return {
+        dynamic: dynamic,
+        windowStart: windowStart,
+        windowEnd: windowStart + span / ts,
+        epochAtZero: dynamic ? ast : (pto / ts) - periodStart,
+        delay: isoSeconds(attr(/suggestedPresentationDelay="([^"]+)"/)) || 25
+      };
+    });
+  }
+
+  /** True for "this hasn't started yet" answers from the play API. */
+  function isNotStarted(err) {
+    return /pre-?live|unavailable/i.test((err && err.message) || '');
+  }
+
   function imageUrl(pictureUrl, w, h) {
     if (!pictureUrl) return '';
     if (pictureUrl.indexOf('http') === 0) return pictureUrl;
@@ -214,6 +329,11 @@ var F1Api = (function () {
     liveNow: liveNow,
     video: video,
     play: play,
+    menu: menu,
+    scheduleFrom: scheduleFrom,
+    seasonFrom: seasonFrom,
+    dashInfo: dashInfo,
+    isNotStarted: isNotStarted,
     imageUrl: imageUrl
   };
 })();

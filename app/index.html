@@ -36,13 +36,24 @@
     <div id="rails" class="rails"></div>
   </section>
 
+  <!-- Vertical lists: season calendar, weekend schedule, account -->
+  <section id="screen-list" class="screen hidden">
+    <div id="list-hero" class="list-hero"></div>
+    <div class="list-head">
+      <div class="brand">F1<span>TV</span></div>
+      <h1 id="list-title"></h1>
+      <p id="list-sub" class="muted"></p>
+    </div>
+    <div id="list-body" class="list-body"><div id="list-inner" class="list-inner"></div></div>
+  </section>
+
   <!-- Feed picker for a session (main feed, F1 Live, onboards, ...) -->
   <section id="screen-feeds" class="screen hidden">
     <div class="feeds-hero" id="feeds-hero"></div>
     <div class="feeds-info">
       <h1 id="feeds-title"></h1>
       <p id="feeds-sub" class="muted"></p>
-      <div id="feeds-list" class="feeds-list"></div>
+      <div class="feeds-wrap"><div id="feeds-list" class="feeds-list"></div></div>
     </div>
   </section>
 
@@ -56,13 +67,33 @@
         <div id="osd-feed" class="osd-feed"></div>
       </div>
       <div class="osd-bottom">
-        <div class="osd-bar"><div id="osd-buffer" class="osd-buffer"></div><div id="osd-progress" class="osd-progress"></div></div>
-        <div class="osd-times"><span id="osd-pos"></span><span id="osd-live" class="live-badge hidden">LIVE</span><span id="osd-dur"></span></div>
-        <div class="osd-hint muted small">◀ ▶ seek · ▲ ▼ switch feed · OK pause · BACK exit</div>
+        <div class="osd-track">
+          <div id="osd-bubble" class="osd-bubble hidden"></div>
+          <div class="osd-bar">
+            <div id="osd-buffer" class="osd-buffer"></div>
+            <div id="osd-progress" class="osd-progress"></div>
+          </div>
+          <div id="osd-marker" class="osd-marker hidden"></div>
+        </div>
+        <div class="osd-times">
+          <span id="osd-pos"></span>
+          <span id="osd-live" class="live-badge hidden">LIVE</span>
+          <span id="osd-dur"></span>
+        </div>
+        <div id="osd-hint" class="osd-hint muted small"></div>
       </div>
     </div>
     <div id="spinner" class="spinner hidden"></div>
   </section>
+
+  <!-- Small choice dialog (e.g. live / from the start) -->
+  <div id="dialog" class="dialog hidden">
+    <div class="dialog-box">
+      <h2 id="dialog-title"></h2>
+      <p id="dialog-text" class="muted"></p>
+      <div id="dialog-actions" class="dialog-actions"></div>
+    </div>
+  </div>
 
   <div id="toast" class="toast hidden"></div>
 

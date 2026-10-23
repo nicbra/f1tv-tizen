@@ -71,7 +71,7 @@ var Player = (function () {
       range: function () { return p.seekRange(); },
       position: function () { return els.video.currentTime; },
       bufferedEnd: function () { var b = els.video.buffered; return b.length ? b.end(b.length - 1) : 0; },
-      seekTo: function (t) { els.video.currentTime = t; },
+      seekTo: function (t, done) { els.video.currentTime = t; if (done) done(); },
       paused: function () { return els.video.paused; },
       play: function () { els.video.play(); },
       pause: function () { els.video.pause(); }
@@ -86,6 +86,7 @@ var Player = (function () {
     var live = false;
     var isPaused = false;
     var posMs = 0;
+    var startAt = null;
 
     function b64ToBytes(b64) {
       var bin = atob(b64), out = new Uint8Array(bin.length);
@@ -129,9 +130,10 @@ var Player = (function () {
       } catch (e) { /* keep default track */ }
     }
 
-    function load(s) {
+    function load(s, startTime) {
       stream = s;
       av = webapis.avplay;
+      startAt = startTime;
       // Encrypted live DASH goes through the local service, which fixes the audio segments.
       if (s.licenseUrl && /\.mpd(\?|$)/.test(s.url)) {
         return Proxy.ensure().then(function () { return open(s, Proxy.manifest(s.url)); });
@@ -161,11 +163,21 @@ var Player = (function () {
         av.setDisplayMethod('PLAYER_DISPLAY_MODE_LETTER_BOX');
         av.prepareAsync(function () {
           var d = av.getDuration();
-          live = !!s.live || !d || d <= 0;
+          live = s.info ? s.info.dynamic : (!!s.live || !d || d <= 0);
           selectEnglishAudio();
           av.play();
+          if (startAt != null) seek(startAt * 1000);
           resolve();
         }, function (e) { reject(new Error('Could not open stream: ' + e)); });
+      });
+    }
+
+    // AVPlay rejects seeks (InvalidValuesError) for a moment after playback starts; retry.
+    function seek(ms, done, tries) {
+      posMs = Math.max(0, ms);
+      av.seekTo(Math.round(posMs), done || function () {}, function () {
+        if ((tries || 0) < 8) setTimeout(function () { seek(ms, done, (tries || 0) + 1); }, 700);
+        else if (done) done();
       });
     }
 
@@ -177,10 +189,13 @@ var Player = (function () {
     }
 
     function range() {
-      if (live) {
-        var p = posMs / 1000;
-        return { start: Math.max(0, p - 3600), end: p };
+      var info = stream && stream.info;
+      if (live && info) {
+        // The live edge keeps moving: wall clock minus the manifest's presentation delay.
+        var edge = Date.now() / 1000 - info.epochAtZero - info.delay;
+        return { start: info.windowStart, end: Math.max(edge, posMs / 1000) };
       }
+      if (live) return { start: Math.max(0, posMs / 1000 - 3600), end: posMs / 1000 };
       return { start: 0, end: av.getDuration() / 1000 };
     }
 
@@ -192,7 +207,7 @@ var Player = (function () {
       range: range,
       position: function () { return posMs / 1000; },
       bufferedEnd: function () { return posMs / 1000; },
-      seekTo: function (t) { av.seekTo(Math.max(0, Math.round(t * 1000))); },
+      seekTo: function (t, done) { seek(t * 1000, done); },
       paused: function () { return isPaused; },
       play: function () { av.play(); isPaused = false; },
       pause: function () { av.pause(); isPaused = true; }
@@ -219,7 +234,10 @@ var Player = (function () {
     return stream.licenseUrl && hasAvPlay() ? AvEngine : ShakaEngine;
   }
 
+  var current = null;
+
   function load(stream, startTime) {
+    current = stream;
     return unload().then(function () {
       engine = choose(stream);
       engineName = engine === AvEngine ? 'avplay' : 'shaka';
@@ -233,10 +251,21 @@ var Player = (function () {
     return e ? e.unload() : Promise.resolve();
   }
 
-  function seekBy(sec) {
+  /** Seeks to an absolute position (player seconds), clamped to the seekable range. */
+  function seekTo(sec, done) {
     if (!engine) return;
     var r = engine.range();
-    engine.seekTo(Math.max(r.start, Math.min(r.end - 1, engine.position() + sec)));
+    engine.seekTo(Math.max(r.start, Math.min(r.end - 1, sec)), done);
+  }
+
+  function seekBy(sec) {
+    if (engine) seekTo(engine.position() + sec);
+  }
+
+  /** Unix seconds shown at a player position, when the stream's timeline is wall-clock based. */
+  function wallClock(pos) {
+    var info = current && current.info;
+    return info && info.epochAtZero > 1e9 ? info.epochAtZero + pos : null;
   }
 
   function togglePause() {
@@ -253,6 +282,9 @@ var Player = (function () {
     load: load,
     unload: unload,
     seekBy: seekBy,
+    seekTo: seekTo,
+    wallClock: wallClock,
+    stream: function () { return current; },
     togglePause: togglePause,
     isLive: proxy('isLive', false),
     range: proxy('range', { start: 0, end: 0 }),

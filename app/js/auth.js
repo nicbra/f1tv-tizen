@@ -71,6 +71,12 @@ var Auth = (function () {
 
   function isPaired() { return !!load().authKey; }
 
+  /** Name and plan from the subscription token, e.g. { firstName: 'Nicholas', product: 'F1 TV Pro Monthly' }. */
+  function profile() {
+    var p = jwtPayload(load().subscriptionToken || '') || {};
+    return { firstName: p.FirstName || '', lastName: p.LastName || '', product: p.SubscribedProduct || '' };
+  }
+
   /** Signs out: forgets the token and the device key (the device stays listed in the account). */
   function clear() { update({ subscriptionToken: null, authKey: null }); }
 
@@ -179,6 +185,7 @@ var Auth = (function () {
     PAIR_PAGE: PAIR_PAGE,
     token: token,
     isPaired: isPaired,
+    profile: profile,
     clear: clear,
     secondsLeft: secondsLeft,
     pairUrl: pairUrl,
