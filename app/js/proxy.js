@@ -36,7 +36,16 @@ var Proxy = (function () {
     });
   }
 
-  function manifest(url) { return BASE + '/mpd?u=' + encodeURIComponent(url); }
+  /**
+   * Manifest via the service; shift (s) time-shifts a live stream so it plays that far behind live,
+   * langs ({ audio, text }) puts the viewer's languages first.
+   */
+  function manifest(url, shift, langs) {
+    langs = langs || {};
+    return BASE + '/mpd?u=' + encodeURIComponent(url) + (shift > 0 ? '&shift=' + Math.round(shift) : '') +
+      (langs.audio ? '&audio=' + encodeURIComponent(langs.audio) : '') +
+      (langs.text ? '&text=' + encodeURIComponent(langs.text) : '');
+  }
 
   return { ensure: ensure, manifest: manifest };
 })();

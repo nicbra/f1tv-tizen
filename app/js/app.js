@@ -12,7 +12,9 @@
   var osdTimer = null;
   var loginJob = null;
   var dialog = null;       // { grid, resolve } while a dialog is open
-  var scrub = null;        // { pos, n, last, timer, info } while seeking with the arrows
+  var scrub = null;        // { pos, n, last, dir, timer, info } while choosing a jump with the arrows
+  var pending = null;      // { pos, info, since } after a jump until playback runs there
+  var liveFocus = false;   // the LIVE button in the time bar is highlighted (▼ in live streams)
   var panel = null;        // { grid, timer } while the watch-options panel is open
   var timingState = null;  // latest timing state for the playing position
   var subtitleTimer = null;
@@ -77,9 +79,15 @@
     return 'in ' + Math.round(min / 1440) + ' days';
   }
 
-  /** 'live' | 'upcoming' | 'done' for a scheduled broadcast. */
+  /**
+   * 'live' | 'upcoming' | 'done' for a scheduled broadcast. F1 marks a broadcast that is on air
+   * as LIVE (the coverage starts before the session); the clock is only a fallback.
+   */
   function status(ev) {
+    if (ev.subtype === 'LIVE') return 'live';
+    if (ev.subtype === 'REPLAY') return 'done';
     var now = Date.now(), end = ev.end || ev.start + 2 * 3600000;
+    if (ev.subtype === 'LIVE_EVENT') return now < end ? 'upcoming' : 'done';
     if (now < ev.start) return 'upcoming';
     return now < end ? 'live' : 'done';
   }
@@ -226,6 +234,13 @@
     });
   }
 
+  /** Red dot on the Home and Schedule tabs while something is on air. */
+  function markLive(on) {
+    Array.prototype.forEach.call($('topnav').children, function (e) {
+      if (/^(Home|Schedule)$/.test(e.textContent)) e.classList.toggle('has-live', !!on);
+    });
+  }
+
   function markTab(i) {
     var items = $('topnav').children;
     for (var j = 0; j < items.length; j++) items[j].classList.toggle('active', j === i);
@@ -263,6 +278,7 @@
       var list = railsFromContainers(containers);
       var weekend = F1Api.scheduleFrom(containers);
       if (weekend && weekend.events.length) list.unshift(weekendRail(weekend));
+      if (pg.kind === 'home') markLive(weekend && weekend.events.some(function (ev) { return status(ev) === 'live'; }));
       drawRails(list, focus);
     }).catch(function (e) {
       rails.innerHTML = '';
@@ -299,7 +315,7 @@
       image: m.pictureUrl,
       contentId: m.contentType === 'VIDEO' ? (m.contentId || item.id) : null,
       uri: action.uri && /\/PAGE\//.test(action.uri) ? action.uri : null,
-      badge: /LIVE/.test(m.contentSubtype || '') && m.contentSubtype !== 'LIVE_REPLAY' ? { text: 'LIVE', cls: '' } : null,
+      badge: m.contentSubtype === 'LIVE' ? { text: 'LIVE', cls: 'live' } : null,
       raw: item
     };
   }
@@ -318,7 +334,7 @@
 
   function scheduleTile(ev) {
     var st = status(ev);
-    var badge = st === 'live' ? { text: 'LIVE', cls: '' }
+    var badge = st === 'live' ? { text: 'LIVE', cls: 'live' }
       : st === 'upcoming' ? { text: when(ev.start), cls: 'soon' } : { text: 'Replay', cls: 'done' };
     return {
       title: ev.title,
@@ -401,7 +417,6 @@
   }
 
   function selectTile(t) {
-    if (t.event && status(t.event) === 'upcoming') return toast(t.title + ' starts ' + when(t.event.start) + ' (' + until(t.event.start) + ').');
     if (t.contentId) return openFeeds(t.contentId, t);
     if (t.uri) return openPage(t.title, function () { return F1Api.pageByUri(t.uri); });
     toast('This item cannot be opened yet');
@@ -501,10 +516,9 @@
           what: ev.title,
           sub: ev.series,
           badge: st === 'live' ? 'LIVE' : st === 'upcoming' ? until(ev.start) : 'Replay',
-          badgeCls: st === 'live' ? 'live' : '',
+          badgeCls: st === 'live' ? 'live pulse' : '',
           past: st === 'done',
           run: function (idx) {
-            if (status(ev) === 'upcoming') return toast(ev.title + ' starts ' + when(ev.start) + ' (' + until(ev.start) + ').');
             var restore = function () { renderList(spec, idx); };
             openFeeds(ev.contentId, { title: ev.title, image: ev.pictureUrl, event: ev }, restore);
           }
@@ -580,7 +594,7 @@
       );
       var ev = tile.event;
       feedsCtx = { contentId: contentId, title: tile.title, image: tile.image, feeds: feeds, index: 0,
-        live: ev ? status(ev) === 'live' : (/^LIVE/.test(m.contentSubtype || '') || !!(tile.badge && tile.badge.text === 'LIVE')),
+        live: ev ? status(ev) !== 'done' : (m.contentSubtype === 'LIVE' || !!(tile.badge && tile.badge.text === 'LIVE')),
         start: ev ? ev.start : null };
       var emf = m.emfAttributes || {};
       feedsCtx.timingMeta = {
@@ -665,13 +679,30 @@
    * position; opts.switching continues at the same moment as the feed playing now. Switches of
    * clear streams are preloaded while the current feed keeps playing.
    */
+  var loadingFeed = false;   // a playFeed load is running
+  var queuedFeed = null;     // the latest request made meanwhile: [i, opts]
+
+  /** Runs playFeed requests one at a time (rapid reloads crash Samsung's player); latest wins. */
   function playFeed(i, opts) {
+    if (loadingFeed) { queuedFeed = [i, opts]; return; }
+    loadingFeed = true;
+    var finished = false;
+    function done() {
+      if (finished) return;
+      finished = true;
+      loadingFeed = false;
+      if (queuedFeed) { var q = queuedFeed; queuedFeed = null; playFeed(q[0], q[1]); }
+    }
+    loadFeed(i, opts).then(done, done);
+  }
+
+  function loadFeed(i, opts) {
     opts = opts || {};
     var f = feedsCtx.feeds[i];
     var playing = screen === 'player' && Player.engineName();
     var from = opts.switching && playing ? { wall: Player.wallClock(Player.position()), at: Date.now() } : null;
     feedsCtx.index = i;
-    ensureSession().then(function (ok) {
+    return ensureSession().then(function (ok) {
       if (!ok) return showLogin('Sign in to watch.');
       show('player');
       scrub = null;
@@ -690,8 +721,18 @@
           return F1Api.streamInfo(stream.url).then(function (info) { stream.info = info; }, function () {});
         })
         .then(function () {
-          if (feedsCtx.index !== i) return; // another feed was picked meanwhile
+          // Superseded by a newer request, or the viewer left the player while it loaded.
+          if (feedsCtx.index !== i || queuedFeed || screen !== 'player') return;
           var start = startPosition(stream.info, opts, from);
+          // Live (dynamic) streams on AVPlay can't seek at start-up; instead the local service
+          // time-shifts the manifest so the player's own live edge lies at the chosen moment
+          // (it starts `delay` before its edge, hence the extra info.delay).
+          var info = stream.info;
+          if (start != null && info && info.dynamic && info.epochAtZero > 1e9 && stream.licenseUrl) {
+            var shift = Date.now() / 1000 - (info.epochAtZero + start) - info.delay;
+            if (shift > 5) stream.startDelay = shift;
+            start = null;
+          }
           if (!from) return Player.load(stream, start);
           var t0 = Date.now();
           return Player.switchTo(stream, start).then(function () {
@@ -702,10 +743,11 @@
         .then(function () {
           $('spinner').classList.add('hidden');
           Timing.load(feedsCtx.timingMeta, F1Api.state.ascendon, feedsCtx.live);
-          if (stream && Player.stream() === stream) watchStart(stream);
+          if (stream && Player.stream() === stream && !opts.retry) watchStart(stream);
         })
         .catch(function (e) {
           $('spinner').classList.add('hidden');
+          if (e && e.message === 'cancelled') return;
           if (F1Api.isNotStarted(e)) {
             stopPlayer();
             return toast(feedsCtx.title + ' hasn\'t started yet' + (feedsCtx.start ? ' — it starts ' + when(feedsCtx.start) + '.' : '.'), 8000);
@@ -721,11 +763,11 @@
     setTimeout(function () {
       if (screen !== 'player' || Player.stream() !== stream || Player.isPaused() || stream.retried) return;
       if (Player.position() > from + 0.5) return;
-      stream.retried = true;
       toast('The video didn\'t start — trying again…', 3000);
-      $('spinner').classList.remove('hidden');
-      Player.load(stream, from || null).then(function () { $('spinner').classList.add('hidden'); },
-        function (e) { $('spinner').classList.add('hidden'); toast('Could not play: ' + e.message, 8000); });
+      // Through playFeed so it queues behind any other load instead of racing it.
+      var wall = Player.wallClock(from);
+      playFeed(feedsCtx.index, Player.isLive() ? (wall ? { liveAt: wall, retry: true } : { retry: true })
+        : { startAt: from || null, retry: true });
     }, 15000);
   }
 
@@ -734,26 +776,39 @@
 
   function startPosition(info, opts, from) {
     if (opts.startAt != null) return opts.startAt;
+    if (opts.liveAt) {
+      var at = Player.positionAt(opts.liveAt, info);
+      if (at != null) return at;
+    }
     if (from && from.wall) {
       var wall = from.wall + (Date.now() - from.at) / 1000 + switchLead;
       var p = Player.positionAt(wall, info);
       if (p != null && p >= info.windowStart && p <= info.windowEnd) return p;
     }
-    if (opts.fromStart && info && info.dynamic) return info.windowStart + 1;
+    // A little after the window start: the player's own DVR window begins a few seconds later.
+    if (opts.fromStart && info && info.dynamic) return info.windowStart + 15;
     return null;
   }
 
   function showOsd() {
     $('osd').classList.remove('hidden');
+    $('screen-player').classList.add('osd-visible');
     clearTimeout(osdTimer);
-    osdTimer = setTimeout(function () { if (!scrub) $('osd').classList.add('hidden'); }, 4000);
+    osdTimer = setTimeout(function () {
+      if (scrub || pending || liveFocus) return showOsd();
+      $('osd').classList.add('hidden');
+      $('screen-player').classList.remove('osd-visible');
+    }, 4000);
   }
+
+  // The live player itself runs ~25-50 s behind real time; within this margin counts as live.
+  var LIVE_MARGIN = 60;
 
   /** Label for a position: offset or behind-live time, plus the real clock time when known. */
   function posLabel(pos, r, live) {
     var wall = Player.wallClock(pos);
     var main;
-    if (live) main = r.end - pos < 15 ? 'LIVE' : '−' + fmtTime(r.end - pos);
+    if (live) main = r.end - pos < LIVE_MARGIN ? 'LIVE' : '−' + fmtTime(r.end - pos);
     else main = fmtTime(pos - r.start);
     return { main: main, clock: wall ? hhmmss(wall * 1000) : '' };
   }
@@ -762,13 +817,23 @@
     if (screen !== 'player') return;
     var pos = Player.position();
     var r = Player.range();
+    // While a stream (re)loads it has no position yet.
+    if (loadingFeed || (Player.isLive() && pos < r.start - 3600)) {
+      $('osd-pos').textContent = 'Loading…';
+      $('osd-dur').textContent = '';
+      $('osd-live').classList.add('hidden');
+      return;
+    }
     var live = Player.isLive();
     var span = Math.max(1, r.end - r.start);
     var pct = function (p) { return Math.max(0, Math.min(100, 100 * (p - r.start) / span)) + '%'; };
     $('osd-progress').style.width = pct(pos);
     $('osd-buffer').style.width = pct(Player.bufferedEnd());
-    var behind = live && r.end - pos >= 15;
-    $('osd-live').classList.toggle('hidden', !live || behind);
+    var behind = live && r.end - pos >= LIVE_MARGIN;
+    $('osd-live').classList.toggle('hidden', !live);
+    $('osd-live').classList.toggle('behind', behind);
+    $('osd-live').classList.toggle('focused', liveFocus);
+    $('osd-live').textContent = behind ? 'GO LIVE ▶▶' : 'LIVE';
     var cur = posLabel(pos, r, live);
     $('osd-pos').textContent = cur.clock ? cur.clock + (live ? '' : '  ·  ' + cur.main) : cur.main;
     $('osd-dur').textContent = live ? (behind ? cur.main + ' behind live' : '') : fmtTime(span);
@@ -778,21 +843,23 @@
     $('osd-feed').textContent = (f ? f.title : '') + (info ? '  ·  ' + info : '');
 
     var marker = $('osd-marker'), bubble = $('osd-bubble');
-    if (scrub) {
-      var lbl = posLabel(scrub.pos, r, live);
-      marker.style.left = pct(scrub.pos);
-      bubble.style.left = pct(scrub.pos);
+    var shown = scrub || pending;
+    if (shown) {
+      var lbl = posLabel(shown.pos, r, live);
+      marker.style.left = pct(shown.pos);
+      bubble.style.left = pct(shown.pos);
       bubble.innerHTML = '';
-      if (scrub.info) bubble.appendChild(el('div', 'bubble-info', scrub.info));
+      if (shown.info) bubble.appendChild(el('div', 'bubble-info', shown.info));
       bubble.appendChild(document.createTextNode(lbl.main));
       if (lbl.clock) bubble.appendChild(el('small', '', lbl.clock));
       marker.classList.remove('hidden');
       bubble.classList.remove('hidden');
-      $('osd-hint').textContent = 'OK to jump · BACK to cancel';
+      $('osd-hint').textContent = scrub ? 'OK to jump · BACK to cancel' : 'Jumping…';
     } else {
       marker.classList.add('hidden');
       bubble.classList.add('hidden');
-      $('osd-hint').textContent = '◀ ▶ seek · OK pause · ▲ ▼ feeds & options · BACK exit' + (behind ? ' · hold ▶ to catch up' : '');
+      $('osd-hint').textContent = liveFocus ? 'OK = go live · ▲ back'
+        : '◀ ▶ seek · OK pause · ▲ feeds & options' + (live ? ' · ▼ LIVE button' : '') + ' · BACK exit';
     }
   }
 
@@ -801,13 +868,18 @@
 
   function scrubMove(dir, big) {
     var now = Date.now();
-    if (!scrub) scrub = { pos: Player.position(), n: -1, last: 0 };
+    if (!scrub) scrub = { pos: pending ? pending.pos : Player.position(), n: -1, last: 0, dir: dir };
+    // Steps grow while pressing quickly in one direction; turning around starts small again.
+    if (scrub.dir !== dir) scrub.n = -1;
+    scrub.dir = dir;
     scrub.n = now - scrub.last < 600 ? Math.min(scrub.n + 1, SCRUB_STEPS.length - 1) : 0;
     scrub.last = now;
     var r = Player.range();
-    scrub.pos = Math.max(r.start, Math.min(r.end, scrub.pos + dir * (big ? 60 : SCRUB_STEPS[scrub.n])));
+    scrub.pos = Math.max(r.start, Math.min(r.end - 1, scrub.pos + dir * (big ? 60 : SCRUB_STEPS[scrub.n])));
     clearTimeout(scrub.timer);
-    scrub.timer = setTimeout(scrubCommit, 1500);
+    // Jump after the presses stop; quick presses keep adding up. Live jumps reopen the stream,
+    // so they wait longer (OK jumps right away).
+    scrub.timer = setTimeout(scrubCommit, Player.isLive() && Player.engineName() === 'avplay' ? 1500 : 800);
     var wall = Player.wallClock(scrub.pos), target = scrub.pos, s = scrub;
     if (wall) Timing.query(wall * 1000).then(function (st) {
       if (scrub === s && s.pos === target) { s.info = Timing.label(st); updateOsd(); }
@@ -816,15 +888,55 @@
     updateOsd();
   }
 
+  /**
+   * Commits the previewed jump. The destination stays on screen until the video actually plays
+   * there; the spinner only appears if that takes longer than a moment.
+   */
   function scrubCommit() {
     if (!scrub) return;
     var p = scrub.pos;
+    // Live streams on Samsung's player don't seek reliably: reopen them instead, at live or
+    // time-shifted to the chosen moment (see playFeed / the service's time-shift).
+    if (Player.isLive() && Player.engineName() === 'avplay') {
+      clearTimeout(scrub.timer);
+      scrub = null;
+      var toLive = Player.range().end - p < LIVE_MARGIN;
+      if (toLive && behindLive() < LIVE_MARGIN) return updateOsd(); // already live: nothing to do
+      return goLive(toLive ? null : Player.wallClock(p));
+    }
     clearTimeout(scrub.timer);
+    pending = { pos: p, info: scrub.info, since: Date.now() };
     scrub = null;
-    $('spinner').classList.remove('hidden');
-    Player.seekTo(p, function () { $('spinner').classList.add('hidden'); });
+    var mine = pending;
+    setTimeout(function () { if (pending === mine) $('spinner').classList.remove('hidden'); }, 450);
+    Player.seekTo(p);
     showOsd();
     updateOsd();
+  }
+
+  /** Reopens the current live feed at live, or (wall = unix seconds) time-shifted to that moment. */
+  function goLive(wall) {
+    closePanel();
+    playFeed(feedsCtx.index, wall ? { liveAt: wall } : {});
+  }
+
+  function behindLive() {
+    if (!Player.isLive()) return 0;
+    return Math.max(0, Player.range().end - Player.position());
+  }
+
+  /** Clears the pending jump once playback runs near its destination (or gives up after 10 s). */
+  function checkPending() {
+    if (!pending) return;
+    var pos = Player.position();
+    var arrived = Math.abs(pos - pending.pos) < 4 && Date.now() - pending.since > 150 &&
+      pending.lastPos != null && pos > pending.lastPos;
+    pending.lastPos = pos;
+    if (arrived || Date.now() - pending.since > 10000) {
+      pending = null;
+      $('spinner').classList.add('hidden');
+      updateOsd();
+    }
   }
 
   function scrubCancel() {
@@ -844,8 +956,10 @@
   }
 
   function stopPlayer() {
+    liveFocus = false;
     saveProgress();
     if (scrub) scrubCancel();
+    pending = null;
     closePanel();
     timingState = null;
     $('tower').classList.add('hidden');
@@ -858,18 +972,44 @@
     if (grid) grid.apply();
   }
 
+  function hideOsd() {
+    clearTimeout(osdTimer);
+    $('osd').classList.add('hidden');
+    $('screen-player').classList.remove('osd-visible');
+  }
+
   function playerKey(key) {
     if (panel) return panelKey(key);
+    // While a stream (re)loads it has no position yet: seeking now would start from 0.
+    if (loadingFeed && (key === K.LEFT || key === K.RIGHT || key === K.RW || key === K.FF)) {
+      return toast('Loading…', 1200);
+    }
+    // BACK first closes whatever is open (preview, LIVE focus, the bar); only then the video.
+    var barVisible = !$('osd').classList.contains('hidden');
+    if (key === K.BACK && !scrub && !liveFocus && barVisible) return hideOsd();
     showOsd();
+    if (liveFocus) {
+      liveFocus = false;
+      if (key === K.ENTER) {
+        if (behindLive() > LIVE_MARGIN) return goLive(null);
+        if (Player.isPaused()) Player.togglePause();
+        updateOsd();
+        return toast('You\'re watching live.', 2000);
+      }
+      updateOsd();
+      if (key === K.BACK) return hideOsd();
+      if (key === K.UP || key === K.DOWN) return;
+    }
     if (scrub) {
       if (key === K.ENTER) return scrubCommit();
-      if (key === K.BACK) return scrubCancel();
+      if (key === K.BACK) { scrubCancel(); return hideOsd(); }
     }
     if (key === K.LEFT) return scrubMove(-1);
     if (key === K.RIGHT) return scrubMove(1);
     if (key === K.RW) return scrubMove(-1, true);
     if (key === K.FF) return scrubMove(1, true);
     if (key === K.ENTER || key === K.PLAY_PAUSE || key === K.PLAY || key === K.PAUSE) return Player.togglePause();
+    if (key === K.DOWN && Player.isLive()) { liveFocus = true; return updateOsd(); }
     if (key === K.UP || key === K.DOWN) return openPanel();
     if (key === K.CH_UP) return switchFeed(-1);
     if (key === K.CH_DOWN) return switchFeed(1);
@@ -910,6 +1050,15 @@
       e._refresh();
       box.appendChild(e);
       rows.push([e]);
+    }
+
+    if (behindLive() > LIVE_MARGIN) {
+      var go = el('div', 'panel-row setting go-live');
+      go.appendChild(el('span', 'panel-label', 'Go to live'));
+      go.appendChild(el('span', 'panel-value', '−' + fmtTime(behindLive())));
+      go._action = function () { goLive(null); };
+      box.appendChild(go);
+      rows.push([go]);
     }
 
     if (Timing.supported(feedsCtx.timingMeta)) {
@@ -961,6 +1110,7 @@
 
     var g = new Focus.Grid(rows, {
       onSelect: function (e) {
+        if (e._action) return e._action();
         if (e._cycle) return e._cycle(1);
         closePanel();
         if (e._feed !== feedsCtx.index) {
@@ -977,6 +1127,7 @@
     panel = { grid: g, timer: null };
     $('panel').classList.remove('hidden');
     $('osd').classList.add('hidden');
+    $('screen-player').classList.remove('osd-visible');
     g.apply();
     armPanel();
   }
@@ -1095,11 +1246,19 @@
     setInterval(updateOsd, 500);
 
     Player.on('error', function (msg) { toast(msg, 8000); $('spinner').classList.add('hidden'); });
-    Player.on('buffering', function (b) { $('spinner').classList.toggle('hidden', !b); });
+    // During a jump the pending-seek logic owns the spinner (it waits a moment before showing it).
+    Player.on('buffering', function (b) { if (!pending) $('spinner').classList.toggle('hidden', !b); });
+    setInterval(checkPending, 100);
     Player.on('ended', function () { if (screen === 'player') stopPlayer(); });
     Player.on('subtitle', showSubtitle);
     setInterval(timingTick, 1000);
     setInterval(saveProgress, 30000);
+    // Refresh the home page now and then so live / upcoming badges stay current.
+    setInterval(function () {
+      if (screen === 'browse' && currentPage && currentPage.kind === 'home' && grid && !dialog) {
+        renderPage(currentPage, { r: grid.r, c: grid.c.slice() });
+      }
+    }, 120000);
 
     Player.init($('video'), $('av-player'))
       .then(function () { return F1Api.refreshConfig(); })

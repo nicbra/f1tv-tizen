@@ -97,7 +97,8 @@ body.avplay #video, body.avplay #video2 { display: none; }
 #av-player { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; }
 #video, #video2 { position: absolute; top: 0; left: 0; right: 0; bottom: 0; width: 1920px; height: 1080px; background: #000; }
 /* Overlays stay above both video layers (they swap z-index during a feed switch). */
-.osd, .tower, .panel, .subtitle, .spinner { z-index: 10; }
+.osd, .tower, .panel, .spinner { z-index: 10; }
+.subtitle { z-index: 5; }
 .osd { position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between;
   background: linear-gradient(to bottom, rgba(0,0,0,0.75) 0, transparent 25%, transparent 70%, rgba(0,0,0,0.85) 100%); }
 .osd-top { padding: 50px 80px; }
@@ -117,10 +118,23 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .osd-times { display: flex; justify-content: space-between; margin-top: 14px; font-size: 24px; }
 .osd-hint { margin-top: 12px; text-align: center; }
 .live-badge { background: var(--red); padding: 2px 12px; border-radius: 4px; font-weight: 700; }
+.live-badge:not(.behind):before { content: ''; display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+  background: #fff; margin-right: 8px; vertical-align: 1px; animation: livePulse 1.4s ease-in-out infinite; }
+.live-badge.behind { background: rgba(255, 255, 255, 0.18); }
+.live-badge.focused { box-shadow: 0 0 0 3px #fff; }
+.live-badge.behind.focused { background: var(--red); }
+.panel-row.go-live .panel-label:before { content: '● '; color: var(--red); }
+.panel-row.go-live.focused .panel-label:before { color: #fff; }
 
-.spinner { position: absolute; left: 50%; top: 50%; width: 90px; height: 90px; margin: -45px 0 0 -45px;
-  border: 8px solid rgba(255,255,255,0.2); border-top-color: var(--red); border-radius: 50%;
+.spinner { position: absolute; left: 50%; top: 50%; width: 84px; height: 84px; margin: -42px 0 0 -42px; }
+.spin-track { position: absolute; top: 0; left: 0; right: 0; bottom: 0; border-radius: 50%;
+  border: 4px solid rgba(255, 255, 255, 0.12); }
+.spin-arc { position: absolute; top: 0; left: 0; right: 0; bottom: 0; border-radius: 50%;
+  background: conic-gradient(rgba(225, 6, 0, 0) 0deg, rgba(225, 6, 0, 0) 220deg, rgba(225, 6, 0, 0.9) 340deg, #ff4b3a 360deg);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 4px), #000 calc(100% - 4px));
   animation: spin 0.9s linear infinite; }
+.spin-arc:after { content: ''; position: absolute; top: 0; left: 50%; width: 4px; height: 4px; margin-left: -2px;
+  border-radius: 50%; background: #ff6a5a; box-shadow: 0 0 10px 3px rgba(225, 6, 0, 0.75); }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .toast { position: absolute; left: 50%; bottom: 80px; transform: translateX(-50%); max-width: 1400px;
@@ -205,7 +219,7 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .tyre-I { border-color: #43b02a; } .tyre-W { border-color: #0067ad; }
 
 /* ---------- Subtitles and seeker info ---------- */
-.subtitle { position: absolute; left: 50%; bottom: 120px; transform: translateX(-50%); max-width: 1400px;
+.subtitle { position: absolute; left: 50%; bottom: 90px; transition: bottom 0.2s ease-out; transform: translateX(-50%); max-width: 1400px;
   background: rgba(0, 0, 0, 0.78); padding: 8px 22px; border-radius: 6px; font-size: 38px; text-align: center; line-height: 1.3; }
 .bubble-info { font-size: 20px; font-weight: 600; color: var(--muted); text-align: center; margin-bottom: 2px; }
 
@@ -214,3 +228,13 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .brand .brand-tv { font-style: italic; font-weight: 900; margin-left: 8px; vertical-align: middle; font-size: 38px; }
 .login-box .brand-logo { height: 64px; }
 .login-box .brand .brand-tv { font-size: 56px; }
+
+/* Live markers */
+@keyframes livePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.tile-badge.live:before, .list-row .badge.live:before { content: ''; display: inline-block; width: 10px; height: 10px;
+  border-radius: 50%; background: #fff; margin-right: 8px; vertical-align: 1px; animation: livePulse 1.4s ease-in-out infinite; }
+.topnav .nav-item.has-live:after { content: ''; display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+  background: var(--red); margin-left: 10px; vertical-align: 3px; animation: livePulse 1.4s ease-in-out infinite; }
+
+/* Subtitles move up above the player bar while it is shown */
+.osd-visible .subtitle { bottom: 270px; }

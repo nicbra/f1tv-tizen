@@ -76,7 +76,8 @@ var Player = (function () {
       player.configure({
         drm: drm,
         // Start on a mid quality and a small buffer so playback begins quickly; ABR then climbs to 1080p.
-        streaming: { bufferingGoal: 30, rebufferingGoal: 1, bufferBehind: 30,
+        // bufferBehind keeps recently watched video so short jumps back are instant.
+        streaming: { bufferingGoal: 30, rebufferingGoal: 1, bufferBehind: 90,
           retryParameters: { maxAttempts: 4, baseDelay: 1000, backoffFactor: 2 } },
         abr: { enabled: true, defaultBandwidthEstimate: 2500000, switchInterval: 4 },
         manifest: { hls: { ignoreManifestProgramDateTime: false } }
@@ -131,10 +132,10 @@ var Player = (function () {
      * Resetting one video element makes the TV's resource manager pause the other one, so after
      * the old player is unloaded the new one is resumed unless the viewer paused it.
      */
-    function keepPlaying(v, ms) {
+    function keepPlaying(v, ms, beforeSwap) {
       var until = Date.now() + (ms || 2500);
       (function check() {
-        if (V() !== v || userPaused || Date.now() > until) return;
+        if ((!beforeSwap && V() !== v) || userPaused || Date.now() > until) return;
         if (v.paused) v.play().catch(function () {});
         setTimeout(check, 150);
       })();
@@ -154,7 +155,7 @@ var Player = (function () {
         next.v.classList.remove('hidden');
         return next.v.play().catch(function () { /* paused by the TV; whenPlaying retries below */ });
       }).then(function () {
-        keepPlaying(next.v);
+        keepPlaying(next.v, 3000, true);
         return whenPlaying(next.v, 3000);
       }).then(function () {
         next.v.muted = false;
@@ -277,9 +278,9 @@ var Player = (function () {
       var t = lang && trackList().text.filter(function (x) { return sameLang(x.lang, lang); })[0];
       try {
         if (!t) { av.setSilentSubtitle(true); emit('subtitle', null); return; }
-        av.setSilentSubtitle(false);
         av.setSelectTrack('TEXT', t.index);
-      } catch (e) { /* subtitles unavailable */ }
+        av.setSilentSubtitle(false);
+      } catch (e) { /* subtitles unavailable in this state */ }
     }
 
     function load(s, startTime) {
@@ -288,10 +289,13 @@ var Player = (function () {
       startAt = startTime;
       // Encrypted live DASH goes through the local service, which fixes the audio segments.
       if (s.licenseUrl && /\.mpd(\?|$)/.test(s.url)) {
-        return Proxy.ensure().then(function () { return open(s, Proxy.manifest(s.url)); });
+        var langs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
+        return Proxy.ensure().then(function () { return open(s, Proxy.manifest(s.url, s.startDelay, langs)); });
       }
       return open(s, s.url);
     }
+
+    var preparing = null;   // settles when the current prepareAsync has finished either way
 
     function open(s, url) {
       isPaused = false;
@@ -314,19 +318,73 @@ var Player = (function () {
         if (s.licenseUrl) {
           av.setDrm('WIDEVINE_CDM', 'SetProperties', JSON.stringify({ AppSession: 'f1tv-' + Date.now() }));
         }
+        tune();
         av.setDisplayRect(0, 0, 1920, 1080);
         av.setDisplayMethod('PLAYER_DISPLAY_MODE_LETTER_BOX');
+        var settle;
+        preparing = new Promise(function (r) { settle = r; });
         av.prepareAsync(function () {
+          settle();
+          // Unloaded or replaced while preparing: don't start (unload() closes the player).
+          if (stream !== s) return reject(new Error('cancelled'));
           var d = av.getDuration();
           live = s.info ? s.info.dynamic : (!!s.live || !d || d <= 0);
           selectAudio(Settings.get('audio'));
-          selectText(Settings.get('subtitles'));
+          // Live streams start where the manifest's presentation delay puts them (see Proxy.manifest);
+          // replays start at startAt with an ordinary seek once playing.
           av.play();
-          if (startAt != null) seek(startAt * 1000);
           ensurePlaying(s);
+          applyTextWhenPlaying(s);
+          if (startAt != null && !live) seek(startAt * 1000, null, 16);
           resolve();
-        }, function (e) { reject(new Error('Could not open stream: ' + e)); });
+        }, function (e) { settle(); reject(new Error(stream !== s ? 'cancelled' : 'Could not open stream: ' + e)); });
       });
+    }
+
+    /**
+     * Seek tuning (set before prepare): after a jump, start on the lowest bitrate so the first
+     * segment arrives fast (ABR climbs again), and resume once 4 s are buffered (Samsung's minimum).
+     */
+    var tuning = { skipLowest: true, resumeBuffer: 4 };
+
+    function tune() {
+      try {
+        if (tuning.skipLowest) av.setStreamingProperty('ADAPTIVE_INFO', 'SKIPBITRATE=LOWEST');
+        if (tuning.resumeBuffer) av.setBufferingParam('PLAYER_BUFFER_FOR_RESUME', 'PLAYER_BUFFER_SIZE_IN_SECOND', tuning.resumeBuffer);
+      } catch (e) { /* older firmware: keep defaults */ }
+    }
+
+    /** AVPlay's own DVR window for live streams in seconds ({ start, end }), or null. */
+    function liveWindow() {
+      try {
+        var parts = String(av.getStreamingProperty('GET_LIVE_DURATION')).split('|');
+        var a = +parts[0] / 1000, b = +parts[1] / 1000;
+        return a > 0 && b > a ? { start: a, end: b } : null;
+      } catch (e) { return null; }
+    }
+
+    /** Live seeks outside AVPlay's window are silently ignored, so keep targets 10 s inside it. */
+    function clampLive(t) {
+      var w = live && liveWindow();
+      return w ? Math.max(w.start + 10, Math.min(w.end - 5, t)) : t;
+    }
+
+    /**
+     * The proxied manifest already lists the preferred subtitles first (AVPlay's default), so this
+     * only shows/hides them; for other streams it selects the track once playback runs (AVPlay
+     * ignores track changes before that).
+     */
+    function applyTextWhenPlaying(s) {
+      var want = Settings.get('subtitles');
+      try { av.setSilentSubtitle(!want); } catch (e) { /* not ready */ }
+      setTimeout(function () {
+        if (stream !== s || !want) return;
+        var cur = null;
+        try { cur = av.getCurrentStreamInfo().filter(function (t) { return t.type === 'TEXT'; })[0]; } catch (e) { return; }
+        var info = {};
+        try { info = JSON.parse((cur && cur.extra_info) || '{}'); } catch (e) { /* unknown */ }
+        if (!sameLang(info.track_lang, want)) selectText(want);
+      }, 1200);
     }
 
     /** Re-issues play() if AVPlay stays READY/PAUSED after starting (and the viewer didn't pause). */
@@ -342,23 +400,54 @@ var Player = (function () {
     }
 
     // AVPlay rejects seeks (InvalidValuesError) for a moment after playback starts; retry.
-    function seek(ms, done, tries) {
-      posMs = Math.max(0, ms);
-      av.seekTo(Math.round(posMs), done || function () {}, function () {
-        if ((tries || 0) < 8) setTimeout(function () { seek(ms, done, (tries || 0) + 1); }, 700);
-        else if (done) done();
-      });
+    var seekGen = 0;
+
+    /**
+     * Seeks to ms. AVPlay rejects seeks with InvalidValuesError for a moment after playback starts,
+     * so those are retried; a newer seek or another stream cancels pending retries.
+     * done(ok) is called once.
+     */
+    function seek(ms, done, maxTries) {
+      var gen = ++seekGen, s = stream, tries = 0;
+      posMs = Math.max(0, clampLive(ms / 1000) * 1000);
+      (function attempt() {
+        if (gen !== seekGen || s !== stream) return;
+        try {
+          av.seekTo(Math.round(posMs), function () { if (gen === seekGen && done) done(true); }, function (e) {
+            if (gen !== seekGen || s !== stream) return;
+            if (e && e.name === 'InvalidValuesError' && ++tries < (maxTries || 8)) return setTimeout(attempt, 500);
+            if (done) done(false);
+          });
+        } catch (e) {
+          if (done) done(false);
+        }
+      })();
     }
 
+    /**
+     * Stops and closes AVPlay. Closing it while prepareAsync is still running can crash the
+     * native player, so that waits for the preparation to finish first.
+     */
     function unload() {
-      try { av && av.stop(); av && av.close(); } catch (e) { /* already closed */ }
+      var wait = preparing || Promise.resolve();
+      stream = null;
       els.av.classList.add('hidden');
       document.body.classList.remove('avplay');
-      return Promise.resolve();
+      return wait.then(function () {
+        try { if (av) av.stop(); } catch (e) { /* not started */ }
+        try { if (av) av.close(); } catch (e) { /* already closed */ }
+        preparing = null;
+      });
     }
 
     function range() {
       var info = stream && stream.info;
+      var w = live && liveWindow();
+      if (w) {
+        // The end is the real live edge, even when the stream is time-shifted behind it.
+        var edge = info ? Date.now() / 1000 - info.epochAtZero - info.delay : w.end;
+        return { start: w.start + 10, end: Math.max(w.end, edge, posMs / 1000) };
+      }
       if (live && info) {
         // The live edge keeps moving: wall clock minus the manifest's presentation delay.
         var edge = Date.now() / 1000 - info.epochAtZero - info.delay;
@@ -382,7 +471,8 @@ var Player = (function () {
       pause: function () { av.pause(); isPaused = true; },
       tracks: trackList,
       setAudio: selectAudio,
-      setSubtitles: selectText
+      setSubtitles: selectText,
+      tuning: tuning
     };
   })();
 
@@ -492,6 +582,7 @@ var Player = (function () {
     seekBy: seekBy,
     seekTo: seekTo,
     switchTo: switchTo,
+    avTuning: AvEngine.tuning,
     wallClock: wallClock,
     positionAt: positionAt,
     stream: function () { return current; },

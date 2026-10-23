@@ -8,7 +8,11 @@
  * corrected (the entries are empty: constant IV, no subsamples). Video goes straight to the CDN.
  *
  *   GET /ping                 -> "ok"
- *   GET /mpd?u=<manifest url> -> manifest with audio segments pointed at /s/
+ *   GET /mpd?u=<manifest url>[&shift=<s>][&audio=eng][&text=eng] -> manifest with audio segments
+ *       pointed at /s/; audio/text put the viewer's languages first (AVPlay starts with the first
+ *       track of each kind); with
+ *       shift, a live manifest is time-shifted so its live edge lies <s> seconds in the past
+ *       (how "watch from the start" and same-moment feed switches work for live streams).
  *   GET /s/<b64 base>/<file>  -> segment from the CDN, patched if needed
  */
 'use strict';
@@ -41,7 +45,7 @@ function fetchBuffer(target, redirects, cb) {
 
 // Buffer.from is missing on very old Node versions; toBuf() is deprecated on new ones.
 function toBuf(s, enc) {
-  return typeof Buffer.from === 'function' && Buffer.from !== Uint8Array.from ? Buffer.from(s, enc) : toBuf(s, enc);
+  return typeof Buffer.from === 'function' && Buffer.from !== Uint8Array.from ? Buffer.from(s, enc) : new Buffer(s, enc);
 }
 
 function b64urlEncode(s) {
@@ -83,6 +87,85 @@ function patchSenc(buf) {
   return buf;
 }
 
+function attr(attrs, name) {
+  var m = new RegExp('\\s' + name + '="([^"]*)"').exec(attrs);
+  return m ? m[1] : null;
+}
+
+function isoSeconds(d) {
+  var m = /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?$/.exec(d || '');
+  return m ? (+(m[1] || 0)) * 86400 + (+(m[2] || 0)) * 3600 + (+(m[3] || 0)) * 60 + (+(m[4] || 0)) : 0;
+}
+
+/**
+ * Time-shifts a dynamic manifest `shift` seconds into the past: availabilityStartTime moves forward
+ * by `shift` and every SegmentTimeline only lists segments that existed `shift` seconds ago. To the
+ * player it is a normal live stream whose live edge is `shift` behind the real one, so it simply
+ * starts there (AVPlay ignores large presentation delays and refuses early live seeks).
+ */
+function timeShift(mpd, shift, nowMs) {
+  var astText = attr(mpd.slice(0, mpd.indexOf('>', mpd.indexOf('<MPD'))), 'availabilityStartTime');
+  if (!astText || !/type="dynamic"/.test(mpd)) return mpd;
+  var ast = Date.parse(astText);
+  var periodStart = isoSeconds(attr((/<Period\b[^>]*>/.exec(mpd) || [''])[0], 'start'));
+  var edgeSeconds = (nowMs - shift * 1000 - ast) / 1000 - periodStart; // shifted edge, period time
+
+  var shifted = mpd.replace(/<SegmentTemplate\b([^>]*)>([\s\S]*?)<\/SegmentTemplate>/g, function (all, attrs, inner) {
+    var ts = +attr(attrs, 'timescale') || 1, pto = +attr(attrs, 'presentationTimeOffset') || 0;
+    var cut = pto + edgeSeconds * ts; // media time of the shifted live edge
+    inner = inner.replace(/<SegmentTimeline>([\s\S]*?)<\/SegmentTimeline>/, function (x, body) {
+      var out = [], t = null;
+      body.replace(/<S\b([^>]*)\/>/g, function (tag, a) {
+        if (attr(a, 't') != null) t = +attr(a, 't');
+        var d = +attr(a, 'd'), r = +(attr(a, 'r') || 0);
+        if (t == null || !d) return tag;
+        var n = Math.max(0, Math.min(r + 1, Math.floor((cut - t) / d)));
+        if (n > 0) out.push('<S t="' + t + '" d="' + d + '"' + (n > 1 ? ' r="' + (n - 1) + '"' : '') + '/>');
+        t += (r + 1) * d;
+        return tag;
+      });
+      return '<SegmentTimeline>' + out.join('') + '</SegmentTimeline>';
+    });
+    return '<SegmentTemplate' + attrs + '>' + inner + '</SegmentTemplate>';
+  });
+  // A set whose timeline is now empty (e.g. subtitles or the trick-play track starting later) is
+  // dropped rather than handed to the player empty.
+  mpd = shifted.replace(/<AdaptationSet\b[\s\S]*?<\/AdaptationSet>/g, function (set) {
+    return /<SegmentTimeline><\/SegmentTimeline>/.test(set) ? '' : set;
+  });
+  return mpd.replace(/availabilityStartTime="[^"]*"/, 'availabilityStartTime="' + new Date(ast + shift * 1000).toISOString() + '"');
+}
+
+function setKind(block) {
+  if (/contentType="audio"/.test(block)) return 'audio';
+  if (/contentType="text"/.test(block) || /codecs="stpp/.test(block) || /codecs="wvtt/.test(block)) return 'text';
+  return null;
+}
+
+/**
+ * Moves the adaptation set in the preferred language to the front of its kind (audio or
+ * subtitles), keeping every other set where it was. AVPlay uses the first track as its default.
+ */
+function preferLanguages(mpd, prefs) {
+  var blocks = [];
+  mpd.replace(/<AdaptationSet\b[\s\S]*?<\/AdaptationSet>/g, function (b, at) { blocks.push({ text: b, at: at }); return b; });
+  if (!blocks.length) return mpd;
+  var order = blocks.map(function (b) { return b.text; });
+  ['audio', 'text'].forEach(function (kind) {
+    var lang = prefs[kind];
+    if (!lang) return;
+    var slots = [], sets = [];
+    blocks.forEach(function (b, i) { if (setKind(b.text) === kind) { slots.push(i); sets.push(b.text); } });
+    var pick = sets.filter(function (t) { return new RegExp('lang="' + lang + '(-[^"]*)?"').test(t); })[0];
+    if (!pick) return;
+    var rest = sets.filter(function (t) { return t !== pick; });
+    [pick].concat(rest).forEach(function (t, k) { order[slots[k]] = t; });
+  });
+  var out = '', pos = 0;
+  blocks.forEach(function (b, i) { out += mpd.slice(pos, b.at) + order[i]; pos = b.at + b.text.length; });
+  return out + mpd.slice(pos);
+}
+
 function rewriteManifest(mpd, manifestUrl) {
   var base = manifestUrl.split('?')[0];
   base = base.substring(0, base.lastIndexOf('/') + 1);
@@ -111,7 +194,10 @@ function handle(req, res) {
     return fetchBuffer(manifestUrl, 3, function (err, status, body) {
       if (err) return send(res, 502, toBuf(String(err)));
       if (status !== 200) return send(res, status, body);
-      send(res, 200, toBuf(rewriteManifest(body.toString('utf8'), manifestUrl), 'utf8'), 'application/dash+xml');
+      var mpd = rewriteManifest(body.toString('utf8'), manifestUrl);
+      if (+u.query.shift > 0) mpd = timeShift(mpd, +u.query.shift, Date.now());
+      if (u.query.audio || u.query.text) mpd = preferLanguages(mpd, { audio: u.query.audio, text: u.query.text });
+      send(res, 200, toBuf(mpd, 'utf8'), 'application/dash+xml');
     });
   }
 

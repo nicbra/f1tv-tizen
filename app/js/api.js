@@ -237,6 +237,7 @@ var F1Api = (function () {
         start: toMs(e.sessionStartDate) || m.contractStartDate || null,
         end: toMs(e.sessionEndDate) || toMs(e.sessionEndTime),
         pictureUrl: m.pictureUrl,
+        subtype: m.contentSubtype || '',   // LIVE = on air now, LIVE_EVENT = scheduled, REPLAY = done
         meeting: e.Meeting_Name || e.Global_Meeting_Name || '',
         meetingKey: e.MeetingKey,
         meetingEnd: toMs(e.Meeting_End_Date),

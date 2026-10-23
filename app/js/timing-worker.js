@@ -1,7 +1,8 @@
 /*
  * Timing worker: loads a session's feeds from F1's timing archive, keeps them on a UTC
- * timeline and answers "what did the timing screen show at time T?". During a live session
- * the feeds are polled for new lines with HTTP range requests.
+ * timeline and answers "what did the timing screen show at time T?". The archive is published
+ * shortly after a session; during a live session the worker uses F1's real-time feed (SignalR)
+ * instead and records it from the moment it connects, so viewers behind live see no spoilers.
  *
  * Messages in:  { cmd: 'load', path, token, live }  |  { cmd: 'query', id, t }  |  { cmd: 'stop' }
  * Messages out: { type: 'loaded', info } | { type: 'error', message } | { type: 'state', id, state }
@@ -12,7 +13,6 @@ var BASE = 'https://livetiming.formula1.com/static/';
 var FEEDS = ['Heartbeat', 'SessionInfo', 'LapCount', 'ExtrapolatedClock', 'SessionData',
   'TrackStatus', 'DriverList', 'TimingAppData', 'TimingData'];
 var SNAPSHOT_MS = 3000;
-var POLL_MS = 8000;
 
 var job = null;
 
@@ -218,30 +218,76 @@ function query(t) {
   return out;
 }
 
-function poll() {
-  var j = job;
-  if (!j || j.stopped || !j.live) return;
-  setTimeout(function () {
-    if (job !== j || j.stopped) return;
-    FEEDS.reduce(function (p, f) { return p.then(function () { return fetchFeed(f); }); }, Promise.resolve())
-      .catch(function () { /* try again next round */ })
-      .then(poll);
-  }, POLL_MS);
-}
-
 function start(m) {
   job = emptyJob(m.path, m.token, m.live);
   var j = job;
   loadAll().then(function () {
     if (job !== j) return;
     self.postMessage({ type: 'loaded', info: { type: j.info.Type, name: j.info.Name, drivers: Object.keys(j.drivers).length } });
-    poll();
   }).catch(function (err) {
     if (job !== j) return;
-    // A live session's archive files appear shortly after it starts; keep trying.
-    if (m.live && !j.stopped) return setTimeout(function () { if (job === j && !j.stopped) start(m); }, 20000);
+    // No archive yet: a live session. Follow F1's real-time feed instead.
+    if (m.live && !j.stopped) return startLive(m);
     self.postMessage({ type: 'error', message: err.message });
   });
+}
+
+// ---------- live: F1's SignalR Core feed (anonymous) ----------
+
+var LIVE = 'https://livetiming.formula1.com/signalrcore';
+var RS = '\x1e';
+
+function startLive(m) {
+  var j = job = emptyJob(m.path, m.token, true);
+  j.collect = null;
+  j.base = 0;          // live records carry absolute UTC times
+  connect(j);
+}
+
+function connect(j) {
+  if (job !== j || j.stopped) return;
+  fetch(LIVE + '/negotiate?negotiateVersion=1', { method: 'POST', credentials: 'include' })
+    .then(function (r) { return r.text(); })
+    .then(function (text) {
+      var n = JSON.parse(text.replace(/^\uFEFF/, ''));
+      var ws = new WebSocket('wss://livetiming.formula1.com/signalrcore?id=' + encodeURIComponent(n.connectionToken || n.connectionId));
+      var handshaken = false, announced = false;
+      j.ws = ws;
+      ws.onopen = function () { ws.send(JSON.stringify({ protocol: 'json', version: 1 }) + RS); };
+      ws.onmessage = function (e) {
+        if (job !== j) return ws.close();
+        var frames = String(e.data).split(RS).filter(Boolean).map(function (f) {
+          try { return JSON.parse(f); } catch (x) { return null; }
+        });
+        if (!handshaken) {
+          handshaken = true;
+          frames.shift();
+          ws.send(JSON.stringify({ type: 1, invocationId: '1', target: 'Subscribe', arguments: [FEEDS] }) + RS);
+          j.keepAlive = setInterval(function () { try { ws.send(JSON.stringify({ type: 6 }) + RS); } catch (x) { /* closed */ } }, 15000);
+        }
+        frames.forEach(function (msg) {
+          if (!msg) return;
+          if (msg.type === 3 && msg.result) {
+            // Full state at subscribe time.
+            var t = Date.now();
+            FEEDS.forEach(function (f) { if (msg.result[f]) apply(f, t, msg.result[f]); });
+            snapshot(t);
+            if (!announced) {
+              announced = true;
+              self.postMessage({ type: 'loaded', info: { type: j.info.Type, name: j.info.Name, live: true } });
+            }
+          } else if (msg.type === 1 && msg.target === 'feed' && msg.arguments) {
+            var a = msg.arguments;
+            apply(a[0], Date.parse(a[2]) || Date.now(), a[1]);
+          }
+        });
+      };
+      ws.onclose = function () {
+        clearInterval(j.keepAlive);
+        if (job === j && !j.stopped) setTimeout(function () { connect(j); }, 5000);
+      };
+    })
+    .catch(function () { setTimeout(function () { connect(j); }, 10000); });
 }
 
 self.onmessage = function (e) {
@@ -253,6 +299,7 @@ self.onmessage = function (e) {
     self.postMessage({ type: 'state', id: m.id, state: query(m.t) });
   } else if (m.cmd === 'stop') {
     if (job) job.stopped = true;
+    if (job && job.ws) try { job.ws.close(); } catch (x) { /* closed */ }
     job = null;
   }
 };
