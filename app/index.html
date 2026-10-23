@@ -83,6 +83,16 @@
         <div id="osd-hint" class="osd-hint muted small"></div>
       </div>
     </div>
+    <div id="tower" class="tower hidden">
+      <div class="tower-head"><span id="tower-label"></span><span id="tower-flag" class="tower-flag hidden"></span></div>
+      <div id="tower-rows"></div>
+    </div>
+    <div id="subtitle" class="subtitle hidden"></div>
+    <div id="panel" class="panel hidden">
+      <div class="panel-title">Watch options</div>
+      <div class="panel-wrap"><div id="panel-list" class="panel-list"></div></div>
+      <div class="panel-hint muted small">▲ ▼ choose · OK select · ◀ ▶ change · BACK close</div>
+    </div>
     <div id="spinner" class="spinner hidden"></div>
   </section>
 
@@ -100,12 +110,14 @@
   <script src="$WEBAPIS/webapis/webapis.js"></script>
   <script src="vendor/shaka-player.compiled.js"></script>
   <script src="vendor/qrcode.js"></script>
+  <script src="js/settings.js"></script>
   <script src="js/keys.js"></script>
   <script src="js/focus.js"></script>
   <script src="js/api.js"></script>
   <script src="js/auth.js"></script>
   <script src="js/proxy.js"></script>
   <script src="js/player.js"></script>
+  <script src="js/timing.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>

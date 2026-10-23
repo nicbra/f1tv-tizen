@@ -19,13 +19,21 @@ way the official apps do it; this app does not break or bypass any DRM.
   Live sessions can be joined live or from the start of the broadcast.
 - YouTube-style seeking: the arrows move a preview marker (steps grow while you keep pressing) that
   shows the position and the real clock time; it jumps on OK or after a short pause.
-- Switching feed (▲ ▼ or CH +/-) continues at the same moment of the session.
+- Watch options panel (▲ ▼ in the player): pick a feed (onboards in team colours), turn the timing
+  overlay on or off, choose commentary (English, German, French, Dutch, Portuguese, Japanese, or
+  track sound only) and subtitles (F1's own captions, also live). Switching feed continues at the
+  same moment of the session.
+- Live timing: a timing tower (positions, gaps or best laps, tyres, track status) and lap or
+  session info ("Lap 34/56", "Q2 · 07:12 left") above the time in the seeker. Works for live
+  sessions and replays, always showing the state at the moment you are watching.
+- Resume where you left off, synced with F1 TV's other apps.
+- Spoiler-free mode (Settings, under your name): blurs artwork of replays and highlights.
 
 ## Remote
 
 | Key | Browse | Player |
 | --- | --- | --- |
-| Arrows | move | ◀ ▶ preview a jump, ▲ ▼ switch feed |
+| Arrows | move | ◀ ▶ preview a jump, ▲ ▼ watch options and feeds |
 | OK | open | jump to the previewed time, otherwise pause / play |
 | ⏪ ⏩ | | preview jumps of 60 s |
 | CH +/- | | switch feed |
@@ -43,6 +51,10 @@ way the official apps do it; this app does not break or bypass any DRM.
   - **AVPlay** (Samsung's native player) for F1's encrypted streams. They are CBCS-encrypted, and
     the 2021 TV's browser engine can't decrypt CBCS video (it shows noise), but AVPlay can.
   - **Shaka Player** for unencrypted streams (most replays and archive content).
+- `js/timing.js` + `js/timing-worker.js` load the session from F1's timing archive
+  (`livetiming.formula1.com/static`, authorised with the F1 TV token) in a Web Worker. F1's video
+  timeline counts real (Unix) time, so every position maps to a moment in the timing data. During
+  live sessions the worker polls the feeds with HTTP range requests.
 - `service/service.js` is a small background Node.js service that runs on the TV. F1's live audio
   segments contain a `senc` box that claims 0 samples, which AVPlay rejects. The service serves the
   manifest, routes only the audio segments through itself and sets the sample count to the real
@@ -56,6 +68,9 @@ way the official apps do it; this app does not break or bypass any DRM.
 3. `scripts/deploy.sh cert` creates a signing certificate (a normal Tizen developer certificate is
    enough for a 2021 TV).
 4. `TV_IP=<tv address> scripts/deploy.sh` builds, installs and launches the app.
+
+A personal app icon can be put in `local/icon.png` (git-ignored); `deploy.sh` uses it instead of
+`app/img/icon.png`. Keep trademarked logos out of the repository.
 
 Apps installed in developer mode can expire after a while; run `scripts/deploy.sh install` again
 if it disappears.

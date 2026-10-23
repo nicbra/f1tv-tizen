@@ -64,8 +64,10 @@ html, body {
 .rail-title { padding: 0 80px; font-size: 30px; margin-bottom: 14px; color: var(--text); }
 .rail-track { padding: 6px 80px; white-space: nowrap; transition: transform 0.2s ease-out; }
 .tile { display: inline-block; vertical-align: top; width: 384px; margin-right: 24px; white-space: normal; }
-.tile-img { width: 384px; height: 216px; border-radius: 8px; background: var(--panel) center / cover no-repeat;
-  border: 4px solid transparent; position: relative; }
+.tile-img { width: 384px; height: 216px; border-radius: 8px; background: var(--panel);
+  border: 4px solid transparent; position: relative; overflow: hidden; }
+.tile-art { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: center / cover no-repeat; }
+.tile-art.spoiler, .feeds-hero.spoiler { filter: blur(18px); transform: scale(1.15); }
 .tile.focused .tile-img { border-color: var(--focus); transform: scale(1.04); }
 .tile-title { margin-top: 10px; font-size: 22px; line-height: 1.3; max-height: 58px; overflow: hidden; }
 .tile-sub { font-size: 18px; color: var(--muted); margin-top: 4px; }
@@ -82,7 +84,7 @@ html, body {
 .feeds-info h1 { font-size: 56px; margin-bottom: 12px; }
 .feeds-wrap { margin-top: 40px; height: 760px; overflow: hidden; }
 .feeds-list { transition: transform 0.15s ease-out; }
-.feed { margin-bottom: 12px; padding: 18px 28px; background: rgba(38, 38, 50, 0.9); border-radius: 8px; border: 3px solid transparent;
+.feed { align-items: center; margin-bottom: 12px; padding: 18px 28px; background: rgba(38, 38, 50, 0.9); border-radius: 8px; border: 3px solid transparent;
   display: flex; justify-content: space-between; }
 .feed.focused { border-color: var(--focus); background: var(--red); }
 .feed .feed-type { color: var(--muted); font-size: 22px; }
@@ -91,9 +93,11 @@ html, body {
 /* ---------- Player ---------- */
 /* AVPlay draws video on a hardware plane behind the page, so the page must be see-through. */
 body.avplay, body.avplay #screen-player { background: transparent; }
-body.avplay #video { display: none; }
+body.avplay #video, body.avplay #video2 { display: none; }
 #av-player { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; }
-#video { position: absolute; top: 0; left: 0; right: 0; bottom: 0; width: 1920px; height: 1080px; background: #000; }
+#video, #video2 { position: absolute; top: 0; left: 0; right: 0; bottom: 0; width: 1920px; height: 1080px; background: #000; }
+/* Overlays stay above both video layers (they swap z-index during a feed switch). */
+.osd, .tower, .panel, .subtitle, .spinner { z-index: 10; }
 .osd { position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between;
   background: linear-gradient(to bottom, rgba(0,0,0,0.75) 0, transparent 25%, transparent 70%, rgba(0,0,0,0.85) 100%); }
 .osd-top { padding: 50px 80px; }
@@ -154,3 +158,59 @@ body.avplay #video { display: none; }
 .dialog-box p { margin-top: 14px; }
 .dialog-actions { margin-top: 36px; display: flex; justify-content: center; }
 .dialog-actions .btn { margin: 0 12px; }
+
+/* ---------- Watch options panel ---------- */
+.panel { position: absolute; top: 0; right: 0; bottom: 0; width: 460px; background: rgba(12, 12, 18, 0.92);
+  border-left: 3px solid var(--red); }
+.panel-title { font-size: 24px; font-weight: 700; padding: 34px 26px 10px; }
+.panel-wrap { position: absolute; top: 84px; bottom: 52px; left: 0; right: 0; overflow: hidden; }
+.panel-list { transition: transform 0.15s ease-out; }
+.panel-head { font-size: 17px; color: var(--muted); text-transform: uppercase; letter-spacing: 2px; padding: 14px 26px 4px; }
+.panel-row { display: flex; align-items: center; height: 42px; padding: 0 26px; border-left: 4px solid transparent; font-size: 21px; }
+.panel-row.focused { background: var(--red); border-left-color: #fff; }
+.panel-row.current .panel-label { font-weight: 700; }
+.panel-row.current .panel-label:after { content: ' ●'; color: var(--red); font-size: 16px; }
+.panel-row.current.focused .panel-label:after { color: #fff; }
+.panel-label { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.panel-label small { font-size: 18px; color: var(--muted); margin-left: 10px; }
+.panel-row.focused .panel-label small { color: var(--text); }
+.panel-value { color: var(--muted); font-size: 18px; margin-left: 10px; white-space: nowrap; }
+.panel-row.focused .panel-value { color: var(--text); }
+.feed-num { width: 46px; margin-right: 12px; text-align: right; font-weight: 800; font-style: italic;
+  font-variant-numeric: tabular-nums; flex: none; }
+.focused .feed-num { color: #fff !important; }
+.feed .feed-name { flex: 1; }
+.feed .feed-name small { margin-left: 14px; color: var(--muted); font-size: 22px; }
+.feed.focused .feed-name small { color: var(--text); }
+.panel-hint { position: absolute; bottom: 16px; left: 26px; right: 26px; font-size: 17px; }
+
+/* ---------- Timing tower ---------- */
+.tower { position: absolute; left: 50px; top: 50px; width: 330px; background: rgba(12, 12, 18, 0.82);
+  border-radius: 10px; padding: 12px 0; font-size: 22px; }
+.tower-head { display: flex; justify-content: space-between; align-items: center; padding: 0 16px 10px;
+  font-weight: 700; font-size: 22px; border-bottom: 2px solid rgba(255,255,255,0.12); margin-bottom: 6px; }
+.tower-flag { padding: 2px 10px; border-radius: 4px; font-size: 18px; font-weight: 800; }
+.tower-flag.yellow { background: #f5d200; color: #000; }
+.tower-flag.sc, .tower-flag.vsc { background: #ff9d00; color: #000; }
+.tower-flag.red { background: var(--red); }
+.tower-row { display: flex; align-items: center; height: 36px; padding: 0 16px; }
+.tower-row.out { opacity: 0.45; }
+.tw-pos { width: 34px; text-align: right; margin-right: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.tw-bar { width: 5px; height: 22px; border-radius: 2px; margin-right: 10px; }
+.tw-tla { width: 70px; font-weight: 700; }
+.tw-val { flex: 1; text-align: right; font-variant-numeric: tabular-nums; color: #ddd; }
+.tw-tyre { width: 24px; height: 24px; margin-left: 10px; border-radius: 50%; border: 3px solid #888; font-size: 13px;
+  line-height: 18px; text-align: center; font-weight: 800; }
+.tyre-S { border-color: #e10600; } .tyre-M { border-color: #ffd12e; } .tyre-H { border-color: #f0f0f0; }
+.tyre-I { border-color: #43b02a; } .tyre-W { border-color: #0067ad; }
+
+/* ---------- Subtitles and seeker info ---------- */
+.subtitle { position: absolute; left: 50%; bottom: 120px; transform: translateX(-50%); max-width: 1400px;
+  background: rgba(0, 0, 0, 0.78); padding: 8px 22px; border-radius: 6px; font-size: 38px; text-align: center; line-height: 1.3; }
+.bubble-info { font-size: 20px; font-weight: 600; color: var(--muted); text-align: center; margin-bottom: 2px; }
+
+/* Logo from img/logo.png when the build has one */
+.brand-logo { height: 40px; vertical-align: middle; }
+.brand .brand-tv { font-style: italic; font-weight: 900; margin-left: 8px; vertical-align: middle; font-size: 38px; }
+.login-box .brand-logo { height: 64px; }
+.login-box .brand .brand-tv { font-size: 56px; }

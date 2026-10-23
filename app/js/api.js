@@ -237,7 +237,10 @@ var F1Api = (function () {
         start: toMs(e.sessionStartDate) || m.contractStartDate || null,
         end: toMs(e.sessionEndDate) || toMs(e.sessionEndTime),
         pictureUrl: m.pictureUrl,
-        meeting: e.Meeting_Name || e.Global_Meeting_Name || ''
+        meeting: e.Meeting_Name || e.Global_Meeting_Name || '',
+        meetingKey: e.MeetingKey,
+        meetingEnd: toMs(e.Meeting_End_Date),
+        endIso: e.sessionEndTime || ''
       };
     }).filter(function (ev) { return ev.start; });
     events.sort(function (a, b) { return a.start - b.start; });
@@ -304,6 +307,69 @@ var F1Api = (function () {
     });
   }
 
+  /**
+   * Same timing facts for an HLS stream. F1's replays are HLS with EXT-X-PROGRAM-DATE-TIME tags,
+   * which give the real clock time of segments; marks maps player positions to Unix seconds.
+   */
+  function hlsInfo(url) {
+    return fetch(url).then(function (r) { return r.text(); }).then(function (master) {
+      var lines = master.split('\n');
+      for (var i = 0; i < lines.length - 1; i++) {
+        if (lines[i].indexOf('#EXT-X-STREAM-INF') === 0) {
+          var media = new URL(lines[i + 1].trim(), url).toString();
+          return fetch(media).then(function (r) { return r.text(); });
+        }
+      }
+      return master;
+    }).then(function (playlist) {
+      var pos = 0, marks = [];
+      playlist.split('\n').forEach(function (l) {
+        if (l.indexOf('#EXT-X-PROGRAM-DATE-TIME:') === 0) {
+          var t = Date.parse(l.slice(25).trim());
+          if (!isNaN(t)) marks.push({ pos: pos, wall: t / 1000 });
+        } else if (l.indexOf('#EXTINF:') === 0) {
+          pos += parseFloat(l.slice(8)) || 0;
+        }
+      });
+      var live = !/#EXT-X-ENDLIST/.test(playlist) && !/PLAYLIST-TYPE:VOD/.test(playlist);
+      return { dynamic: live, windowStart: 0, windowEnd: pos, delay: 25, marks: marks,
+        epochAtZero: marks.length ? marks[0].wall - marks[0].pos : 0 };
+    });
+  }
+
+  /** Clock-time facts for any stream URL (DASH or HLS). */
+  function streamInfo(url) {
+    return /\.m3u8(\?|$)/.test(url) ? hlsInfo(url) : dashInfo(url);
+  }
+
+  /** Saved resume position (seconds) for a video, shared with F1 TV's other apps; 0 if none. */
+  function resumePosition(contentId, duration) {
+    if (!state.entitlement) return Promise.resolve(0);
+    var l = loc();
+    var url = [BASE, '2.0', 'R', LANG, PAGE_PLATFORM, 'ALL/CONTENT/USERSELECTIONS', l.entitlement, l.groupId].join('/');
+    var body = {};
+    body[contentId] = { duration: duration || 0 };
+    return http(url, {
+      method: 'POST',
+      headers: { entitlementtoken: state.entitlement, 'content-type': 'text/plain;charset=UTF-8', 'x-f1-device-info': DEVICE_INFO },
+      body: JSON.stringify(body)
+    }).then(function (data) {
+      var r = data && data.resultObj && data.resultObj[contentId];
+      return (r && r.user && r.user.resume && r.user.resume.playHeadPosition) || 0;
+    }).catch(function () { return 0; });
+  }
+
+  /** Saves the resume position, like the web player's progress heartbeat. */
+  function savePosition(contentId, seconds, contentSubtype) {
+    if (!state.ascendon || !state.entitlement) return Promise.resolve();
+    var url = [BASE, '1.0', 'R', LANG, PAGE_PLATFORM, 'ALL/ACTION/PLAY'].join('/');
+    return http(url, {
+      method: 'POST',
+      headers: { ascendontoken: state.ascendon, entitlementtoken: state.entitlement, 'content-type': 'application/json', 'x-f1-device-info': DEVICE_INFO },
+      body: JSON.stringify({ contentId: +contentId, playHeadPosition: Math.round(seconds), contentSubType: contentSubtype || 'REPLAY' })
+    }).catch(function () { /* best effort */ });
+  }
+
   /** True for "this hasn't started yet" answers from the play API. */
   function isNotStarted(err) {
     return /pre-?live|unavailable/i.test((err && err.message) || '');
@@ -333,6 +399,9 @@ var F1Api = (function () {
     scheduleFrom: scheduleFrom,
     seasonFrom: seasonFrom,
     dashInfo: dashInfo,
+    streamInfo: streamInfo,
+    resumePosition: resumePosition,
+    savePosition: savePosition,
     isNotStarted: isNotStarted,
     imageUrl: imageUrl
   };
