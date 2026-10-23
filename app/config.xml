@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<widget xmlns="http://www.w3.org/ns/widgets" xmlns:tizen="http://tizen.org/ns/widgets"
+        id="http://f1tv-tizen.local/app" version="0.1.0" viewmodes="maximized">
+    <tizen:application id="F1TVtizen1.F1TV" package="F1TVtizen1" required_version="3.0"/>
+    <name>F1 TV</name>
+    <description>Unofficial F1 TV client for Samsung Tizen TVs</description>
+    <icon src="img/icon.png"/>
+    <content src="index.html"/>
+
+    <feature name="http://tizen.org/feature/screen.size.normal.1080.1920"/>
+    <tizen:profile name="tv-samsung"/>
+    <feature name="http://tizen.org/feature/web.service"/>
+
+    <!-- The app talks to f1tv.formula1.com, api.formula1.com and the video CDNs. -->
+    <access origin="*" subdomains="true"/>
+    <tizen:allow-navigation>*</tizen:allow-navigation>
+    <!-- The default policy blocks blob: media, which MSE playback needs. -->
+    <tizen:content-security-policy>default-src * data: blob: 'unsafe-inline' 'unsafe-eval'; media-src * blob: data:; img-src * data: blob:</tizen:content-security-policy>
+
+    <tizen:privilege name="http://tizen.org/privilege/internet"/>
+    <tizen:privilege name="http://tizen.org/privilege/tv.inputdevice"/>
+    <tizen:privilege name="http://developer.samsung.com/privilege/productinfo"/>
+    <tizen:privilege name="http://developer.samsung.com/privilege/drmplay"/>
+    <tizen:privilege name="http://tizen.org/privilege/application.launch"/>
+
+    <tizen:setting screen-orientation="landscape" context-menu="disable"
+                   background-support="disable" encryption="disable"
+                   install-location="auto" hwkey-event="enable"/>
+
+    <!-- Local helper that fixes F1's live audio segments for AVPlay (see service/service.js). -->
+    <tizen:service id="F1TVtizen1.Proxy">
+        <tizen:content src="service/service.js"/>
+        <tizen:name>F1TVProxy</tizen:name>
+        <tizen:description>Local stream helper</tizen:description>
+    </tizen:service>
+</widget>

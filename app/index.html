@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=1920, height=1080">
+  <title>F1 TV</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <!-- Login / pairing -->
+  <section id="screen-login" class="screen">
+    <div class="login-box">
+      <div class="brand">F1<span>TV</span></div>
+      <h1 id="login-title">Sign in</h1>
+      <p id="login-text" class="muted"></p>
+      <div class="pair-row">
+        <div id="login-qr" class="pair-qr hidden"></div>
+        <div class="pair-steps">
+          <div id="login-code" class="pair-code"></div>
+          <p id="login-hint" class="muted small"></p>
+        </div>
+      </div>
+      <p id="login-status" class="muted small"></p>
+      <div class="login-actions" id="login-actions"></div>
+    </div>
+  </section>
+
+  <!-- Browse -->
+  <section id="screen-browse" class="screen hidden">
+    <header class="topbar">
+      <div class="brand">F1<span>TV</span></div>
+      <nav id="topnav" class="topnav"></nav>
+      <div id="clock" class="clock"></div>
+    </header>
+    <h2 id="page-title" class="page-title"></h2>
+    <div id="rails" class="rails"></div>
+  </section>
+
+  <!-- Feed picker for a session (main feed, F1 Live, onboards, ...) -->
+  <section id="screen-feeds" class="screen hidden">
+    <div class="feeds-hero" id="feeds-hero"></div>
+    <div class="feeds-info">
+      <h1 id="feeds-title"></h1>
+      <p id="feeds-sub" class="muted"></p>
+      <div id="feeds-list" class="feeds-list"></div>
+    </div>
+  </section>
+
+  <!-- Player -->
+  <section id="screen-player" class="screen hidden">
+    <object id="av-player" type="application/avplayer" class="hidden"></object>
+    <video id="video" autoplay></video>
+    <div id="osd" class="osd hidden">
+      <div class="osd-top">
+        <div id="osd-title" class="osd-title"></div>
+        <div id="osd-feed" class="osd-feed"></div>
+      </div>
+      <div class="osd-bottom">
+        <div class="osd-bar"><div id="osd-buffer" class="osd-buffer"></div><div id="osd-progress" class="osd-progress"></div></div>
+        <div class="osd-times"><span id="osd-pos"></span><span id="osd-live" class="live-badge hidden">LIVE</span><span id="osd-dur"></span></div>
+        <div class="osd-hint muted small">◀ ▶ seek · ▲ ▼ switch feed · OK pause · BACK exit</div>
+      </div>
+    </div>
+    <div id="spinner" class="spinner hidden"></div>
+  </section>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="$WEBAPIS/webapis/webapis.js"></script>
+  <script src="vendor/shaka-player.compiled.js"></script>
+  <script src="vendor/qrcode.js"></script>
+  <script src="js/keys.js"></script>
+  <script src="js/focus.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/auth.js"></script>
+  <script src="js/proxy.js"></script>
+  <script src="js/player.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
