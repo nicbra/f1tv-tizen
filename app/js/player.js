@@ -75,11 +75,12 @@ var Player = (function () {
       player.resetConfiguration();
       player.configure({
         drm: drm,
-        // Start on a mid quality and a small buffer so playback begins quickly; ABR then climbs to 1080p.
-        // bufferBehind keeps recently watched video so short jumps back are instant.
+        // A small start buffer so playback begins quickly; bufferBehind keeps recently watched video
+        // so short jumps back are instant. ABR starts from a 10 Mbit/s estimate (enough for F1's
+        // 1080p, measured to start in 1080p) instead of the browser's network hint.
         streaming: { bufferingGoal: 30, rebufferingGoal: 1, bufferBehind: 90,
           retryParameters: { maxAttempts: 4, baseDelay: 1000, backoffFactor: 2 } },
-        abr: { enabled: true, defaultBandwidthEstimate: 2500000, switchInterval: 4 },
+        abr: { enabled: true, defaultBandwidthEstimate: 10000000, useNetworkInformation: false, switchInterval: 4 },
         manifest: { hls: { ignoreManifestProgramDateTime: false } }
       });
     }
@@ -304,10 +305,12 @@ var Player = (function () {
       document.body.classList.add('avplay');
       return new Promise(function (resolve, reject) {
         av.open(url);
+        openedAt = Date.now();
+        quietUntil = openedAt + 6000;
         av.setListener({
-          onbufferingstart: function () { emit('buffering', true); },
+          onbufferingstart: function () { emit('buffering', true); noteBuffering(s); },
           onbufferingcomplete: function () { emit('buffering', false); },
-          oncurrentplaytime: function (ms) { posMs = ms; },
+          oncurrentplaytime: function (ms) { posMs = ms; noteSmooth(s); },
           onstreamcompleted: function () { emit('ended'); },
           onerror: function (e) { emit('error', 'Player error: ' + e); },
           onsubtitlechange: function (duration, text) {
@@ -323,35 +326,77 @@ var Player = (function () {
         av.setDisplayMethod('PLAYER_DISPLAY_MODE_LETTER_BOX');
         var settle;
         preparing = new Promise(function (r) { settle = r; });
-        av.prepareAsync(function () {
-          settle();
-          // Unloaded or replaced while preparing: don't start (unload() closes the player).
-          if (stream !== s) return reject(new Error('cancelled'));
-          var d = av.getDuration();
-          live = s.info ? s.info.dynamic : (!!s.live || !d || d <= 0);
-          selectAudio(Settings.get('audio'));
-          // Live streams start where the manifest's presentation delay puts them (see Proxy.manifest);
-          // replays start at startAt with an ordinary seek once playing.
-          av.play();
-          ensurePlaying(s);
-          applyTextWhenPlaying(s);
-          if (startAt != null && !live) seek(startAt * 1000, null, 16);
-          resolve();
-        }, function (e) { settle(); reject(new Error(stream !== s ? 'cancelled' : 'Could not open stream: ' + e)); });
+        function prepare() {
+          if (stream !== s) { settle(); return reject(new Error('cancelled')); }
+          av.prepareAsync(function () {
+            settle();
+            // Unloaded or replaced while preparing: don't start (unload() closes the player).
+            if (stream !== s) return reject(new Error('cancelled'));
+            var d = av.getDuration();
+            live = s.info ? s.info.dynamic : (!!s.live || !d || d <= 0);
+            selectAudio(Settings.get('audio'));
+            // Live streams start where the manifest's presentation delay puts them (see Proxy.manifest).
+            av.play();
+            ensurePlaying(s);
+            applyTextWhenPlaying(s);
+            if (startAt != null && !live && !seekFirst) seek(startAt * 1000, null, 16);
+            resolve();
+          }, function (e) { settle(); reject(new Error(stream !== s ? 'cancelled' : 'Could not open stream: ' + e)); });
+        }
+        // Replays start at their position natively: a seek before preparation makes AVPlay load from
+        // there (the start of that segment) and never shows the beginning of the video first.
+        var seekFirst = startAt != null && !(s.info ? s.info.dynamic : s.live);
+        if (!seekFirst) return prepare();
+        posMs = startAt * 1000;
+        try {
+          av.seekTo(Math.round(startAt * 1000), prepare, function () { seekFirst = false; prepare(); });
+        } catch (e) { seekFirst = false; prepare(); }
       });
     }
 
     /**
-     * Seek tuning (set before prepare): after a jump, start on the lowest bitrate so the first
-     * segment arrives fast (ABR climbs again), and resume once 4 s are buffered (Samsung's minimum).
+     * Tuning set before prepare: the start quality (see startLevel) and resuming after a seek once
+     * 4 s are buffered (Samsung's minimum).
      */
-    var tuning = { skipLowest: true, resumeBuffer: 4 };
+    var tuning = { resumeBuffer: 4 };
 
     function tune() {
+      try { av.setStreamingProperty('ADAPTIVE_INFO', 'STARTBITRATE=' + START_LEVELS[startLevel()]); } catch (e) { /* keep default */ }
       try {
-        if (tuning.skipLowest) av.setStreamingProperty('ADAPTIVE_INFO', 'SKIPBITRATE=LOWEST');
         if (tuning.resumeBuffer) av.setBufferingParam('PLAYER_BUFFER_FOR_RESUME', 'PLAYER_BUFFER_SIZE_IN_SECOND', tuning.resumeBuffer);
       } catch (e) { /* older firmware: keep defaults */ }
+    }
+
+    /*
+     * Start quality. Left alone, AVPlay starts on a low bitrate and climbs one segment at a time
+     * (about 25 s of blur on live streams, a whole 30 s segment on single-feed videos). Starting on
+     * the top bitrate (6 Mbit/s for F1) was measured to start as fast, so that is the default; a
+     * stall soon after a start makes the next start a level lower, minutes of smooth playback a
+     * level higher again.
+     */
+    var START_LEVELS = ['HIGHEST', 'AVERAGE', 'LOWEST'];
+    var LEVEL_KEY = 'f1tv.startLevel';
+    var openedAt = 0, quietUntil = 0, levelNoted = null;
+
+    function startLevel() {
+      try { return Math.min(2, Math.max(0, +localStorage.getItem(LEVEL_KEY) || 0)); } catch (e) { return 0; }
+    }
+
+    function setStartLevel(l) {
+      try { localStorage.setItem(LEVEL_KEY, String(l)); } catch (e) { /* storage unavailable */ }
+    }
+
+    /** Buffering while playing (not right after opening or a seek) soon after the start: a stall. */
+    function noteBuffering(s) {
+      if (levelNoted === s || isPaused || Date.now() < quietUntil || Date.now() - openedAt > 90000) return;
+      levelNoted = s;
+      setStartLevel(Math.min(2, startLevel() + 1));
+    }
+
+    function noteSmooth(s) {
+      if (levelNoted === s || Date.now() - openedAt < 180000) return;
+      levelNoted = s;
+      if (startLevel() > 0) setStartLevel(startLevel() - 1);
     }
 
     /** AVPlay's own DVR window for live streams in seconds ({ start, end }), or null. */
@@ -409,6 +454,7 @@ var Player = (function () {
      */
     function seek(ms, done, maxTries) {
       var gen = ++seekGen, s = stream, tries = 0;
+      quietUntil = Date.now() + 6000;
       posMs = Math.max(0, clampLive(ms / 1000) * 1000);
       (function attempt() {
         if (gen !== seekGen || s !== stream) return;
@@ -472,6 +518,10 @@ var Player = (function () {
       tracks: trackList,
       setAudio: selectAudio,
       setSubtitles: selectText,
+      grid: function () {
+        var i = stream && stream.info;
+        return !live && i && i.segDur >= 10 ? { size: i.segDur, origin: i.windowStart || 0 } : null;
+      },
       tuning: tuning
     };
   })();
@@ -593,6 +643,11 @@ var Player = (function () {
     position: proxy('position', 0),
     bufferedEnd: proxy('bufferedEnd', 0),
     engineName: function () { return engineName; },
+    /**
+     * Long-segment replays on AVPlay (30 s segments): { size, origin } of the segment grid. A seek
+     * to a segment start plays in ~3 s; one deep inside a segment can take 10 s.
+     */
+    seekGrid: function () { return engine === AvEngine ? AvEngine.grid() : null; },
     tracks: function () { return engine ? engine.tracks() : { audio: [], text: [] }; },
     setAudio: function (l) { if (engine) engine.setAudio(l); },
     setSubtitles: function (l) { if (engine) engine.setSubtitles(l); },

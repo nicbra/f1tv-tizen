@@ -976,7 +976,10 @@
       else if (m.uiDuration) subParts.push(m.uiDuration);
       $('feeds-sub').textContent = subParts.filter(Boolean).join(' · ');
       var list = $('feeds-list');
-      var rows = feeds.map(function (f, i) {
+      feedsCtx.single = feeds.length === 1;
+      // Documentaries, shows etc. have just one feed: no list, they play straight away (after the
+      // resume check) over the title and artwork.
+      var rows = feedsCtx.single ? [] : feeds.map(function (f, i) {
         var e = el('div', 'feed');
         e.appendChild(feedNumber(f));
         var name = el('span', 'feed-name', f.title);
@@ -987,13 +990,11 @@
         list.appendChild(e);
         return [e];
       });
-      feedsCtx.single = feeds.length === 1;
       grid = new Focus.Grid(rows, {
         onSelect: function (e) { chooseStart(e._i); },
         onMove: function (r) { list.style.transform = 'translateY(' + (-Math.max(0, r - 5) * 72) + 'px)'; }
       });
       grid.apply();
-      // Documentaries, shows etc. have just one feed: play straight away (after the resume check).
       if (feedsCtx.single) {
         var ctx = feedsCtx;
         resumeReady.then(function () { if (feedsCtx === ctx && screen === 'feeds') chooseStart(0); });
@@ -1231,8 +1232,15 @@
     scrub.dir = dir;
     scrub.n = now - scrub.last < 600 ? Math.min(scrub.n + 1, SCRUB_STEPS.length - 1) : 0;
     scrub.last = now;
-    var r = Player.range();
-    scrub.pos = Math.max(r.start, Math.min(r.end - 1, scrub.pos + dir * (big ? 60 : SCRUB_STEPS[scrub.n])));
+    var r = Player.range(), g = Player.seekGrid();
+    var step = big ? 60 : SCRUB_STEPS[scrub.n], next = scrub.pos + dir * step;
+    // Long-segment replays move on their segment grid, where seeks play in ~3 s (see Player.seekGrid).
+    if (g) {
+      step = Math.max(g.size, Math.round(step / g.size) * g.size);
+      var k = (scrub.pos - g.origin) / g.size;
+      next = g.origin + g.size * (dir > 0 ? Math.floor(k + 1e-6) : Math.ceil(k - 1e-6)) + dir * step;
+    }
+    scrub.pos = Math.max(r.start, Math.min(r.end - 1, next));
     clearTimeout(scrub.timer);
     // Jump after the presses stop; quick presses keep adding up. Live jumps reopen the stream,
     // so they wait longer (OK jumps right away).

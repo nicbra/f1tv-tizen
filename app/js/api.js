@@ -298,8 +298,10 @@ var F1Api = (function () {
       }
       var windowStart = periodStart + (t0 - pto) / ts;
       var ast = Date.parse(attr(/availabilityStartTime="([^"]+)"/) || '') / 1000 || 0;
+      var segDur = (+attr(/<SegmentTemplate\b[^>]*\sduration="(\d+)"/) || +attr(/<S\b[^>]*\sd="(\d+)"/) || 0) / ts;
       return {
         dynamic: dynamic,
+        segDur: segDur,
         windowStart: windowStart,
         windowEnd: windowStart + span / ts,
         epochAtZero: dynamic ? ast : (pto / ts) - periodStart,
