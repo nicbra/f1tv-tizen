@@ -1,4 +1,10 @@
 /* Laid out for a fixed 1920x1080 canvas; the TV scales it to the panel. */
+
+/* Ubuntu (variable weight 300-700), bundled under the Ubuntu Font Licence (fonts/LICENCE.txt). */
+@font-face { font-family: 'Ubuntu'; src: url('../fonts/Ubuntu.ttf') format('truetype');
+  font-weight: 300 700; font-style: normal; }
+@font-face { font-family: 'Ubuntu'; src: url('../fonts/Ubuntu-Italic.ttf') format('truetype');
+  font-weight: 300 700; font-style: italic; }
 :root {
   --bg: #0f0f14;
   --panel: #1b1b24;
@@ -14,7 +20,7 @@
 html, body {
   width: 1920px; height: 1080px; overflow: hidden;
   background: var(--bg); color: var(--text);
-  font-family: "SamsungOne", "Samsung Sans", Arial, sans-serif;
+  font-family: "Ubuntu", "SamsungOne", Arial, sans-serif;
   font-size: 26px;
 }
 
@@ -238,3 +244,52 @@ body.avplay #video, body.avplay #video2 { display: none; }
 
 /* Subtitles move up above the player bar while it is shown */
 .osd-visible .subtitle { bottom: 270px; }
+
+/* ---------- Standings and driver pages ---------- */
+.list-row .row-colour { width: 6px; height: 40px; border-radius: 3px; margin-right: 18px; background: #555; flex: none; }
+.list-row .row-face { width: 56px; height: 56px; border-radius: 50%; margin-right: 18px; flex: none;
+  background: var(--panel-2) center top / cover no-repeat; }
+.driver-header { margin-bottom: 10px; }
+.driver-card { display: flex; align-items: center; margin-bottom: 26px; }
+.driver-face { width: 190px; height: 190px; border-radius: 50%; background: var(--panel-2) center top / cover no-repeat; flex: none; }
+.driver-number { font-size: 120px; font-weight: 700; font-style: italic; width: 230px; text-align: center; color: var(--text); }
+.stat-tiles { display: flex; flex-wrap: wrap; flex: 1; }
+.stat-tile { width: 138px; margin: 8px 12px 8px 0; padding: 14px 14px; border-radius: 10px; background: rgba(38, 38, 50, 0.85); }
+.stat-value { font-size: 40px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.stat-label { font-size: 19px; color: var(--muted); margin-top: 4px; }
+.chart-title { font-size: 22px; color: var(--muted); text-transform: uppercase; letter-spacing: 2px; margin: 6px 0 8px; }
+.points-chart { display: block; }
+.points-chart .axis { stroke: rgba(255, 255, 255, 0.18); stroke-width: 1; }
+.points-chart .bar { transition: opacity 0.15s; }
+.points-chart .bar.dim { opacity: 0.4; }
+.points-chart .bar.zero { fill: rgba(255, 255, 255, 0.25); }
+.points-chart .tick { fill: var(--muted); font-size: 18px; text-anchor: middle; }
+.points-chart .value { fill: var(--text); font-size: 20px; font-weight: 700; text-anchor: middle; }
+.list-row.compact .when { width: 90px; }
+
+/* ---------- Championship battle ---------- */
+.chart-legend { position: absolute; left: 120px; top: 268px; right: 420px; display: flex; flex-wrap: wrap; }
+.legend-item { display: inline-flex; align-items: center; margin: 0 28px 10px 0; font-size: 22px; color: var(--text); }
+.legend-item svg { margin-right: 10px; }
+.chart-plot { position: absolute; left: 120px; top: 330px; }
+.battle-chart .grid { stroke: rgba(255, 255, 255, 0.07); stroke-width: 1; }
+.battle-chart .axis { stroke: rgba(255, 255, 255, 0.22); stroke-width: 1; }
+.battle-chart .ytick { fill: var(--muted); font-size: 18px; text-anchor: end; }
+.battle-chart .xtick { fill: var(--muted); font-size: 18px; text-anchor: middle; }
+.battle-chart .line { fill: none; stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; }
+.battle-chart .crosshair { stroke: rgba(255, 255, 255, 0.35); stroke-width: 2; stroke-dasharray: 4 6; }
+.battle-chart .marker { stroke: var(--bg); stroke-width: 2; }
+.battle-chart .endlabel { fill: var(--text); font-size: 20px; font-weight: 700; }
+.chart-readout { position: absolute; right: 120px; top: 330px; width: 300px; padding: 22px 24px; border-radius: 12px;
+  background: rgba(38, 38, 50, 0.85); }
+.readout-round { font-size: 20px; color: var(--muted); text-transform: uppercase; letter-spacing: 2px; }
+.readout-name { font-size: 30px; font-weight: 700; margin: 4px 0 16px; }
+.readout-row { display: flex; align-items: center; height: 44px; font-size: 24px; }
+.readout-pos { width: 30px; color: var(--muted); }
+.readout-swatch { width: 26px; height: 0; border-top: 4px solid #888; margin-right: 12px; }
+.readout-swatch.dashed { border-top-style: dashed; }
+.readout-swatch.dotted { border-top-style: dotted; }
+.readout-label { flex: 1; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.readout-pts { width: 60px; text-align: right; font-variant-numeric: tabular-nums; }
+.readout-gain { width: 56px; text-align: right; color: var(--muted); font-size: 20px; }
+.chart-hint { position: absolute; left: 120px; bottom: 40px; }

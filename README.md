@@ -28,6 +28,12 @@ way the official apps do it; this app does not break or bypass any DRM.
   sessions and replays, always showing the state at the moment you are watching.
 - Resume where you left off, synced with F1 TV's other apps.
 - Spoiler-free mode (Settings, under your name): blurs artwork of replays and highlights.
+- Standings: drivers' and constructors' championships, and a page per driver with headshot,
+  season stats (wins, podiums, poles, fastest laps, best/average finish, DNFs), a points-per-round
+  chart and every race result.
+- Championship battle: cumulative points round by round for the top 6 drivers or constructors.
+  ◀ ▶ steps through the rounds with a readout of the standings after each one; ▲ ▼ switches
+  between drivers and constructors.
 
 ## Remote
 
@@ -91,3 +97,6 @@ aren't public, so the app uses the Android tablet profile). Removing it there si
 - F1 TV API request shapes from [eXhumer/f1tv-api](https://github.com/eXhumer/f1tv-api) and
   [npanu420/F1OpenViewer](https://github.com/npanu420/F1OpenViewer).
 - The background-service approach follows [TizenBrew](https://github.com/reisxd/TizenBrew).
+- Standings and results from [jolpica-f1](https://github.com/jolpica/jolpica-f1) (Ergast-compatible API);
+  headshots and team colours from F1's timing data.
+- [Ubuntu font](https://design.ubuntu.com/font) under the Ubuntu Font Licence 1.0 (`app/fonts/LICENCE.txt`).

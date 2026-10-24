@@ -47,6 +47,19 @@
     <div id="list-body" class="list-body"><div id="list-inner" class="list-inner"></div></div>
   </section>
 
+  <!-- Championship battle: cumulative points per round -->
+  <section id="screen-chart" class="screen hidden">
+    <div class="list-head">
+      <div class="brand">F1<span>TV</span></div>
+      <h1 id="chart-title">Championship battle</h1>
+      <p id="chart-sub" class="muted"></p>
+    </div>
+    <div id="chart-legend" class="chart-legend"></div>
+    <div id="chart-plot" class="chart-plot"></div>
+    <div id="chart-readout" class="chart-readout"></div>
+    <div class="chart-hint muted small">◀ ▶ round · ▲ ▼ drivers / constructors · BACK back</div>
+  </section>
+
   <!-- Feed picker for a session (main feed, F1 Live, onboards, ...) -->
   <section id="screen-feeds" class="screen hidden">
     <div class="feeds-hero" id="feeds-hero"></div>
@@ -119,6 +132,7 @@
   <script src="js/proxy.js"></script>
   <script src="js/player.js"></script>
   <script src="js/timing.js"></script>
+  <script src="js/stats.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>

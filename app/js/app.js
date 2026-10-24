@@ -27,7 +27,7 @@
   // ---------- helpers ----------
 
   function show(name) {
-    ['login', 'browse', 'list', 'feeds', 'player'].forEach(function (n) {
+    ['login', 'browse', 'list', 'chart', 'feeds', 'player'].forEach(function (n) {
       $('screen-' + n).classList.toggle('hidden', n !== name);
     });
     screen = name;
@@ -213,6 +213,7 @@
       var home = find(/^home$/i), season = find(/season/i);
       navTabs = [{ title: 'Home', kind: 'home', load: home ? page(home.uri) : byId(F1Api.HOME_PAGE_ID) }];
       if (season) navTabs.push({ title: 'Schedule', run: function () { openCalendar(season.uri); } });
+      navTabs.push({ title: 'Standings', run: function () { openStandings(); } });
       menu.forEach(function (m) {
         if (m === home || m === season || /search/i.test(m.title)) return;
         navTabs.push({ title: m.title, load: page(m.uri) });
@@ -437,11 +438,23 @@
     var inner = $('list-inner');
     inner.innerHTML = '';
     inner.style.transform = '';
+    if (spec.header) inner.appendChild(spec.header);
     var rows = [];
     spec.rows.forEach(function (row) {
       if (row.day) return inner.appendChild(el('div', 'list-day', row.day));
-      var e = el('div', 'list-row' + (row.past ? ' past' : '') + (row.info ? ' info' : ''));
+      var compact = row.colour !== undefined || row.img !== undefined;
+      var e = el('div', 'list-row' + (row.past ? ' past' : '') + (row.info ? ' info' : '') + (compact ? ' compact' : ''));
       e.appendChild(el('div', 'when', row.when || ''));
+      if (row.colour !== undefined) {
+        var bar = el('div', 'row-colour');
+        if (row.colour) bar.style.background = row.colour;
+        e.appendChild(bar);
+      }
+      if (row.img !== undefined) {
+        var face = el('div', 'row-face');
+        if (row.img) face.style.backgroundImage = 'url("' + row.img + '")';
+        e.appendChild(face);
+      }
       var what = el('div', 'what', row.what);
       if (row.sub) what.appendChild(el('small', '', row.sub));
       e.appendChild(what);
@@ -453,7 +466,9 @@
       onSelect: function (e) { e._row.run(rows.indexOf(rows.filter(function (r) { return r[0] === e; })[0])); },
       onMove: function (r, c, e) {
         var top = e.offsetTop, view = $('list-body').clientHeight;
-        inner.style.transform = 'translateY(' + (-Math.max(0, top - view / 2 + 60)) + 'px)';
+        var y = spec.header ? top + e.offsetHeight - view + 40 : top - view / 2 + 60;
+        inner.style.transform = 'translateY(' + (-Math.max(0, y)) + 'px)';
+        if (spec.onFocus) spec.onFocus(e._row);
       }
     });
     grid.r = Math.max(0, Math.min(focusIndex || 0, rows.length - 1));
@@ -535,6 +550,348 @@
       if (!sched) spec.sub = 'No broadcast schedule published yet';
       renderList(spec, focus < 0 ? 0 : focus);
     }).catch(function (e) { $('list-sub').textContent = 'Could not load: ' + e.message; });
+  }
+
+  // ---------- standings and driver pages ----------
+
+  function ordinal(n) { return 'P' + n; }
+
+  function openStandings(focus) {
+    show('list');
+    $('list-title').textContent = 'Standings';
+    $('list-sub').textContent = 'Loading…';
+    $('list-inner').innerHTML = '';
+    Promise.all([Stats.driverStandings(), Stats.constructorStandings(), Stats.lastRace(), Stats.driverInfo(F1Api.state.ascendon)])
+      .then(function (all) {
+        var ds = all[0], cs = all[1], last = all[2], info = all[3];
+        var teamColour = {};
+        ds.drivers.forEach(function (d) { var i = info[d.code]; if (i && i.colour) teamColour[d.teamId] = i.colour; });
+        var rows = [{
+          what: 'Championship battle', sub: 'How the points built up, round by round', badge: 'Graph',
+          run: function (idx) { backStack.push(function () { openStandings(idx); }); openBattle('drivers'); }
+        }, { day: 'Drivers' }];
+        ds.drivers.forEach(function (d) {
+          var i = info[d.code] || {};
+          rows.push({
+            when: ordinal(d.pos), colour: i.colour || '', img: i.headshot || '',
+            what: d.first + ' ' + d.last, sub: d.team + (d.wins ? ' · ' + d.wins + (d.wins === 1 ? ' win' : ' wins') : ''),
+            badge: d.points + ' pts',
+            run: function (idx) {
+              backStack.push(function () { openStandings(idx); });
+              openDriver(d, i);
+            }
+          });
+        });
+        rows.push({ day: 'Constructors' });
+        cs.forEach(function (c) {
+          rows.push({
+            when: ordinal(c.pos), colour: teamColour[c.id] || '', what: c.name,
+            sub: c.wins ? c.wins + (c.wins === 1 ? ' win' : ' wins') : '', badge: c.points + ' pts',
+            run: function (idx) {
+              backStack.push(function () { openStandings(idx); });
+              openTeam(c, ds.drivers, info);
+            }
+          });
+        });
+        renderList({ title: 'Standings', sub: new Date().getFullYear() + ' season' + (last ? ' · after round ' + last.round + ' (' + last.name + ')' : ''), rows: rows }, focus || 0);
+      })
+      .catch(function (e) { $('list-sub').textContent = 'Could not load the standings: ' + e.message; });
+  }
+
+  function openTeam(team, drivers, info) {
+    var rows = drivers.filter(function (d) { return d.teamId === team.id; }).map(function (d) {
+      var i = info[d.code] || {};
+      return { when: ordinal(d.pos), colour: i.colour || '', img: i.headshot || '', what: d.first + ' ' + d.last,
+        sub: d.wins ? d.wins + ' wins' : '', badge: d.points + ' pts',
+        run: function (idx) { backStack.push(function () { openTeam(team, drivers, info); }); openDriver(d, i); } };
+    });
+    renderList({ title: team.name, sub: ordinal(team.pos) + ' in the constructors\' championship · ' + team.points + ' pts', rows: rows }, 0);
+  }
+
+  function svgEl(tag, attrs) {
+    var e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    Object.keys(attrs).forEach(function (k) { e.setAttribute(k, attrs[k]); });
+    return e;
+  }
+
+  /**
+   * Points per round as thin bars in the team colour (race + sprint), rounded tops on a recessive
+   * baseline, the best round labelled. Returns { node, highlight(round) }.
+   */
+  function pointsChart(races, colour) {
+    var W = 1640, H = 230, top = 34, base = 196, gap = 4;
+    var max = Math.max(25, Math.max.apply(null, races.map(function (r) { return r.points + (r.sprint ? r.sprint.points : 0); })));
+    var n = Math.max(races.length, 1), slot = W / n, bw = Math.min(56, slot - gap);
+    var svg = svgEl('svg', { width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, 'class': 'points-chart' });
+    svg.appendChild(svgEl('line', { x1: 0, x2: W, y1: base + 0.5, y2: base + 0.5, 'class': 'axis' }));
+    var bars = {}, best = null;
+    races.forEach(function (r, i) {
+      var pts = r.points + (r.sprint ? r.sprint.points : 0);
+      if (!best || pts > best.pts) best = { pts: pts, i: i };
+      var h = Math.round((base - top) * pts / max), x = Math.round(i * slot + (slot - bw) / 2);
+      if (h > 0) {
+        var rad = Math.min(4, h, bw / 2), y = base - h;
+        var d = 'M' + x + ',' + base + 'V' + (y + rad) + 'Q' + x + ',' + y + ' ' + (x + rad) + ',' + y +
+          'H' + (x + bw - rad) + 'Q' + (x + bw) + ',' + y + ' ' + (x + bw) + ',' + (y + rad) + 'V' + base + 'Z';
+        var bar = svgEl('path', { d: d, fill: colour || '#9aa0aa', 'class': 'bar' });
+        svg.appendChild(bar);
+        bars[r.round] = bar;
+      } else {
+        bars[r.round] = svg.appendChild(svgEl('rect', { x: x, y: base - 2, width: bw, height: 2, 'class': 'bar zero' }));
+      }
+      var lbl = svgEl('text', { x: x + bw / 2, y: H - 8, 'class': 'tick' });
+      lbl.textContent = r.round;
+      svg.appendChild(lbl);
+    });
+    if (best && best.pts > 0) {
+      var bx = Math.round(best.i * slot + slot / 2), by = base - Math.round((base - top) * best.pts / max) - 10;
+      var v = svgEl('text', { x: bx, y: by, 'class': 'value' });
+      v.textContent = best.pts;
+      svg.appendChild(v);
+    }
+    return {
+      node: svg,
+      highlight: function (round) {
+        Object.keys(bars).forEach(function (k) { bars[k].setAttribute('class', bars[k].getAttribute('class').replace(/ dim/g, '') + (round && +k !== round ? ' dim' : '')); });
+      }
+    };
+  }
+
+  // ---------- championship battle graph ----------
+
+  var battle = null;   // { data, info, ds, cs, mode: 'drivers' | 'teams', idx }
+
+  function openBattle(mode) {
+    show('chart');
+    grid = null;
+    $('chart-sub').textContent = 'Loading…';
+    $('chart-plot').innerHTML = '';
+    $('chart-legend').innerHTML = '';
+    $('chart-readout').innerHTML = '';
+    Promise.all([Stats.seasonProgress(), Stats.driverInfo(F1Api.state.ascendon), Stats.driverStandings(), Stats.constructorStandings()])
+      .then(function (all) {
+        battle = { data: all[0], info: all[1], ds: all[2], cs: all[3], mode: mode, idx: all[0].rounds.length - 1 };
+        drawBattle();
+      })
+      .catch(function (e) { $('chart-sub').textContent = 'Could not load the season: ' + e.message; });
+  }
+
+  // Short labels for the chart's line ends and readout (jolpica constructor ids).
+  var TEAM_CODES = { mercedes: 'MER', ferrari: 'FER', mclaren: 'MCL', red_bull: 'RBR', rb: 'RB', alpine: 'ALP', haas: 'HAA',
+    williams: 'WIL', aston_martin: 'AMR', sauber: 'SAU', audi: 'AUD', cadillac: 'CAD' };
+
+  /** The plotted series: top 6 drivers or teams, cumulative points per round, in team colours. */
+  function battleSeries() {
+    var b = battle, rounds = b.data.rounds, teamColour = {}, teamName = {};
+    b.ds.drivers.forEach(function (d) {
+      var i = b.info[d.code];
+      if (i && i.colour && !teamColour[d.teamId]) teamColour[d.teamId] = i.colour;
+      if (i && i.team && !teamName[d.teamId]) teamName[d.teamId] = i.team;   // F1's own name, e.g. "Racing Bulls"
+    });
+    function cumulative(perRound) {
+      var sum = 0;
+      return rounds.map(function (r) { sum += perRound[r.round] || 0; return sum; });
+    }
+    if (b.mode === 'teams') {
+      return assignDashes(b.cs.slice(0, 6).map(function (c) {
+        var src = b.data.teams[c.id] || { perRound: {} };
+        var name = teamName[c.id] || c.name.replace(/ F1 Team$/, '');
+        return { label: TEAM_CODES[c.id] || name.slice(0, 3).toUpperCase(), name: name, colour: teamColour[c.id] || '#9aa0aa',
+          values: cumulative(src.perRound) };
+      }));
+    }
+    return assignDashes(b.ds.drivers.slice(0, 6).map(function (d) {
+      var src = b.data.drivers[d.id] || { perRound: {} };
+      return { label: d.code, name: d.first + ' ' + d.last, colour: (b.info[d.code] || {}).colour || teamColour[d.teamId] || '#9aa0aa',
+        values: cumulative(src.perRound) };
+    }));
+  }
+
+  /** OKLab distance (x100) between two #rrggbb colours; below ~12 two lines read as the same colour. */
+  function colourDistance(a, b) {
+    function lab(hex) {
+      var n = parseInt(hex.slice(1), 16);
+      var c = [n >> 16, (n >> 8) & 255, n & 255].map(function (v) { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); });
+      var l = Math.cbrt(0.4122214708 * c[0] + 0.5363325363 * c[1] + 0.0514459929 * c[2]);
+      var m = Math.cbrt(0.2119034982 * c[0] + 0.6806995451 * c[1] + 0.1073969566 * c[2]);
+      var q = Math.cbrt(0.0883024619 * c[0] + 0.2817188376 * c[1] + 0.6299787005 * c[2]);
+      return [0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * q, 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * q,
+        0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * q];
+    }
+    var x = lab(a), y = lab(b);
+    return 100 * Math.sqrt(Math.pow(x[0] - y[0], 2) + Math.pow(x[1] - y[1], 2) + Math.pow(x[2] - y[2], 2));
+  }
+
+  /**
+   * Lines that share (nearly) a colour - teammates, or look-alike team colours such as the blues of
+   * Red Bull, Racing Bulls and Alpine - get different styles: dash 0 solid, 1 dashed, 2 dotted.
+   */
+  function assignDashes(series) {
+    series.forEach(function (s, i) {
+      var used = {};
+      for (var j = 0; j < i; j++) if (colourDistance(s.colour, series[j].colour) < 12) used[series[j].dash] = true;
+      s.dash = 0;
+      while (used[s.dash] && s.dash < 2) s.dash++;
+    });
+    return series;
+  }
+
+  function niceStep(max) {
+    var steps = [25, 50, 100, 200, 250, 500];
+    for (var i = 0; i < steps.length; i++) if (max / steps[i] <= 7) return steps[i];
+    return 1000;
+  }
+
+  function drawBattle() {
+    var b = battle, rounds = b.data.rounds, series = battleSeries();
+    var W = 1400, H = 640, L = 70, R = 90, T = 16, B = 44;
+    var max = Math.max.apply(null, series.map(function (s) { return s.values[s.values.length - 1] || 0; }).concat([10]));
+    var step = niceStep(max), top = Math.ceil(max / step) * step;
+    var n = rounds.length;
+    var x = function (i) { return L + (n > 1 ? i * (W - L - R) / (n - 1) : 0); };
+    var y = function (v) { return T + (H - T - B) * (1 - v / top); };
+
+    $('chart-title').textContent = 'Championship battle';
+    $('chart-sub').textContent = (b.mode === 'teams' ? 'Top 6 constructors' : 'Top 6 drivers') + ' · points after each round, sprints included';
+
+    var svg = svgEl('svg', { width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, 'class': 'battle-chart' });
+    for (var v = 0; v <= top; v += step) {
+      svg.appendChild(svgEl('line', { x1: L, x2: W - R, y1: Math.round(y(v)) + 0.5, y2: Math.round(y(v)) + 0.5, 'class': v ? 'grid' : 'axis' }));
+      var t = svgEl('text', { x: L - 14, y: y(v) + 6, 'class': 'ytick' });
+      t.textContent = v;
+      svg.appendChild(t);
+    }
+    rounds.forEach(function (r, i) {
+      var t = svgEl('text', { x: x(i), y: H - 12, 'class': 'xtick' });
+      t.textContent = r.round;
+      svg.appendChild(t);
+    });
+    // crosshair behind the lines
+    svg.appendChild(svgEl('line', { x1: x(b.idx), x2: x(b.idx), y1: T, y2: H - B, 'class': 'crosshair' }));
+    series.forEach(function (s) {
+      var d = s.values.map(function (val, i) { return (i ? 'L' : 'M') + x(i).toFixed(1) + ',' + y(val).toFixed(1); }).join('');
+      var attrs = { d: d, stroke: s.colour, 'class': 'line' };
+      if (s.dash) attrs['stroke-dasharray'] = s.dash === 1 ? '10 7' : '0.1 8';
+      svg.appendChild(svgEl('path', attrs));
+    });
+    // markers at the selected round, with a surface ring so overlaps stay readable
+    series.forEach(function (s) {
+      svg.appendChild(svgEl('circle', { cx: x(b.idx), cy: y(s.values[b.idx] || 0), r: 7, fill: s.colour, 'class': 'marker' }));
+    });
+    // direct labels at the line ends, nudged apart so they never collide
+    var ends = series.map(function (s) { return { s: s, y: y(s.values[n - 1] || 0) }; }).sort(function (a, c) { return a.y - c.y; });
+    for (var k = 1; k < ends.length; k++) if (ends[k].y - ends[k - 1].y < 26) ends[k].y = ends[k - 1].y + 26;
+    ends.forEach(function (e) {
+      var lbl = svgEl('text', { x: W - R + 14, y: e.y + 7, 'class': 'endlabel' });
+      lbl.textContent = e.s.label;
+      svg.appendChild(lbl);
+    });
+    $('chart-plot').innerHTML = '';
+    $('chart-plot').appendChild(svg);
+
+    // legend: swatch (in the line's dash style) + name
+    var legend = $('chart-legend');
+    legend.innerHTML = '';
+    series.forEach(function (s) {
+      var item = el('span', 'legend-item');
+      var sw = svgEl('svg', { width: 34, height: 12 });
+      var ln = svgEl('line', { x1: 2, x2: 32, y1: 6, y2: 6, stroke: s.colour, 'stroke-width': 4, 'stroke-linecap': 'round' });
+      if (s.dash) ln.setAttribute('stroke-dasharray', s.dash === 1 ? '7 5' : '0.1 7');
+      sw.appendChild(ln);
+      item.appendChild(sw);
+      item.appendChild(document.createTextNode(s.name));
+      legend.appendChild(item);
+    });
+
+    // readout for the selected round (the TV's stand-in for a hover tooltip)
+    var r = rounds[b.idx], out = $('chart-readout');
+    out.innerHTML = '';
+    out.appendChild(el('div', 'readout-round', 'Round ' + r.round));
+    out.appendChild(el('div', 'readout-name', r.name));
+    series.slice().sort(function (a, c) { return (c.values[b.idx] || 0) - (a.values[b.idx] || 0); }).forEach(function (s, i) {
+      var row = el('div', 'readout-row');
+      var sw = el('span', 'readout-swatch' + ['', ' dashed', ' dotted'][s.dash]);
+      sw.style.borderColor = s.colour;
+      row.appendChild(el('span', 'readout-pos', i + 1));
+      row.appendChild(sw);
+      row.appendChild(el('span', 'readout-label', s.label));
+      row.appendChild(el('span', 'readout-pts', s.values[b.idx] || 0));
+      var gain = (s.values[b.idx] || 0) - (b.idx ? s.values[b.idx - 1] || 0 : 0);
+      row.appendChild(el('span', 'readout-gain', gain ? '+' + gain : '–'));
+      out.appendChild(row);
+    });
+  }
+
+  function chartKey(key) {
+    if (!battle) return key === K.BACK ? goBack() : null;
+    var n = battle.data.rounds.length;
+    if (key === K.LEFT && battle.idx > 0) { battle.idx--; return drawBattle(); }
+    if (key === K.RIGHT && battle.idx < n - 1) { battle.idx++; return drawBattle(); }
+    if (key === K.UP || key === K.DOWN) { battle.mode = battle.mode === 'teams' ? 'drivers' : 'teams'; return drawBattle(); }
+    if (key === K.BACK) return goBack();
+  }
+
+  function statTile(value, label) {
+    var t = el('div', 'stat-tile');
+    t.appendChild(el('div', 'stat-value', value));
+    t.appendChild(el('div', 'stat-label', label));
+    return t;
+  }
+
+  function openDriver(d, info) {
+    info = info || {};
+    show('list');
+    $('list-title').textContent = d.first + ' ' + d.last;
+    $('list-sub').textContent = 'Loading the season…';
+    $('list-inner').innerHTML = '';
+    Stats.driverSeason(d.id).then(function (races) {
+      var sum = Stats.summary(races);
+      var card = el('div', 'driver-card');
+      var face = el('div', 'driver-face');
+      if (info.headshot) face.style.backgroundImage = 'url("' + info.headshot + '")';
+      card.appendChild(face);
+      var numberEl = el('div', 'driver-number', d.number || d.code);
+      if (info.colour) numberEl.style.color = info.colour;
+      card.appendChild(numberEl);
+      var tiles = el('div', 'stat-tiles');
+      tiles.appendChild(statTile(ordinal(d.pos), d.points + ' pts'));
+      tiles.appendChild(statTile(sum.wins, sum.wins === 1 ? 'Win' : 'Wins'));
+      tiles.appendChild(statTile(sum.podiums, 'Podiums'));
+      tiles.appendChild(statTile(sum.poles, 'Poles'));
+      tiles.appendChild(statTile(sum.fastestLaps, 'Fastest laps'));
+      tiles.appendChild(statTile(sum.best ? ordinal(sum.best) : '–', 'Best finish'));
+      tiles.appendChild(statTile(sum.avg ? sum.avg.toFixed(1) : '–', 'Avg finish'));
+      tiles.appendChild(statTile(sum.dnfs, 'DNFs'));
+      card.appendChild(tiles);
+      var header = el('div', 'driver-header');
+      header.appendChild(card);
+      header.appendChild(el('div', 'chart-title', 'Points per round'));
+      var chart = pointsChart(races, info.colour);
+      header.appendChild(chart.node);
+
+      var rows = [{ day: 'Races' }];
+      races.slice().reverse().forEach(function (r) {
+        var bits = [];
+        if (r.grid) bits.push('from ' + ordinal(r.grid));
+        if (r.quali === 1) bits.push('pole');
+        if (r.fastest) bits.push('fastest lap');
+        if (r.sprint) bits.push('sprint ' + (r.sprint.pos ? ordinal(r.sprint.pos) : 'DNF') + (r.sprint.points ? ' (+' + r.sprint.points + ')' : ''));
+        var pts = r.points + (r.sprint ? r.sprint.points : 0);
+        rows.push({
+          when: 'R' + r.round, what: r.name + '  ·  ' + (r.pos ? ordinal(r.pos) : (r.posText === 'D' ? 'DSQ' : 'DNF')),
+          sub: bits.join(' · ') + (r.pos ? '' : (bits.length ? ' · ' : '') + r.status),
+          badge: pts ? '+' + pts + ' pts' : '0 pts', badgeCls: r.pos === 1 ? 'live' : '',
+          round: r.round, run: function () {}
+        });
+      });
+      renderList({
+        title: d.first + ' ' + d.last,
+        sub: d.team + ' · #' + (d.number || '') + ' · ' + (d.nationality || ''),
+        header: header, rows: rows,
+        onFocus: function (row) { chart.highlight(row && row.round); }
+      }, 0);
+      chart.highlight(races.length ? races[races.length - 1].round : null);
+    }).catch(function (e) { $('list-sub').textContent = 'Could not load the season: ' + e.message; });
   }
 
   function openAccount(focus) {
@@ -1211,6 +1568,7 @@
       return dialog.grid.handle(key);
     }
     if (screen === 'player') { e.preventDefault(); return playerKey(key); }
+    if (screen === 'chart') { e.preventDefault(); return chartKey(key); }
     if (key === K.BACK) {
       e.preventDefault();
       if (screen === 'login' || !backStack.length) return exitApp();
