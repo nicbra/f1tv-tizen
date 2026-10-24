@@ -276,16 +276,60 @@
     rails.appendChild(el('div', 'empty', 'Loading…'));
     pg.load().then(function (containers) {
       if (currentPage !== pg) return;
-      var list = railsFromContainers(containers);
-      var weekend = F1Api.scheduleFrom(containers);
-      if (weekend && weekend.events.length) list.unshift(weekendRail(weekend));
-      if (pg.kind === 'home') markLive(weekend && weekend.events.some(function (ev) { return status(ev) === 'live'; }));
+      var list = pageRails(pg, containers);
+      pg.layout = railsLayout(list);
       drawRails(list, focus);
     }).catch(function (e) {
       rails.innerHTML = '';
       rails.appendChild(el('div', 'empty', 'Could not load: ' + e.message));
       buildBrowseGrid([], focus);
     });
+  }
+
+  /** A loaded page's rails, with the race weekend first where the page lists one; marks live on Home. */
+  function pageRails(pg, containers) {
+    var list = railsFromContainers(containers);
+    var weekend = F1Api.scheduleFrom(containers);
+    if (weekend && weekend.events.length) list.unshift(weekendRail(weekend));
+    if (pg.kind === 'home') markLive(weekend && weekend.events.some(function (ev) { return status(ev) === 'live'; }));
+    return list;
+  }
+
+  /** What the rails show, apart from badges: rail titles and their tiles. */
+  function railsLayout(list) {
+    return JSON.stringify(list.map(function (r) {
+      return [r.title, r.tiles.map(function (t) { return [t.contentId || t.uri, t.title, t.sub, t.image]; })];
+    }));
+  }
+
+  /**
+   * Reloads the page on screen in the background so live and upcoming badges stay current. Badges
+   * change in place; the rails are only redrawn when tiles came or went, and never blank out
+   * ("Loading…") while F1's API answers.
+   */
+  function refreshPage(pg) {
+    pg.load().then(function (containers) {
+      if (currentPage !== pg || screen !== 'browse' || dialog || !grid) return;
+      var list = pageRails(pg, containers), layout = railsLayout(list);
+      if (layout !== pg.layout) {
+        pg.layout = layout;
+        return drawRails(list, { r: grid.r, c: grid.c.slice() });
+      }
+      var fresh = [];
+      list.forEach(function (r) { fresh = fresh.concat(r.tiles); });
+      Array.prototype.forEach.call($('rails').querySelectorAll('.tile'), function (e, i) { if (fresh[i]) updateTile(e, fresh[i]); });
+    }).catch(function () { /* keep what is shown */ });
+  }
+
+  function updateTile(e, t) {
+    e._tile = t;
+    e.classList.toggle('upcoming', !!t.upcoming);
+    var img = e.querySelector('.tile-img'), badge = img.querySelector('.tile-badge');
+    img.querySelector('.tile-art').classList.toggle('spoiler', !spoilerSafe(t));
+    if (!t.badge) { if (badge) img.removeChild(badge); return; }
+    if (!badge) { badge = el('div'); img.appendChild(badge); }
+    badge.className = 'tile-badge ' + t.badge.cls;
+    badge.textContent = t.badge.text;
   }
 
   function railsFromContainers(containers) {
@@ -1328,6 +1372,7 @@
     closePanel();
     timingState = null;
     $('tower').classList.add('hidden');
+    $('screen-player').classList.remove('tower-on');
     showSubtitle(null);
     Player.unload();
     $('spinner').classList.add('hidden');
@@ -1530,6 +1575,7 @@
   function renderTower() {
     var visible = screen === 'player' && Settings.get('timing') && timingState && timingState.standings && timingState.standings.length;
     $('tower').classList.toggle('hidden', !visible);
+    $('screen-player').classList.toggle('tower-on', !!visible);   // moves the player title clear of it
     if (!visible) return;
     var st = timingState, race = st.type === 'Race';
     $('tower-label').textContent = Timing.label({ type: st.type, name: st.name, lap: st.lap, totalLaps: st.totalLaps,
@@ -1621,9 +1667,7 @@
     setInterval(saveProgress, 30000);
     // Refresh the home page now and then so live / upcoming badges stay current.
     setInterval(function () {
-      if (screen === 'browse' && currentPage && currentPage.kind === 'home' && grid && !dialog) {
-        renderPage(currentPage, { r: grid.r, c: grid.c.slice() });
-      }
+      if (screen === 'browse' && currentPage && currentPage.kind === 'home' && grid && !dialog) refreshPage(currentPage);
     }, 120000);
 
     Player.init($('video'), $('av-player'))

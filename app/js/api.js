@@ -250,12 +250,14 @@ var F1Api = (function () {
 
   /** Meetings of a season page (the "2026 Season" menu entry), in calendar order. */
   function seasonFrom(containers) {
-    var out = [];
+    var out = [], seen = {};
     (containers || []).forEach(function (c) {
       var items = (c.retrieveItems && c.retrieveItems.resultObj && c.retrieveItems.resultObj.containers) || [];
       items.forEach(function (it) {
         var m = it.metadata || {}, e = m.emfAttributes || {}, a = (it.actions || [])[0] || {};
-        if (!e.MeetingKey || !/\/PAGE\//.test(a.uri || '')) return;
+        // The current weekend is listed in more than one section of the season page.
+        if (!e.MeetingKey || !/\/PAGE\//.test(a.uri || '') || seen[e.MeetingKey]) return;
+        seen[e.MeetingKey] = true;
         out.push({
           key: e.MeetingKey,
           name: e.Meeting_Name || e.Global_Meeting_Name || m.title || '',

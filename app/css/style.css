@@ -53,9 +53,10 @@ html, body {
 
 /* ---------- Browse ---------- */
 .topbar { height: 110px; padding: 0 80px; display: flex; align-items: center; }
-.topbar .brand { margin-right: 60px; }
+.topbar .brand { margin-right: 40px; flex-shrink: 0; white-space: nowrap; }
 .topnav { display: flex; flex: 1; }
-.topnav .nav-item { margin-right: 16px; padding: 12px 28px; border-radius: 30px; color: var(--muted); border: 3px solid transparent; }
+.topnav .nav-item { margin-right: 8px; padding: 12px 24px; border-radius: 30px; color: var(--muted); border: 3px solid transparent;
+  white-space: nowrap; }
 .topnav .nav-item.active { color: var(--text); background: var(--panel-2); }
 .topnav .nav-item.focused { border-color: var(--focus); color: var(--text); }
 .clock { color: var(--muted); font-size: 28px; margin-left: 30px; }
@@ -108,6 +109,8 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .osd { position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between;
   background: linear-gradient(to bottom, rgba(0,0,0,0.75) 0, transparent 25%, transparent 70%, rgba(0,0,0,0.85) 100%); }
 .osd-top { padding: 50px 80px; }
+/* The timing tower covers the top-left corner; the title then starts right of it. */
+.tower-on .osd-top { padding-left: 430px; }
 .osd-title { font-size: 40px; font-weight: 700; }
 .osd-feed { font-size: 28px; color: var(--muted); margin-top: 8px; }
 .osd-bottom { padding: 0 80px 50px; }
