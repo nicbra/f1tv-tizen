@@ -1,0 +1,16 @@
+services:
+  f1tv-monitor:
+    build:
+      context: ..
+      dockerfile: monitor/Dockerfile
+    restart: unless-stopped
+    environment:
+      # Where to send a message when checks start or stop failing (ntfy topic URL or Discord webhook).
+      NOTIFY_URL: https://ntfy.sh/f1tv-monitor-change-this-to-something-random
+      CHECK_EVERY: 6        # hours between checks
+      TZ: Europe/Oslo
+    volumes:
+      - data:/data          # the sign-in and the last results
+
+volumes:
+  data:

@@ -2,3 +2,4 @@ build/
 .cert-password
 local/
 __pycache__/
+monitor/data/

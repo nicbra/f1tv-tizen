@@ -183,6 +183,9 @@ player (against a fake one), the stream helper service (manifest rewriting, time
 fixes), the live timing data, standings and season statistics, remote navigation, settings, the
 update check, and the release packaging.
 
+[`monitor/`](monitor/README.md) checks F1's live services on a schedule, using the app's own code, and
+sends a message when something the app depends on changes.
+
 Releases are built and signed by GitHub Actions; see [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Credits
