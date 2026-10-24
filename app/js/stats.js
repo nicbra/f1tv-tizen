@@ -6,17 +6,25 @@ var Stats = (function () {
   var API = 'https://api.jolpi.ca/ergast/f1/current';
   var TIMING = 'https://livetiming.formula1.com/static/';
   var INFO_KEY = 'f1tv.drivers';
+  var CACHE_MS = 10 * 60000;   // standings change after each session; ask again at most every 10 minutes
   var cache = {};
 
+  /** One request per key at a time; an answer is reused for CACHE_MS, a failure is retried next time. */
+  function cached(key, load) {
+    var c = cache[key];
+    if (c && Date.now() - c.at < CACHE_MS) return c.promise;
+    var entry = cache[key] = { at: Date.now(), promise: load() };
+    entry.promise.catch(function () { if (cache[key] === entry) delete cache[key]; });
+    return entry.promise;
+  }
+
   function get(path) {
-    if (!cache[path]) {
-      cache[path] = fetch(API + path + '?limit=100').then(function (r) {
+    return cached(path, function () {
+      return fetch(API + path + '?limit=100').then(function (r) {
         if (!r.ok) throw new Error('Stats unavailable (HTTP ' + r.status + ')');
         return r.json();
       }).then(function (j) { return j.MRData; });
-      cache[path].catch(function () { delete cache[path]; });
-    }
-    return cache[path];
+    });
   }
 
   function shortRace(name) { return String(name || '').replace(/ Grand Prix$/, ' GP'); }
@@ -135,21 +143,19 @@ var Stats = (function () {
 
   /** All pages of a jolpica list endpoint (max 100 per page). */
   function allPages(path, pick) {
-    var key = 'pages:' + path;
-    if (!cache[key]) {
-      cache[key] = (function next(offset, acc) {
+    return cached('pages:' + path, function () {
+      return (function next(offset, acc) {
         return fetch(API + path + '?limit=100&offset=' + offset).then(function (r) {
           if (!r.ok) throw new Error('Stats unavailable (HTTP ' + r.status + ')');
           return r.json();
         }).then(function (j) {
-          var d = j.MRData, items = pick(d);
-          acc = acc.concat(items);
-          return +d.offset + +d.limit < +d.total ? next(offset + 100, acc) : acc;
+          var d = j.MRData, size = +d.limit || 100;
+          acc = acc.concat(pick(d));
+          // The API may answer with smaller pages than asked for.
+          return +d.offset + size < +d.total ? next(+d.offset + size, acc) : acc;
         });
       })(0, []);
-      cache[key].catch(function () { delete cache[key]; });
-    }
-    return cache[key];
+    });
   }
 
   /**

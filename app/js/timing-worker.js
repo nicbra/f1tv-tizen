@@ -22,7 +22,7 @@ function emptyJob(path, token) {
     info: {},                              // SessionInfo
     lap: [], clock: [], part: [], track: [],
     drivers: {}, timing: {}, stints: {},
-    snaps: [], lastSnap: -1
+    snaps: [], lastSnap: -1, changed: -1   // changed: time of the newest change not yet in a snapshot
   };
 }
 
@@ -75,12 +75,18 @@ function apply(feed, t, d) {
       break;
     case 'TrackStatus': if (d.Status != null) j.track.push([t, String(d.Status), d.Message || '']); break;
     case 'DriverList': merge(j.drivers, d); break;
-    case 'TimingAppData': if (d.Lines) merge(j.stints, d.Lines); break;
+    case 'TimingAppData': if (d.Lines) { merge(j.stints, d.Lines); j.changed = t; } break;
     case 'TimingData':
       if (d.Lines) merge(j.timing, d.Lines);
+      j.changed = t;
       if (t - j.lastSnap >= SNAPSHOT_MS) snapshot(t);
       break;
   }
+}
+
+/** Snapshots changes that came after the last snapshot: at the end of the data, or when live updates pause. */
+function flush(j) {
+  if (job === j && j.changed > j.lastSnap) snapshot(j.changed);
 }
 
 function val(x) { return x && typeof x === 'object' ? x.Value : x; }
@@ -154,6 +160,7 @@ function loadAll() {
     .then(function () {
       if (job !== j) return;
       replayCollected();
+      flush(j);
       j.clock.sort(function (a, b) { return a[0] - b[0]; });
       j.part.sort(function (a, b) { return a[0] - b[0]; });
     });
@@ -260,6 +267,8 @@ function connect(j) {
             apply(a[0], Date.parse(a[2]) || Date.now(), a[1]);
           }
         });
+        clearTimeout(j.flushTimer);
+        j.flushTimer = setTimeout(function () { flush(j); }, SNAPSHOT_MS);
       };
       ws.onclose = function () {
         clearInterval(j.keepAlive);
@@ -279,6 +288,7 @@ self.onmessage = function (e) {
   } else if (m.cmd === 'stop') {
     if (job) job.stopped = true;
     if (job && job.ws) try { job.ws.close(); } catch (x) { /* closed */ }
+    if (job) clearTimeout(job.flushTimer);
     job = null;
   }
 };

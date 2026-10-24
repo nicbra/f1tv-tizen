@@ -1,5 +1,5 @@
 /* Starts the app's background service (service/service.js) and builds URLs through it. */
-var Proxy = (function () {
+var StreamProxy = (function () {
   var BASE = 'http://127.0.0.1:18765';
 
   function ping() {

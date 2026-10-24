@@ -1,5 +1,9 @@
 # F1 TV for Samsung TVs
 
+[![Tests](https://github.com/nicbra/f1tv-tizen/actions/workflows/test.yml/badge.svg)](https://github.com/nicbra/f1tv-tizen/actions/workflows/test.yml)
+[![Latest release](https://img.shields.io/github/v/release/nicbra/f1tv-tizen)](https://github.com/nicbra/f1tv-tizen/releases/latest)
+[![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Watch F1 TV on a Samsung Smart TV that has no F1 TV app in its store: live sessions, replays,
 every onboard camera, and a timing tower that stays in sync with the picture.
 
@@ -167,6 +171,18 @@ excluded from releases. The default styles and fonts are bundled in `app/`.
 Updates must use the same signing certificate. Switching certificates requires uninstalling
 the app first, which signs you out; the installer prompts before doing this.
 
+The tests need only Node.js 18 or newer and Python 3, and run on every push:
+
+```sh
+node --test tests/*.test.js
+python3 -m unittest discover -s tests -p '*_test.py'
+```
+
+They cover the F1 TV API client, sign-in and pairing, how the player drives Samsung's video
+player (against a fake one), the stream helper service (manifest rewriting, time-shifting, audio
+fixes), the live timing data, standings and season statistics, remote navigation, settings, the
+update check, and the release packaging.
+
 Releases are built and signed by GitHub Actions; see [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Credits
@@ -181,3 +197,9 @@ Releases are built and signed by GitHub Actions; see [docs/RELEASING.md](docs/RE
 - [Titillium Web](https://fonts.google.com/specimen/Titillium+Web) by the Accademia di Belle Arti di Urbino,
   under the SIL Open Font License 1.1 (`app/fonts/OFL.txt`).
 - Formula 1 display fonts (`app/fonts/Formula1-*.woff2`) from formula1.com, owned by Formula 1.
+
+## License
+
+The app's own code is under the [MIT license](LICENSE). The bundled libraries and the Titillium
+Web font keep their own licenses (see above). The Formula 1 fonts and logo belong to Formula 1
+and are not covered by it.

@@ -36,7 +36,10 @@ var Auth = (function () {
     try {
       var part = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
       while (part.length % 4) part += '=';
-      return JSON.parse(atob(part));
+      // atob gives bytes; the payload is UTF-8 (names like "Søren").
+      var bytes = atob(part), escaped = '';
+      for (var i = 0; i < bytes.length; i++) escaped += '%' + ('0' + bytes.charCodeAt(i).toString(16)).slice(-2);
+      return JSON.parse(decodeURIComponent(escaped));
     } catch (e) { return null; }
   }
 

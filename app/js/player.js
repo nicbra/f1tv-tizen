@@ -275,7 +275,7 @@ var Player = (function () {
       // Encrypted live DASH goes through the local service, which fixes the audio segments.
       if (s.licenseUrl && /\.mpd(\?|$)/.test(s.url)) {
         var langs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
-        return Proxy.ensure().then(function () { return open(s, Proxy.manifest(s.url, s.startDelay, langs)); });
+        return StreamProxy.ensure().then(function () { return open(s, StreamProxy.manifest(s.url, s.startDelay, langs)); });
       }
       return open(s, s.url);
     }
@@ -319,7 +319,7 @@ var Player = (function () {
             var d = av.getDuration();
             live = s.info ? s.info.dynamic : (!!s.live || !d || d <= 0);
             selectAudio(Settings.get('audio'));
-            // Live streams start where the manifest's presentation delay puts them (see Proxy.manifest).
+            // Live streams start where the manifest's presentation delay puts them (see StreamProxy.manifest).
             av.play();
             ensurePlaying(s);
             applyTextWhenPlaying(s);
