@@ -120,6 +120,13 @@ body.avplay #video, body.avplay #video2 { display: none; }
 #video, #video2 { position: absolute; top: 0; left: 0; right: 0; bottom: 0; width: 1920px; height: 1080px; background: #000; }
 /* Overlays stay above both video layers (they swap z-index during a feed switch). */
 .osd, .tower, .panel, .spinner { z-index: 10; }
+/* "Up next" card for the next part of a broadcast (pre-show, session, post-show). */
+.upnext { position: absolute; right: 80px; bottom: 300px; width: 560px; padding: 26px 32px; border-radius: 10px;
+  background: rgba(16, 16, 24, 0.95); border-left: 8px solid var(--red); z-index: 11; }
+.upnext-label { font-size: 20px; color: var(--muted); text-transform: uppercase; letter-spacing: 2px; }
+.upnext-title { font-size: 40px; font-weight: 700; margin-top: 6px; }
+.upnext-sub { font-size: 26px; margin-top: 8px; }
+.upnext-hint { margin-top: 14px; }
 .subtitle { z-index: 5; }
 .playback-feedback { position: absolute; left: 50%; top: 50%; width: 192px; height: 192px;
   margin: -96px 0 0 -96px; z-index: 11; opacity: 0; pointer-events: none;
@@ -264,7 +271,7 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .tw-bar { width: 4px; height: 20px; border-radius: 2px; margin-right: 8px; }
 .tw-tla { width: 50px; font-weight: 700; }
 .tw-val { flex: 1; text-align: right; font-size: 19px; font-variant-numeric: tabular-nums; color: #ddd; white-space: nowrap; }
-.tw-val.up { color: #3ccf6e; } .tw-val.down { color: #ff5a4f; } .tw-val.pit { color: var(--muted); }
+.tw-val.up { color: #3ccf6e; } .tw-val.down { color: #ff5a4f; } .tw-val.pit, .tw-val.old { color: var(--muted); }
 .tw-tyre { width: 22px; height: 22px; margin-left: 8px; border-radius: 50%; border: 3px solid #888; font-size: 11px;
   line-height: 16px; text-align: center; font-weight: 800; flex: none; }
 .tyre-S { border-color: #e10600; } .tyre-M { border-color: #ffd12e; } .tyre-H { border-color: #f0f0f0; }

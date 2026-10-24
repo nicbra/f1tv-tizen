@@ -21,6 +21,8 @@
   var accountGrid = null;
   var checkingUpdate = false;
   var playbackFeedbackTimer = null;
+  var seasonUri = null;    // the season page, which links every race weekend's page
+  var upNext = null;       // { ctx, ev, timer, left } while the "Up next" card is shown
 
   var DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   var LANG_NAMES = { eng: 'English', deu: 'Deutsch', fra: 'Français', nld: 'Nederlands', por: 'Português',
@@ -213,6 +215,7 @@
     F1Api.menu().catch(function () { return []; }).then(function (menu) {
       var find = function (re) { return menu.filter(function (m) { return re.test(m.title); })[0]; };
       var home = find(/^home$/i), season = find(/season/i);
+      seasonUri = season ? season.uri : null;
       navTabs = [{ title: 'Home', kind: 'home', load: home ? page(home.uri) : byId(F1Api.HOME_PAGE_ID) }];
       if (season) navTabs.push({ title: 'Schedule', run: function () { openCalendar(season.uri); } });
       navTabs.push({ title: 'Standings', run: function () { openStandings(); } });
@@ -1008,7 +1011,8 @@
 
   // feeds
 
-  function openFeeds(contentId, tile, restore) {
+  /** auto: play the main feed straight away, from the real moment auto.at (Unix seconds) if given. */
+  function openFeeds(contentId, tile, restore, auto) {
     backStack.push(restore || snapshot());
     show('feeds');
     $('feeds-title').textContent = tile.title;
@@ -1044,6 +1048,9 @@
         meetingEnd: ev && ev.meetingEnd
       };
       feedsCtx.subtype = m.contentSubtype;
+      // A pre-show, its session and the post-show are parts of one event, each naming the next.
+      var next = emf.multipartEvent === 'true' && emf.multipartEventNextHouseId;
+      feedsCtx.nextPart = next && next !== m.externalId ? { houseId: next, end: +emf.sessionEndDate || 0 } : null;
       feedsCtx.duration = m.duration;
       var resumeReady = Promise.resolve();
       if (!feedsCtx.live) {
@@ -1077,6 +1084,7 @@
         onMove: function (r) { list.style.transform = 'translateY(' + (-Math.max(0, r - 5) * 72) + 'px)'; }
       });
       grid.apply();
+      if (auto) return playFeed(0, auto.at ? { liveAt: auto.at } : feedsCtx.live ? {} : { fromStart: true });
       if (feedsCtx.single) {
         var ctx = feedsCtx;
         resumeReady.then(function () { if (feedsCtx === ctx && screen === 'feeds') chooseStart(0); });
@@ -1215,7 +1223,10 @@
     if (opts.startAt != null) return opts.startAt;
     if (opts.liveAt) {
       var at = Player.positionAt(opts.liveAt, info);
-      if (at != null) return at;
+      // A moment from before this stream began (a next part that starts later) plays from its start;
+      // one at or past its end, at live.
+      if (at != null && info) at = Math.max(at, info.windowStart + (info.dynamic ? 15 : 0));
+      if (at != null && (!info || at < info.windowEnd)) return at;
     }
     if (from && from.wall) {
       var wall = from.wall + (Date.now() - from.at) / 1000 + switchLead;
@@ -1393,18 +1404,24 @@
     }
   }
 
-  function stopPlayer() {
+  /** Stops playback and clears the player's overlays, staying on the player screen. */
+  function leavePlayer() {
     liveFocus = false;
     saveProgress();
     if (scrub) scrubCancel();
     pending = null;
     closePanel();
+    dismissUpNext();
     timingState = null;
     $('tower').classList.add('hidden');
     $('screen-player').classList.remove('tower-on');
     showSubtitle(null);
     Player.unload();
     $('spinner').classList.add('hidden');
+  }
+
+  function stopPlayer() {
+    leavePlayer();
     // Single-feed videos never showed the feed list, so go straight back to where we came from.
     if (feedsCtx && feedsCtx.single) return goBack();
     show('feeds');
@@ -1437,6 +1454,8 @@
 
   function playerKey(key) {
     if (panel) return panelKey(key);
+    if (upNext && key === K.ENTER && upNext.left != null) return playNextPart();
+    if (upNext && key === K.BACK) return dismissUpNext();
     // While a stream (re)loads it has no position yet: seeking now would start from 0.
     if (loadingFeed && (key === K.LEFT || key === K.RIGHT || key === K.RW || key === K.FF)) {
       return toast('Loading…', 1200);
@@ -1480,6 +1499,93 @@
     var i = (feedsCtx.index + d + n) % n;
     grid.r = i;
     playFeed(i, { switching: true });
+  }
+
+  // up next: the following part of a pre-show / session / post-show event
+
+  /** The broadcast schedule of the race weekend with this MeetingKey. */
+  function weekendSchedule(meetingKey) {
+    if (!seasonUri) return Promise.resolve(null);
+    return F1Api.pageByUri(seasonUri).then(function (containers) {
+      var mt = F1Api.seasonFrom(containers).filter(function (x) { return String(x.key) === String(meetingKey); })[0];
+      return mt ? F1Api.pageByUri(mt.uri).then(F1Api.scheduleFrom) : null;
+    });
+  }
+
+  /**
+   * Live broadcasts end on F1's "coverage has concluded" screen while the next part runs as a
+   * separate stream. Once the moment being watched passes the scheduled end (behind live as well)
+   * and F1 no longer lists the broadcast as live, so an overrunning session is not cut off, offer
+   * the next part. Replays offer it when the video ends.
+   */
+  function checkNextPart() {
+    var ctx = feedsCtx, n = ctx && ctx.nextPart;
+    if (screen !== 'player' || !n || n.offered || !n.end || loadingFeed || !Player.isLive()) return;
+    var wall = Player.wallClock(Player.position());
+    if (!wall || wall * 1000 < n.end || Date.now() < (n.checkAt || 0)) return;
+    n.checkAt = Date.now() + 30000;
+    F1Api.video(ctx.contentId).then(function (v) {
+      if (feedsCtx === ctx && (v.metadata || {}).contentSubtype !== 'LIVE') offerNextPart();
+    }).catch(function () { /* try again later */ });
+  }
+
+  /** Looks up the next part and shows the "Up next" card; false when there is no next part. */
+  function offerNextPart(onMissing) {
+    var ctx = feedsCtx, n = ctx && ctx.nextPart;
+    if (!n || n.offered || n.dismissed) return false;
+    n.offered = true;
+    (function lookUp() {
+      weekendSchedule(ctx.timingMeta.meetingKey).then(function (sched) {
+        if (feedsCtx !== ctx || screen !== 'player' || n.dismissed) return;
+        var ev = sched && sched.events.filter(function (e) { return e.houseId === n.houseId; })[0];
+        if (!ev) return onMissing && onMissing();
+        showUpNext(ctx, ev);
+        // Not on air yet: look again until it is.
+        if (status(ev) === 'upcoming') n.retry = setTimeout(lookUp, 30000);
+      }).catch(function () { if (onMissing && feedsCtx === ctx && screen === 'player') onMissing(); });
+    })();
+    return true;
+  }
+
+  /** The card counts down from 10 s and then plays the next part; one not yet on air shows its start time. */
+  function showUpNext(ctx, ev) {
+    clearUpNext();
+    var st = status(ev), u = upNext = { ctx: ctx, ev: ev, left: st === 'upcoming' ? null : 10 };
+    $('upnext-title').textContent = ev.title;
+    $('upnext').classList.remove('hidden');
+    (function tick() {
+      if (upNext !== u) return;
+      if (u.left === 0) return playNextPart();
+      $('upnext-sub').textContent = u.left == null ? 'Starts ' + when(ev.start)
+        : (st === 'live' ? 'Live now' : 'Replay') + ' · starts in ' + u.left + ' s';
+      if (u.left != null) { u.left--; u.timer = setTimeout(tick, 1000); }
+    })();
+  }
+
+  function clearUpNext() {
+    if (upNext) clearTimeout(upNext.timer);
+    upNext = null;
+    $('upnext').classList.add('hidden');
+  }
+
+  /** Hides the card for good for this video. */
+  function dismissUpNext() {
+    var n = upNext && upNext.ctx.nextPart;
+    if (n) { n.dismissed = true; clearTimeout(n.retry); }
+    clearUpNext();
+  }
+
+  /**
+   * Plays the next part from the real moment reached in this one: seamless where the two overlap,
+   * from its start after a gap, and at live for a viewer who was watching live.
+   */
+  function playNextPart() {
+    if (!upNext) return;
+    var ev = upNext.ev, wall = Player.wallClock(Player.position());
+    clearUpNext();
+    leavePlayer();
+    // BACK from the next part returns to wherever the previous part was opened from.
+    openFeeds(ev.contentId, { title: ev.title, image: ev.pictureUrl, event: ev }, backStack.pop(), { at: wall });
   }
 
   // watch options panel (feeds, timing, commentary, subtitles)
@@ -1687,12 +1793,15 @@
 
   /**
    * One driver's value in the chosen view: [text, extra class]. A driver in the pits shows
-   * "In pit" in races; in practice and qualifying they keep their time, dimmed.
+   * "In pit" in races; in practice and qualifying they keep their time, dimmed. So do times from an
+   * earlier qualifying part (no lap yet in this one, or knocked out).
    */
   function towerCell(d, view, race) {
     if (d.out) return ['OUT'];
-    if (!d.pit || (view !== 'interval' && view !== 'leader')) return viewCell(d, view, race);
-    var time = race ? '' : viewCell(d, view, race)[0];
+    var gapView = view === 'interval' || view === 'leader', cell = viewCell(d, view, race);
+    if (d.old && cell[0] && (gapView || view === 'best')) cell = [cell[0], 'old'];
+    if (!d.pit || !gapView) return cell;
+    var time = race ? '' : cell[0];
     return time ? [time, 'pit'] : ['In pit'];
   }
 
@@ -1810,10 +1919,11 @@
     // During a jump the pending-seek logic owns the spinner (it waits a moment before showing it).
     Player.on('buffering', function (b) { if (!pending) $('spinner').classList.toggle('hidden', !b); });
     setInterval(checkPending, 100);
-    Player.on('ended', function () { if (screen === 'player') stopPlayer(); });
+    Player.on('ended', function () { if (screen === 'player' && !offerNextPart(stopPlayer)) stopPlayer(); });
     Player.on('subtitle', showSubtitle);
     setInterval(timingTick, 250);   // often, so the session clock ticks with the on-screen one
     setInterval(saveProgress, 30000);
+    setInterval(checkNextPart, 2000);
     setInterval(function () {
       if (screen === 'browse' && currentPage && currentPage.kind === 'home' && grid && !dialog) refreshPage(currentPage);
     }, 120000);

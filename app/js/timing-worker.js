@@ -20,7 +20,7 @@ function emptyJob(path, token) {
     collect: [],                           // initial load: [offset, feed, raw line] applied in time order
     base: null,                            // UTC ms of offset 0
     info: {},                              // SessionInfo
-    lap: [], clock: [], part: [], track: [],
+    lap: [], clock: [], part: [], track: [], sessionPart: 0,   // sessionPart: the qualifying part (1-3) TimingData is on
     drivers: {}, timing: {}, stints: {},
     snaps: [], lastSnap: -1, changed: -1   // changed: time of the newest change not yet in a snapshot
   };
@@ -77,6 +77,7 @@ function apply(feed, t, d) {
     case 'DriverList': merge(j.drivers, d); break;
     case 'TimingAppData': if (d.Lines) { merge(j.stints, d.Lines); j.changed = t; } break;
     case 'TimingData':
+      if (d.SessionPart != null) j.sessionPart = +d.SessionPart;
       if (d.Lines) merge(j.timing, d.Lines);
       j.changed = t;
       if (t - j.lastSnap >= SNAPSHOT_MS) snapshot(t);
@@ -90,6 +91,15 @@ function flush(j) {
 }
 
 function val(x) { return x && typeof x === 'object' ? x.Value : x; }
+
+/** The latest qualifying part, at or before `part`, with a value for key: { value, part }, or null. */
+function latestPart(list, part, key) {
+  for (var p = part; list && p >= 0; p--) {
+    var v = list[p] && val(list[p][key]);
+    if (v) return { value: v, part: p };
+  }
+  return null;
+}
 
 function snapshot(t) {
   var j = job, rows = [];
@@ -105,11 +115,25 @@ function snapshot(t) {
       fresh = !!s && String(s.New) === 'true';
     }
     var stops = l.NumberOfPitStops != null ? +l.NumberOfPitStops : (keys.length ? keys.length - 1 : null);
-    rows.push([num, +l.Position, val(l.GapToLeader) || val(l.TimeDiffToFastest) || '',
-      val(l.IntervalToPositionAhead) || val(l.TimeDiffToPositionAhead) || '',
-      val(l.BestLapTime) || '', val(l.LastLapTime) || '', l.NumberOfLaps || 0,
+    // Qualifying keeps gaps (Stats) and best laps (BestLapTimes) per part and clears the current ones
+    // when a part starts. A driver without a lap in this part yet, or knocked out, keeps their latest
+    // earlier part's times, marked old.
+    var part = Math.max(0, j.sessionPart - 1), stats = l.Stats || {}, laps = l.BestLapTimes;
+    var cur = stats[part] || {}, old = false;
+    var best = val(l.BestLapTime) || (laps && laps[part] ? val(laps[part].Value) : '');
+    var gap = val(l.GapToLeader) || val(l.TimeDiffToFastest) || val(cur.TimeDiffToFastest);
+    var interval = val(l.IntervalToPositionAhead) || val(l.TimeDiffToPositionAhead) || val(cur.TimeDifftoPositionAhead);
+    var prev = laps && !(laps[part] && val(laps[part].Value)) && latestPart(laps, part - 1, 'Value');
+    if (prev) {
+      var s = stats[prev.part] || {};
+      old = true;
+      best = prev.value;
+      gap = val(s.TimeDiffToFastest);
+      interval = val(s.TimeDifftoPositionAhead);
+    }
+    rows.push([num, +l.Position, gap || '', interval || '', best || '', val(l.LastLapTime) || '', l.NumberOfLaps || 0,
       !!(l.InPit || l.PitOut), !!(l.Retired || l.Stopped), !!l.KnockedOut, compound,
-      stops, age, fresh, +app.GridPos || null]);
+      stops, age, fresh, +app.GridPos || null, old]);
   });
   rows.sort(function (a, b) { return a[1] - b[1]; });
   j.snaps.push([t, rows]);
@@ -198,7 +222,7 @@ function query(t) {
       var d = j.drivers[r[0]] || {};
       return { num: r[0], pos: r[1], tla: d.Tla || r[0], colour: d.TeamColour ? '#' + d.TeamColour : '#888',
         gap: r[2], interval: r[3], best: r[4], last: r[5], laps: r[6], pit: r[7], out: r[8], knockedOut: r[9], tyre: r[10],
-        stops: r[11], tyreAge: r[12], tyreNew: r[13], grid: r[14] };
+        stops: r[11], tyreAge: r[12], tyreNew: r[13], grid: r[14], old: r[15] };
     });
   }
   out.started = j.snaps.length ? t >= j.snaps[0][0] : false;

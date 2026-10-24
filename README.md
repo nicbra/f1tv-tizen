@@ -15,7 +15,7 @@ BV. I have shamelessly added the F1 logo in the app.
 
 ## What you get
 
-- Live sessions and replays in up to 1080p at 50 fps.
+- Live sessions and replays in at least 1080p at 50 fps (4K not tested).
 - All of F1 TV's feeds: the main broadcast, F1 Live, an onboard camera for each driver, the
   tracker and the data channel. Switching feeds keeps you at the same moment of the session.
 - A timing tower in sync with the video: positions, gaps, lap times, tyres, pit stops and track

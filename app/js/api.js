@@ -219,6 +219,7 @@ var F1Api = (function () {
       var m = ev.metadata || {}, e = m.emfAttributes || {};
       return {
         contentId: m.contentId || ev.id,
+        houseId: m.externalId || '',       // links the parts of a multipart event (see app.js offerNextPart)
         title: m.titleBrief || m.title || '',
         series: e.Series || m.uiSeries || '',
         start: toMs(e.sessionStartDate) || m.contractStartDate || null,

@@ -451,3 +451,48 @@ test('a tyre change after the last timing update still shows once the data ends'
   assert.equal(row(w.ask(at(11)), '1').tyre, 'M');
   assert.equal(row(w.ask(at(12)), '1').tyre, 'H');
 });
+
+// ---- qualifying: per-part gaps and best laps ----
+
+const q1Lap = (best, gap, int) => ({ BestLapTime: { Value: best }, BestLapTimes: { 0: { Value: best } },
+  Stats: { 0: { TimeDiffToFastest: gap, TimeDifftoPositionAhead: int } } });
+const qualifying = (...timing) => ({
+  ...base(),
+  SessionInfo: stream(line(0, { Type: 'Qualifying', Name: 'Qualifying' })),
+  TimingData: stream(
+    line(10, { SessionPart: 1, Lines: {
+      1: { Position: '1', BestLapTimes: [{ Value: '' }, {}, {}], Stats: [{ TimeDiffToFastest: '', TimeDifftoPositionAhead: '' }, {}, {}] },
+      44: { Position: '2', BestLapTimes: [{ Value: '' }, {}, {}], Stats: [{ TimeDiffToFastest: '', TimeDifftoPositionAhead: '' }, {}, {}] },
+      16: { Position: '3', BestLapTimes: [{ Value: '' }, {}, {}], Stats: [{ TimeDiffToFastest: '', TimeDifftoPositionAhead: '' }, {}, {}] } } }),
+    line(20, { Lines: { 1: q1Lap('1:32.000', '', ''), 44: q1Lap('1:32.300', '+0.300', '+0.300'), 16: q1Lap('1:33.000', '+1.000', '+0.700') } }),
+    ...timing)
+});
+
+test('qualifying gaps and intervals come from the current part', async () => {
+  const w = await loadedWorker(qualifying());
+  const s = w.ask(at(21));
+  assert.deepEqual([row(s, '44').gap, row(s, '44').interval, row(s, '44').best, row(s, '44').old], ['+0.300', '+0.300', '1:32.300', false]);
+  assert.equal(row(s, '1').best, '1:32.000');
+});
+
+test('when a new qualifying part starts, earlier times stay, marked old', async () => {
+  const w = await loadedWorker(qualifying(
+    line(40, { SessionPart: 2, Lines: { 1: { BestLapTime: { Value: '' }, BestLapTimes: { 1: { Value: '' } } },
+      44: { BestLapTime: { Value: '' }, BestLapTimes: { 1: { Value: '' } } }, 16: { KnockedOut: true } } })
+  ));
+  const s = w.ask(at(41));
+  assert.deepEqual([row(s, '44').gap, row(s, '44').best, row(s, '44').old], ['+0.300', '1:32.300', true]);
+  assert.deepEqual([row(s, '1').best, row(s, '1').old], ['1:32.000', true]);
+  // Knocked out: F1 keeps the best lap but the gap is in the earlier part's stats.
+  assert.deepEqual([row(s, '16').gap, row(s, '16').interval, row(s, '16').old], ['+1.000', '+0.700', true]);
+});
+
+test('a lap in the new qualifying part replaces the old times', async () => {
+  const w = await loadedWorker(qualifying(
+    line(40, { SessionPart: 2, Lines: { 44: { BestLapTime: { Value: '' }, BestLapTimes: { 1: { Value: '' } } } } }),
+    line(50, { Lines: { 44: { BestLapTime: { Value: '1:31.900' }, BestLapTimes: { 1: { Value: '1:31.900' } },
+      Stats: { 1: { TimeDiffToFastest: '+0.100', TimeDifftoPositionAhead: '+0.100' } } } } })
+  ));
+  const s = w.ask(at(51));
+  assert.deepEqual([row(s, '44').gap, row(s, '44').best, row(s, '44').old], ['+0.100', '1:31.900', false]);
+});

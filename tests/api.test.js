@@ -132,12 +132,13 @@ test('scheduleFrom reads the weekend schedule from the ALL group, sorted by star
   const { F1Api } = api();
   const containers = [{ layout: 'hero' }, { layout: 'interactive_schedule', retrieveItems: { resultObj: { containers: [
     { eventName: 'F1', events: [event(9, 'Wrong group', 1)] },
-    { eventName: 'ALL', events: [event(2, 'Qualifying', 2000, { contentSubtype: 'LIVE_EVENT' }), event(1, 'Practice 3', 1000, { contentSubtype: 'LIVE' }), { id: 3, metadata: { title: 'No time' } }] }
+    { eventName: 'ALL', events: [event(2, 'Qualifying', 2000, { contentSubtype: 'LIVE_EVENT', externalId: 'FOM_SESSION_11392' }), event(1, 'Practice 3', 1000, { contentSubtype: 'LIVE' }), { id: 3, metadata: { title: 'No time' } }] }
   ] } } }];
   const s = F1Api.scheduleFrom(containers);
   assert.equal(s.meeting, 'United States Grand Prix');
   assert.deepEqual(plain(s.events.map((e) => [e.contentId, e.title, e.start, e.subtype, e.series])), [
     [1, 'Practice 3', 1000, 'LIVE', 'FORMULA 1'], [2, 'Qualifying', 2000, 'LIVE_EVENT', 'FORMULA 1']]);
+  assert.equal(s.events[1].houseId, 'FOM_SESSION_11392'); // links the parts of a pre-show / session / post-show
 });
 
 test('scheduleFrom returns null for pages without a schedule', () => {

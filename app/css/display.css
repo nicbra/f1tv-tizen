@@ -9,7 +9,7 @@
 @font-face { font-family: 'F1 Display'; src: url('../fonts/Formula1-Black.woff2') format('woff2');
   font-weight: 900; font-style: normal; }
 
-h1, h2, .osd-title, .rail-title, .driver-number, .brand-tv {
+h1, h2, .osd-title, .rail-title, .driver-number, .brand-tv, .upnext-title {
   font-family: 'F1 Display', 'Titillium Web', sans-serif;
 }
 
