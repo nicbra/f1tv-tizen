@@ -135,15 +135,19 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .panel-row.go-live .panel-label:before { content: '● '; color: var(--red); }
 .panel-row.go-live.focused .panel-label:before { color: #fff; }
 
-.spinner { position: absolute; left: 50%; top: 50%; width: 84px; height: 84px; margin: -42px 0 0 -42px; }
-.spin-track { position: absolute; top: 0; left: 0; right: 0; bottom: 0; border-radius: 50%;
-  border: 4px solid rgba(255, 255, 255, 0.12); }
-.spin-arc { position: absolute; top: 0; left: 0; right: 0; bottom: 0; border-radius: 50%;
-  background: conic-gradient(rgba(225, 6, 0, 0) 0deg, rgba(225, 6, 0, 0) 220deg, rgba(225, 6, 0, 0.9) 340deg, #ff4b3a 360deg);
-  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 4px), #000 calc(100% - 4px));
-  animation: spin 0.9s linear infinite; }
-.spin-arc:after { content: ''; position: absolute; top: 0; left: 50%; width: 4px; height: 4px; margin-left: -2px;
-  border-radius: 50%; background: #ff6a5a; box-shadow: 0 0 10px 3px rgba(225, 6, 0, 0.75); }
+/*
+ * Loading: the red lettering of a fast-spinning F1 tyre. PIRELLI smears into fine concentric lines,
+ * with the two logos as brighter zones sweeping round.
+ */
+.spinner { position: absolute; left: 50%; top: 50%; width: 96px; height: 96px; margin: -48px 0 0 -48px; }
+.tyre-text { position: absolute; top: 0; left: 0; right: 0; bottom: 0; border-radius: 50%; }
+.tyre-text {
+  background: radial-gradient(circle closest-side, transparent 33.5px, #ff4634 34px, #ff4634 35.2px,
+    rgba(225, 6, 0, 0.5) 35.8px, rgba(225, 6, 0, 0.5) 38.2px, rgba(255, 70, 52, 0.85) 38.8px, rgba(255, 70, 52, 0.85) 39.6px,
+    rgba(225, 6, 0, 0.5) 40.2px, rgba(225, 6, 0, 0.5) 41.4px, #ff4634 42px, #ff4634 43px, transparent 43.5px);
+  -webkit-mask: conic-gradient(rgba(0, 0, 0, 0.14) 0deg, rgba(0, 0, 0, 0.14) 20deg, #000 75deg, #000 105deg, rgba(0, 0, 0, 0.14) 160deg,
+    rgba(0, 0, 0, 0.14) 200deg, #000 255deg, #000 285deg, rgba(0, 0, 0, 0.14) 340deg);
+  animation: spin 0.275s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .toast { position: absolute; left: 50%; bottom: 80px; transform: translateX(-50%); max-width: 1400px;

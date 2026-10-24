@@ -71,6 +71,8 @@
     return dayDate(ms) + ' ' + hhmm(ms);
   }
 
+  function capitalise(text) { return text.charAt(0).toUpperCase() + text.slice(1); }
+
   /** "in 5 min", "in 1 h 52 min", "in 3 days". */
   function until(ms) {
     var min = Math.max(1, Math.round((ms - Date.now()) / 60000));
@@ -325,7 +327,12 @@
     e._tile = t;
     e.classList.toggle('upcoming', !!t.upcoming);
     var img = e.querySelector('.tile-img'), badge = img.querySelector('.tile-badge');
-    img.querySelector('.tile-art').classList.toggle('spoiler', !spoilerSafe(t));
+    var art = img.querySelector('.tile-art'), spoiler = !spoilerSafe(t);
+    if (art.classList.contains('spoiler') !== spoiler) {
+      art.classList.toggle('spoiler', spoiler);
+      var src = artUrl(t, 384, 216);
+      art.style.backgroundImage = src ? 'url("' + src + '")' : '';
+    }
     if (!t.badge) { if (badge) img.removeChild(badge); return; }
     if (!badge) { badge = el('div'); img.appendChild(badge); }
     badge.className = 'tile-badge ' + t.badge.cls;
@@ -380,7 +387,7 @@
   function scheduleTile(ev) {
     var st = status(ev);
     var badge = st === 'live' ? { text: 'LIVE', cls: 'live' }
-      : st === 'upcoming' ? { text: when(ev.start), cls: 'soon' } : { text: 'Replay', cls: 'done' };
+      : st === 'upcoming' ? { text: capitalise(when(ev.start)), cls: 'soon' } : { text: 'Replay', cls: 'done' };
     return {
       title: ev.title,
       sub: ev.series + ' · ' + dayDate(ev.start) + ' ' + hhmm(ev.start),
@@ -411,7 +418,7 @@
         var tile = el('div', 'tile' + (t.upcoming ? ' upcoming' : ''));
         var img = el('div', 'tile-img');
         var art = el('div', 'tile-art' + (spoilerSafe(t) ? '' : ' spoiler'));
-        var src = F1Api.imageUrl(t.image, 384, 216);
+        var src = artUrl(t, 384, 216);
         if (src) art.style.backgroundImage = 'url("' + src + '")';
         img.appendChild(art);
         if (t.badge) img.appendChild(el('div', 'tile-badge ' + t.badge.cls, t.badge.text));
@@ -454,6 +461,14 @@
     var active = navTabs.indexOf(navTabs.filter(function (t) { return t.title === (currentPage && currentPage.title); })[0]);
     if (active >= 0) grid.c[0] = active;
     grid.apply();
+  }
+
+  /**
+   * Artwork for a tile at w x h. Spoiler-hidden art is fetched as a 32x18 thumbnail: the CSS blur
+   * makes it smooth, and even a frame the TV draws before applying the blur shows nothing readable.
+   */
+  function artUrl(t, w, h) {
+    return spoilerSafe(t) ? F1Api.imageUrl(t.image, w, h) : F1Api.imageUrl(t.image, 32, 18);
   }
 
   /** In spoiler-free mode only live and upcoming artwork is shown unblurred. */
@@ -976,7 +991,7 @@
     $('feeds-sub').textContent = 'Loading…';
     $('feeds-list').innerHTML = '';
     $('feeds-list').style.transform = '';
-    var hero = F1Api.imageUrl(tile.image, 1920, 1080);
+    var hero = artUrl(tile, 1920, 1080);
     $('feeds-hero').style.backgroundImage = hero ? 'url("' + hero + '")' : '';
     $('feeds-hero').classList.toggle('spoiler', !spoilerSafe(tile));
     grid = new Focus.Grid([]);
