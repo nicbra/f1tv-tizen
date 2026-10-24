@@ -32,11 +32,12 @@ cmd_build() {
   rm -rf "$ROOT/build" && mkdir -p "$ROOT/build/src"
   # APP_SRC: another copy of app/ (build-release.sh archives a tag and stamps its version).
   cp -r "${APP_SRC:-$ROOT/app}/." "$ROOT/build/src/"
-  # Personal overrides that stay out of the repo (local/icon.png, local/logo.png).
-  # Release builds (RELEASE=1, see build-release.sh) never include them.
+  # Personal overrides that stay out of the repo: local/icon.png, local/logo.png and local/app/
+  # (copied over the bundled app files). Release builds (RELEASE=1) never include them.
   if [[ -z "${RELEASE:-}" ]]; then
     [[ -f "$ROOT/local/icon.png" ]] && cp "$ROOT/local/icon.png" "$ROOT/build/src/img/icon.png"
     [[ -f "$ROOT/local/logo.png" ]] && cp "$ROOT/local/logo.png" "$ROOT/build/src/img/logo.png"
+    [[ -d "$ROOT/local/app" ]] && cp -r "$ROOT/local/app/." "$ROOT/build/src/"
   fi
   "$TIZEN" package -t wgt -s "$PROFILE" -o "$ROOT/build" -- "$ROOT/build/src"
   mv "$ROOT/build/"*.wgt "$ROOT/build/F1TV.wgt"
@@ -46,7 +47,7 @@ cmd_build() {
 cmd_install() {
   "$SDB" connect "$TV_IP:26101"
   local serial; serial="$("$SDB" devices | awk -v ip="$TV_IP" 'index($1, ip) { print $3; exit }')"
-  [[ -n "$serial" ]] || { echo "TV not found via sdb - is Developer Mode on with host IP $(pc_ip)?"; exit 1; }
+  [[ -n "$serial" ]] || { echo "TV not found via sdb. Is Developer Mode on with host IP $(pc_ip)?"; exit 1; }
   "$TIZEN" install -n "$ROOT/build/F1TV.wgt" -t "$serial"
   "$TIZEN" run -p "$APP_ID" -t "$serial"
 }

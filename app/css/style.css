@@ -1,10 +1,23 @@
-/* Laid out for a fixed 1920x1080 canvas; the TV scales it to the panel. */
+/* Fixed 1920x1080 canvas, scaled by the TV. */
 
-/* Ubuntu (variable weight 300-700), bundled under the Ubuntu Font Licence (fonts/LICENCE.txt). */
-@font-face { font-family: 'Ubuntu'; src: url('../fonts/Ubuntu.ttf') format('truetype');
-  font-weight: 300 700; font-style: normal; }
-@font-face { font-family: 'Ubuntu'; src: url('../fonts/Ubuntu-Italic.ttf') format('truetype');
-  font-weight: 300 700; font-style: italic; }
+/*
+ * Titillium Web, bundled under the SIL Open Font License 1.1 (fonts/OFL.txt). It has no 500 or
+ * 800 weight (those render as 400 and 900) and no black italic (900 italic renders as 700 italic).
+ */
+@font-face { font-family: 'Titillium Web'; src: url('../fonts/TitilliumWeb-Light.ttf') format('truetype');
+  font-weight: 300; font-style: normal; }
+@font-face { font-family: 'Titillium Web'; src: url('../fonts/TitilliumWeb-Regular.ttf') format('truetype');
+  font-weight: 400; font-style: normal; }
+@font-face { font-family: 'Titillium Web'; src: url('../fonts/TitilliumWeb-Italic.ttf') format('truetype');
+  font-weight: 400; font-style: italic; }
+@font-face { font-family: 'Titillium Web'; src: url('../fonts/TitilliumWeb-SemiBold.ttf') format('truetype');
+  font-weight: 600; font-style: normal; }
+@font-face { font-family: 'Titillium Web'; src: url('../fonts/TitilliumWeb-Bold.ttf') format('truetype');
+  font-weight: 700; font-style: normal; }
+@font-face { font-family: 'Titillium Web'; src: url('../fonts/TitilliumWeb-BoldItalic.ttf') format('truetype');
+  font-weight: 700; font-style: italic; }
+@font-face { font-family: 'Titillium Web'; src: url('../fonts/TitilliumWeb-Black.ttf') format('truetype');
+  font-weight: 900; font-style: normal; }
 :root {
   --bg: #0f0f14;
   --panel: #1b1b24;
@@ -20,8 +33,10 @@
 html, body {
   width: 1920px; height: 1080px; overflow: hidden;
   background: var(--bg); color: var(--text);
-  font-family: "Ubuntu", "SamsungOne", Arial, sans-serif;
+  font-family: "Titillium Web", "SamsungOne", Arial, sans-serif;
   font-size: 26px;
+  /* Titillium's default line spacing (~1.5) overflows the fixed layout. */
+  line-height: 1.15;
 }
 
 .hidden { display: none !important; }
@@ -32,7 +47,7 @@ html, body {
 .brand { font-weight: 900; font-style: italic; font-size: 44px; letter-spacing: -1px; color: var(--red); }
 .brand span { color: var(--text); margin-left: 4px; }
 
-/* ---------- Login ---------- */
+/* Login */
 #screen-login { display: flex; align-items: center; justify-content: center;
   background: radial-gradient(circle at 30% 20%, #2a0a0a 0, var(--bg) 60%); }
 .login-box { width: 1100px; text-align: center; }
@@ -51,7 +66,7 @@ html, body {
   font-size: 28px; border: 3px solid transparent; }
 .btn.focused { border-color: var(--focus); background: var(--red); }
 
-/* ---------- Browse ---------- */
+/* Browse */
 .topbar { height: 110px; padding: 0 80px; display: flex; align-items: center; }
 .topbar .brand { margin-right: 40px; flex-shrink: 0; white-space: nowrap; }
 .topnav { display: flex; flex: 1; }
@@ -85,7 +100,7 @@ html, body {
 .tile.upcoming .tile-img { opacity: 0.55; }
 .empty { padding: 40px 80px; color: var(--muted); }
 
-/* ---------- Feeds ---------- */
+/* Feeds */
 .feeds-hero { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: center / cover no-repeat; opacity: 0.25; }
 .feeds-info { position: absolute; left: 120px; top: 120px; width: 1100px; }
 .feeds-info h1 { font-size: 56px; margin-bottom: 12px; }
@@ -97,7 +112,7 @@ html, body {
 .feed .feed-type { color: var(--muted); font-size: 22px; }
 .feed.focused .feed-type { color: var(--text); }
 
-/* ---------- Player ---------- */
+/* Player */
 /* AVPlay draws video on a hardware plane behind the page, so the page must be see-through. */
 body.avplay, body.avplay #screen-player { background: transparent; }
 body.avplay #video, body.avplay #video2 { display: none; }
@@ -156,26 +171,22 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .panel-row.go-live .panel-label:before { content: '● '; color: var(--red); }
 .panel-row.go-live.focused .panel-label:before { color: #fff; }
 
-/*
- * Loading: the red lettering of a fast-spinning F1 tyre. PIRELLI smears into fine concentric lines,
- * with the two logos as brighter zones sweeping round.
- */
+/* Spinner: red tyre lettering. */
 .spinner { position: absolute; left: 50%; top: 50%; width: 96px; height: 96px; margin: -48px 0 0 -48px; }
-.tyre-text { position: absolute; top: 0; left: 0; right: 0; bottom: 0; border-radius: 50%; }
-.tyre-text {
+.tyre-text { position: absolute; top: 0; left: 0; right: 0; bottom: 0; border-radius: 50%;
   background: radial-gradient(circle closest-side, transparent 33.5px, #ff4634 34px, #ff4634 35.2px,
     rgba(225, 6, 0, 0.5) 35.8px, rgba(225, 6, 0, 0.5) 38.2px, rgba(255, 70, 52, 0.85) 38.8px, rgba(255, 70, 52, 0.85) 39.6px,
     rgba(225, 6, 0, 0.5) 40.2px, rgba(225, 6, 0, 0.5) 41.4px, #ff4634 42px, #ff4634 43px, transparent 43.5px);
   -webkit-mask: conic-gradient(rgba(0, 0, 0, 0.14) 0deg, rgba(0, 0, 0, 0.14) 20deg, #000 75deg, #000 105deg, rgba(0, 0, 0, 0.14) 160deg,
     rgba(0, 0, 0, 0.14) 200deg, #000 255deg, #000 285deg, rgba(0, 0, 0, 0.14) 340deg);
-  animation: spin 0.275s linear infinite; }
+  animation: spin 0.175s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .toast { position: absolute; left: 50%; bottom: 80px; transform: translateX(-50%); max-width: 1400px;
   background: rgba(30,30,40,0.95); border-left: 8px solid var(--red); padding: 22px 34px; border-radius: 8px;
   font-size: 26px; line-height: 1.4; }
 
-/* ---------- Lists (calendar, weekend, account) ---------- */
+/* Lists (calendar, weekend, account) */
 .list-hero { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: center / cover no-repeat; opacity: 0.18; }
 .list-head { position: absolute; left: 120px; top: 70px; width: 1680px; }
 .list-head h1 { font-size: 54px; margin-top: 24px; }
@@ -195,9 +206,10 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .list-row .badge { padding: 4px 14px; border-radius: 4px; font-size: 20px; font-weight: 700; background: var(--panel-2); }
 .list-row .badge.live { background: var(--red); }
 .list-row.focused .badge.live { background: #fff; color: var(--red); }
+.list-row.focused .badge.live:before { background: var(--red); }
 .list-row.info { background: transparent; border: none; padding: 6px 26px; }
 
-/* ---------- Dialog ---------- */
+/* Dialog */
 .dialog { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6);
   display: flex; align-items: center; justify-content: center; }
 .dialog-box { background: var(--panel); border-radius: 12px; padding: 50px 70px; min-width: 820px; text-align: center;
@@ -207,7 +219,7 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .dialog-actions { margin-top: 36px; display: flex; justify-content: center; }
 .dialog-actions .btn { margin: 0 12px; }
 
-/* ---------- Watch options panel ---------- */
+/* Watch options panel */
 .panel { position: absolute; top: 0; right: 0; bottom: 0; width: 460px; background: rgba(12, 12, 18, 0.92);
   border-left: 3px solid var(--red); }
 .panel-title { font-size: 24px; font-weight: 700; padding: 34px 26px 10px; }
@@ -232,11 +244,8 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .feed.focused .feed-name small { color: var(--text); }
 .panel-hint { position: absolute; bottom: 16px; left: 26px; right: 26px; font-size: 17px; }
 
-/* ---------- Timing tower ---------- */
-/*
- * Same box as F1's own tower in the broadcast (2026 graphics: x 90, y 44-1034, 246 px wide, rows
- * from y 179), so on the main feed it sits right over F1's and the rows line up.
- */
+/* Timing tower */
+/* Align with F1's 2026 broadcast tower: x 90, y 44-1034, width 246, rows starting at y 179. */
 .tower { position: absolute; left: 90px; top: 44px; width: 246px; height: 990px; display: flex; flex-direction: column;
   background: rgba(16, 16, 24, 0.98); border-radius: 6px; font-size: 20px; overflow: hidden; }
 .tower-head { flex: none; height: 135px; display: flex; flex-direction: column; justify-content: center; align-items: center;
@@ -255,20 +264,20 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .tw-bar { width: 4px; height: 20px; border-radius: 2px; margin-right: 8px; }
 .tw-tla { width: 50px; font-weight: 700; }
 .tw-val { flex: 1; text-align: right; font-size: 19px; font-variant-numeric: tabular-nums; color: #ddd; white-space: nowrap; }
-.tw-val.up { color: #3ccf6e; } .tw-val.down { color: #ff5a4f; }
+.tw-val.up { color: #3ccf6e; } .tw-val.down { color: #ff5a4f; } .tw-val.pit { color: var(--muted); }
 .tw-tyre { width: 22px; height: 22px; margin-left: 8px; border-radius: 50%; border: 3px solid #888; font-size: 11px;
   line-height: 16px; text-align: center; font-weight: 800; flex: none; }
 .tyre-S { border-color: #e10600; } .tyre-M { border-color: #ffd12e; } .tyre-H { border-color: #f0f0f0; }
 .tyre-I { border-color: #43b02a; } .tyre-W { border-color: #0067ad; }
 
-/* ---------- Subtitles and seeker info ---------- */
+/* Subtitles and seeker info */
 .subtitle { position: absolute; left: 50%; bottom: 90px; transition: bottom 0.2s ease-out; transform: translateX(-50%); max-width: 1400px;
   background: rgba(0, 0, 0, 0.78); padding: 8px 22px; border-radius: 6px; font-size: 38px; text-align: center; line-height: 1.3; }
 .bubble-info { font-size: 20px; font-weight: 600; color: var(--muted); text-align: center; margin-bottom: 2px; }
 
-/* Logo from img/logo.png when the build has one */
+/* Brand: logo image and "TV" */
 .brand-logo { height: 40px; vertical-align: middle; }
-.brand .brand-tv { font-style: italic; font-weight: 900; margin-left: 8px; vertical-align: middle; font-size: 38px; }
+.brand .brand-tv { font-style: normal; font-weight: 400; margin-left: 8px; vertical-align: middle; font-size: 38px; }
 .login-box .brand-logo { height: 64px; }
 .login-box .brand .brand-tv { font-size: 56px; }
 
@@ -279,12 +288,11 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .topnav .nav-item.has-live:after { content: ''; display: inline-block; width: 10px; height: 10px; border-radius: 50%;
   background: var(--red); margin-left: 10px; vertical-align: 3px; animation: livePulse 1.4s ease-in-out infinite; }
 
-/* Subtitles move up above the player bar while it is shown */
 .osd-visible .subtitle { bottom: 270px; }
-/* With the tower on (x 90-336) subtitles stay centred but narrower, so long lines never go behind it. */
+/* Narrow subtitles to clear the tower (x 90-336). */
 .tower-on .subtitle { max-width: 1160px; }
 
-/* ---------- Standings and driver pages ---------- */
+/* Standings and driver pages */
 .list-row .row-colour { width: 6px; height: 40px; border-radius: 3px; margin-right: 18px; background: #555; flex: none; }
 .list-row .row-face { width: 56px; height: 56px; border-radius: 50%; margin-right: 18px; flex: none;
   background: var(--panel-2) center top / cover no-repeat; }
@@ -306,7 +314,7 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .points-chart .value { fill: var(--text); font-size: 20px; font-weight: 700; text-anchor: middle; }
 .list-row.compact .when { width: 90px; }
 
-/* ---------- Championship battle ---------- */
+/* Championship battle */
 .chart-legend { position: absolute; left: 120px; top: 268px; right: 420px; display: flex; flex-wrap: wrap; }
 .legend-item { display: inline-flex; align-items: center; margin: 0 28px 10px 0; font-size: 22px; color: var(--text); }
 .legend-item svg { margin-right: 10px; }

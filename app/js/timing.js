@@ -1,7 +1,4 @@
-/*
- * Live timing for the session being watched. Finds the session in F1's timing archive and
- * runs js/timing-worker.js, which answers queries for any moment (live or replay).
- */
+/* Finds the session's timing archive and queries timing-worker.js at the video's timestamp. */
 var Timing = (function () {
   var BASE = 'https://livetiming.formula1.com/static/';
   var SESSIONS = /^(Practice [123]|Qualifying|Sprint Qualifying|Sprint Shootout|Sprint|Race)$/;
@@ -17,7 +14,6 @@ var Timing = (function () {
     else if (m.type === 'state' && waiting[m.id]) { waiting[m.id](m.state); delete waiting[m.id]; }
   }
 
-  /** True when the content is an F1 session that has timing data. */
   function supported(meta) {
     return !!meta && /FORMULA 1/i.test(meta.series || '') && SESSIONS.test(meta.title || '');
   }
@@ -85,7 +81,6 @@ var Timing = (function () {
 
   var TRACK = { '2': 'Yellow flag', '4': 'Safety car', '5': 'Red flag', '6': 'Virtual safety car', '7': 'VSC ending' };
 
-  /** Short line for the seeker / OSD: "Lap 34/56", "Q2 · 07:12 left", "FP2 · 32:10 left". */
   function label(s) {
     if (!s) return '';
     var parts = [];

@@ -6,7 +6,7 @@ var Settings = (function () {
     tower: '',           // what the tower shows (see TOWER_VIEWS in app.js); '' = the session's default
     audio: 'eng',        // preferred commentary track (language code, 'fx' = track sound only)
     subtitles: '',       // subtitle language, '' = off
-    spoilerFree: false,  // hide result-revealing artwork and timing on replays
+    spoilerFree: false,  // blur the artwork of replays and highlights
     updates: true        // look for a newer release on GitHub once a day
   };
   var values = {};

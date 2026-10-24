@@ -1,7 +1,4 @@
-/*
- * Minimal grid focus for remote navigation. A "grid" is a list of rows, each row
- * a list of DOM elements. Rows scroll horizontally, the row container vertically.
- */
+/* Remote navigation over rows of DOM elements, remembering each row's selected column. */
 var Focus = (function () {
   function Grid(rows, opts) {
     this.rows = rows;

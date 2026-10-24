@@ -27,7 +27,7 @@
     jpn: '日本語', spa: 'Español', ita: 'Italiano', fx: 'Track sound only', tea: 'Team radio' };
   var MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-  // ---------- helpers ----------
+  // helpers
 
   function show(name) {
     hidePlaybackFeedback();
@@ -85,10 +85,7 @@
     return 'in ' + Math.round(min / 1440) + ' days';
   }
 
-  /**
-   * 'live' | 'upcoming' | 'done' for a scheduled broadcast. F1 marks a broadcast that is on air
-   * as LIVE (the coverage starts before the session); the clock is only a fallback.
-   */
+  /** F1's LIVE flag takes precedence over scheduled times: coverage can start before the session. */
   function status(ev) {
     if (ev.subtype === 'LIVE') return 'live';
     if (ev.subtype === 'REPLAY') return 'done';
@@ -115,7 +112,7 @@
     if (fn) fn(); else exitApp();
   }
 
-  // ---------- dialog ----------
+  // dialog
 
   /** Shows a choice dialog; resolves with the chosen option's value, or null on BACK. */
   function ask(title, text, options) {
@@ -138,16 +135,15 @@
     });
   }
 
-  // ---------- login ----------
+  // login
 
-  /** Sign-in screen: starts pairing straight away and shows the code plus a QR link. */
   function showLogin(reason) {
     show('login');
     backStack = [];
     if (loginJob && loginJob.cancel) loginJob.cancel();
     $('login-title').textContent = 'Sign in to F1 TV';
-    $('login-text').textContent = 'Scan the code with your phone, or go to ' +
-      Auth.PAIR_PAGE.replace('https://', '') + ' and enter the code. Sign in with your F1 TV account and confirm.';
+    $('login-text').textContent = 'Scan the QR code, or visit ' +
+      Auth.PAIR_PAGE.replace('https://', '') + ' and enter this code to sign in.';
     $('login-code').textContent = '';
     $('login-hint').textContent = '';
     $('login-qr').classList.add('hidden');
@@ -162,7 +158,7 @@
 
     loginJob = Auth.pair(function (code) {
       $('login-code').textContent = code;
-      $('login-hint').textContent = 'The code renews by itself if it expires.';
+      $('login-hint').textContent = 'Expired codes refresh automatically.';
       showQr(Auth.pairUrl(code));
       $('login-status').textContent = 'Waiting for confirmation…';
     });
@@ -192,7 +188,6 @@
     });
   }
 
-  /** Makes sure we hold a valid token before playing; renews paired devices silently. */
   function ensureSession() {
     var t = Auth.token();
     if (t && t === F1Api.state.ascendon && F1Api.state.entitlement) return Promise.resolve(true);
@@ -206,7 +201,7 @@
     return renewAndLogin();
   }
 
-  // ---------- navigation tabs ----------
+  // navigation tabs
 
   function enterBrowse() {
     if (loginJob && loginJob.cancel) loginJob.cancel();
@@ -242,7 +237,6 @@
     });
   }
 
-  /** Red dot on the Home and Schedule tabs while something is on air. */
   function markLive(on) {
     Array.prototype.forEach.call($('topnav').children, function (e) {
       if (/^(Home|Schedule)$/.test(e.textContent)) e.classList.toggle('has-live', !!on);
@@ -267,7 +261,7 @@
     renderPage(currentPage);
   }
 
-  // ---------- browse (rails) ----------
+  // browse (rails)
 
   function openPage(title, load) {
     var prev = currentPage, focus = grid ? { r: grid.r, c: grid.c.slice() } : null;
@@ -293,7 +287,6 @@
     });
   }
 
-  /** A loaded page's rails, with the race weekend first where the page lists one; marks live on Home. */
   function pageRails(pg, containers) {
     var list = railsFromContainers(containers);
     var weekend = F1Api.scheduleFrom(containers);
@@ -302,18 +295,14 @@
     return list;
   }
 
-  /** What the rails show, apart from badges: rail titles and their tiles. */
+  /** Compare rail contents separately from their live/upcoming badges. */
   function railsLayout(list) {
     return JSON.stringify(list.map(function (r) {
       return [r.title, r.tiles.map(function (t) { return [t.contentId || t.uri, t.title, t.sub, t.image]; })];
     }));
   }
 
-  /**
-   * Reloads the page on screen in the background so live and upcoming badges stay current. Badges
-   * change in place; the rails are only redrawn when tiles came or went, and never blank out
-   * ("Loading…") while F1's API answers.
-   */
+  /** Refresh badges in place; redraw rails only when their contents change. */
   function refreshPage(pg) {
     pg.load().then(function (containers) {
       if (currentPage !== pg || screen !== 'browse' || dialog || !grid) return;
@@ -354,7 +343,7 @@
       var tiles = items.map(toTile).filter(function (t) { return t && (t.contentId || t.uri); });
       if (tiles.length) out.push({ title: inner ? label : '', tiles: tiles });
     });
-    // LIVENOW returns bare items: fold single-item rails into one.
+    // A page of bare items (no rails) becomes one rail.
     if (out.length > 1 && out.every(function (r) { return !r.title && r.tiles.length === 1; })) {
       out = [{ title: '', tiles: out.map(function (r) { return r.tiles[0]; }) }];
     }
@@ -468,15 +457,11 @@
     grid.apply();
   }
 
-  /**
-   * Artwork for a tile at w x h. Spoiler-hidden art is fetched as a 32x18 thumbnail: the CSS blur
-   * makes it smooth, and even a frame the TV draws before applying the blur shows nothing readable.
-   */
+  /** Tiny thumbnails hide spoilers even if the TV draws a frame before applying the CSS blur. */
   function artUrl(t, w, h) {
     return spoilerSafe(t) ? F1Api.imageUrl(t.image, w, h) : F1Api.imageUrl(t.image, 32, 18);
   }
 
-  /** In spoiler-free mode only live and upcoming artwork is shown unblurred. */
   function spoilerSafe(t) {
     return !Settings.get('spoilerFree') || t.upcoming || (t.badge && t.badge.text === 'LIVE') || !t.contentId;
   }
@@ -484,10 +469,10 @@
   function selectTile(t) {
     if (t.contentId) return openFeeds(t.contentId, t);
     if (t.uri) return openPage(t.title, function () { return F1Api.pageByUri(t.uri); });
-    toast('This item cannot be opened yet');
+    toast('This item can\'t be opened yet.');
   }
 
-  // ---------- lists: calendar, weekend, account ----------
+  // lists: calendar, weekend, account
 
   /**
    * Renders a vertical list. rows: [{ day } | { when, what, sub, badge, badgeCls, past, info, run }].
@@ -563,17 +548,17 @@
           badgeCls: current ? 'live' : '',
           past: past,
           run: function (idx) {
-            backStack.push(function () { openCalendarAt(seasonUri, idx, rows); });
+            backStack.push(function () { openCalendarAt(idx, rows); });
             openWeekend(mt);
           }
         });
       });
-      openCalendarAt(seasonUri, focus < 0 ? rows.length - 1 : focus, rows);
+      openCalendarAt(focus < 0 ? rows.length - 1 : focus, rows);
     }).catch(function (e) { $('list-sub').textContent = 'Could not load the calendar: ' + e.message; });
   }
 
-  function openCalendarAt(seasonUri, focus, rows) {
-    renderList({ title: 'Schedule', sub: (new Date().getFullYear()) + ' season · times in your local time zone', rows: rows }, focus);
+  function openCalendarAt(focus, rows) {
+    renderList({ title: 'Schedule', sub: new Date().getFullYear() + ' season · times in your local time zone', rows: rows }, focus);
   }
 
   function openWeekend(mt) {
@@ -616,9 +601,9 @@
     }).catch(function (e) { $('list-sub').textContent = 'Could not load: ' + e.message; });
   }
 
-  // ---------- standings and driver pages ----------
+  // standings and driver pages
 
-  function ordinal(n) { return 'P' + n; }
+  function place(n) { return 'P' + n; }
 
   function openStandings(focus) {
     show('list');
@@ -637,7 +622,7 @@
         ds.drivers.forEach(function (d) {
           var i = info[d.code] || {};
           rows.push({
-            when: ordinal(d.pos), colour: i.colour || '', img: i.headshot || '',
+            when: place(d.pos), colour: i.colour || '', img: i.headshot || '',
             what: d.first + ' ' + d.last, sub: d.team + (d.wins ? ' · ' + d.wins + (d.wins === 1 ? ' win' : ' wins') : ''),
             badge: d.points + ' pts',
             run: function (idx) {
@@ -649,7 +634,7 @@
         rows.push({ day: 'Constructors' });
         cs.forEach(function (c) {
           rows.push({
-            when: ordinal(c.pos), colour: teamColour[c.id] || '', what: c.name,
+            when: place(c.pos), colour: teamColour[c.id] || '', what: c.name,
             sub: c.wins ? c.wins + (c.wins === 1 ? ' win' : ' wins') : '', badge: c.points + ' pts',
             run: function (idx) {
               backStack.push(function () { openStandings(idx); });
@@ -665,11 +650,11 @@
   function openTeam(team, drivers, info) {
     var rows = drivers.filter(function (d) { return d.teamId === team.id; }).map(function (d) {
       var i = info[d.code] || {};
-      return { when: ordinal(d.pos), colour: i.colour || '', img: i.headshot || '', what: d.first + ' ' + d.last,
-        sub: d.wins ? d.wins + ' wins' : '', badge: d.points + ' pts',
+      return { when: place(d.pos), colour: i.colour || '', img: i.headshot || '', what: d.first + ' ' + d.last,
+        sub: d.wins ? d.wins + (d.wins === 1 ? ' win' : ' wins') : '', badge: d.points + ' pts',
         run: function (idx) { backStack.push(function () { openTeam(team, drivers, info); }); openDriver(d, i); } };
     });
-    renderList({ title: team.name, sub: ordinal(team.pos) + ' in the constructors\' championship · ' + team.points + ' pts', rows: rows }, 0);
+    renderList({ title: team.name, sub: place(team.pos) + ' in the constructors\' championship · ' + team.points + ' pts', rows: rows }, 0);
   }
 
   function svgEl(tag, attrs) {
@@ -678,10 +663,7 @@
     return e;
   }
 
-  /**
-   * Points per round as thin bars in the team colour (race + sprint), rounded tops on a recessive
-   * baseline, the best round labelled. Returns { node, highlight(round) }.
-   */
+  /** Points per round (race + sprint) as bars in the team colour, best round labelled. Returns { node, highlight(round) }. */
   function pointsChart(races, colour) {
     var W = 1640, H = 230, top = 34, base = 196, gap = 4;
     var max = Math.max(25, Math.max.apply(null, races.map(function (r) { return r.points + (r.sprint ? r.sprint.points : 0); })));
@@ -721,7 +703,7 @@
     };
   }
 
-  // ---------- championship battle graph ----------
+  // championship battle graph
 
   var battle = null;   // { data, info, ds, cs, mode: 'drivers' | 'teams', idx }
 
@@ -786,10 +768,7 @@
     return 100 * Math.sqrt(Math.pow(x[0] - y[0], 2) + Math.pow(x[1] - y[1], 2) + Math.pow(x[2] - y[2], 2));
   }
 
-  /**
-   * Lines that share (nearly) a colour - teammates, or look-alike team colours such as the blues of
-   * Red Bull, Racing Bulls and Alpine - get different styles: dash 0 solid, 1 dashed, 2 dotted.
-   */
+  /** Distinguish similar team colours: dash 0 = solid, 1 = dashed, 2 = dotted. */
   function assignDashes(series) {
     series.forEach(function (s, i) {
       var used = {};
@@ -853,7 +832,6 @@
     $('chart-plot').innerHTML = '';
     $('chart-plot').appendChild(svg);
 
-    // legend: swatch (in the line's dash style) + name
     var legend = $('chart-legend');
     legend.innerHTML = '';
     series.forEach(function (s) {
@@ -867,7 +845,6 @@
       legend.appendChild(item);
     });
 
-    // readout for the selected round (the TV's stand-in for a hover tooltip)
     var r = rounds[b.idx], out = $('chart-readout');
     out.innerHTML = '';
     out.appendChild(el('div', 'readout-round', 'Round ' + r.round));
@@ -918,12 +895,12 @@
       if (info.colour) numberEl.style.color = info.colour;
       card.appendChild(numberEl);
       var tiles = el('div', 'stat-tiles');
-      tiles.appendChild(statTile(ordinal(d.pos), d.points + ' pts'));
+      tiles.appendChild(statTile(place(d.pos), d.points + ' pts'));
       tiles.appendChild(statTile(sum.wins, sum.wins === 1 ? 'Win' : 'Wins'));
       tiles.appendChild(statTile(sum.podiums, 'Podiums'));
       tiles.appendChild(statTile(sum.poles, 'Poles'));
       tiles.appendChild(statTile(sum.fastestLaps, 'Fastest laps'));
-      tiles.appendChild(statTile(sum.best ? ordinal(sum.best) : '–', 'Best finish'));
+      tiles.appendChild(statTile(sum.best ? place(sum.best) : '–', 'Best finish'));
       tiles.appendChild(statTile(sum.avg ? sum.avg.toFixed(1) : '–', 'Avg finish'));
       tiles.appendChild(statTile(sum.dnfs, 'DNFs'));
       card.appendChild(tiles);
@@ -936,13 +913,13 @@
       var rows = [{ day: 'Races' }];
       races.slice().reverse().forEach(function (r) {
         var bits = [];
-        if (r.grid) bits.push('from ' + ordinal(r.grid));
+        if (r.grid) bits.push('from ' + place(r.grid));
         if (r.quali === 1) bits.push('pole');
         if (r.fastest) bits.push('fastest lap');
-        if (r.sprint) bits.push('sprint ' + (r.sprint.pos ? ordinal(r.sprint.pos) : 'DNF') + (r.sprint.points ? ' (+' + r.sprint.points + ')' : ''));
+        if (r.sprint) bits.push('sprint ' + (r.sprint.pos ? place(r.sprint.pos) : 'DNF') + (r.sprint.points ? ' (+' + r.sprint.points + ')' : ''));
         var pts = r.points + (r.sprint ? r.sprint.points : 0);
         rows.push({
-          when: 'R' + r.round, what: r.name + '  ·  ' + (r.pos ? ordinal(r.pos) : (r.posText === 'D' ? 'DSQ' : 'DNF')),
+          when: 'R' + r.round, what: r.name + '  ·  ' + (r.pos ? place(r.pos) : (r.posText === 'D' ? 'DSQ' : 'DNF')),
           sub: bits.join(' · ') + (r.pos ? '' : (bits.length ? ' · ' : '') + r.status),
           badge: pts ? '+' + pts + ' pts' : '0 pts', badgeCls: r.pos === 1 ? 'live' : '',
           round: r.round, run: function () {}
@@ -958,13 +935,12 @@
     }).catch(function (e) { $('list-sub').textContent = 'Could not load the season: ' + e.message; });
   }
 
-  /** Daily check for a newer release; tells the viewer once per new version. */
   function checkForUpdate() {
     if (!Settings.get('updates')) return;
     Updates.check().then(function (u) {
       if (u.available && Updates.firstNotice(u.latest)) {
-        toast('F1 TV ' + u.latest + ' is available. To update, run the installer on your computer again ' +
-          '(details under your name → About).', 12000);
+        toast('F1 TV ' + u.latest + ' is available. Run the installer on your computer again to update. ' +
+          'Details under your name → About.', 12000);
       }
     });
   }
@@ -981,9 +957,9 @@
         if (dialog) dialog.grid.apply();
       }
       if (u.error) {
-        toast('Error checking for updates.', 8000);
+        toast('Could not check for updates.', 8000);
       } else if (u.available) {
-        toast('F1 TV ' + u.latest + ' is available. To update, run the installer on your computer again: ' +
+        toast('F1 TV ' + u.latest + ' is available. Run the installer on your computer again: ' +
           u.page.replace(/^https:\/\//, ''), 12000);
       } else if (u.current) {
         toast('F1 TV ' + u.current + ' is up to date.');
@@ -1005,11 +981,11 @@
       sub: p.product || 'F1 TV',
       rows: [
         { day: 'Settings' },
-        toggle('spoilerFree', 'Spoiler-free mode', 'Blurs artwork of replays and highlights so results stay hidden.'),
-        toggle('timing', 'Live timing overlay', 'Timing tower while watching sessions. Choose what it shows in the player under ▲ Watch options.'),
+        toggle('spoilerFree', 'Spoiler-free mode', 'Blur replay and highlight artwork.'),
+        toggle('timing', 'Live timing overlay', 'Show the timing tower. Change its view under ▲ Watch options.'),
         { day: 'Account' },
-        { what: 'Sign out of this TV', sub: 'You can sign in again with a code at any time.', run: function () {
-          ask('Sign out?', 'This TV stops being able to play F1 TV until you sign in again.', [
+        { what: 'Sign out of this TV', run: function () {
+          ask('Sign out?', 'You\'ll need to sign in again to watch.', [
             { label: 'Cancel', value: false }, { label: 'Sign out', value: true }
           ]).then(function (yes) {
             if (!yes) return;
@@ -1020,18 +996,17 @@
         } },
         { day: 'About' },
         { info: true, what: 'Version ' + (u.current || '?'), badge: u.available ? 'Update' : '', badgeCls: u.available ? 'live' : '',
-          sub: u.available ? 'Version ' + u.latest + ' is out. Run the installer on your computer again to update: ' + site
+          sub: u.available ? 'Version ' + u.latest + ' available. Run the installer on your computer again: ' + site
             : (u.latest ? 'Up to date · ' : '') + site },
-        { what: checkingUpdate ? 'Checking for updates…' : 'Check for updates now',
-          sub: 'Asks GitHub now, even when automatic checks are off.', run: checkForUpdateNow },
-        toggle('updates', 'Automatic update checks', 'Asks GitHub once a day whether there is a newer version.'),
-        { info: true, what: 'Unofficial app — not affiliated with Formula 1.', sub: 'Streams play through the TV\'s own Widevine DRM.' }
+        { what: checkingUpdate ? 'Checking for updates…' : 'Check for updates now', run: checkForUpdateNow },
+        toggle('updates', 'Automatic update checks', 'Check for new versions daily.'),
+        { info: true, what: 'Unofficial F1 TV app', sub: 'Not affiliated with Formula 1.' }
       ]
     }, focus || 0);
     accountGrid = grid;
   }
 
-  // ---------- feeds ----------
+  // feeds
 
   function openFeeds(contentId, tile, restore) {
     backStack.push(restore || snapshot());
@@ -1078,15 +1053,14 @@
           $('feeds-sub').textContent += ' · Watched to ' + fmtTime(pos);
         });
       }
-      var subParts = [m.emfAttributes && m.emfAttributes.Meeting_Name];
+      var subParts = [emf.Meeting_Name];
       if (feedsCtx.live) subParts.push('LIVE now');
       else if (ev && status(ev) === 'upcoming') subParts.push('Starts ' + when(ev.start));
       else if (m.uiDuration) subParts.push(m.uiDuration);
       $('feeds-sub').textContent = subParts.filter(Boolean).join(' · ');
       var list = $('feeds-list');
       feedsCtx.single = feeds.length === 1;
-      // Documentaries, shows etc. have just one feed: no list, they play straight away (after the
-      // resume check) over the title and artwork.
+      // Skip the feed picker for single-feed videos.
       var rows = feedsCtx.single ? [] : feeds.map(function (f, i) {
         var e = el('div', 'feed');
         e.appendChild(feedNumber(f));
@@ -1119,7 +1093,6 @@
     return n;
   }
 
-  /** Live sessions ask whether to join live or watch from the start of the broadcast. */
   function chooseStart(i) {
     if (!feedsCtx.live && feedsCtx.resume && i === 0) {
       return ask('Continue watching?', 'You stopped at ' + fmtTime(feedsCtx.resume) + '.', [
@@ -1138,17 +1111,15 @@
     });
   }
 
-  // ---------- player ----------
+  // player
 
-  /**
-   * Plays feed i. opts.fromStart starts at the beginning of the broadcast; opts.startAt at a given
-   * position; opts.switching continues at the same moment as the feed playing now. Switches of
-   * clear streams are preloaded while the current feed keeps playing.
-   */
   var loadingFeed = false;   // a playFeed load is running
   var queuedFeed = null;     // the latest request made meanwhile: [i, opts]
 
-  /** Runs playFeed requests one at a time (rapid reloads crash Samsung's player); latest wins. */
+  /**
+   * opts: fromStart (broadcast start), startAt (player seconds), switching (same moment).
+   * Serialize loads: overlapping requests crash Samsung's player. The latest request wins.
+   */
   function playFeed(i, opts) {
     if (loadingFeed) { queuedFeed = [i, opts]; return; }
     loadingFeed = true;
@@ -1216,20 +1187,20 @@
           if (e && e.message === 'cancelled') return;
           if (F1Api.isNotStarted(e)) {
             stopPlayer();
-            return toast(feedsCtx.title + ' hasn\'t started yet' + (feedsCtx.start ? ' — it starts ' + when(feedsCtx.start) + '.' : '.'), 8000);
+            return toast(feedsCtx.title + (feedsCtx.start ? ' starts ' + when(feedsCtx.start) + '.' : ' hasn\'t started yet.'), 8000);
           }
           toast('Could not play: ' + (e.message || e), 8000);
         });
     });
   }
 
-  /** Safety net: if a video hasn't started 15 s after loading, load it once more. */
+  /** Retry once if playback hasn't started after 15 s. */
   function watchStart(stream) {
     var from = Player.position();
     setTimeout(function () {
       if (screen !== 'player' || Player.stream() !== stream || Player.isPaused() || stream.retried) return;
       if (Player.position() > from + 0.5) return;
-      toast('The video didn\'t start — trying again…', 3000);
+      toast('The video didn\'t start, trying again…', 3000);
       // Through playFeed so it queues behind any other load instead of racing it.
       var wall = Player.wallClock(from);
       playFeed(feedsCtx.index, Player.isLive() ? (wall ? { liveAt: wall, retry: true } : { retry: true })
@@ -1325,11 +1296,10 @@
       marker.classList.add('hidden');
       bubble.classList.add('hidden');
       $('osd-hint').textContent = liveFocus ? 'OK = go live · ▲ back'
-        : '◀ ▶ seek · OK pause · ▲ feeds & options' + (live ? ' · ▼ LIVE button' : '') + ' · BACK exit';
+        : '◀ ▶ seek · OK pause' + optionsHint() + (live ? ' · ▼ LIVE button' : '') + ' · BACK exit';
     }
   }
 
-  // Seek steps grow while the arrow is held / pressed quickly, like on YouTube or NRK TV.
   var SCRUB_STEPS = [10, 10, 15, 30, 30, 60, 60, 120];
 
   function scrubMove(dir, big) {
@@ -1361,23 +1331,19 @@
     updateOsd();
   }
 
-  /**
-   * Commits the previewed jump. The destination stays on screen until the video actually plays
-   * there; the spinner only appears if that takes longer than a moment.
-   */
+  /** Keep the seek preview visible until playback reaches it; delay the spinner to avoid flashes. */
   function scrubCommit() {
     if (!scrub) return;
     var p = scrub.pos;
-    // Live streams on Samsung's player don't seek reliably: reopen them instead, at live or
-    // time-shifted to the chosen moment (see playFeed / the service's time-shift).
+    clearTimeout(scrub.timer);
+    // Live streams on AVPlay are reopened at the chosen moment instead (time-shifted by the
+    // service, see playFeed): that plays in ~3 s, a seek within the live window in ~5 s.
     if (Player.isLive() && Player.engineName() === 'avplay') {
-      clearTimeout(scrub.timer);
       scrub = null;
       var toLive = Player.range().end - p < LIVE_MARGIN;
       if (toLive && behindLive() < LIVE_MARGIN) return updateOsd(); // already live: nothing to do
       return goLive(toLive ? null : Player.wallClock(p));
     }
-    clearTimeout(scrub.timer);
     pending = { pos: p, info: scrub.info, since: Date.now() };
     scrub = null;
     var mine = pending;
@@ -1418,7 +1384,6 @@
     updateOsd();
   }
 
-  /** Saves how far the main feed of a replay has been watched (synced with F1 TV). */
   function saveProgress() {
     if (screen !== 'player' || !feedsCtx || feedsCtx.live || feedsCtx.index !== 0 || !Player.engineName()) return;
     var pos = Player.position() - Player.range().start;
@@ -1508,7 +1473,6 @@
     if (key === K.STOP || key === K.BACK) return stopPlayer();
   }
 
-  /** Switches feed and continues at the same moment of the session. */
   function switchFeed(d) {
     var n = feedsCtx.feeds.length;
     if (n < 2) return;
@@ -1518,11 +1482,30 @@
     playFeed(i, { switching: true });
   }
 
-  // ---------- watch options panel (feeds, timing, commentary, subtitles) ----------
+  // watch options panel (feeds, timing, commentary, subtitles)
 
   function cycleValue(list, current, dir) {
     var i = list.indexOf(current);
     return list[(i + dir + list.length) % list.length];
+  }
+
+  function panelOptions() {
+    var tracks = Player.tracks();
+    return {
+      goLive: behindLive() > LIVE_MARGIN,
+      timing: !!feedsCtx && Timing.supported(feedsCtx.timingMeta),
+      audio: tracks.audio.map(function (a) { return a.lang; }).filter(Boolean),
+      text: tracks.text.map(function (t) { return t.lang; }).filter(Boolean),
+      // Single-feed videos (documentaries, shows) only get the settings.
+      feeds: feedsCtx && feedsCtx.feeds.length > 1 ? feedsCtx.feeds : []
+    };
+  }
+
+  /** The ▲ part of the player hint: feeds, options, or nothing when the panel would be empty. */
+  function optionsHint() {
+    var o = panelOptions();
+    if (o.feeds.length) return ' · ▲ feeds & options';
+    return o.goLive || o.timing || o.audio.length > 1 || o.text.length ? ' · ▲ options' : '';
   }
 
   function openPanel() {
@@ -1530,7 +1513,7 @@
     box.innerHTML = '';
     box.style.transform = '';
     var rows = [];
-    var tracks = Player.tracks();
+    var opts = panelOptions();
 
     function setting(label, value, cycle) {
       var e = el('div', 'panel-row setting');
@@ -1544,7 +1527,7 @@
       rows.push([e]);
     }
 
-    if (behindLive() > LIVE_MARGIN) {
+    if (opts.goLive) {
       var go = el('div', 'panel-row setting go-live');
       go.appendChild(el('span', 'panel-label', 'Go to live'));
       go.appendChild(el('span', 'panel-value', '−' + fmtTime(behindLive())));
@@ -1553,7 +1536,7 @@
       rows.push([go]);
     }
 
-    if (Timing.supported(feedsCtx.timingMeta)) {
+    if (opts.timing) {
       // Off, or what the tower shows - the views F1's own tower cycles through.
       setting('Live timing', function () { return Settings.get('timing') ? viewLabel(towerView()) : 'Off'; },
         function (dir) {
@@ -1564,7 +1547,7 @@
         });
     }
 
-    var audio = tracks.audio.map(function (a) { return a.lang; }).filter(Boolean);
+    var audio = opts.audio;
     if (audio.length > 1) {
       setting('Commentary', function () {
         var cur = audio.indexOf(Settings.get('audio')) >= 0 ? Settings.get('audio') : audio[0];
@@ -1576,7 +1559,7 @@
       });
     }
 
-    var text = [''].concat(tracks.text.map(function (t) { return t.lang; }).filter(Boolean));
+    var text = [''].concat(opts.text);
     if (text.length > 1) {
       setting('Subtitles', function () { var cur = Settings.get('subtitles'); return cur ? (LANG_NAMES[cur] || cur) : 'Off'; },
         function (dir) {
@@ -1587,8 +1570,7 @@
         });
     }
 
-    // Single-feed videos (documentaries, shows) only get the settings.
-    var feeds = feedsCtx.feeds.length > 1 ? feedsCtx.feeds : [];
+    var feeds = opts.feeds;
     if (feeds.length) box.appendChild(el('div', 'panel-head', 'Feeds'));
     var current = feeds.length ? rows.length : 0;
     feeds.forEach(function (f, i) {
@@ -1651,7 +1633,7 @@
     panel.grid.handle(key);
   }
 
-  // ---------- timing tower and subtitles ----------
+  // timing tower and subtitles
 
   /*
    * F1's video is stamped with the encoder's timecode (the DASH timeline and HLS program date-time
@@ -1703,10 +1685,18 @@
     return view === 'leader' && !raceSession() ? 'Gap to fastest' : TOWER_VIEWS[view];
   }
 
-  /** One driver's value in the chosen view: [text, extra class]. */
+  /**
+   * One driver's value in the chosen view: [text, extra class]. A driver in the pits shows
+   * "In pit" in races; in practice and qualifying they keep their time, dimmed.
+   */
   function towerCell(d, view, race) {
     if (d.out) return ['OUT'];
-    if (d.pit && (view === 'interval' || view === 'leader')) return ['PIT'];
+    if (!d.pit || (view !== 'interval' && view !== 'leader')) return viewCell(d, view, race);
+    var time = race ? '' : viewCell(d, view, race)[0];
+    return time ? [time, 'pit'] : ['In pit'];
+  }
+
+  function viewCell(d, view, race) {
     switch (view) {
       case 'interval': return [d.pos === 1 ? (race ? 'Leader' : d.best) : (d.interval || d.gap)];
       case 'leader': return [d.pos === 1 ? (race ? 'Leader' : d.best) : d.gap];
@@ -1772,7 +1762,7 @@
     subtitleTimer = setTimeout(function () { box.classList.add('hidden'); }, Math.max(1500, s.ms));
   }
 
-  // ---------- keys ----------
+  // keys
 
   function onKey(e) {
     var key = Keys.normalize(e);
@@ -1792,9 +1782,8 @@
     if (grid && grid.handle(key)) e.preventDefault();
   }
 
-  // ---------- boot ----------
+  // boot
 
-  /** Uses img/logo.png in place of the text brand when a build provides one (see local/). */
   function useLogo() {
     var img = new Image();
     img.onload = function () {
@@ -1825,7 +1814,6 @@
     Player.on('subtitle', showSubtitle);
     setInterval(timingTick, 250);   // often, so the session clock ticks with the on-screen one
     setInterval(saveProgress, 30000);
-    // Refresh the home page now and then so live / upcoming badges stay current.
     setInterval(function () {
       if (screen === 'browse' && currentPage && currentPage.kind === 'home' && grid && !dialog) refreshPage(currentPage);
     }, 120000);

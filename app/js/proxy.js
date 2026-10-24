@@ -17,7 +17,6 @@ var Proxy = (function () {
     });
   }
 
-  /** Resolves once the service answers; launches it when needed. */
   function ensure() {
     return ping().then(function (up) {
       if (up) return true;
@@ -36,10 +35,7 @@ var Proxy = (function () {
     });
   }
 
-  /**
-   * Manifest via the service; shift (s) time-shifts a live stream so it plays that far behind live,
-   * langs ({ audio, text }) puts the viewer's languages first.
-   */
+  /** shift: seconds behind live. langs: preferred { audio, text } language codes. */
   function manifest(url, shift, langs) {
     langs = langs || {};
     return BASE + '/mpd?u=' + encodeURIComponent(url) + (shift > 0 ? '&shift=' + Math.round(shift) : '') +

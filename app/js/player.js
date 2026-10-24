@@ -1,13 +1,11 @@
 /*
- * Playback with two engines behind one interface:
- *  - 'avplay': Samsung's native player (webapis.avplay). Handles F1 TV's CBCS-encrypted
- *    Widevine streams; the app answers the license challenge itself so it can add F1's headers.
- *  - 'shaka':  Shaka Player on MSE/EME. Fine for clear HLS and CENC content.
+ * AVPlay handles CBCS streams; Shaka handles clear replays with background feed switching.
+ * License requests include F1's required headers.
  */
 var Player = (function () {
-  var engine = null;          // active engine object
+  var engine = null;
   var engineName = null;
-  var listeners = { error: null, buffering: null };
+  var listeners = {};
   var els = { video: null, av: null };
 
   function emit(name, arg) { if (listeners[name]) listeners[name](arg); }
@@ -17,15 +15,13 @@ var Player = (function () {
   function lang3(l) { return LANG3[l] || l; }
   function sameLang(a, b) { return !!a && !!b && lang3(a) === lang3(b); }
 
-  // ---------- Shaka (MSE/EME) ----------
+  // Shaka (MSE/EME)
 
   var ShakaEngine = (function () {
-    // Two players: a feed switch loads the next stream paused on the idle one while the current
-    // keeps playing (the TV decodes only one video at a time), then they swap.
+    // Preload on the idle player, paused: the TV can only decode one video at a time.
     var slots = [];
     var cur = 0;
     var licenseHeaders = {};
-    var robustness = '';
     var userPaused = false;
 
     function P() { return slots[cur].p; }
@@ -67,17 +63,11 @@ var Player = (function () {
 
     function configure(player, stream) {
       licenseHeaders = stream.licenseHeaders || {};
-      var drm = {};
-      if (stream.licenseUrl) {
-        drm.servers = { 'com.widevine.alpha': stream.licenseUrl };
-        if (robustness) drm.advanced = { 'com.widevine.alpha': { videoRobustness: robustness, audioRobustness: 'SW_SECURE_CRYPTO' } };
-      }
+      var drm = stream.licenseUrl ? { servers: { 'com.widevine.alpha': stream.licenseUrl } } : {};
       player.resetConfiguration();
       player.configure({
         drm: drm,
-        // A small start buffer so playback begins quickly; bufferBehind keeps recently watched video
-        // so short jumps back are instant. ABR starts from a 10 Mbit/s estimate (enough for F1's
-        // 1080p, measured to start in 1080p) instead of the browser's network hint.
+        // Keep recent video for backward seeks. A 10 Mbit/s estimate starts F1 streams at 1080p.
         streaming: { bufferingGoal: 30, rebufferingGoal: 1, bufferBehind: 90,
           retryParameters: { maxAttempts: 4, baseDelay: 1000, backoffFactor: 2 } },
         abr: { enabled: true, defaultBandwidthEstimate: 10000000, useNetworkInformation: false, switchInterval: 4 },
@@ -98,8 +88,7 @@ var Player = (function () {
       userPaused = false;
       return slot.p.load(stream.url, startTime == null ? null : startTime).then(function () {
         applyPrefs(slot.p);
-        // play() can be cancelled by the TV right after another video element was reset;
-        // keepPlaying retries until it runs.
+        // Resetting another video element can cancel play(); keepPlaying retries it.
         var started = slot.v.play();
         keepPlaying(slot.v, 5000);
         return started && started.catch(function () {});
@@ -129,10 +118,7 @@ var Player = (function () {
       });
     }
 
-    /**
-     * Resetting one video element makes the TV's resource manager pause the other one, so after
-     * the old player is unloaded the new one is resumed unless the viewer paused it.
-     */
+    /** Unloading the old player can pause the new one. Resume unless the viewer paused it. */
     function keepPlaying(v, ms, beforeSwap) {
       var until = Date.now() + (ms || 2500);
       (function check() {
@@ -142,7 +128,6 @@ var Player = (function () {
       })();
     }
 
-    /** Loads the next stream behind the current one and swaps once it plays. */
     function swap(stream, startTime) {
       var old = slots[cur], next = slots[1 - cur];
       configure(next.p, stream);
@@ -204,7 +189,6 @@ var Player = (function () {
       setAudio: function (l) { try { P().selectAudioLanguage(langOf(l)); } catch (e) { /* single track */ } },
       setSubtitles: function (l) { textTrack(P(), l); },
       unload: unload,
-      setRobustness: function (r) { robustness = r || ''; },
       isLive: function () { return P().isLive(); },
       range: function () { return P().seekRange(); },
       position: function () { return V().currentTime; },
@@ -216,7 +200,7 @@ var Player = (function () {
     };
   })();
 
-  // ---------- Samsung AVPlay ----------
+  // Samsung AVPlay
 
   var AvEngine = (function () {
     var av = null;
@@ -343,8 +327,7 @@ var Player = (function () {
             resolve();
           }, function (e) { settle(); reject(new Error(stream !== s ? 'cancelled' : 'Could not open stream: ' + e)); });
         }
-        // Replays start at their position natively: a seek before preparation makes AVPlay load from
-        // there (the start of that segment) and never shows the beginning of the video first.
+        // Seek before preparation to avoid briefly showing the beginning of a resumed replay.
         var seekFirst = startAt != null && !(s.info ? s.info.dynamic : s.live);
         if (!seekFirst) return prepare();
         posMs = startAt * 1000;
@@ -354,10 +337,7 @@ var Player = (function () {
       });
     }
 
-    /**
-     * Tuning set before prepare: the start quality (see startLevel) and resuming after a seek once
-     * 4 s are buffered (Samsung's minimum).
-     */
+    // Samsung requires at least 4 s of buffering after a seek.
     var tuning = { resumeBuffer: 4 };
 
     function tune() {
@@ -368,11 +348,9 @@ var Player = (function () {
     }
 
     /*
-     * Start quality. Left alone, AVPlay starts on a low bitrate and climbs one segment at a time
-     * (about 25 s of blur on live streams, a whole 30 s segment on single-feed videos). Starting on
-     * the top bitrate (6 Mbit/s for F1) was measured to start as fast, so that is the default; a
-     * stall soon after a start makes the next start a level lower, minutes of smooth playback a
-     * level higher again.
+     * AVPlay's default starts blurry for 25-30 s. The highest bitrate (6 Mbit/s) starts just as
+     * fast in testing. Lower the next start's quality after an early stall; raise it after
+     * several minutes of smooth playback.
      */
     var START_LEVELS = ['HIGHEST', 'AVERAGE', 'LOWEST'];
     var LEVEL_KEY = 'f1tv.startLevel';
@@ -408,16 +386,15 @@ var Player = (function () {
       } catch (e) { return null; }
     }
 
-    /** Live seeks outside AVPlay's window are silently ignored, so keep targets 10 s inside it. */
+    /** AVPlay silently ignores out-of-window seeks; leave a margin at each end. */
     function clampLive(t) {
       var w = live && liveWindow();
       return w ? Math.max(w.start + 10, Math.min(w.end - 5, t)) : t;
     }
 
     /**
-     * The proxied manifest already lists the preferred subtitles first (AVPlay's default), so this
-     * only shows/hides them; for other streams it selects the track once playback runs (AVPlay
-     * ignores track changes before that).
+     * The proxy puts preferred subtitles first. Check other streams after playback starts;
+     * AVPlay ignores track changes before then.
      */
     function applyTextWhenPlaying(s) {
       var want = Settings.get('subtitles');
@@ -444,13 +421,11 @@ var Player = (function () {
       })();
     }
 
-    // AVPlay rejects seeks (InvalidValuesError) for a moment after playback starts; retry.
     var seekGen = 0;
 
     /**
-     * Seeks to ms. AVPlay rejects seeks with InvalidValuesError for a moment after playback starts,
-     * so those are retried; a newer seek or another stream cancels pending retries.
-     * done(ok) is called once.
+     * AVPlay briefly rejects seeks after starting. Retry InvalidValuesError until superseded
+     * by a newer seek or stream; report completion through done(ok).
      */
     function seek(ms, done, maxTries) {
       var gen = ++seekGen, s = stream, tries = 0;
@@ -470,10 +445,7 @@ var Player = (function () {
       })();
     }
 
-    /**
-     * Stops and closes AVPlay. Closing it while prepareAsync is still running can crash the
-     * native player, so that waits for the preparation to finish first.
-     */
+    // Closing AVPlay during prepareAsync can crash the native player; wait for it to finish.
     function unload() {
       var wait = preparing || Promise.resolve();
       stream = null;
@@ -489,16 +461,11 @@ var Player = (function () {
     function range() {
       var info = stream && stream.info;
       var w = live && liveWindow();
-      if (w) {
-        // The end is the real live edge, even when the stream is time-shifted behind it.
-        var edge = info ? Date.now() / 1000 - info.epochAtZero - info.delay : w.end;
-        return { start: w.start + 10, end: Math.max(w.end, edge, posMs / 1000) };
-      }
-      if (live && info) {
-        // The live edge keeps moving: wall clock minus the manifest's presentation delay.
-        var edge = Date.now() / 1000 - info.epochAtZero - info.delay;
-        return { start: info.windowStart, end: Math.max(edge, posMs / 1000) };
-      }
+      // The real live edge (wall clock minus the presentation delay), also when the stream is
+      // time-shifted behind it.
+      var edge = live && info ? Date.now() / 1000 - info.epochAtZero - info.delay : null;
+      if (w) return { start: w.start + 10, end: Math.max(w.end, edge || 0, posMs / 1000) };
+      if (edge != null) return { start: info.windowStart, end: Math.max(edge, posMs / 1000) };
       if (live) return { start: Math.max(0, posMs / 1000 - 3600), end: posMs / 1000 };
       return { start: 0, end: av.getDuration() / 1000 };
     }
@@ -526,7 +493,7 @@ var Player = (function () {
     };
   })();
 
-  // ---------- public interface ----------
+  // public interface
 
   var engines = { shaka: ShakaEngine, avplay: AvEngine };
 
@@ -541,9 +508,8 @@ var Player = (function () {
   }
 
   /**
-   * Picks the engine: Samsung's AVPlay for encrypted streams and single-feed videos (it starts
-   * long-segment videos in ~2 s where Shaka needs the whole first segment), Shaka for clear
-   * multi-feed replays so feed switches can load in the background.
+   * AVPlay starts long-segment videos in ~2 s; Shaka needs the whole first segment but can
+   * preload feed switches. Use Shaka for clear multi-feed replays.
    */
   function choose(stream) {
     if (Player.forceEngine) return engines[Player.forceEngine];
@@ -604,10 +570,6 @@ var Player = (function () {
     return info.epochAtZero > 1e9 ? wall - info.epochAtZero : null;
   }
 
-  /**
-   * Switches to another stream. Clear streams on Shaka are preloaded while the current one keeps
-   * playing, so the switch feels instant; otherwise it is a normal load.
-   */
   function switchTo(stream, startTime) {
     if (engine === ShakaEngine && choose(stream) === ShakaEngine) {
       current = stream;
@@ -651,7 +613,6 @@ var Player = (function () {
     tracks: function () { return engine ? engine.tracks() : { audio: [], text: [] }; },
     setAudio: function (l) { if (engine) engine.setAudio(l); },
     setSubtitles: function (l) { if (engine) engine.setSubtitles(l); },
-    setShakaRobustness: ShakaEngine.setRobustness,
     forceEngine: null,
     on: function (name, fn) { listeners[name] = fn; }
   };

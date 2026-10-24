@@ -1,0 +1,21 @@
+/*
+ * F1's display font for big headings. The files come from formula1.com and belong to F1.
+ * No italic cut is included, so italic headings are slanted from the upright ones.
+ */
+@font-face { font-family: 'F1 Display'; src: url('../fonts/Formula1-Regular.woff2') format('woff2');
+  font-weight: 400; font-style: normal; }
+@font-face { font-family: 'F1 Display'; src: url('../fonts/Formula1-Bold.woff2') format('woff2');
+  font-weight: 700; font-style: normal; }
+@font-face { font-family: 'F1 Display'; src: url('../fonts/Formula1-Black.woff2') format('woff2');
+  font-weight: 900; font-style: normal; }
+
+h1, h2, .osd-title, .rail-title, .driver-number, .brand-tv {
+  font-family: 'F1 Display', 'Titillium Web', sans-serif;
+}
+
+/* The timing tower in F1's broadcast font, a little smaller since it runs wider. */
+.tower { font-family: 'F1 Display', 'Titillium Web', sans-serif; }
+.tower .tower-value { font-size: 26px; }
+.tower .tw-pos { width: 28px; font-size: 16px; }
+.tower .tw-tla { width: 54px; font-size: 18px; }
+.tower .tw-val { font-size: 16px; }

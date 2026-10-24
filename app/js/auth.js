@@ -1,14 +1,9 @@
-/*
- * Session handling. The TV pairs itself with the F1 account the way the official
- * TV apps do: it shows a code, you confirm it at f1tv.formula1.com/tv, and the
- * TV gets a device key it can trade for a fresh subscription token at any time.
- */
+/* Pairing and token renewal. The saved device key renews the subscription token. */
 var Auth = (function () {
   var KEY = 'f1tv.session';
   var ACCOUNT_API = 'https://api.formula1.com';
 
-  // Account API identity. The official TV builds aren't public, so this is the
-  // Android tablet profile from the F1 TV app; the TV is listed as a tablet in the account.
+  // Android tablet profile; this is how the TV appears in the F1 account's device list.
   var PROFILE = {
     apiKey: 'PpJW2yg3t1S4K4SoKNGZVLsI1G8GsLTm',
     systemId: '60a9ad84-e93d-480f-80d6-af37494f2e22',
@@ -71,7 +66,6 @@ var Auth = (function () {
 
   function isPaired() { return !!load().authKey; }
 
-  /** Name and plan from the subscription token, e.g. { firstName: 'Nicholas', product: 'F1 TV Pro Monthly' }. */
   function profile() {
     var p = jwtPayload(load().subscriptionToken || '') || {};
     return { firstName: p.FirstName || '', lastName: p.LastName || '', product: p.SubscribedProduct || '' };
@@ -80,7 +74,7 @@ var Auth = (function () {
   /** Signs out: forgets the token and the device key (the device stays listed in the account). */
   function clear() { update({ subscriptionToken: null, authKey: null }); }
 
-  // ---------- PIN pairing ----------
+  // PIN pairing
 
   /** The page that confirms a code; F1 pre-fills the code from ?pin=. */
   function pairUrl(code) { return PAIR_PAGE + '?pin=' + encodeURIComponent(code.toLowerCase()); }
@@ -118,11 +112,7 @@ var Auth = (function () {
     }, true);
   }
 
-  /**
-   * Runs pairing until the code is confirmed. onCode(code) is called with every
-   * code shown (a new one replaces an expired one). Resolves with a token.
-   * The returned promise has cancel().
-   */
+  /** Resolves with a token; the promise has cancel(). onCode receives each new or renewed code. */
   function pair(onCode) {
     var cancelled = false;
     var timer = null;
@@ -187,7 +177,6 @@ var Auth = (function () {
     isPaired: isPaired,
     profile: profile,
     clear: clear,
-    secondsLeft: secondsLeft,
     pairUrl: pairUrl,
     pair: pair,
     renew: renew

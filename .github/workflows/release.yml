@@ -64,7 +64,6 @@ jobs:
           curl --fail --silent --show-error --location --retry 3 \
             --output "$installer" \
             https://download.tizen.org/sdk/Installer/tizen-studio_6.1/web-cli_Tizen_Studio_6.1_ubuntu-64.bin
-          # Pinned installer checksum is verified before executing the download.
           echo "7f33fe09eda4eb5d50463cf997e8f676d455060720470070ae1932994413aaf4  $installer" | sha256sum --check
           chmod +x "$installer"
           # The Linux installer requires a destination under the user's home directory.
@@ -84,8 +83,7 @@ jobs:
             echo 'Set TIZEN_AUTHOR_CERT_BASE64 and TIZEN_AUTHOR_PASSWORD in repository Actions secrets.' >&2
             exit 1
           }
-          # Tizen stores signing passwords in Secret Service. Use one D-Bus session for
-          # both profile import and packaging so the headless runner never needs a prompt.
+          # Share Tizen's Secret Service session between profile import and packaging.
           dbus-run-session -- bash -euo pipefail <<'SIGN'
           printf '%s\n' "$TIZEN_AUTHOR_PASSWORD" | gnome-keyring-daemon --unlock --components=secrets
           umask 077

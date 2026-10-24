@@ -81,7 +81,6 @@ var Stats = (function () {
     });
   }
 
-  /** Headline numbers for a season list from driverSeason(). */
   function summary(races) {
     var s = { wins: 0, podiums: 0, poles: 0, fastestLaps: 0, dnfs: 0, best: null, finishes: 0, sum: 0, points: 0 };
     races.forEach(function (r) {
@@ -98,8 +97,8 @@ var Stats = (function () {
   }
 
   /**
-   * Headshots and team colours by driver code (TLA), from the newest session in F1's timing
-   * archive (needs the F1 TV token). Cached for a day; resolves {} when unavailable.
+   * Headshots and colours by driver code from F1's latest timing archive (requires a token).
+   * Cached for a day; resolves {} when unavailable.
    */
   function driverInfo(token) {
     try {

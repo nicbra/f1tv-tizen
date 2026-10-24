@@ -1,19 +1,12 @@
 /*
- * Background service (Node.js on the TV) that sits between Samsung's AVPlay and F1 TV's CDN
- * for encrypted live streams. It only fixes container metadata; decryption still happens in
- * the TV's Widevine CDM with F1's own license.
+ * Local audio proxy for AVPlay. F1's CBCS audio segments report zero senc samples despite
+ * having hundreds in the fragment. Correcting the count lets AVPlay accept them; the entries
+ * are empty (constant IV, no subsamples). Widevine handles decryption; video goes to the CDN.
  *
- * F1 TV's CBCS audio segments carry a `senc` box that claims 0 samples while the fragment has
- * hundreds. AVPlay rejects that, so audio segments are routed through here and the count is
- * corrected (the entries are empty: constant IV, no subsamples). Video goes straight to the CDN.
- *
- *   GET /ping                 -> "ok"
- *   GET /mpd?u=<manifest url>[&shift=<s>][&audio=eng][&text=eng] -> manifest with audio segments
- *       pointed at /s/; audio/text put the viewer's languages first (AVPlay starts with the first
- *       track of each kind); with
- *       shift, a live manifest is time-shifted so its live edge lies <s> seconds in the past
- *       (how "watch from the start" and same-moment feed switches work for live streams).
- *   GET /s/<b64 base>/<file>  -> segment from the CDN, patched if needed
+ *   GET /ping -> "ok"
+ *   GET /mpd?u=<url>[&shift=<seconds>][&audio=eng][&text=eng] -> rewritten manifest
+ *       shift delays the live edge; audio/text put the preferred tracks first for AVPlay.
+ *   GET /s/<b64 base>/<file> -> segment with its sample count patched if needed
  */
 'use strict';
 
@@ -43,7 +36,7 @@ function fetchBuffer(target, redirects, cb) {
   req.on('error', function (e) { cb(e); });
 }
 
-// Buffer.from is missing on very old Node versions; toBuf() is deprecated on new ones.
+// Buffer.from is missing on very old Node versions; new Buffer() is deprecated on new ones.
 function toBuf(s, enc) {
   return typeof Buffer.from === 'function' && Buffer.from !== Uint8Array.from ? Buffer.from(s, enc) : new Buffer(s, enc);
 }
@@ -98,10 +91,8 @@ function isoSeconds(d) {
 }
 
 /**
- * Time-shifts a dynamic manifest `shift` seconds into the past: availabilityStartTime moves forward
- * by `shift` and every SegmentTimeline only lists segments that existed `shift` seconds ago. To the
- * player it is a normal live stream whose live edge is `shift` behind the real one, so it simply
- * starts there (AVPlay ignores large presentation delays and refuses early live seeks).
+ * Move availabilityStartTime forward by `shift` seconds and trim SegmentTimelines to that
+ * delayed live edge. AVPlay ignores large presentation delays and refuses early live seeks.
  */
 function timeShift(mpd, shift, nowMs) {
   var astText = attr(mpd.slice(0, mpd.indexOf('>', mpd.indexOf('<MPD'))), 'availabilityStartTime');
@@ -128,8 +119,7 @@ function timeShift(mpd, shift, nowMs) {
     });
     return '<SegmentTemplate' + attrs + '>' + inner + '</SegmentTemplate>';
   });
-  // A set whose timeline is now empty (e.g. subtitles or the trick-play track starting later) is
-  // dropped rather than handed to the player empty.
+  // Drop tracks that have no segments at the shifted time.
   mpd = shifted.replace(/<AdaptationSet\b[\s\S]*?<\/AdaptationSet>/g, function (set) {
     return /<SegmentTimeline><\/SegmentTimeline>/.test(set) ? '' : set;
   });
@@ -142,10 +132,7 @@ function setKind(block) {
   return null;
 }
 
-/**
- * Moves the adaptation set in the preferred language to the front of its kind (audio or
- * subtitles), keeping every other set where it was. AVPlay uses the first track as its default.
- */
+/** AVPlay defaults to the first track; put the preferred audio/subtitle language first. */
 function preferLanguages(mpd, prefs) {
   var blocks = [];
   mpd.replace(/<AdaptationSet\b[\s\S]*?<\/AdaptationSet>/g, function (b, at) { blocks.push({ text: b, at: at }); return b; });

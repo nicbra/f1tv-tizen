@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs or updates the unofficial F1 TV app on a Samsung TV, from Linux or macOS.
+# Install or update F1 TV from Linux or macOS. Requires curl and unzip.
 #
 #   curl -fsSL https://raw.githubusercontent.com/nicbra/f1tv-tizen/HEAD/scripts/install.sh | bash
 #   bash install.sh [TV address] [--force] [--check] [--wgt F1TV.wgt]
@@ -9,10 +9,7 @@
 #   --check     only check the TV and download, don't install
 #   --wgt FILE  install this package instead of the latest GitHub release
 #
-# Needs only curl and unzip. It downloads Samsung's sdb tool (download.tizen.org) and the app
-# (GitHub releases) into ~/.cache/f1tv-tizen, checks both against SHA-256 sums, and installs over
-# the network. The TV must be in Developer Mode with this computer as Host PC IP (see README).
-# Running it again later updates the app; the TV stays signed in.
+# Enable Developer Mode with this computer as Host PC IP (see README).
 # No pipefail: several pipes end in head/awk that stop reading early, and outputs are checked instead.
 set -eu
 
@@ -21,8 +18,6 @@ APP_ID="F1TVtizen1.F1TV"
 SDB_VERSION="4.2.36"
 SDB_BASE="https://download.tizen.org/sdk/tizenstudio/official/binary"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/f1tv-tizen"
-# Time limits, so a stalled connection fails instead of hanging: lookups 60 s, downloads give up
-# when slower than 1 KB/s for 30 s.
 CURL_API=(curl -fsSL --connect-timeout 15 --max-time 60)
 CURL_GET=(curl -fL --connect-timeout 15 --speed-limit 1024 --speed-time 30 --progress-bar)
 
@@ -31,7 +26,7 @@ TV="" WGT="" FORCE=0 CHECK=0 VERSION="" SDB="" SERIAL=""
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
 die()  { printf '\nError: %b\n' "$*" >&2; exit 1; }
-# Reads from the terminal, also when the script itself arrives through a pipe (curl | bash).
+# Read from the terminal when invoked through curl | bash.
 ask()  { local a=""; printf '%s' "$1" > /dev/tty; read -r a < /dev/tty || true; printf '%s' "$a"; }
 
 usage() {
@@ -60,7 +55,7 @@ sha256() {
 # First value of "key": "value" in a JSON text (enough for the flat answers used here).
 field() { printf '%s\n' "$1" | sed -n "s/.*\"$2\" *: *\"\([^\"]*\)\".*/\1/p" | head -1; }
 
-# ---------- Samsung's sdb tool ----------
+# Samsung's sdb tool
 
 sdb_platform() {
   case "$(uname -s)-$(uname -m)" in
@@ -95,7 +90,7 @@ get_sdb() {
   chmod +x "$SDB"
 }
 
-# ---------- finding the TV ----------
+# finding the TV
 
 # Samsung TVs describe themselves (name, model, developer mode) at http://<tv>:8001/api/v2/.
 tv_info() { curl -s -m "${2:-3}" "http://$1:8001/api/v2/" 2>/dev/null || true; }
@@ -105,8 +100,7 @@ describe() {
   printf '%s (%s) at %s' "$(field "$j" name)" "$(field "$j" modelName)" "$1"
 }
 
-# This computer's IPv4 addresses, the one it uses for the internet first (virtual networks from
-# Docker, VMs etc. come later).
+# Search the default route's network before other interfaces (including VMs and Docker).
 local_ips() {
   local ifc
   if command -v ip >/dev/null; then
@@ -119,8 +113,7 @@ local_ips() {
   fi | awk 'NF && !seen[$0]++'
 }
 
-# Asks every address in this computer's /24 networks for Samsung's device description, network
-# by network, and stops at the first network with a TV.
+# Scan local /24 networks; stop at the first one with a TV.
 find_tvs() {
   local ip net found
   for ip in $(local_ips); do
@@ -186,7 +179,7 @@ check_tv() {
   fi
 }
 
-# ---------- the app package ----------
+# the app package
 
 wgt_version() {
   unzip -p "$1" config.xml 2>/dev/null | tr '\n' ' ' | sed -n 's/.*<widget\([^>]*\)>.*/\1/p' |
@@ -219,10 +212,9 @@ get_wgt() {
   mv "$WGT.part" "$WGT"
 }
 
-# ---------- talking to the TV ----------
+# talking to the TV
 
-# An sdb command's output without carriage returns. Its status is tr's, so callers judge the output
-# (the push in install_app checks sdb's own status).
+# Returns tr's status, so callers must inspect the output. install_app checks push separately.
 run_sdb() { "$SDB" -s "$SERIAL" "$@" 2>&1 | tr -d '\r'; }
 
 connect() {

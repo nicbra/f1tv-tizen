@@ -6,14 +6,13 @@
 var F1Api = (function () {
   var BASE = 'https://f1tv.formula1.com';
   var LANG = 'ENG';
-  // Platforms tried for playback, in order. BIG_SCREEN_* is what the official TV apps use.
+  // Try the TV platform before the web fallback.
   var PLAY_PLATFORMS = ['BIG_SCREEN_DASH', 'WEB_DASH'];
   var PAGE_PLATFORM = 'WEB_DASH';
-  // The play API's stream rules reject requests without this header. It describes the
-  // TV's web engine (Chromium 76) in the web player's format; a 'device=tv' value is refused.
+  // Playback requires this header in web-player format; 'device=tv' is rejected.
   var DEVICE_INFO = 'device=web;screen=browser;os=tizen;browser=chrome;browserVersion=76;' +
     'osVersion=6.0;appVersion=55.0.3;playerVersion=8.212.0;p=false;tms=1';
-  // Fallback page ids; the live menu (menu()) is preferred.
+  // Fallback IDs when menu() is unavailable.
   var HOME_PAGE_ID = 395;
   var ARCHIVE_PAGE_ID = 493;
 
@@ -93,7 +92,6 @@ var F1Api = (function () {
     });
   }
 
-  /** Sets the subscription token and loads the entitlement + location that go with it. */
   function login(ascendon) {
     state.ascendon = ascendon;
     return fetchEntitlement().then(refreshLocation);
@@ -116,14 +114,6 @@ var F1Api = (function () {
   /** Follows an action uri from a page item (they are already full API paths). */
   function pageByUri(uri) {
     var url = uri.indexOf('http') === 0 ? uri : BASE + uri;
-    return http(url, { headers: authHeaders() }).then(function (data) {
-      return (data && data.resultObj && data.resultObj.containers) || [];
-    });
-  }
-
-  function liveNow() {
-    var l = loc();
-    var url = [BASE, '1.0', loginStatus(), LANG, PAGE_PLATFORM, 'ALL/EVENTS/LIVENOW', l.entitlement, l.groupId].join('/');
     return http(url, { headers: authHeaders() }).then(function (data) {
       return (data && data.resultObj && data.resultObj.containers) || [];
     });
@@ -155,10 +145,7 @@ var F1Api = (function () {
     });
   }
 
-  /**
-   * Resolves a playable stream: manifest url, license url and the headers the
-   * license server wants. Tries the TV platform first, then the web one.
-   */
+  /** Resolves the manifest URL, license URL and required license headers. */
   function play(contentId, channelId) {
     var i = 0;
     var firstErr = null;
@@ -397,13 +384,11 @@ var F1Api = (function () {
     logout: logout,
     page: page,
     pageByUri: pageByUri,
-    liveNow: liveNow,
     video: video,
     play: play,
     menu: menu,
     scheduleFrom: scheduleFrom,
     seasonFrom: seasonFrom,
-    dashInfo: dashInfo,
     streamInfo: streamInfo,
     resumePosition: resumePosition,
     savePosition: savePosition,

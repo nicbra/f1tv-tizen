@@ -1,8 +1,6 @@
 /*
- * Timing worker: loads a session's feeds from F1's timing archive, keeps them on a UTC
- * timeline and answers "what did the timing screen show at time T?". The archive is published
- * shortly after a session; during a live session the worker uses F1's real-time feed (SignalR)
- * instead and records it from the moment it connects, so viewers behind live see no spoilers.
+ * Replays timing data on a UTC timeline. Uses the archive when available; otherwise records
+ * SignalR updates from connection time so delayed viewers see timing that matches the video.
  *
  * Messages in:  { cmd: 'load', path, token, live }  |  { cmd: 'query', id, t }  |  { cmd: 'stop' }
  * Messages out: { type: 'loaded', info } | { type: 'error', message } | { type: 'state', id, state }
@@ -16,10 +14,9 @@ var SNAPSHOT_MS = 3000;
 
 var job = null;
 
-function emptyJob(path, token, live) {
+function emptyJob(path, token) {
   return {
-    path: path, token: token, live: live, stopped: false,
-    bytes: {}, partial: {},                // per feed: bytes read, unfinished last line
+    path: path, token: token, stopped: false,
     collect: [],                           // initial load: [offset, feed, raw line] applied in time order
     base: null,                            // UTC ms of offset 0
     info: {},                              // SessionInfo
@@ -88,7 +85,6 @@ function apply(feed, t, d) {
 
 function val(x) { return x && typeof x === 'object' ? x.Value : x; }
 
-/** Compact standings at the current point of the replay. */
 function snapshot(t) {
   var j = job, rows = [];
   Object.keys(j.timing).forEach(function (num) {
@@ -114,47 +110,25 @@ function snapshot(t) {
   j.lastSnap = t;
 }
 
+/** Collect before replaying so tyre and timing updates are applied in timestamp order. */
 function handleLine(feed, line) {
   var off = offsetMs(line);
-  if (off == null) return;
-  // While loading, keep raw lines and apply them later in global time order, so that e.g.
-  // tyre stints and timing lines interleave correctly in the snapshots.
-  if (job.collect) return job.collect.push([off, feed, line]);
-  var data;
-  try { data = JSON.parse(line.slice(12)); } catch (e) { return; }
-  apply(feed, job.base + off, data);
+  if (off != null) job.collect.push([off, feed, line]);
 }
 
 function fetchFeed(feed) {
-  var j = job, from = j.bytes[feed] || 0;
-  var headers = { Authorization: 'Bearer ' + j.token };
-  if (from) headers.Range = 'bytes=' + from + '-';
-  return fetch(BASE + j.path + feed + '.jsonStream', { headers: headers, cache: 'no-store' }).then(function (r) {
+  var j = job;
+  return fetch(BASE + j.path + feed + '.jsonStream', { headers: { Authorization: 'Bearer ' + j.token }, cache: 'no-store' }).then(function (r) {
     // Missing feeds (e.g. LapCount in practice) come back as 403 from the archive's storage.
-    if (r.status === 416 || r.status === 404 || r.status === 403) return '';
+    if (r.status === 404 || r.status === 403) return '';
     if (!r.ok) throw new Error(feed + ': HTTP ' + r.status);
-    var whole = r.status === 200;
-    return r.text().then(function (text) {
-      if (whole && from) text = text.slice(from); // server ignored the range
-      return text;
-    });
+    return r.text();
   }).then(function (text) {
     if (!text || job !== j) return;
-    j.bytes[feed] = (j.bytes[feed] || 0) + utf8Length(text);
-    var body = (j.partial[feed] || '') + text.replace(/^﻿/, '');
-    var lines = body.split('\n');
-    j.partial[feed] = lines.pop();
+    var lines = text.replace(/^\uFEFF/, '').split('\n');
+    lines.pop();   // empty, or a line still being written
     lines.forEach(function (l) { handleLine(feed, l.replace(/\r$/, '')); });
   });
-}
-
-function utf8Length(s) {
-  var n = 0;
-  for (var i = 0; i < s.length; i++) {
-    var c = s.charCodeAt(i);
-    n += c < 0x80 ? 1 : c < 0x800 ? 2 : (c >= 0xd800 && c < 0xdc00) ? (i++, 4) : 3;
-  }
-  return n;
 }
 
 /** Applies the collected lines in time order; the first heartbeat gives the UTC time base. */
@@ -225,7 +199,7 @@ function query(t) {
 }
 
 function start(m) {
-  job = emptyJob(m.path, m.token, m.live);
+  job = emptyJob(m.path, m.token);
   var j = job;
   loadAll().then(function () {
     if (job !== j) return;
@@ -238,14 +212,13 @@ function start(m) {
   });
 }
 
-// ---------- live: F1's SignalR Core feed (anonymous) ----------
+// live: F1's SignalR Core feed (anonymous)
 
 var LIVE = 'https://livetiming.formula1.com/signalrcore';
 var RS = '\x1e';
 
 function startLive(m) {
-  var j = job = emptyJob(m.path, m.token, true);
-  j.collect = null;
+  var j = job = emptyJob(m.path, m.token);
   j.base = 0;          // live records carry absolute UTC times
   connect(j);
 }

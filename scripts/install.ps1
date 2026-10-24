@@ -1,4 +1,4 @@
-# Installs or updates the unofficial F1 TV app on a Samsung TV, from Windows.
+# Install or update F1 TV from Windows.
 #
 #   irm https://raw.githubusercontent.com/nicbra/f1tv-tizen/HEAD/scripts/install.ps1 | iex
 #   powershell -ExecutionPolicy Bypass -File install.ps1 [-Tv 192.168.1.50] [-Force] [-Check] [-Wgt F1TV.wgt]
@@ -8,10 +8,7 @@
 #   -Check  only check the TV and download, don't install
 #   -Wgt    install this package instead of the latest GitHub release
 #
-# It downloads Samsung's sdb tool (download.tizen.org) and the app (GitHub releases) into
-# %LOCALAPPDATA%\f1tv-tizen, checks both against SHA-256 sums, and installs over the network.
-# The TV must be in Developer Mode with this computer as Host PC IP (see README). Running it
-# again later updates the app; the TV stays signed in.
+# Enable Developer Mode with this computer as Host PC IP (see README).
 param(
   [string]$Tv = '',
   [switch]$Force,
@@ -73,8 +70,7 @@ function Get-LocalAddresses {
   return @($main + $all | Where-Object { $_ -match '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' } | Select-Object -Unique)
 }
 
-# Asks every address in this computer's /24 networks for Samsung's device description, network
-# by network, and stops at the first network with a TV.
+# Scan local /24 networks; stop at the first one with a TV.
 function Find-Tvs {
   Add-Type -AssemblyName System.Net.Http
   $client = New-Object System.Net.Http.HttpClient
@@ -169,9 +165,8 @@ function Get-Wgt {
   Move-Item -LiteralPath $part -Destination $script:Wgt -Force
 }
 
-# Runs sdb and returns its output as one string (sdb prints errors on stdout as well); its exit
-# code is left in $script:SdbExit. Windows PowerShell turns stderr lines into errors, so they must
-# not stop the script here.
+# Capture both streams: sdb also writes errors to stdout. Save its exit code in $script:SdbExit.
+# PowerShell treats stderr as errors, so temporarily allow them.
 function Invoke-Sdb {
   $ErrorActionPreference = 'Continue'
   $out = & $script:Sdb @args 2>&1 | ForEach-Object { "$_" } | Out-String
