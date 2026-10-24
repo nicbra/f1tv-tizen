@@ -30,10 +30,14 @@ cmd_cert() {
 
 cmd_build() {
   rm -rf "$ROOT/build" && mkdir -p "$ROOT/build/src"
-  cp -r "$ROOT/app/." "$ROOT/build/src/"
-  # Personal overrides that stay out of the repo (e.g. local/icon.png with the official F1 logo).
-  [[ -f "$ROOT/local/icon.png" ]] && cp "$ROOT/local/icon.png" "$ROOT/build/src/img/icon.png"
-  [[ -f "$ROOT/local/logo.png" ]] && cp "$ROOT/local/logo.png" "$ROOT/build/src/img/logo.png"
+  # APP_SRC: another copy of app/ (build-release.sh archives a tag and stamps its version).
+  cp -r "${APP_SRC:-$ROOT/app}/." "$ROOT/build/src/"
+  # Personal overrides that stay out of the repo (local/icon.png, local/logo.png).
+  # Release builds (RELEASE=1, see build-release.sh) never include them.
+  if [[ -z "${RELEASE:-}" ]]; then
+    [[ -f "$ROOT/local/icon.png" ]] && cp "$ROOT/local/icon.png" "$ROOT/build/src/img/icon.png"
+    [[ -f "$ROOT/local/logo.png" ]] && cp "$ROOT/local/logo.png" "$ROOT/build/src/img/logo.png"
+  fi
   "$TIZEN" package -t wgt -s "$PROFILE" -o "$ROOT/build" -- "$ROOT/build/src"
   mv "$ROOT/build/"*.wgt "$ROOT/build/F1TV.wgt"
   echo "Built $ROOT/build/F1TV.wgt"

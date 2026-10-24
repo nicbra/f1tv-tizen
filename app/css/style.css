@@ -106,6 +106,27 @@ body.avplay #video, body.avplay #video2 { display: none; }
 /* Overlays stay above both video layers (they swap z-index during a feed switch). */
 .osd, .tower, .panel, .spinner { z-index: 10; }
 .subtitle { z-index: 5; }
+.playback-feedback { position: absolute; left: 50%; top: 50%; width: 192px; height: 192px;
+  margin: -96px 0 0 -96px; z-index: 11; opacity: 0; pointer-events: none;
+  filter: drop-shadow(0 3px 10px rgba(0,0,0,0.3)); }
+.playback-feedback svg { display: block; width: 100%; height: 100%; fill: #fff; }
+.feedback-play { stroke: #fff; stroke-width: 4; stroke-linejoin: round; }
+.playback-feedback .feedback-pause, .playback-feedback.paused .feedback-play { display: none; }
+.playback-feedback.paused .feedback-pause { display: inline; }
+.playback-feedback.visible { animation: playbackFeedback 1s ease-out both; }
+@keyframes playbackFeedback {
+  0% { opacity: 0; transform: scale(0.8); }
+  16% { opacity: 0.82; transform: scale(1); }
+  60% { opacity: 0.82; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1.12); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .playback-feedback.visible { animation-name: playbackFeedbackFade; }
+}
+@keyframes playbackFeedbackFade {
+  0%, 100% { opacity: 0; }
+  16%, 60% { opacity: 0.82; }
+}
 .osd { position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between;
   background: linear-gradient(to bottom, rgba(0,0,0,0.75) 0, transparent 25%, transparent 70%, rgba(0,0,0,0.85) 100%); }
 .osd-top { padding: 50px 80px; }

@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- Development placeholder; release builds take the installed version from the Git tag. -->
 <widget xmlns="http://www.w3.org/ns/widgets" xmlns:tizen="http://tizen.org/ns/widgets"
-        id="http://f1tv-tizen.local/app" version="0.1.0" viewmodes="maximized">
+        id="http://f1tv-tizen.local/app" version="0.0.0" viewmodes="maximized">
     <tizen:application id="F1TVtizen1.F1TV" package="F1TVtizen1" required_version="3.0"/>
     <name>F1 TV</name>
     <description>Unofficial F1 TV client for Samsung Tizen TVs</description>

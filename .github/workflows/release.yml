@@ -1,0 +1,105 @@
+name: Build release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag to build, for example v0.2.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Validate tag format
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo 'Expected an existing version tag such as v0.2.0.' >&2
+            exit 1
+          }
+
+      - name: Check out the version tag
+        uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Validate release tag and run tests
+        run: |
+          bash scripts/build-release.sh "$RELEASE_TAG" --check
+          node --test tests/*.test.js
+          python3 -m unittest discover -s tests -p '*_test.py'
+          for script in scripts/*.sh; do bash -n "$script"; done
+          for script in app/js/*.js app/service/*.js; do node --check "$script"; done
+
+      - name: Install Tizen Studio 6.1 CLI
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends dbus gnome-keyring libsecret-tools
+          installer="$RUNNER_TEMP/web-cli_Tizen_Studio_6.1_ubuntu-64.bin"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$installer" \
+            https://download.tizen.org/sdk/Installer/tizen-studio_6.1/web-cli_Tizen_Studio_6.1_ubuntu-64.bin
+          # Pinned installer checksum is verified before executing the download.
+          echo "7f33fe09eda4eb5d50463cf997e8f676d455060720470070ae1932994413aaf4  $installer" | sha256sum --check
+          chmod +x "$installer"
+          # The Linux installer requires a destination under the user's home directory.
+          sdk_dir="$HOME/tizen-studio"
+          "$installer" --accept-license "$sdk_dir"
+          # The installer wrapper can exit successfully even when installation failed.
+          test -x "$sdk_dir/tools/ide/bin/tizen"
+          echo "TIZEN_HOME=$sdk_dir" >> "$GITHUB_ENV"
+
+      - name: Import signing certificate and build release package
+        shell: bash
+        env:
+          TIZEN_AUTHOR_CERT_BASE64: ${{ secrets.TIZEN_AUTHOR_CERT_BASE64 }}
+          TIZEN_AUTHOR_PASSWORD: ${{ secrets.TIZEN_AUTHOR_PASSWORD }}
+        run: |
+          [[ -n "$TIZEN_AUTHOR_CERT_BASE64" && -n "$TIZEN_AUTHOR_PASSWORD" ]] || {
+            echo 'Set TIZEN_AUTHOR_CERT_BASE64 and TIZEN_AUTHOR_PASSWORD in repository Actions secrets.' >&2
+            exit 1
+          }
+          # Tizen stores signing passwords in Secret Service. Use one D-Bus session for
+          # both profile import and packaging so the headless runner never needs a prompt.
+          dbus-run-session -- bash -euo pipefail <<'SIGN'
+          printf '%s\n' "$TIZEN_AUTHOR_PASSWORD" | gnome-keyring-daemon --unlock --components=secrets
+          umask 077
+          certificate="$RUNNER_TEMP/f1tv-author.p12"
+          trap 'rm -f "$certificate"' EXIT
+          printf '%s' "$TIZEN_AUTHOR_CERT_BASE64" | base64 --decode > "$certificate"
+          "$TIZEN_HOME/tools/ide/bin/tizen" security-profiles add \
+            -n f1tv -a "$certificate" -p "$TIZEN_AUTHOR_PASSWORD"
+          bash scripts/build-release.sh "$RELEASE_TAG"
+          (cd build && sha256sum --check F1TV.wgt.sha256)
+          SIGN
+
+      - name: Upload package to a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bash scripts/draft-release.sh "$RELEASE_TAG"

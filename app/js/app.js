@@ -18,6 +18,9 @@
   var panel = null;        // { grid, timer } while the watch-options panel is open
   var timingState = null;  // latest timing state for the playing position
   var subtitleTimer = null;
+  var accountGrid = null;
+  var checkingUpdate = false;
+  var playbackFeedbackTimer = null;
 
   var DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   var LANG_NAMES = { eng: 'English', deu: 'Deutsch', fra: 'Français', nld: 'Nederlands', por: 'Português',
@@ -27,6 +30,7 @@
   // ---------- helpers ----------
 
   function show(name) {
+    hidePlaybackFeedback();
     ['login', 'browse', 'list', 'chart', 'feeds', 'player'].forEach(function (n) {
       $('screen-' + n).classList.toggle('hidden', n !== name);
     });
@@ -208,6 +212,7 @@
     if (loginJob && loginJob.cancel) loginJob.cancel();
     loginJob = null;
     show('browse');
+    checkForUpdate();
     var page = function (uri) { return function () { return F1Api.pageByUri(uri); }; };
     var byId = function (id) { return function () { return F1Api.page(id); }; };
     F1Api.menu().catch(function () { return []; }).then(function (menu) {
@@ -953,8 +958,44 @@
     }).catch(function (e) { $('list-sub').textContent = 'Could not load the season: ' + e.message; });
   }
 
+  /** Daily check for a newer release; tells the viewer once per new version. */
+  function checkForUpdate() {
+    if (!Settings.get('updates')) return;
+    Updates.check().then(function (u) {
+      if (u.available && Updates.firstNotice(u.latest)) {
+        toast('F1 TV ' + u.latest + ' is available. To update, run the installer on your computer again ' +
+          '(details under your name → About).', 12000);
+      }
+    });
+  }
+
+  function checkForUpdateNow(focus) {
+    if (checkingUpdate) return;
+    checkingUpdate = true;
+    openAccount(focus);
+    toast('Checking for updates…', 16000);
+    Updates.check(true).then(function (u) {
+      checkingUpdate = false;
+      if (screen === 'list' && grid === accountGrid) {
+        openAccount(grid.r);
+        if (dialog) dialog.grid.apply();
+      }
+      if (u.error) {
+        toast('Error checking for updates.', 8000);
+      } else if (u.available) {
+        toast('F1 TV ' + u.latest + ' is available. To update, run the installer on your computer again: ' +
+          u.page.replace(/^https:\/\//, ''), 12000);
+      } else if (u.current) {
+        toast('F1 TV ' + u.current + ' is up to date.');
+      } else {
+        toast('Latest release: F1 TV ' + u.latest + '. Could not read the installed version.', 8000);
+      }
+    });
+  }
+
   function openAccount(focus) {
     var p = Auth.profile();
+    var u = Updates.status(), site = u.page.replace(/^https:\/\//, '');
     var toggle = function (key, name, help) {
       return { what: name, sub: help, badge: Settings.get(key) ? 'On' : 'Off', badgeCls: Settings.get(key) ? 'live' : '',
         run: function (idx) { Settings.set(key, !Settings.get(key)); openAccount(idx); } };
@@ -977,9 +1018,17 @@
             showLogin();
           });
         } },
+        { day: 'About' },
+        { info: true, what: 'Version ' + (u.current || '?'), badge: u.available ? 'Update' : '', badgeCls: u.available ? 'live' : '',
+          sub: u.available ? 'Version ' + u.latest + ' is out. Run the installer on your computer again to update: ' + site
+            : (u.latest ? 'Up to date · ' : '') + site },
+        { what: checkingUpdate ? 'Checking for updates…' : 'Check for updates now',
+          sub: 'Asks GitHub now, even when automatic checks are off.', run: checkForUpdateNow },
+        toggle('updates', 'Automatic update checks', 'Asks GitHub once a day whether there is a newer version.'),
         { info: true, what: 'Unofficial app — not affiliated with Formula 1.', sub: 'Streams play through the TV\'s own Widevine DRM.' }
       ]
     }, focus || 0);
+    accountGrid = grid;
   }
 
   // ---------- feeds ----------
@@ -1403,6 +1452,24 @@
     $('screen-player').classList.remove('osd-visible');
   }
 
+  function hidePlaybackFeedback() {
+    clearTimeout(playbackFeedbackTimer);
+    playbackFeedbackTimer = null;
+    $('playback-feedback').classList.remove('visible');
+  }
+
+  function togglePause() {
+    if (!Player.engineName()) return;
+    Player.togglePause();
+    var feedback = $('playback-feedback');
+    hidePlaybackFeedback();
+    feedback.classList.toggle('paused', Player.isPaused());
+    // Restart the animation even when the remote is pressed again before it finishes.
+    void feedback.offsetWidth;
+    feedback.classList.add('visible');
+    playbackFeedbackTimer = setTimeout(hidePlaybackFeedback, 1000);
+  }
+
   function playerKey(key) {
     if (panel) return panelKey(key);
     // While a stream (re)loads it has no position yet: seeking now would start from 0.
@@ -1417,7 +1484,7 @@
       liveFocus = false;
       if (key === K.ENTER) {
         if (behindLive() > LIVE_MARGIN) return goLive(null);
-        if (Player.isPaused()) Player.togglePause();
+        if (Player.isPaused()) togglePause();
         updateOsd();
         return toast('You\'re watching live.', 2000);
       }
@@ -1433,7 +1500,7 @@
     if (key === K.RIGHT) return scrubMove(1);
     if (key === K.RW) return scrubMove(-1, true);
     if (key === K.FF) return scrubMove(1, true);
-    if (key === K.ENTER || key === K.PLAY_PAUSE || key === K.PLAY || key === K.PAUSE) return Player.togglePause();
+    if (key === K.ENTER || key === K.PLAY_PAUSE || key === K.PLAY || key === K.PAUSE) return togglePause();
     if (key === K.DOWN && Player.isLive()) { liveFocus = true; return updateOsd(); }
     if (key === K.UP || key === K.DOWN) return openPanel();
     if (key === K.CH_UP) return switchFeed(-1);
