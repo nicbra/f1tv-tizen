@@ -81,11 +81,12 @@ var Timing = (function () {
 
   var TRACK = { '2': 'Yellow flag', '4': 'Safety car', '5': 'Red flag', '6': 'Virtual safety car', '7': 'VSC ending' };
 
-  function label(s) {
+  /** short: without the total laps ("Lap 34"), for the seek bubble. */
+  function label(s, short) {
     if (!s) return '';
     var parts = [];
     var mmss = function (sec) { var m = Math.floor(sec / 60), r = sec % 60; return (m < 10 ? '0' : '') + m + ':' + (r < 10 ? '0' : '') + r; };
-    if (s.type === 'Race' && s.lap) parts.push('Lap ' + s.lap + (s.totalLaps ? '/' + s.totalLaps : ''));
+    if (s.type === 'Race' && s.lap) parts.push('Lap ' + s.lap + (s.totalLaps && !short ? '/' + s.totalLaps : ''));
     else if (s.type === 'Qualifying') {
       var sprint = /sprint/i.test(s.name);
       parts.push((sprint ? 'SQ' : 'Q') + (s.part || 1) + (s.remaining != null ? ' · ' + mmss(s.remaining) + ' left' : ''));

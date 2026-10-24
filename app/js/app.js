@@ -10,9 +10,10 @@
   var currentPage = null;  // { title, load, kind } shown on the browse screen
   var feedsCtx = null;     // { contentId, title, image, feeds, index, live, start }
   var osdTimer = null;
+  var lastKeyAt = 0;       // when a key was last pressed in the player
   var loginJob = null;
   var dialog = null;       // { grid, resolve } while a dialog is open
-  var scrub = null;        // { pos, n, last, dir, timer, info } while choosing a jump with the arrows
+  var scrub = null;        // { pos, n, last, dir, info } while choosing a jump with the arrows (OK jumps)
   var pending = null;      // { pos, info, since } after a jump until playback runs there
   var liveFocus = false;   // the LIVE button in the time bar is highlighted (▼ in live streams)
   var panel = null;        // { grid, timer } while the watch-options panel is open
@@ -33,16 +34,17 @@
 
   function show(name) {
     hidePlaybackFeedback();
-    ['login', 'browse', 'list', 'chart', 'feeds', 'player'].forEach(function (n) {
+    ['start', 'login', 'browse', 'list', 'chart', 'feeds', 'player'].forEach(function (n) {
       $('screen-' + n).classList.toggle('hidden', n !== name);
     });
     screen = name;
   }
 
-  function toast(msg, ms) {
+  /** kind 'notice': stands out, for things the viewer should act on (a new version). */
+  function toast(msg, ms, kind) {
     var t = $('toast');
     t.textContent = msg;
-    t.classList.remove('hidden');
+    t.className = 'toast' + (kind ? ' ' + kind : '');
     clearTimeout(toast.timer);
     toast.timer = setTimeout(function () { t.classList.add('hidden'); }, ms || 5000);
   }
@@ -682,7 +684,7 @@
         var rad = Math.min(4, h, bw / 2), y = base - h;
         var d = 'M' + x + ',' + base + 'V' + (y + rad) + 'Q' + x + ',' + y + ' ' + (x + rad) + ',' + y +
           'H' + (x + bw - rad) + 'Q' + (x + bw) + ',' + y + ' ' + (x + bw) + ',' + (y + rad) + 'V' + base + 'Z';
-        var bar = svgEl('path', { d: d, fill: colour || '#9aa0aa', 'class': 'bar' });
+        var bar = svgEl('path', { d: d, fill: colour || '#adadb1', 'class': 'bar' });
         svg.appendChild(bar);
         bars[r.round] = bar;
       } else {
@@ -745,13 +747,13 @@
       return assignDashes(b.cs.slice(0, 6).map(function (c) {
         var src = b.data.teams[c.id] || { perRound: {} };
         var name = teamName[c.id] || c.name.replace(/ F1 Team$/, '');
-        return { label: TEAM_CODES[c.id] || name.slice(0, 3).toUpperCase(), name: name, colour: teamColour[c.id] || '#9aa0aa',
+        return { label: TEAM_CODES[c.id] || name.slice(0, 3).toUpperCase(), name: name, colour: teamColour[c.id] || '#adadb1',
           values: cumulative(src.perRound) };
       }));
     }
     return assignDashes(b.ds.drivers.slice(0, 6).map(function (d) {
       var src = b.data.drivers[d.id] || { perRound: {} };
-      return { label: d.code, name: d.first + ' ' + d.last, colour: (b.info[d.code] || {}).colour || teamColour[d.teamId] || '#9aa0aa',
+      return { label: d.code, name: d.first + ' ' + d.last, colour: (b.info[d.code] || {}).colour || teamColour[d.teamId] || '#adadb1',
         values: cumulative(src.perRound) };
     }));
   }
@@ -943,7 +945,7 @@
     Updates.check().then(function (u) {
       if (u.available && Updates.firstNotice(u.latest)) {
         toast('F1 TV ' + u.latest + ' is available. Run the installer on your computer again to update. ' +
-          'Details under your name → About.', 12000);
+          'Details under your name → About.', 12000, 'notice');
       }
     });
   }
@@ -963,7 +965,7 @@
         toast('Could not check for updates.', 8000);
       } else if (u.available) {
         toast('F1 TV ' + u.latest + ' is available. Run the installer on your computer again: ' +
-          u.page.replace(/^https:\/\//, ''), 12000);
+          u.page.replace(/^https:\/\//, ''), 12000, 'notice');
       } else if (u.current) {
         toast('F1 TV ' + u.current + ' is up to date.');
       } else {
@@ -1048,6 +1050,9 @@
         meetingEnd: ev && ev.meetingEnd
       };
       feedsCtx.subtype = m.contentSubtype;
+      // The race weekend for the line under the title in the player, such as "United States Grand Prix 2026".
+      var weekend = emf.Meeting_Name || emf.Global_Meeting_Name;
+      feedsCtx.event = weekend ? weekend + ' ' + (m.year || new Date(+emf.sessionStartDate || Date.now()).getFullYear()) : '';
       // A pre-show, its session and the post-show are parts of one event, each naming the next.
       var next = emf.multipartEvent === 'true' && emf.multipartEventNextHouseId;
       feedsCtx.nextPart = next && next !== m.externalId ? { houseId: next, end: +emf.sessionEndDate || 0 } : null;
@@ -1152,6 +1157,7 @@
       show('player');
       scrub = null;
       $('osd-title').textContent = feedsCtx.title;
+      $('osd-event').textContent = feedsCtx.event;
       $('osd-feed').textContent = feedsCtx.feeds.length > 1 ? f.title : '';   // one feed: no need to name it
       if (from) toast('Switching to ' + (f.full || f.title) + '…', 2500);
       else $('spinner').classList.remove('hidden');
@@ -1242,11 +1248,20 @@
     $('osd').classList.remove('hidden');
     $('screen-player').classList.add('osd-visible');
     clearTimeout(osdTimer);
-    osdTimer = setTimeout(function () {
-      if (scrub || pending || liveFocus) return showOsd();
-      $('osd').classList.add('hidden');
-      $('screen-player').classList.remove('osd-visible');
-    }, 4000);
+    osdTimer = setTimeout(osdTimeout, 4000);
+  }
+
+  /**
+   * The bar hides 4 s after the last key. A jump preview or the highlighted LIVE button stays 5 s
+   * after the last key and is then dropped unconfirmed; a jump in progress keeps the bar up.
+   */
+  function osdTimeout() {
+    if (pending) return showOsd();
+    var idle = Date.now() - lastKeyAt;
+    if ((scrub || liveFocus) && idle < 5000) { osdTimer = setTimeout(osdTimeout, 5000 - idle); return; }
+    if (scrub) scrubCancel();
+    liveFocus = false;
+    hideOsd();
   }
 
   // The live player itself runs ~25-50 s behind real time; within this margin counts as live.
@@ -1297,12 +1312,12 @@
       marker.style.left = pct(shown.pos);
       bubble.style.left = pct(shown.pos);
       bubble.innerHTML = '';
+      bubble.appendChild(el('div', 'bubble-main', lbl.main));
       if (shown.info) bubble.appendChild(el('div', 'bubble-info', shown.info));
-      bubble.appendChild(document.createTextNode(lbl.main));
-      if (lbl.clock) bubble.appendChild(el('small', '', lbl.clock));
+      if (lbl.clock) bubble.appendChild(el('div', 'bubble-clock', 'Time ' + lbl.clock));
       marker.classList.remove('hidden');
       bubble.classList.remove('hidden');
-      $('osd-hint').textContent = scrub ? 'OK to jump · BACK to cancel' : 'Jumping…';
+      $('osd-hint').textContent = scrub ? '' : 'Jumping…';
     } else {
       marker.classList.add('hidden');
       bubble.classList.add('hidden');
@@ -1330,13 +1345,9 @@
       next = g.origin + g.size * (dir > 0 ? Math.floor(k + 1e-6) : Math.ceil(k - 1e-6)) + dir * step;
     }
     scrub.pos = Math.max(r.start, Math.min(r.end - 1, next));
-    clearTimeout(scrub.timer);
-    // Jump after the presses stop; quick presses keep adding up. Live jumps reopen the stream,
-    // so they wait longer (OK jumps right away).
-    scrub.timer = setTimeout(scrubCommit, Player.isLive() && Player.engineName() === 'avplay' ? 1500 : 800);
     var wall = Player.wallClock(scrub.pos), target = scrub.pos, s = scrub;
     if (wall) timingAt(wall).then(function (st) {
-      if (scrub === s && s.pos === target) { s.info = Timing.label(st); updateOsd(); }
+      if (scrub === s && s.pos === target) { s.info = Timing.label(st, true); updateOsd(); }
     });
     showOsd();
     updateOsd();
@@ -1346,7 +1357,6 @@
   function scrubCommit() {
     if (!scrub) return;
     var p = scrub.pos;
-    clearTimeout(scrub.timer);
     // Live streams on AVPlay are reopened at the chosen moment instead (time-shifted by the
     // service, see playFeed): that plays in ~3 s, a seek within the live window in ~5 s.
     if (Player.isLive() && Player.engineName() === 'avplay') {
@@ -1390,7 +1400,6 @@
   }
 
   function scrubCancel() {
-    clearTimeout(scrub.timer);
     scrub = null;
     updateOsd();
   }
@@ -1453,6 +1462,7 @@
   }
 
   function playerKey(key) {
+    lastKeyAt = Date.now();
     if (panel) return panelKey(key);
     if (upNext && key === K.ENTER && upNext.left != null) return playNextPart();
     if (upNext && key === K.BACK) return dismissUpNext();
@@ -1551,13 +1561,13 @@
   function showUpNext(ctx, ev) {
     clearUpNext();
     var st = status(ev), u = upNext = { ctx: ctx, ev: ev, left: st === 'upcoming' ? null : 10 };
-    $('upnext-title').textContent = ev.title;
     $('upnext').classList.remove('hidden');
     (function tick() {
       if (upNext !== u) return;
       if (u.left === 0) return playNextPart();
-      $('upnext-sub').textContent = u.left == null ? 'Starts ' + when(ev.start)
-        : (st === 'live' ? 'Live now' : 'Replay') + ' · starts in ' + u.left + ' s';
+      var text = UpNext.lines(ev.title, st, u.left, when(ev.start));
+      $('upnext-title').textContent = text.title;
+      $('upnext-sub').textContent = text.sub;
       if (u.left != null) { u.left--; u.timer = setTimeout(tick, 1000); }
     })();
   }
@@ -1862,13 +1872,20 @@
     });
   }
 
+  /**
+   * Lines often follow each other back to back, or with an empty "clear" in between. Hiding waits a
+   * moment so the box changes text instead of blinking off and on; null (subtitles off, player
+   * closed) hides it at once.
+   */
   function showSubtitle(s) {
     var box = $('subtitle');
+    var hide = function () { box.classList.add('hidden'); };
     clearTimeout(subtitleTimer);
-    if (!s || !s.text || !Settings.get('subtitles')) return box.classList.add('hidden');
-    box.textContent = s.text;
+    if (!s || !Settings.get('subtitles')) return hide();
+    if (!s.text) { subtitleTimer = setTimeout(hide, 300); return; }
+    if (box.textContent !== s.text) box.textContent = s.text;
     box.classList.remove('hidden');
-    subtitleTimer = setTimeout(function () { box.classList.add('hidden'); }, Math.max(1500, s.ms));
+    subtitleTimer = setTimeout(hide, Math.max(1500, s.ms) + 300);
   }
 
   // keys

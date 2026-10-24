@@ -220,7 +220,7 @@ function query(t) {
   if (si >= 0) {
     out.standings = j.snaps[si][1].map(function (r) {
       var d = j.drivers[r[0]] || {};
-      return { num: r[0], pos: r[1], tla: d.Tla || r[0], colour: d.TeamColour ? '#' + d.TeamColour : '#888',
+      return { num: r[0], pos: r[1], tla: d.Tla || r[0], colour: d.TeamColour ? '#' + d.TeamColour : '#77777d',
         gap: r[2], interval: r[3], best: r[4], last: r[5], laps: r[6], pit: r[7], out: r[8], knockedOut: r[9], tyre: r[10],
         stops: r[11], tyreAge: r[12], tyreNew: r[13], grid: r[14], old: r[15] };
     });

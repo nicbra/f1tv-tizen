@@ -14,5 +14,5 @@ if state="$(gh release view "$TAG" --repo "$GH_REPO" --json isDraft --jq .isDraf
   gh release upload "$TAG" build/F1TV.wgt build/F1TV.wgt.sha256 --repo "$GH_REPO" --clobber
 else
   gh release create "$TAG" build/F1TV.wgt build/F1TV.wgt.sha256 --repo "$GH_REPO" \
-    --draft --verify-tag --title "F1 TV ${TAG#v}" --generate-notes
+    --draft --verify-tag --title "$TAG" --generate-notes
 fi

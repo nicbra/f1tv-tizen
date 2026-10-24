@@ -35,6 +35,7 @@ test('label shows the lap in races', () => {
   const { Timing } = timing();
   assert.equal(Timing.label({ type: 'Race', lap: 22, totalLaps: 62 }), 'Lap 22/62');
   assert.equal(Timing.label({ type: 'Race', lap: 3 }), 'Lap 3');
+  assert.equal(Timing.label({ type: 'Race', lap: 22, totalLaps: 62 }, true), 'Lap 22'); // the seek bubble
 });
 
 test('label shows the qualifying part and the time left', () => {

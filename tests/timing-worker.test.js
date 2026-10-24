@@ -166,7 +166,7 @@ test('standings are ordered by position and use TLA and team colour from DriverL
   const s = w.ask(at(10));
   assert.deepEqual(s.standings.map((r) => [r.pos, r.tla]), [[1, 'VER'], [2, 'HAM'], [3, 'LEC']]);
   assert.equal(row(s, '1').colour, '#3671C6');
-  assert.equal(row(s, '16').colour, '#888');
+  assert.equal(row(s, '16').colour, '#77777d');
 });
 
 test('a later TimingData patch reorders standings', async () => {
