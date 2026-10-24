@@ -965,7 +965,7 @@
       rows: [
         { day: 'Settings' },
         toggle('spoilerFree', 'Spoiler-free mode', 'Blurs artwork of replays and highlights so results stay hidden.'),
-        toggle('timing', 'Live timing overlay', 'Timing tower while watching sessions. Also in the player with ▲ ▼.'),
+        toggle('timing', 'Live timing overlay', 'Timing tower while watching sessions. Choose what it shows in the player under ▲ Watch options.'),
         { day: 'Account' },
         { what: 'Sign out of this TV', sub: 'You can sign in again with a code at any time.', run: function () {
           ask('Sign out?', 'This TV stops being able to play F1 TV until you sign in again.', [
@@ -1124,7 +1124,7 @@
       show('player');
       scrub = null;
       $('osd-title').textContent = feedsCtx.title;
-      $('osd-feed').textContent = f.title;
+      $('osd-feed').textContent = feedsCtx.feeds.length > 1 ? f.title : '';   // one feed: no need to name it
       if (from) toast('Switching to ' + (f.full || f.title) + '…', 2500);
       else $('spinner').classList.remove('hidden');
       showOsd();
@@ -1255,9 +1255,9 @@
     $('osd-pos').textContent = cur.clock ? cur.clock + (live ? '' : '  ·  ' + cur.main) : cur.main;
     $('osd-dur').textContent = live ? (behind ? cur.main + ' behind live' : '') : fmtTime(span);
 
-    var f = feedsCtx && feedsCtx.feeds[feedsCtx.index];
+    var f = feedsCtx && feedsCtx.feeds.length > 1 && feedsCtx.feeds[feedsCtx.index];
     var info = Timing.label(timingState);
-    $('osd-feed').textContent = (f ? f.title : '') + (info ? '  ·  ' + info : '');
+    $('osd-feed').textContent = [f ? f.title : '', info].filter(Boolean).join('  ·  ');
 
     var marker = $('osd-marker'), bubble = $('osd-bubble');
     var shown = scrub || pending;
@@ -1305,7 +1305,7 @@
     // so they wait longer (OK jumps right away).
     scrub.timer = setTimeout(scrubCommit, Player.isLive() && Player.engineName() === 'avplay' ? 1500 : 800);
     var wall = Player.wallClock(scrub.pos), target = scrub.pos, s = scrub;
-    if (wall) Timing.query(wall * 1000).then(function (st) {
+    if (wall) timingAt(wall).then(function (st) {
       if (scrub === s && s.pos === target) { s.info = Timing.label(st); updateOsd(); }
     });
     showOsd();
@@ -1487,8 +1487,14 @@
     }
 
     if (Timing.supported(feedsCtx.timingMeta)) {
-      setting('Live timing', function () { return Settings.get('timing') ? 'On' : 'Off'; },
-        function () { Settings.set('timing', !Settings.get('timing')); renderTower(); });
+      // Off, or what the tower shows - the views F1's own tower cycles through.
+      setting('Live timing', function () { return Settings.get('timing') ? viewLabel(towerView()) : 'Off'; },
+        function (dir) {
+          var next = cycleValue(['off'].concat(towerViews()), Settings.get('timing') ? towerView() : 'off', dir);
+          Settings.set('timing', next !== 'off');
+          if (next !== 'off') Settings.set('tower', next);
+          renderTower();
+        });
     }
 
     var audio = tracks.audio.map(function (a) { return a.lang; }).filter(Boolean);
@@ -1580,11 +1586,81 @@
 
   // ---------- timing tower and subtitles ----------
 
+  /*
+   * F1's video is stamped with the encoder's timecode (the DASH timeline and HLS program date-time
+   * both come from it), which runs behind the timing data: the picture stamped T shows the graphics
+   * for about T - 5.3 s. Measured by finding the frame where F1's on-screen lap counter changes
+   * (5.1-5.6 s over six laps of the 2025 US and 2026 Singapore races). F1's session clock graphic
+   * runs another 2 s behind (7.3-7.4 s in Singapore Q1 and Q2), so the countdown uses its own lag.
+   */
+  var TIMING_LAG = 5.3;   // tower, lap counter, flags
+  var CLOCK_LAG = 7.4;    // session clock and Q1/Q2/Q3
+
+  /** Timing state matching the picture stamped `wall` (Unix seconds). */
+  function timingAt(wall) {
+    return Promise.all([Timing.query((wall - TIMING_LAG) * 1000), Timing.query((wall - CLOCK_LAG) * 1000)])
+      .then(function (r) {
+        if (r[0] && r[1]) { r[0].remaining = r[1].remaining; r[0].part = r[1].part; }
+        return r[0];
+      });
+  }
+
   function timingTick() {
     if (screen !== 'player' || !Timing.isReady()) return;
     var wall = Player.wallClock(Player.position());
     if (!wall) return;
-    Timing.query(wall * 1000).then(function (st) { timingState = st; renderTower(); });
+    timingAt(wall).then(function (st) { timingState = st; renderTower(); });
+  }
+
+  var towerSig = '';
+
+  var TOWER_VIEWS = { interval: 'Interval', leader: 'Gap to leader', last: 'Last lap', best: 'Best lap',
+    tyres: 'Tyres', pits: 'Pit stops', positions: 'Positions' };
+
+  function raceSession() {
+    return timingState ? timingState.type === 'Race' : /^(Race|Sprint)$/.test((feedsCtx && feedsCtx.timingMeta.title) || '');
+  }
+
+  /** The views that make sense for this session; the first is its default. */
+  function towerViews() {
+    return raceSession() ? ['interval', 'leader', 'last', 'best', 'tyres', 'pits', 'positions']
+      : ['leader', 'interval', 'best', 'last', 'tyres'];
+  }
+
+  function towerView() {
+    var list = towerViews();
+    return list.indexOf(Settings.get('tower')) >= 0 ? Settings.get('tower') : list[0];
+  }
+
+  function viewLabel(view) {
+    return view === 'leader' && !raceSession() ? 'Gap to fastest' : TOWER_VIEWS[view];
+  }
+
+  /** One driver's value in the chosen view: [text, extra class]. */
+  function towerCell(d, view, race) {
+    if (d.out) return ['OUT'];
+    if (d.pit && (view === 'interval' || view === 'leader')) return ['PIT'];
+    switch (view) {
+      case 'interval': return [d.pos === 1 ? (race ? 'Leader' : d.best) : (d.interval || d.gap)];
+      case 'leader': return [d.pos === 1 ? (race ? 'Leader' : d.best) : d.gap];
+      case 'last': return [d.last];
+      case 'best': return [d.best];
+      case 'tyres': return [d.tyreAge == null ? '' : (d.tyreNew && d.tyreAge === 0 ? 'New' : d.tyreAge + (d.tyreAge === 1 ? ' lap' : ' laps'))];
+      case 'pits': return [d.stops == null ? '' : d.stops === 0 ? '–' : d.stops + (d.stops === 1 ? ' stop' : ' stops')];
+      case 'positions':
+        if (!d.grid) return [''];
+        var g = d.grid - d.pos;
+        return g > 0 ? ['▲ ' + g, 'up'] : g < 0 ? ['▼ ' + (-g), 'down'] : ['–'];
+    }
+    return [''];
+  }
+
+  /** The tower's headline, as F1 shows it: "Lap 24 / 62", "Q1 13:10", or the practice clock. */
+  function towerValue(st) {
+    var clock = st.remaining != null ? Math.floor(st.remaining / 60) + ':' + pad(st.remaining % 60) : '';
+    if (st.type === 'Race') return st.lap ? 'Lap ' + st.lap + (st.totalLaps ? ' / ' + st.totalLaps : '') : clock;
+    if (st.type === 'Qualifying') return (/sprint/i.test(st.name) ? 'SQ' : 'Q') + (st.part || 1) + ' ' + clock;
+    return clock;
   }
 
   function renderTower() {
@@ -1593,11 +1669,17 @@
     $('screen-player').classList.toggle('tower-on', !!visible);   // moves the player title clear of it
     if (!visible) return;
     var st = timingState, race = st.type === 'Race';
-    $('tower-label').textContent = Timing.label({ type: st.type, name: st.name, lap: st.lap, totalLaps: st.totalLaps,
-      remaining: st.remaining, part: st.part }) || st.name;
+    var view = towerView();
+    $('tower-name').textContent = st.name;
+    $('tower-label').textContent = towerValue(st);
+    $('tower-view').textContent = viewLabel(view);
     var flag = $('tower-flag'), t = st.track;
     flag.className = 'tower-flag ' + ({ '2': 'yellow', '4': 'sc', '5': 'red', '6': 'vsc', '7': 'vsc' }[t] || 'hidden');
     flag.textContent = { '2': 'YELLOW', '4': 'SC', '5': 'RED', '6': 'VSC', '7': 'VSC' }[t] || '';
+    // Redrawn four times a second for the clock; the rows only when they changed.
+    var sig = view + JSON.stringify(st.standings);
+    if (sig === towerSig) return;
+    towerSig = sig;
     var rows = $('tower-rows');
     rows.innerHTML = '';
     st.standings.forEach(function (d) {
@@ -1607,12 +1689,8 @@
       bar.style.background = d.colour;
       row.appendChild(bar);
       row.appendChild(el('span', 'tw-tla', d.tla));
-      var value;
-      if (d.out) value = 'OUT';
-      else if (d.pit) value = 'PIT';
-      else if (d.pos === 1) value = race ? 'Leader' : d.best;
-      else value = race ? (d.interval || d.gap) : d.gap;
-      row.appendChild(el('span', 'tw-val', value || ''));
+      var cell = towerCell(d, view, race);
+      row.appendChild(el('span', 'tw-val' + (cell[1] ? ' ' + cell[1] : ''), cell[0] || ''));
       if (d.tyre) row.appendChild(el('span', 'tw-tyre tyre-' + d.tyre, d.tyre));
       rows.appendChild(row);
     });
@@ -1678,7 +1756,7 @@
     setInterval(checkPending, 100);
     Player.on('ended', function () { if (screen === 'player') stopPlayer(); });
     Player.on('subtitle', showSubtitle);
-    setInterval(timingTick, 1000);
+    setInterval(timingTick, 250);   // often, so the session clock ticks with the on-screen one
     setInterval(saveProgress, 30000);
     // Refresh the home page now and then so live / upcoming badges stay current.
     setInterval(function () {

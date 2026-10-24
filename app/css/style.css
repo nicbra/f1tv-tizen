@@ -109,8 +109,8 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .osd { position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between;
   background: linear-gradient(to bottom, rgba(0,0,0,0.75) 0, transparent 25%, transparent 70%, rgba(0,0,0,0.85) 100%); }
 .osd-top { padding: 50px 80px; }
-/* The timing tower covers the top-left corner; the title then starts right of it. */
-.tower-on .osd-top { padding-left: 430px; }
+/* The timing tower covers the left edge; the title and the seek bar then start right of it. */
+.tower-on .osd-top, .tower-on .osd-bottom { padding-left: 380px; }
 .osd-title { font-size: 40px; font-weight: 700; }
 .osd-feed { font-size: 28px; color: var(--muted); margin-top: 8px; }
 .osd-bottom { padding: 0 80px 50px; }
@@ -212,22 +212,31 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .panel-hint { position: absolute; bottom: 16px; left: 26px; right: 26px; font-size: 17px; }
 
 /* ---------- Timing tower ---------- */
-.tower { position: absolute; left: 50px; top: 50px; width: 330px; background: rgba(12, 12, 18, 0.82);
-  border-radius: 10px; padding: 12px 0; font-size: 22px; }
-.tower-head { display: flex; justify-content: space-between; align-items: center; padding: 0 16px 10px;
-  font-weight: 700; font-size: 22px; border-bottom: 2px solid rgba(255,255,255,0.12); margin-bottom: 6px; }
-.tower-flag { padding: 2px 10px; border-radius: 4px; font-size: 18px; font-weight: 800; }
+/*
+ * Same box as F1's own tower in the broadcast (2026 graphics: x 90, y 44-1034, 246 px wide, rows
+ * from y 179), so on the main feed it sits right over F1's and the rows line up.
+ */
+.tower { position: absolute; left: 90px; top: 44px; width: 246px; height: 990px; display: flex; flex-direction: column;
+  background: rgba(16, 16, 24, 0.98); border-radius: 6px; font-size: 20px; overflow: hidden; }
+.tower-head { flex: none; height: 135px; display: flex; flex-direction: column; justify-content: center; align-items: center;
+  border-bottom: 2px solid rgba(255, 255, 255, 0.12); }
+.tower-name { font-size: 17px; color: var(--muted); text-transform: uppercase; letter-spacing: 1.5px; }
+.tower-value { font-size: 30px; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.tower-view { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 1.5px; margin-top: 6px; }
+.tower-flag { margin-top: 6px; padding: 1px 10px; border-radius: 4px; font-size: 16px; font-weight: 800; }
 .tower-flag.yellow { background: #f5d200; color: #000; }
 .tower-flag.sc, .tower-flag.vsc { background: #ff9d00; color: #000; }
 .tower-flag.red { background: var(--red); }
-.tower-row { display: flex; align-items: center; height: 36px; padding: 0 16px; }
+#tower-rows { flex: 1; display: flex; flex-direction: column; }
+.tower-row { flex: 1; min-height: 0; display: flex; align-items: center; padding: 0 10px; }
 .tower-row.out { opacity: 0.45; }
-.tw-pos { width: 34px; text-align: right; margin-right: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
-.tw-bar { width: 5px; height: 22px; border-radius: 2px; margin-right: 10px; }
-.tw-tla { width: 70px; font-weight: 700; }
-.tw-val { flex: 1; text-align: right; font-variant-numeric: tabular-nums; color: #ddd; }
-.tw-tyre { width: 24px; height: 24px; margin-left: 10px; border-radius: 50%; border: 3px solid #888; font-size: 13px;
-  line-height: 18px; text-align: center; font-weight: 800; }
+.tw-pos { width: 26px; text-align: right; margin-right: 8px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.tw-bar { width: 4px; height: 20px; border-radius: 2px; margin-right: 8px; }
+.tw-tla { width: 50px; font-weight: 700; }
+.tw-val { flex: 1; text-align: right; font-size: 19px; font-variant-numeric: tabular-nums; color: #ddd; white-space: nowrap; }
+.tw-val.up { color: #3ccf6e; } .tw-val.down { color: #ff5a4f; }
+.tw-tyre { width: 22px; height: 22px; margin-left: 8px; border-radius: 50%; border: 3px solid #888; font-size: 11px;
+  line-height: 16px; text-align: center; font-weight: 800; flex: none; }
 .tyre-S { border-color: #e10600; } .tyre-M { border-color: #ffd12e; } .tyre-H { border-color: #f0f0f0; }
 .tyre-I { border-color: #43b02a; } .tyre-W { border-color: #0067ad; }
 
@@ -251,6 +260,8 @@ body.avplay #video, body.avplay #video2 { display: none; }
 
 /* Subtitles move up above the player bar while it is shown */
 .osd-visible .subtitle { bottom: 270px; }
+/* With the tower on (x 90-336) subtitles stay centred but narrower, so long lines never go behind it. */
+.tower-on .subtitle { max-width: 1160px; }
 
 /* ---------- Standings and driver pages ---------- */
 .list-row .row-colour { width: 6px; height: 40px; border-radius: 3px; margin-right: 18px; background: #555; flex: none; }

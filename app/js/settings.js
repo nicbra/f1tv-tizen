@@ -3,6 +3,7 @@ var Settings = (function () {
   var KEY = 'f1tv.settings';
   var defaults = {
     timing: true,        // timing tower overlay in the player
+    tower: '',           // what the tower shows (see TOWER_VIEWS in app.js); '' = the session's default
     audio: 'eng',        // preferred commentary track (language code, 'fx' = track sound only)
     subtitles: '',       // subtitle language, '' = off
     spoilerFree: false   // hide result-revealing artwork and timing on replays

@@ -94,16 +94,20 @@ function snapshot(t) {
   Object.keys(j.timing).forEach(function (num) {
     var l = j.timing[num];
     if (!l || !l.Position) return;
-    var stints = j.stints[num] && j.stints[num].Stints, compound = '';
+    var app = j.stints[num] || {}, stints = app.Stints, keys = [], compound = '', age = null, fresh = false;
     if (stints) {
-      var keys = Object.keys(stints).map(Number).sort(function (a, b) { return a - b; });
+      keys = Object.keys(stints).map(Number).sort(function (a, b) { return a - b; });
       var s = stints[keys[keys.length - 1]];
       compound = s && s.Compound ? s.Compound.charAt(0) : '';
+      if (s && s.TotalLaps != null) age = +s.TotalLaps;
+      fresh = !!s && String(s.New) === 'true';
     }
+    var stops = l.NumberOfPitStops != null ? +l.NumberOfPitStops : (keys.length ? keys.length - 1 : null);
     rows.push([num, +l.Position, val(l.GapToLeader) || val(l.TimeDiffToFastest) || '',
       val(l.IntervalToPositionAhead) || val(l.TimeDiffToPositionAhead) || '',
       val(l.BestLapTime) || '', val(l.LastLapTime) || '', l.NumberOfLaps || 0,
-      !!(l.InPit || l.PitOut), !!(l.Retired || l.Stopped), !!l.KnockedOut, compound]);
+      !!(l.InPit || l.PitOut), !!(l.Retired || l.Stopped), !!l.KnockedOut, compound,
+      stops, age, fresh, +app.GridPos || null]);
   });
   rows.sort(function (a, b) { return a[1] - b[1]; });
   j.snaps.push([t, rows]);
@@ -200,7 +204,8 @@ function query(t) {
   var ci = at(j.clock, t);
   if (ci >= 0) {
     var c = j.clock[ci];
-    out.remaining = Math.max(0, Math.round(c[1] - (c[2] ? (t - c[3]) / 1000 : 0)));
+    // Rounded up, like F1's clock: it shows 0:01 until the time is up.
+    out.remaining = Math.max(0, Math.ceil(c[1] - (c[2] ? (t - c[3]) / 1000 : 0) - 1e-6));
   }
   var pi = at(j.part, t);
   if (pi >= 0) out.part = j.part[pi][1];
@@ -211,7 +216,8 @@ function query(t) {
     out.standings = j.snaps[si][1].map(function (r) {
       var d = j.drivers[r[0]] || {};
       return { num: r[0], pos: r[1], tla: d.Tla || r[0], colour: d.TeamColour ? '#' + d.TeamColour : '#888',
-        gap: r[2], interval: r[3], best: r[4], last: r[5], laps: r[6], pit: r[7], out: r[8], knockedOut: r[9], tyre: r[10] };
+        gap: r[2], interval: r[3], best: r[4], last: r[5], laps: r[6], pit: r[7], out: r[8], knockedOut: r[9], tyre: r[10],
+        stops: r[11], tyreAge: r[12], tyreNew: r[13], grid: r[14] };
     });
   }
   out.started = j.snaps.length ? t >= j.snaps[0][0] : false;
