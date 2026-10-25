@@ -130,7 +130,7 @@ test('before the first timing data there are no standings and started is false',
   assert.equal(w.ask(at(10)).started, true);
 });
 
-test('the first heartbeat fixes the UTC base: offsets map to heartbeat Utc minus its offset', async () => {
+test('a heartbeat fixes the UTC base: offsets map to heartbeat Utc minus its offset', async () => {
   // Heartbeat at offset 5s says it is 12:00:05, so offset 0 is 12:00:00.
   const w = await loadedWorker({
     ...base(),
@@ -138,6 +138,20 @@ test('the first heartbeat fixes the UTC base: offsets map to heartbeat Utc minus
   });
   assert.equal(w.ask(at(20) - 1).standings, undefined);
   assert.equal(w.ask(at(20)).standings.length, 1);
+});
+
+test('buffered heartbeats with old Utc times at the start and end do not shift the UTC base', async () => {
+  // Like Bahrain 2023: a burst written at one offset with Utc times minutes old, then steady heartbeats.
+  const w = await loadedWorker({
+    ...base(),
+    Heartbeat: stream(
+      line(300, { Utc: iso(-15) }), line(300, { Utc: iso(0) }), line(300, { Utc: iso(15) }),
+      line(310, { Utc: iso(310) }), line(325, { Utc: iso(325) }), line(340, { Utc: iso(340) }),
+      line(355, { Utc: iso(355) }), line(370, { Utc: iso(370) }), line(380, { Utc: iso(9000) })),
+    TimingData: stream(line(320, { Lines: { 1: { Position: '1' } } }))
+  });
+  assert.equal(w.ask(at(320) - 1).standings, undefined);
+  assert.equal(w.ask(at(320)).standings.length, 1);
 });
 
 test('a query returns state as of that time, not later data', async () => {
@@ -402,6 +416,43 @@ test('qualifying part comes from SessionData series', async () => {
   assert.equal(w.ask(at(9)).part, undefined);
   assert.equal(w.ask(at(20)).part, 1);
   assert.equal(w.ask(at(30)).part, 2);
+});
+
+test('a race has not started until its first Started status, though LapCount already says lap 1', async () => {
+  // Like Bahrain 2023: lap 1 from the session's opening, lights out much later, the last lap kept after the flag.
+  const w = await loadedWorker({
+    ...base(),
+    LapCount: stream(line(10, { CurrentLap: 1, TotalLaps: 57 }), line(200, { CurrentLap: 2 }), line(300, { CurrentLap: 57 })),
+    SessionData: stream(
+      line(10, { Series: [], StatusSeries: [{ Utc: iso(10), TrackStatus: 'AllClear' }] }),
+      line(100, { StatusSeries: { 1: { Utc: iso(100), SessionStatus: 'Started' } } }),
+      line(150, { StatusSeries: { 2: { Utc: iso(150), SessionStatus: 'Aborted' } } }),
+      line(160, { StatusSeries: { 3: { Utc: iso(160), SessionStatus: 'Started' } } }),
+      line(400, { StatusSeries: { 4: { Utc: iso(400), SessionStatus: 'Finished' } } }))
+  });
+  assert.equal(w.ask(at(50)).beforeStart, true);
+  assert.equal(w.ask(at(50)).lap, 1);
+  assert.equal(w.ask(at(100)).beforeStart, false);
+  assert.equal(w.ask(at(155)).beforeStart, false);   // a red flag does not undo the start
+  assert.deepEqual([w.ask(at(500)).beforeStart, w.ask(at(500)).lap], [false, 57]);
+});
+
+test('without status data a race counts as started', async () => {
+  const w = await loadedWorker({
+    ...base(),
+    LapCount: stream(line(10, { CurrentLap: 1, TotalLaps: 57 }))
+  });
+  assert.equal(w.ask(at(20)).beforeStart, false);
+});
+
+test('a race without a Started status counts as started from lap 2', async () => {
+  const w = await loadedWorker({
+    ...base(),
+    LapCount: stream(line(10, { CurrentLap: 1, TotalLaps: 57 }), line(200, { CurrentLap: 2 })),
+    SessionData: stream(line(10, { StatusSeries: [{ Utc: iso(10), TrackStatus: 'AllClear' }] }))
+  });
+  assert.equal(w.ask(at(100)).beforeStart, true);
+  assert.equal(w.ask(at(200)).beforeStart, false);
 });
 
 test('lines with a byte order mark, CRLF endings or bad JSON do not break loading', async () => {

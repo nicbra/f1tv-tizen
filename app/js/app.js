@@ -1054,8 +1054,9 @@
       var weekend = emf.Meeting_Name || emf.Global_Meeting_Name;
       feedsCtx.event = weekend ? weekend + ' ' + (m.year || new Date(+emf.sessionStartDate || Date.now()).getFullYear()) : '';
       // A pre-show, its session and the post-show are parts of one event, each naming the next.
+      // houseId is null for the last part and for videos that are not part of one.
       var next = emf.multipartEvent === 'true' && emf.multipartEventNextHouseId;
-      feedsCtx.nextPart = next && next !== m.externalId ? { houseId: next, end: +emf.sessionEndDate || 0 } : null;
+      feedsCtx.nextPart = { houseId: next && next !== m.externalId ? next : null, end: +emf.sessionEndDate || 0 };
       feedsCtx.duration = m.duration;
       var resumeReady = Promise.resolve();
       if (!feedsCtx.live) {
@@ -1526,7 +1527,7 @@
    * Live broadcasts end on F1's "coverage has concluded" screen while the next part runs as a
    * separate stream. Once the moment being watched passes the scheduled end (behind live as well)
    * and F1 no longer lists the broadcast as live, so an overrunning session is not cut off, offer
-   * the next part. Replays offer it when the video ends.
+   * the next part, or close the player after the last part. Replays offer it when the video ends.
    */
   function checkNextPart() {
     var ctx = feedsCtx, n = ctx && ctx.nextPart;
@@ -1535,24 +1536,29 @@
     if (!wall || wall * 1000 < n.end || Date.now() < (n.checkAt || 0)) return;
     n.checkAt = Date.now() + 30000;
     F1Api.video(ctx.contentId).then(function (v) {
-      if (feedsCtx === ctx && (v.metadata || {}).contentSubtype !== 'LIVE') offerNextPart();
+      if (feedsCtx === ctx && screen === 'player' && (v.metadata || {}).contentSubtype !== 'LIVE') offerNextPart();
     }).catch(function () { /* try again later */ });
   }
 
-  /** Looks up the next part and shows the "Up next" card; false when there is no next part. */
+  /**
+   * Looks up the next part and shows the "Up next" card. Without one, onMissing runs, or without
+   * that the "Broadcast ended" card. False when this was handled already.
+   */
   function offerNextPart(onMissing) {
     var ctx = feedsCtx, n = ctx && ctx.nextPart;
     if (!n || n.offered || n.dismissed) return false;
     n.offered = true;
+    var missing = function () { if (onMissing) onMissing(); else showEnded(ctx); };
+    if (!n.houseId) { missing(); return true; }
     (function lookUp() {
       weekendSchedule(ctx.timingMeta.meetingKey).then(function (sched) {
         if (feedsCtx !== ctx || screen !== 'player' || n.dismissed) return;
         var ev = sched && sched.events.filter(function (e) { return e.houseId === n.houseId; })[0];
-        if (!ev) return onMissing && onMissing();
+        if (!ev) return missing();
         showUpNext(ctx, ev);
         // Not on air yet: look again until it is.
         if (status(ev) === 'upcoming') n.retry = setTimeout(lookUp, 30000);
-      }).catch(function () { if (onMissing && feedsCtx === ctx && screen === 'player') onMissing(); });
+      }).catch(function () { if (feedsCtx === ctx && screen === 'player') missing(); });
     })();
     return true;
   }
@@ -1561,6 +1567,7 @@
   function showUpNext(ctx, ev) {
     clearUpNext();
     var st = status(ev), u = upNext = { ctx: ctx, ev: ev, left: st === 'upcoming' ? null : 10 };
+    $('upnext-label').textContent = 'Next';
     $('upnext').classList.remove('hidden');
     (function tick() {
       if (upNext !== u) return;
@@ -1569,6 +1576,23 @@
       $('upnext-title').textContent = text.title;
       $('upnext-sub').textContent = text.sub;
       if (u.left != null) { u.left--; u.timer = setTimeout(tick, 1000); }
+    })();
+  }
+
+  /** After the last part of a live broadcast: counts down from 10 s, then closes the player. */
+  function showEnded(ctx) {
+    clearUpNext();
+    closePanel();   // it would take the keys, and BACK would not stop the countdown
+    var u = upNext = { ctx: ctx, ev: null, left: 10 };
+    $('upnext-label').textContent = 'Broadcast ended';
+    $('upnext-title').textContent = ctx.title;
+    $('upnext').classList.remove('hidden');
+    (function tick() {
+      if (upNext !== u) return;
+      if (u.left === 0) return playNextPart();
+      $('upnext-sub').textContent = 'Closing in ' + u.left + ' s';
+      u.left--;
+      u.timer = setTimeout(tick, 1000);
     })();
   }
 
@@ -1591,6 +1615,7 @@
    */
   function playNextPart() {
     if (!upNext) return;
+    if (!upNext.ev) return stopPlayer();   // the "Broadcast ended" card
     var ev = upNext.ev, wall = Player.wallClock(Player.position());
     clearUpNext();
     leavePlayer();
@@ -1759,13 +1784,13 @@
    * runs another 2 s behind (7.3-7.4 s in Singapore Q1 and Q2), so the countdown uses its own lag.
    */
   var TIMING_LAG = 5.3;   // tower, lap counter, flags
-  var CLOCK_LAG = 7.4;    // session clock and Q1/Q2/Q3
+  var CLOCK_LAG = 7.4;    // session clock, Q1/Q2/Q3 and the race start
 
   /** Timing state matching the picture stamped `wall` (Unix seconds). */
   function timingAt(wall) {
     return Promise.all([Timing.query((wall - TIMING_LAG) * 1000), Timing.query((wall - CLOCK_LAG) * 1000)])
       .then(function (r) {
-        if (r[0] && r[1]) { r[0].remaining = r[1].remaining; r[0].part = r[1].part; }
+        if (r[0] && r[1]) { r[0].remaining = r[1].remaining; r[0].part = r[1].part; r[0].beforeStart = r[1].beforeStart; }
         return r[0];
       });
   }
@@ -1834,7 +1859,10 @@
   /** The tower's headline, as F1 shows it: "Lap 24 / 62", "Q1 13:10", or the practice clock. */
   function towerValue(st) {
     var clock = st.remaining != null ? Math.floor(st.remaining / 60) + ':' + pad(st.remaining % 60) : '';
-    if (st.type === 'Race') return st.lap ? 'Lap ' + st.lap + (st.totalLaps ? ' / ' + st.totalLaps : '') : clock;
+    if (st.type === 'Race') {
+      if (st.beforeStart) return 'Not started';
+      return st.lap ? 'Lap ' + st.lap + (st.totalLaps ? ' / ' + st.totalLaps : '') : clock;
+    }
     if (st.type === 'Qualifying') return (/sprint/i.test(st.name) ? 'SQ' : 'Q') + (st.part || 1) + ' ' + clock;
     return clock;
   }

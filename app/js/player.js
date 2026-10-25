@@ -23,6 +23,7 @@ var Player = (function () {
     var cur = 0;
     var licenseHeaders = {};
     var userPaused = false;
+    var swapping = false;   // a feed switch is under way; the outgoing feed stays current until it is done
 
     function P() { return slots[cur].p; }
     function V() { return slots[cur].v; }
@@ -40,6 +41,7 @@ var Player = (function () {
         });
         player.addEventListener('error', function (ev) { if (slots[cur] === slot) emit('error', describe(ev.detail)); });
         player.addEventListener('buffering', function (ev) { if (slots[cur] === slot) emit('buffering', ev.buffering); });
+        video.addEventListener('ended', function () { if (slots[cur] === slot && !swapping) emit('ended'); });
         return slot;
       });
     }
@@ -132,6 +134,7 @@ var Player = (function () {
       var old = slots[cur], next = slots[1 - cur];
       configure(next.p, stream);
       next.v.muted = true;
+      swapping = true;
       return next.p.load(stream.url, startTime == null ? null : startTime).then(function () {
         return whenBuffered(next, 4, 6000);
       }).then(function () {
@@ -146,6 +149,7 @@ var Player = (function () {
       }).then(function () {
         next.v.muted = false;
         cur = 1 - cur;
+        swapping = false;
         userPaused = false;
         old.v.classList.add('hidden');
         old.v.style.zIndex = '';
@@ -153,6 +157,7 @@ var Player = (function () {
         old.p.unload().then(function () { keepPlaying(next.v); });
         keepPlaying(next.v);
       }, function (err) {
+        swapping = false;
         next.v.classList.add('hidden');
         next.p.unload();
         old.v.style.zIndex = '';

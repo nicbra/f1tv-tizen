@@ -3,7 +3,14 @@ const { readFileSync } = require('node:fs');
 const { test } = require('node:test');
 const vm = require('node:vm');
 
-const el = () => ({ classList: { add() {}, remove() {}, toggle() {} }, style: {} });
+const el = () => {
+  const listeners = {};
+  return {
+    classList: { add() {}, remove() {}, toggle() {} }, style: {},
+    addEventListener: (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); },
+    fire: (type) => (listeners[type] || []).forEach((fn) => fn())
+  };
+};
 
 /** A fake Samsung AVPlay that records what the app asks of it. */
 function fakeAvPlay({ liveWindow = '', duration = 0 } = {}) {
@@ -33,11 +40,14 @@ function fakeAvPlay({ liveWindow = '', duration = 0 } = {}) {
   return av;
 }
 
-/** Loads the real settings, service launcher and player with a fake AVPlay and Shaka. */
-async function player(av, storage) {
+/** Loads the real settings, service launcher and player with a fake AVPlay and Shaka. shakaLoad: Shaka's load(). */
+async function player(av, storage, shakaLoad) {
   const store = Object.assign({}, storage);
   class ShakaPlayer {
     attach() { return Promise.resolve(); }
+    resetConfiguration() {}
+    configure() {}
+    load() { return shakaLoad ? shakaLoad() : Promise.reject(new Error('no stream')); }
     getNetworkingEngine() { return { registerRequestFilter() {} }; }
     addEventListener() {}
     unload() { return Promise.resolve(); }
@@ -51,8 +61,10 @@ async function player(av, storage) {
     setTimeout, clearTimeout, Date, Math, JSON, Promise, encodeURIComponent
   });
   for (const f of ['settings.js', 'proxy.js', 'player.js']) vm.runInContext(readFileSync('app/js/' + f, 'utf8'), context);
-  const video = Object.assign(el(), { cloneNode: () => el(), parentNode: { insertBefore() {} } });
+  const second = el();
+  const video = Object.assign(el(), { cloneNode: () => second, parentNode: { insertBefore() {} } });
   await context.Player.init(video, el());
+  context.Player.videos = [video, second];
   return context.Player;
 }
 
@@ -137,6 +149,34 @@ test('clear multi-feed replays play on Shaka; clear single-feed videos on AVPlay
   await single.load(Object.assign({}, clear, { multiFeed: false }), null);
   assert.equal(single.engineName(), 'avplay');
   assert.equal(av.calls.find((c) => c[0] === 'open')[1], clear.url);
+});
+
+test('a Shaka video that plays to its end reports it; the idle preload slot does not', async () => {
+  const P = await player(fakeAvPlay());
+  let ended = 0;
+  P.on('ended', () => ended++);
+  P.forceEngine = 'shaka';
+  await P.load({ url: 'https://ott-video-fer-cf.formula1.com/x/index.m3u8', licenseUrl: '', multiFeed: true, info: { dynamic: false } }, null).catch(() => {});
+  P.videos[1].fire('ended');
+  assert.equal(ended, 0);
+  P.videos[0].fire('ended');
+  assert.equal(ended, 1);
+});
+
+test('the outgoing Shaka feed reaching its end during a feed switch does not end playback', async () => {
+  let loads = 0;
+  // The first feed loads; the switch's load stays pending, so the old feed is still current.
+  const P = await player(fakeAvPlay(), undefined, () => (loads++ ? new Promise(() => {}) : Promise.resolve()));
+  let ended = 0;
+  P.on('ended', () => ended++);
+  P.forceEngine = 'shaka';
+  const feed = { url: 'https://ott-video-fer-cf.formula1.com/x/index.m3u8', licenseUrl: '', multiFeed: true, info: { dynamic: false } };
+  P.videos[0].play = P.videos[1].play = () => Promise.resolve();
+  await P.load(feed, null);
+  P.switchTo(Object.assign({}, feed, { url: feed.url.replace('x', 'y') }), null);
+  await new Promise((r) => setImmediate(r));
+  P.videos[0].fire('ended');
+  assert.equal(ended, 0);
 });
 
 test('unloading waits for preparation, then stops and closes the native player', async () => {

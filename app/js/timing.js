@@ -86,7 +86,8 @@ var Timing = (function () {
     if (!s) return '';
     var parts = [];
     var mmss = function (sec) { var m = Math.floor(sec / 60), r = sec % 60; return (m < 10 ? '0' : '') + m + ':' + (r < 10 ? '0' : '') + r; };
-    if (s.type === 'Race' && s.lap) parts.push('Lap ' + s.lap + (s.totalLaps && !short ? '/' + s.totalLaps : ''));
+    if (s.type === 'Race' && s.beforeStart) parts.push('Not started');
+    else if (s.type === 'Race' && s.lap) parts.push('Lap ' + s.lap + (s.totalLaps && !short ? '/' + s.totalLaps : ''));
     else if (s.type === 'Qualifying') {
       var sprint = /sprint/i.test(s.name);
       parts.push((sprint ? 'SQ' : 'Q') + (s.part || 1) + (s.remaining != null ? ' · ' + mmss(s.remaining) + ' left' : ''));

@@ -21,6 +21,7 @@ function emptyJob(path, token) {
     base: null,                            // UTC ms of offset 0
     info: {},                              // SessionInfo
     lap: [], clock: [], part: [], track: [], sessionPart: 0,   // sessionPart: the qualifying part (1-3) TimingData is on
+    hasStatus: false, startedAt: null,     // startedAt: UTC ms of the first SessionStatus 'Started' (a race's lights out)
     drivers: {}, timing: {}, stints: {},
     snaps: [], lastSnap: -1, changed: -1   // changed: time of the newest change not yet in a snapshot
   };
@@ -67,10 +68,17 @@ function apply(feed, t, d) {
       }
       break;
     case 'SessionData':
-      var series = d.Series;
+      var series = d.Series, status = d.StatusSeries;
       if (series) Object.keys(series).forEach(function (k) {
         var s = series[k];
         if (s && s.QualifyingPart != null) j.part.push([Date.parse(s.Utc) || t, s.QualifyingPart]);
+      });
+      if (status) Object.keys(status).forEach(function (k) {
+        var s = status[k];
+        if (!s) return;
+        j.hasStatus = true;
+        var u = Date.parse(s.Utc) || t;
+        if (s.SessionStatus === 'Started' && (j.startedAt == null || u < j.startedAt)) j.startedAt = u;
       });
       break;
     case 'TrackStatus': if (d.Status != null) j.track.push([t, String(d.Status), d.Message || '']); break;
@@ -161,16 +169,23 @@ function fetchFeed(feed) {
   });
 }
 
-/** Applies the collected lines in time order; the first heartbeat gives the UTC time base. */
+/**
+ * Applies the collected lines in time order. The heartbeats give the UTC time base: the median of
+ * their Utc minus offset, because some archives start (and end) with a burst of buffered heartbeats
+ * written at once with older Utc times, minutes off (Bahrain 2023 race: 5 min).
+ */
 function replayCollected() {
-  var j = job, lines = j.collect;
+  var j = job, lines = j.collect, bases = [];
   j.collect = null;
   lines.sort(function (a, b) { return a[0] - b[0]; });
-  for (var i = 0; i < lines.length && j.base == null; i++) {
-    if (lines[i][1] !== 'Heartbeat') continue;
-    try { j.base = Date.parse(JSON.parse(lines[i][2].slice(12)).Utc) - lines[i][0]; } catch (e) { /* next */ }
-  }
-  if (j.base == null) throw new Error('No timing data for this session yet');
+  lines.forEach(function (l) {
+    if (l[1] !== 'Heartbeat') return;
+    try { var u = Date.parse(JSON.parse(l[2].slice(12)).Utc); } catch (e) { return; }
+    if (!isNaN(u)) bases.push(u - l[0]);
+  });
+  if (!bases.length) throw new Error('No timing data for this session yet');
+  bases.sort(function (a, b) { return a - b; });
+  j.base = bases[bases.length >> 1];
   lines.forEach(function (l) {
     var data;
     try { data = JSON.parse(l[2].slice(12)); } catch (e) { return; }
@@ -226,6 +241,9 @@ function query(t) {
     });
   }
   out.started = j.snaps.length ? t >= j.snaps[0][0] : false;
+  // LapCount says lap 1 from the session's opening, an hour before the start; a race starts at its
+  // first 'Started' status. Without status data, or once lap 2 is on, it has started.
+  out.beforeStart = j.hasStatus && !(j.startedAt != null && t >= j.startedAt) && !(out.lap > 1);
   return out;
 }
 
