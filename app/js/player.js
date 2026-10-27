@@ -24,6 +24,7 @@ var Player = (function () {
     var licenseHeaders = {};
     var userPaused = false;
     var swapping = false;   // a feed switch is under way; the outgoing feed stays current until it is done
+    var generation = 0;     // bumped by every load, swap and unload, so late callbacks can tell they are stale
 
     function P() { return slots[cur].p; }
     function V() { return slots[cur].v; }
@@ -69,6 +70,7 @@ var Player = (function () {
       player.resetConfiguration();
       player.configure({
         drm: drm,
+        preferredVideoHdrLevel: stream.hdr ? 'HLG' : 'AUTO',
         // Keep recent video for backward seeks. A 10 Mbit/s estimate starts F1 streams at 1080p.
         streaming: { bufferingGoal: 30, rebufferingGoal: 1, bufferBehind: 90,
           retryParameters: { maxAttempts: 4, baseDelay: 1000, backoffFactor: 2 } },
@@ -83,7 +85,7 @@ var Player = (function () {
     }
 
     function load(stream, startTime) {
-      var slot = slots[cur];
+      var slot = slots[cur], gen = ++generation;
       configure(slot.p, stream);
       slot.v.muted = false;
       slot.v.classList.remove('hidden');
@@ -93,8 +95,27 @@ var Player = (function () {
         // Resetting another video element can cancel play(); keepPlaying retries it.
         var started = slot.v.play();
         keepPlaying(slot.v, 5000);
+        if (stream.hdr) reloadIfFrozen(slot, stream, startTime, gen);
         return started && started.catch(function () {});
       });
+    }
+
+    /**
+     * The first HDR video after the app starts can stay frozen on this TV (the screen switching to
+     * HDR, presumably): data buffered, not one frame decoded. Loading it again starts it.
+     */
+    function reloadIfFrozen(slot, stream, startTime, gen) {
+      setTimeout(function () {
+        var q = slot.v.getVideoPlaybackQuality ? slot.v.getVideoPlaybackQuality() : null;
+        if (gen !== generation || userPaused || !q || q.totalVideoFrames > 0 || slot.v.readyState < 3) return;
+        // From where it is now, which includes a seek made meanwhile.
+        var at = slot.v.currentTime > 0 ? slot.v.currentTime : startTime;
+        slot.p.load(stream.url, at == null ? null : at).then(function () {
+          if (gen !== generation || userPaused) return;
+          slot.v.play().catch(function () {});
+          keepPlaying(slot.v, 5000);
+        }).catch(function () { /* the start watch in app.js falls back to SDR */ });
+      }, 5000);
     }
 
     /** Resolves once `seconds` of video are buffered ahead of the playhead (or after a timeout). */
@@ -132,6 +153,7 @@ var Player = (function () {
 
     function swap(stream, startTime) {
       var old = slots[cur], next = slots[1 - cur];
+      generation++;
       configure(next.p, stream);
       next.v.muted = true;
       swapping = true;
@@ -182,6 +204,7 @@ var Player = (function () {
 
     function unload() {
       licenseHeaders = {};
+      generation++;
       slots.forEach(function (s) { s.v.classList.add('hidden'); s.v.style.zIndex = ''; });
       return Promise.all(slots.map(function (s) { return s.p.unload(); }));
     }
@@ -512,12 +535,25 @@ var Player = (function () {
     return ShakaEngine.init();
   }
 
+  var hdrSupport = null;
+
+  function hdrCapable() {
+    if (hdrSupport !== null) return hdrSupport;
+    try {
+      hdrSupport = webapis.avinfo.isHdrTvSupport() === true &&
+        MediaSource.isTypeSupported('video/mp4; codecs="hvc1.2.4.L153.B0"') === true;
+    } catch (e) { hdrSupport = false; }
+    return hdrSupport;
+  }
+
   /**
    * AVPlay starts long-segment videos in ~2 s; Shaka needs the whole first segment but can
    * preload feed switches. Use Shaka for clear multi-feed replays.
    */
   function choose(stream) {
     if (Player.forceEngine) return engines[Player.forceEngine];
+    // AVPlay picks SDR variants from HDR playlists; Shaka can be told to prefer HLG.
+    if (stream.hdr) return ShakaEngine;
     if (!hasAvPlay()) return ShakaEngine;
     return stream.licenseUrl || !stream.multiFeed ? AvEngine : ShakaEngine;
   }
@@ -594,6 +630,7 @@ var Player = (function () {
 
   return {
     init: init,
+    hdrCapable: hdrCapable,
     load: load,
     unload: unload,
     seekBy: seekBy,

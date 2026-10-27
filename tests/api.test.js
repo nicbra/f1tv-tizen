@@ -7,18 +7,22 @@ const vm = require('node:vm');
  * Loads api.js with a fetch that answers from `route(url, init)`, which returns
  * { status, body } (objects are sent as JSON). Every request is recorded.
  */
-function api(route) {
+function api(route, globals) {
   const calls = [];
   const fetch = async (url, init) => {
     calls.push({ url, init: init || {} });
     const r = (route && route(url, init || {})) || { status: 404, body: { message: 'not found' } };
+    if (r === HANG) return new Promise(() => {});
     const text = typeof r.body === 'string' ? r.body : JSON.stringify(r.body);
     return { ok: (r.status || 200) < 400, status: r.status || 200, text: async () => text };
   };
-  const context = vm.createContext({ fetch, URL, encodeURIComponent, Date });
+  const context = vm.createContext({ fetch, URL, encodeURIComponent, Date, setTimeout, clearTimeout, ...globals });
   vm.runInContext(readFileSync('app/js/api.js', 'utf8'), context);
   return { F1Api: context.F1Api, calls };
 }
+
+// A route answer for a request that never completes.
+const HANG = Symbol('hang');
 
 // The vm has its own Object/Array prototypes; compare plain copies.
 const plain = (v) => JSON.parse(JSON.stringify(v));
@@ -111,6 +115,107 @@ test('play leaves clear streams without a license URL and reports the first erro
   assert.equal((await F1Api.play('1')).licenseUrl, '');
   const { F1Api: failing } = api((url) => ({ status: 403, body: { message: url.includes('BIG_SCREEN') ? 'first' : 'second' } }));
   await assert.rejects(failing.play('1'), /first/);
+});
+
+const HDR = { url: 'https://cdn/hdr.m3u8?token=1', streamType: 'HDR_UHD_CMAF' };
+const MASTER = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE=HLG\n2160p.m3u8\n';
+const SDR = { url: 'https://cdn/sdr.m3u8', streamType: 'SDR_HD_CMAF' };
+
+function premium(route) {
+  const result = api(route);
+  Object.assign(result.F1Api.state, { ascendon: 'ASC', entitlement: 'ENT', location: { entitlement: 'PREMIUM' } });
+  return result;
+}
+
+for (const [tier, opts] of [['PRO', { hdr: true }], ['PREMIUM', undefined], ['PREMIUM', { hdr: false }]]) {
+  test('play keeps the normal requests and result for ' + tier + ' with ' + JSON.stringify(opts), async () => {
+    const route = (url) => url.includes('/BIG_SCREEN_DASH/')
+      ? { status: 400, body: { message: 'Platform not allowed' } } : { body: { resultObj: SDR } };
+    const normal = premium(route);
+    const expected = await normal.F1Api.play('42', 'ch1');
+    const actual = premium(route);
+    actual.F1Api.state.location.entitlement = tier;
+    assert.deepEqual(plain(await actual.F1Api.play('42', 'ch1', opts)), plain(expected));
+    assert.deepEqual(plain(actual.calls), plain(normal.calls));
+    assert.equal(actual.calls.length, 2);
+    assert.ok(actual.calls.every((c) => c.init.headers['x-f1-device-info'].startsWith('device=web;')));
+  });
+}
+
+for (const key of ['', '#EXT-X-KEY:METHOD=NONE\n']) {
+  test('play accepts clear Premium HDR after checking the master' + (key ? ' with METHOD=NONE' : ''), async () => {
+    const { F1Api, calls } = premium((url) => ({ body: url === HDR.url ? MASTER + key : { resultObj: HDR } }));
+    const stream = await F1Api.play('42', 'ch1', { hdr: true });
+    assert.equal(stream.hdr, true);
+    assert.equal(stream.url, HDR.url);
+    assert.equal(stream.streamType, 'HDR_UHD_CMAF');
+    assert.equal(stream.platform, 'BIG_SCREEN_DASH');
+    assert.equal(stream.licenseUrl, '');
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].url, 'https://f1tv.formula1.com/3.0/R/ENG/BIG_SCREEN_DASH/ALL/CONTENT/PLAY?contentId=42&player=player_bm&channelId=ch1');
+    assert.deepEqual(plain(calls[0].init.headers), {
+      ascendontoken: 'ASC', entitlementtoken: 'ENT', 'x-f1-device-info': 'device=tvos;'
+    });
+    assert.equal(calls[1].url, HDR.url);
+    assert.deepEqual(plain(calls[1].init), {}); // CDN requests need no account tokens.
+  });
+}
+
+for (const [name, answer, master] of [
+  ['SDR answer', { body: { resultObj: SDR } }],
+  ['license URL', { body: { resultObj: { ...HDR, laURL: 'https://lic/fairplay' } } }],
+  ['alternate license URL', { body: { resultObj: { ...HDR, laUrl: 'https://lic/fairplay' } } }],
+  ['non-HLS URL', { body: { resultObj: { ...HDR, url: 'https://cdn/hdr.mpd' } } }],
+  ['encrypted master', { body: { resultObj: HDR } }, { body: MASTER + '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://key"\n' }],
+  ['session key', { body: { resultObj: HDR } }, { body: MASTER + '#EXT-X-SESSION-KEY:URI="skd://key",METHOD=SAMPLE-AES\n' }],
+  ['key URI containing NONE', { body: { resultObj: HDR } }, { body: MASTER + '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://key,METHOD=NONE,token"\n' }],
+  ['mixed keys', { body: { resultObj: HDR } }, { body: MASTER + '#EXT-X-KEY:METHOD=NONE\n#EXT-X-KEY:METHOD=AES-128,URI="key"\n' }],
+  ['HTTP error', { status: 403, body: { message: 'Not entitled' } }],
+  ['network error', new Error('offline')],
+  ['malformed answer', { body: '{invalid' }],
+  ['missing stream', { body: { resultObj: {} } }],
+  ['master HTTP error', { body: { resultObj: HDR } }, { status: 403, body: MASTER }],
+  ['master network error', { body: { resultObj: HDR } }, new Error('offline')],
+  ['malformed master', { body: { resultObj: HDR } }, { body: '<html>error</html>' }]
+]) {
+  test('play falls back to the unchanged platform sequence after HDR ' + name, async () => {
+    const route = (url) => url.includes('/BIG_SCREEN_DASH/')
+      ? { status: 400, body: { message: 'Platform not allowed' } } : { body: { resultObj: SDR } };
+    const normal = premium(route);
+    const expected = await normal.F1Api.play('42', 'ch1');
+    const { F1Api, calls } = premium((url, init) => {
+      const response = url === HDR.url ? master : init.headers['x-f1-device-info'] === 'device=tvos;' ? answer : route(url);
+      if (response instanceof Error) throw response;
+      return response;
+    });
+    assert.deepEqual(plain(await F1Api.play('42', 'ch1', { hdr: true })), plain(expected));
+    assert.equal(calls[0].init.headers['x-f1-device-info'], 'device=tvos;');
+    assert.deepEqual(plain(calls.slice(master ? 2 : 1)), plain(normal.calls));
+  });
+}
+
+for (const location of [null, {}, { entitlement: '' }]) {
+  test('play keeps the normal requests when the account tier is unknown: ' + JSON.stringify(location), async () => {
+    const { F1Api, calls } = premium(() => ({ body: { resultObj: SDR } }));
+    F1Api.state.location = location;
+    await F1Api.play('42', null, { hdr: true });
+    assert.ok(calls.every((c) => c.init.headers['x-f1-device-info'].startsWith('device=web;')));
+  });
+}
+
+test('a Premium HDR request that hangs gives way to the normal request after 8 s', async () => {
+  const timers = [];
+  const { F1Api, calls } = api((url, init) => (init.headers || {})['x-f1-device-info'] === 'device=tvos;'
+    ? HANG : { body: { resultObj: SDR } }, { setTimeout: (fn, ms) => timers.push({ fn, ms }), clearTimeout() {} });
+  Object.assign(F1Api.state, { ascendon: 'ASC', entitlement: 'ENT', location: { entitlement: 'PREMIUM' } });
+  const playing = F1Api.play('42', null, { hdr: true });
+  await new Promise(setImmediate);
+  assert.equal(calls.length, 1);
+  timers.find((t) => t.ms === 8000).fn();
+  const stream = await playing;
+  assert.equal(stream.url, SDR.url);
+  assert.equal(stream.hdr, undefined);
+  assert.equal(calls[1].init.headers['x-f1-device-info'].startsWith('device=web;'), true);
 });
 
 test('menu collects every entry that links to a page, however deeply nested', async () => {
@@ -208,6 +313,14 @@ test('streamInfo follows an HLS master playlist and maps positions to program da
   const t0 = Date.parse('2026-10-11T11:55:00Z') / 1000;
   assert.deepEqual(plain(info.marks), [{ pos: 0, wall: t0 }, { pos: 12, wall: t0 + 30 }]);
   assert.equal(info.epochAtZero, t0);
+  assert.equal(info.encrypted, false);
+});
+
+test('streamInfo reports keys in the variant playlist, which a clear master does not show', async () => {
+  const master = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nlow/index.m3u8\n';
+  const media = '#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://key"\n#EXTINF:6.0,\na.mp4\n#EXT-X-ENDLIST\n';
+  const { F1Api } = api((url) => ({ body: url.endsWith('/low/index.m3u8') ? media : master }));
+  assert.equal((await F1Api.streamInfo('https://cdn/race/index.m3u8')).encrypted, true);
 });
 
 test('streamInfo treats an HLS playlist without an end as live', async () => {

@@ -9,6 +9,8 @@ var F1Api = (function () {
   // Try the TV platform before the web fallback.
   var PLAY_PLATFORMS = ['BIG_SCREEN_DASH', 'WEB_DASH'];
   var PAGE_PLATFORM = 'WEB_DASH';
+  // How long the extra Premium HDR request may take before playback goes ahead without it.
+  var HDR_WAIT = 8000;
   // Playback requires this header in web-player format; 'device=tv' is rejected.
   var DEVICE_INFO = 'device=web;screen=browser;os=tizen;browser=chrome;browserVersion=76;' +
     'osVersion=6.0;appVersion=55.0.3;playerVersion=8.212.0;p=false;tms=1';
@@ -129,12 +131,12 @@ var F1Api = (function () {
     });
   }
 
-  function playOn(platform, contentId, channelId) {
+  function playOn(platform, contentId, channelId, deviceInfo) {
     var url = [BASE, state.playApi, 'R', LANG, platform, 'ALL/CONTENT/PLAY'].join('/') +
       '?contentId=' + encodeURIComponent(contentId) + '&player=player_bm' +
       (channelId ? '&channelId=' + encodeURIComponent(channelId) : '');
     var headers = authHeaders();
-    headers['x-f1-device-info'] = DEVICE_INFO;
+    headers['x-f1-device-info'] = deviceInfo || DEVICE_INFO;
     return http(url, { headers: headers }).then(function (data) {
       var r = data && data.resultObj;
       if (!r || !r.url) {
@@ -145,8 +147,40 @@ var F1Api = (function () {
     });
   }
 
+  /**
+   * Premium's 4K HDR stream, which F1 gives the Apple TV app: clear HLS with HLG and SDR variants.
+   * Null unless it is that (for Pro, or old replays, tvOS gets SDR), so the caller can fall back.
+   */
+  function playHdr(contentId, channelId) {
+    var ask = playOn(PLAY_PLATFORMS[0], contentId, channelId, 'device=tvos;').then(function (r) {
+      if (!/^HDR_/.test(r.streamType || '') || typeof r.url !== 'string' ||
+          !/\.m3u8(\?|$)/.test(r.url) || r.laURL || r.laUrl) return null;
+      // tvOS may receive FairPlay streams, which this player cannot decrypt.
+      return fetch(r.url).then(function (res) {
+        if (!res.ok) return null;
+        return res.text().then(function (master) {
+          if (!/^#EXTM3U\s/.test(master) || hasKeys(master)) return null;
+          r.hdr = true;
+          return r;
+        });
+      });
+    }).catch(function () { return null; });
+    // Never let the extra request hold up playback.
+    return new Promise(function (resolve) {
+      var timer = setTimeout(function () { resolve(null); }, HDR_WAIT);
+      ask.then(function (r) { clearTimeout(timer); resolve(r); });
+    });
+  }
+
+  /** True when an HLS playlist has a key other than METHOD=NONE (the variant playlists can have them too). */
+  function hasKeys(playlist) {
+    return (playlist.match(/^#EXT-X-(?:SESSION-)?KEY:.*$/gm) || []).some(function (key) {
+      return !/[:,]\s*METHOD=NONE\s*(?:,|$)/.test(key.replace(/"[^"]*"/g, ''));
+    });
+  }
+
   /** Resolves the manifest URL, license URL and required license headers. */
-  function play(contentId, channelId) {
+  function play(contentId, channelId, opts) {
     var i = 0;
     var firstErr = null;
     function next() {
@@ -157,7 +191,10 @@ var F1Api = (function () {
         return next();
       });
     }
-    return next().then(function (r) {
+    // Only for Premium: Pro accounts, and accounts whose tier is unknown, keep exactly today's request.
+    var request = opts && opts.hdr && /^PREMIUM/i.test((state.location && state.location.entitlement) || '')
+      ? playHdr(contentId, channelId).then(function (r) { return r || next(); }) : next();
+    return request.then(function (r) {
       var la = r.laURL || r.laUrl || '';
       if (!la && /WV/i.test(r.streamType || '')) {
         // Newer VODs omit laURL; the web player falls back to this endpoint.
@@ -171,13 +208,15 @@ var F1Api = (function () {
         'x-f1-device-info': DEVICE_INFO
       };
       if (r.drmToken) licenseHeaders.customdata = r.drmToken;
-      return {
+      var stream = {
         url: r.url,
         streamType: r.streamType || '',
         platform: r.platform,
         licenseUrl: la,
         licenseHeaders: licenseHeaders
       };
+      if (r.hdr) stream.hdr = true;
+      return stream;
     });
   }
 
@@ -326,7 +365,7 @@ var F1Api = (function () {
       });
       var live = !/#EXT-X-ENDLIST/.test(playlist) && !/PLAYLIST-TYPE:VOD/.test(playlist);
       return { dynamic: live, windowStart: 0, windowEnd: pos, delay: 25, marks: marks,
-        epochAtZero: marks.length ? marks[0].wall - marks[0].pos : 0 };
+        epochAtZero: marks.length ? marks[0].wall - marks[0].pos : 0, encrypted: hasKeys(playlist) };
     });
   }
 

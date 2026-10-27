@@ -20,6 +20,8 @@ const vm = require('vm');
 const ROOT = path.join(__dirname, '..');
 const DATA = process.env.DATA_DIR || path.join(__dirname, 'data');
 const SESSIONS = /^(Practice [123]|Qualifying|Sprint Qualifying|Sprint|Race)$/;
+// Reports each change once; two different changes in a row must both notify.
+const OFFER_CHECK = 'what F1 offers (changes)';
 
 const read = (f) => fs.readFileSync(path.join(ROOT, f), 'utf8');
 
@@ -61,6 +63,13 @@ function timingWorker(sessionPath, token) {
   const self = { postMessage: (m) => messages.push(m) };
   const ctx = vm.createContext({ self, fetch, console, setTimeout, clearTimeout, setInterval, clearInterval, Date, JSON, Math });
   vm.runInContext(read('app/js/timing-worker.js'), ctx, { filename: 'timing-worker.js' });
+  // Observe the first heartbeat without changing how the worker builds its median clock.
+  let firstHeartbeat = null;
+  const handleLine = ctx.handleLine;
+  ctx.handleLine = (feed, line) => {
+    if (feed === 'Heartbeat' && firstHeartbeat == null) firstHeartbeat = heartbeatBase(line);
+    handleLine(feed, line);
+  };
   self.onmessage({ data: { cmd: 'load', path: sessionPath, token, live: false } });
   return new Promise((resolve, reject) => {
     const started = Date.now();
@@ -69,7 +78,8 @@ function timingWorker(sessionPath, token) {
       if (m && m.type === 'error') return reject(new Error(m.message));
       if (m) {
         let id = 0;
-        return resolve({ info: m.info, base: ctx.job.base, snaps: ctx.job.snaps, query: (t) => {
+        return resolve({ info: m.info, base: ctx.job.base, startedAt: ctx.job.startedAt,
+          firstHeartbeat, snaps: ctx.job.snaps, query: (t) => {
           self.onmessage({ data: { cmd: 'query', id: ++id, t } });
           return messages.find((x) => x.type === 'state' && x.id === id).state;
         } });
@@ -117,6 +127,82 @@ function sencCount(buf) {
   return i < 4 || i + 12 > buf.length ? null : buf.readUInt32BE(i + 8);
 }
 
+/** HLG video sizes, largest first; quoted CODECS attributes can contain commas. */
+function hlgVariants(master) {
+  const variants = [];
+  for (const line of master.split(/\r?\n/)) {
+    if (!line.startsWith('#EXT-X-STREAM-INF:')) continue;
+    const attrs = {};
+    for (const [, key, value] of line.slice(18).matchAll(/(?:^|,)\s*([\w-]+)=("[^"]*"|[^,]*)/g)) {
+      attrs[key] = value.replace(/^"|"$/g, '').trim();
+    }
+    const size = /^(\d+)x(\d+)$/.exec(attrs.RESOLUTION || '');
+    if (attrs['VIDEO-RANGE'] === 'HLG' && size && +size[1] > 0 && +size[2] > 0) {
+      variants.push({ width: +size[1], height: +size[2] });
+    }
+  }
+  return variants.sort((a, b) => b.width * b.height - a.width * a.height);
+}
+
+/** UTC milliseconds at offset zero according to one heartbeat. */
+function heartbeatBase(line) {
+  const m = /^(\d{2}):(\d{2}):(\d{2})\.(\d{3})/.exec(line);
+  if (!m) return null;
+  try {
+    const utc = Date.parse(JSON.parse(line.slice(12)).Utc);
+    return Number.isFinite(utc) ? utc - ((+m[1] * 60 + +m[2]) * 60 + +m[3]) * 1000 - +m[4] : null;
+  } catch (e) { return null; }
+}
+
+/** Keep capabilities, not replay ids or expiring URLs, so ordinary new replays don't alert. */
+function offerSnapshot(video, devices) {
+  const enabled = (video.liveNow || {}).enabled || {};
+  return {
+    devices,
+    liveNow: Object.keys(enabled).filter((p) => enabled[p] === true).sort(),
+    videoKeys: Object.keys(video).sort(),
+    feeds: [...new Set(((video.metadata || {}).additionalStreams || []).map((s) => s.identifier).filter(Boolean))].sort(),
+    playbackOffsetsVersion: video.playbackOffsetsVersion ?? null
+  };
+}
+
+/** Readable changes between two capability snapshots; no timestamps or ordering noise. */
+function offerDiff(before, after) {
+  const changes = [];
+  for (const device of [...new Set([...Object.keys(before.devices), ...Object.keys(after.devices)])].sort()) {
+    if (before.devices[device] !== after.devices[device]) {
+      changes.push(`${device}: ${before.devices[device] ?? 'missing'} → ${after.devices[device] ?? 'missing'}`);
+    }
+  }
+  for (const key of ['liveNow', 'videoKeys', 'feeds']) {
+    const added = after[key].filter((v) => !before[key].includes(v)).sort();
+    const removed = before[key].filter((v) => !after[key].includes(v)).sort();
+    if (key === 'videoKeys') {
+      if (added.length) changes.push('new video keys: ' + added.join(', '));
+      if (removed.length) changes.push('removed video keys: ' + removed.join(', '));
+    } else {
+      const parts = [];
+      if (added.length) parts.push('+ ' + added.join(', '));
+      if (removed.length) parts.push('- ' + removed.join(', '));
+      if (parts.length) changes.push(key + ': ' + parts.join('; '));
+    }
+  }
+  if (before.playbackOffsetsVersion !== after.playbackOffsetsVersion) {
+    changes.push(`playbackOffsetsVersion: ${before.playbackOffsetsVersion} → ${after.playbackOffsetsVersion}`);
+  }
+  return changes;
+}
+
+async function archiveSessions(token) {
+  const year = new Date().getUTCFullYear();
+  const r = await fetch(`https://livetiming.formula1.com/static/${year}/Index.json`, { headers: { Authorization: 'Bearer ' + token } });
+  need(r.ok, 'Index.json answered HTTP ' + r.status);
+  const index = JSON.parse((await r.text()).replace(/^\uFEFF/, ''));
+  const sessions = [];
+  index.Meetings.forEach((m) => (m.Sessions || []).forEach((s) => { if (s.Path && SESSIONS.test(s.Name)) sessions.push(s); }));
+  return sessions;
+}
+
 async function text(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + url.split('?')[0].slice(0, 80));
@@ -130,11 +216,11 @@ async function runChecks() {
   const results = [];
   // Rate limits, server errors and network blips get one retry a minute later before they count.
   const transient = /HTTP (429|5\d\d)|fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up/;
-  const check = async (name, fn) => {
+  const check = async (name, fn, retry = true) => {
     for (let attempt = 1; ; attempt++) {
       try { return results.push({ name, ok: true, detail: (await fn()) || '' }); }
       catch (e) {
-        if (attempt === 1 && transient.test(e.message)) { await new Promise((r) => setTimeout(r, +process.env.RETRY_WAIT || 60000)); continue; }
+        if (retry && attempt === 1 && transient.test(e.message)) { await new Promise((r) => setTimeout(r, +process.env.RETRY_WAIT || 60000)); continue; }
         return results.push({ name, ok: false, detail: e.message });
       }
     }
@@ -240,25 +326,38 @@ async function runChecks() {
     need(token && replay, 'needs sign-in and a replay');
     stream = await F1Api.play(replay.contentId);
     need(stream.platform === 'BIG_SCREEN_DASH', `the TV platform was refused; fell back to ${stream.platform}`);
-    need(stream.licenseUrl, 'no licence URL for an encrypted stream');
-    return `${replay.title}: ${stream.streamType}`;
+    const hls = /\.m3u8(\?|$)/.test(stream.url);
+    need(hls || stream.licenseUrl, 'no licence URL for an encrypted stream');
+    return `${replay.title}: ${stream.streamType}, ${hls ? 'hls' : 'dash'}`;
   });
 
   await check('stream manifest and clock', async () => {
     need(stream, 'needs a stream');
     const info = await F1Api.streamInfo(stream.url);
+    if (/\.m3u8(\?|$)/.test(stream.url)) {
+      need(info.marks && info.marks.length > 0, 'no program date-times in HLS (tower and seeking break)');
+    }
     need(info.epochAtZero > 1e9, 'the video timeline no longer maps to real time (tower and seeking break)');
     need(info.windowEnd > info.windowStart, 'empty timeline');
-    return `${info.dynamic ? 'live' : 'replay'}, ${Math.round(info.windowEnd - info.windowStart)} s, ${info.segDur} s segments`;
+    return `${info.dynamic ? 'live' : 'replay'}, ${Math.round(info.windowEnd - info.windowStart)} s` +
+      (info.segDur ? `, ${info.segDur} s segments` : '');
   });
 
+  const live = schedule && schedule.events.find((e) => e.subtype === 'LIVE');
   await check('audio fix (senc sample count)', async () => {
-    need(stream, 'needs a stream');
-    const mpd = await text(stream.url);
-    const rewritten = svc.preferLanguages(svc.rewriteManifest(mpd, stream.url), { audio: 'eng' });
+    need(stream || (live && token), 'needs a replay stream or a live broadcast and sign-in');
+    let audio = stream;
+    if (!audio || /\.m3u8(\?|$)/.test(audio.url)) {
+      if (!live) return 'replays are clear HLS; the fix is checked while something is live';
+      need(token, 'needs sign-in for the live stream');
+      audio = await F1Api.play(live.contentId);
+    }
+    need(/\.mpd(\?|$)/.test(audio.url) && audio.licenseUrl, 'needs an encrypted DASH stream to check the audio fix');
+    const mpd = await text(audio.url);
+    const rewritten = svc.preferLanguages(svc.rewriteManifest(mpd, audio.url), { audio: 'eng' });
     need(/contentType="audio"[^>]*lang="eng[^"]*"[^>]*><BaseURL>http:\/\/127\.0\.0\.1/.test(rewritten) ||
       /contentType="audio"[^>]*><BaseURL>http:\/\/127\.0\.0\.1/.test(rewritten), 'audio sets were not routed through the service');
-    const url = audioSegmentUrl(mpd, stream.url);
+    const url = audioSegmentUrl(mpd, audio.url);
     need(url, 'could not find an audio segment in the manifest');
     const r = await fetch(url);
     need(r.ok, 'audio segment answered HTTP ' + r.status);
@@ -273,12 +372,7 @@ async function runChecks() {
 
   await check('timing archive', async () => {
     need(token, 'needs sign-in');
-    const year = new Date().getUTCFullYear();
-    const r = await fetch(`https://livetiming.formula1.com/static/${year}/Index.json`, { headers: { Authorization: 'Bearer ' + token } });
-    need(r.ok, 'Index.json answered HTTP ' + r.status);
-    const index = JSON.parse((await r.text()).replace(/^﻿/, ''));
-    const sessions = [];
-    index.Meetings.forEach((m) => (m.Sessions || []).forEach((s) => { if (s.Path && SESSIONS.test(s.Name)) sessions.push(s); }));
+    const sessions = await archiveSessions(token);
     const last = sessions.pop();
     need(last, 'no sessions in the archive index');
     const w = await timingWorker(last.Path, token);
@@ -292,6 +386,68 @@ async function runChecks() {
     return `${last.Name} (${last.Path.split('/')[1]}): ${st.standings.length} drivers, ${timed} with times`;
   });
 
+  await check('race start in the timing data', async () => {
+    need(token, 'needs sign-in');
+    const last = (await archiveSessions(token)).filter((s) => /^(Race|Sprint)$/.test(s.Name)).pop();
+    need(last, 'no Race or Sprint in the archive index');
+    const w = await timingWorker(last.Path, token);
+    need(Number.isFinite(w.startedAt) && w.startedAt > 0, 'no race start in SessionData (tower cannot show lights out)');
+    const before = w.query(w.startedAt - 60000), after = w.query(w.startedAt + 60000);
+    need(before && before.beforeStart === true, 'tower thinks the race has started a minute before lights out');
+    need(after && after.beforeStart === false && after.lap >= 1, 'tower has no racing lap a minute after lights out');
+    const off = w.firstHeartbeat == null ? null : Math.round(Math.abs(w.firstHeartbeat - w.base) / 1000);
+    return `${last.Name} (${last.Path.split('/')[1]}): lap ${after.lap} after lights out; ` +
+      (off == null ? 'first heartbeat could not be read' : `first heartbeat ${off} s off` + (off > 1 ? ' (buffered burst)' : ''));
+  });
+
+  await check('4K HDR (Premium)', async () => {
+    need(token && F1Api.state.entitlement, 'needs sign-in');
+    if ((F1Api.state.location || {}).entitlement === 'PRO') return 'Pro account: no HDR to check';
+    need(replay, 'needs a replay');
+    const hdr = await F1Api.play(replay.contentId, null, { hdr: true });
+    need(hdr.hdr === true, 'the app has fallen back to SDR for Premium');
+    const variants = hlgVariants(await text(hdr.url));
+    need(variants.length, 'no HLG video variants (Premium HDR is missing)');
+    const sdr = stream || await F1Api.play(replay.contentId);
+    const hdrInfo = await F1Api.streamInfo(hdr.url), sdrInfo = await F1Api.streamInfo(sdr.url);
+    need(!hdrInfo.encrypted, 'the HDR variant playlists are encrypted (the app falls back to SDR)');
+    need(variants[0].height >= 2160, `HDR tops out at ${variants[0].width}x${variants[0].height}: no more 4K`);
+    need(hdrInfo.epochAtZero > 1e9 && sdrInfo.epochAtZero > 1e9, 'HDR or SDR has no video clock (tower cannot sync)');
+    const offset = Math.abs(hdrInfo.epochAtZero - sdrInfo.epochAtZero);
+    need(offset <= 1, `HDR and SDR clocks differ by ${offset.toFixed(1)} s (tower is out of sync)`);
+    return `${replay.title}: HLG ${variants[0].width}x${variants[0].height}; SDR clock within ${offset.toFixed(1)} s`;
+  });
+
+  await check(OFFER_CHECK, async () => {
+    need(token && F1Api.state.entitlement && replay, 'needs sign-in and a replay');
+    const video = await F1Api.video(replay.contentId);
+    const devices = {};
+    const url = `https://f1tv.formula1.com/${F1Api.state.playApi}/R/ENG/BIG_SCREEN_DASH/ALL/CONTENT/PLAY` +
+      `?contentId=${encodeURIComponent(replay.contentId)}&player=player_bm`;
+    for (const device of ['web', 'tvos', 'android_tv', 'ios', 'chromecast']) {
+      // Probe directly: play() would hide rejected devices behind its SDR/web fallback.
+      const deviceInfo = device === 'web'
+        ? 'device=web;screen=browser;os=tizen;browser=chrome;browserVersion=76;osVersion=6.0;appVersion=55.0.3;playerVersion=8.212.0;p=false;tms=1'
+        : `device=${device};`;
+      try {
+        const data = await F1Api.http(url, { headers: {
+          ascendontoken: F1Api.state.ascendon, entitlementtoken: F1Api.state.entitlement, 'x-f1-device-info': deviceInfo
+        } });
+        need(data && data.resultObj && data.resultObj.streamType, (data && data.message) || 'no streamType returned');
+        devices[device] = data.resultObj.streamType;
+      } catch (e) { devices[device] = 'error: ' + e.message; }
+    }
+    const snapshot = offerSnapshot(video, devices), file = path.join(DATA, 'offer.json');
+    let previous = null;
+    try { previous = JSON.parse(fs.readFileSync(file, 'utf8')); }
+    catch (e) { if (e.code !== 'ENOENT') throw e; }
+    const changes = previous ? offerDiff(previous, snapshot) : [];
+    fs.mkdirSync(DATA, { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(snapshot, null, 1), { mode: 0o600 });
+    need(!changes.length, changes.join('; '));
+    return previous ? 'no changes' : 'baseline saved';
+  }, false); // A saved change containing "HTTP 500" must still alert once, not pass on retry.
+
   await check('driver headshots and colours', async () => {
     need(token, 'needs sign-in');
     const info = await Stats.driverInfo(token);
@@ -300,7 +456,6 @@ async function runChecks() {
     return `${n} drivers`;
   });
 
-  const live = schedule && schedule.events.find((e) => e.subtype === 'LIVE');
   if (live && token) {
     await check('live stream and time-shift', async () => {
       const s = await F1Api.play(live.contentId);
@@ -330,10 +485,15 @@ async function notify(title, body) {
   if (!r.ok) console.error('notification failed: HTTP ' + r.status);
 }
 
+/** What identifies each failure for notifications: its name; for the changes check, also what changed. */
+function failingKeys(results) {
+  return results.filter((r) => !r.ok).map((r) => (r.name === OFFER_CHECK ? `${r.name}: ${r.detail}` : r.name));
+}
+
 /** Notifies when the set of failing checks changes (or every run with NOTIFY_ON=always). */
 async function runAndNotify() {
   const results = await runChecks();
-  const failing = results.filter((r) => !r.ok).map((r) => r.name);
+  const failing = failingKeys(results);
   const stateFile = path.join(DATA, 'state.json');
   let previous = null;
   try { previous = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch (e) { /* first run */ }
@@ -370,4 +530,4 @@ async function main(mode) {
 
 if (require.main === module) main(process.argv[2]).catch((e) => { console.error(e); process.exitCode = 1; });
 
-module.exports = { audioSegmentUrl, sencCount };
+module.exports = { audioSegmentUrl, sencCount, hlgVariants, heartbeatBase, offerSnapshot, offerDiff, timingWorker, failingKeys };

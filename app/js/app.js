@@ -1147,8 +1147,18 @@
     loadFeed(i, opts).then(done, done);
   }
 
+  function hdrWanted() {
+    return !feedsCtx.live && !feedsCtx.hdrFailed && Player.hdrCapable();
+  }
+
+  function feedLabel(stream) {
+    var title = feedsCtx.feeds.length > 1 ? feedsCtx.feeds[feedsCtx.index].title : '';
+    return title + (stream && stream.hdr ? (title ? ' · HDR' : 'HDR') : '');
+  }
+
   function loadFeed(i, opts) {
     opts = opts || {};
+    var ctx = feedsCtx;
     var f = feedsCtx.feeds[i];
     var playing = screen === 'player' && Player.engineName();
     var from = opts.switching && playing ? { wall: Player.wallClock(Player.position()), at: Date.now() } : null;
@@ -1159,13 +1169,13 @@
       scrub = null;
       $('osd-title').textContent = feedsCtx.title;
       $('osd-event').textContent = feedsCtx.event;
-      $('osd-feed').textContent = feedsCtx.feeds.length > 1 ? f.title : '';   // one feed: no need to name it
+      $('osd-feed').textContent = feedLabel();
       if (from) toast('Switching to ' + (f.full || f.title) + '…', 2500);
       else $('spinner').classList.remove('hidden');
       showOsd();
       var stream;
       return (from ? Promise.resolve() : Player.unload())
-        .then(function () { return F1Api.play(feedsCtx.contentId, f.channelId); })
+        .then(function () { return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted() }); })
         .then(function (s) {
           stream = s;
           stream.live = feedsCtx.live;
@@ -1175,6 +1185,9 @@
         .then(function () {
           // Superseded by a newer request, or the viewer left the player while it loaded.
           if (feedsCtx.index !== i || queuedFeed || screen !== 'player') return;
+          // Keys in the variant playlist: not playable here; the catch below falls back to SDR.
+          if (stream.hdr && stream.info && stream.info.encrypted) throw new Error('encrypted HDR stream');
+          $('osd-feed').textContent = feedLabel(stream);
           var start = startPosition(stream.info, opts, from);
           // Live (dynamic) streams on AVPlay can't seek at start-up; instead the local service
           // time-shifts the manifest so the player's own live edge lies at the chosen moment
@@ -1199,7 +1212,13 @@
         })
         .catch(function (e) {
           $('spinner').classList.add('hidden');
-          if (e && e.message === 'cancelled') return;
+          if (feedsCtx !== ctx || (e && e.message === 'cancelled')) return;
+          if (stream && stream.hdr && !feedsCtx.hdrFailed) {
+            feedsCtx.hdrFailed = true;
+            // Queue the SDR retry behind this load; a newer feed request still wins.
+            if (!queuedFeed && screen === 'player') playFeed(i, opts);
+            return;
+          }
           if (F1Api.isNotStarted(e)) {
             stopPlayer();
             return toast(feedsCtx.title + (feedsCtx.start ? ' starts ' + when(feedsCtx.start) + '.' : ' hasn\'t started yet.'), 8000);
@@ -1209,18 +1228,24 @@
     });
   }
 
-  /** Retry once if playback hasn't started after 15 s. */
+  /**
+   * Retry once if playback hasn't started after 15 s; an HDR stream gets 25 s, since its first
+   * segments have taken ~20 s when the CDN had to fetch them, and its retry falls back to SDR.
+   */
   function watchStart(stream) {
-    var from = Player.position();
+    var from = Player.position(), ctx = feedsCtx;
     setTimeout(function () {
+      // A newer load or another video has taken over; it has its own watch.
+      if (feedsCtx !== ctx || loadingFeed) return;
       if (screen !== 'player' || Player.stream() !== stream || Player.isPaused() || stream.retried) return;
       if (Player.position() > from + 0.5) return;
       toast('The video didn\'t start, trying again…', 3000);
       // Through playFeed so it queues behind any other load instead of racing it.
       var wall = Player.wallClock(from);
+      if (stream.hdr) feedsCtx.hdrFailed = true;
       playFeed(feedsCtx.index, Player.isLive() ? (wall ? { liveAt: wall, retry: true } : { retry: true })
         : { startAt: from || null, retry: true });
-    }, 15000);
+    }, stream.hdr ? 25000 : 15000);
   }
 
   // Seconds a feed switch takes; the new feed starts this far ahead so it lines up. Learned per switch.
@@ -1302,9 +1327,8 @@
     $('osd-pos').textContent = cur.clock ? cur.clock + (live ? '' : '  ·  ' + cur.main) : cur.main;
     $('osd-dur').textContent = live ? (behind ? cur.main + ' behind live' : '') : fmtTime(span);
 
-    var f = feedsCtx && feedsCtx.feeds.length > 1 && feedsCtx.feeds[feedsCtx.index];
     var info = Timing.label(timingState);
-    $('osd-feed').textContent = [f ? f.title : '', info].filter(Boolean).join('  ·  ');
+    $('osd-feed').textContent = [feedsCtx ? feedLabel(Player.stream()) : '', info].filter(Boolean).join('  ·  ');
 
     var marker = $('osd-marker'), bubble = $('osd-bubble');
     var shown = scrub || pending;

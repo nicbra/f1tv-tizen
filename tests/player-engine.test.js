@@ -41,30 +41,32 @@ function fakeAvPlay({ liveWindow = '', duration = 0 } = {}) {
 }
 
 /** Loads the real settings, service launcher and player with a fake AVPlay and Shaka. shakaLoad: Shaka's load(). */
-async function player(av, storage, shakaLoad) {
+async function player(av, storage, shakaLoad, globals) {
   const store = Object.assign({}, storage);
+  const configs = [];
   class ShakaPlayer {
     attach() { return Promise.resolve(); }
     resetConfiguration() {}
-    configure() {}
-    load() { return shakaLoad ? shakaLoad() : Promise.reject(new Error('no stream')); }
+    configure(config) { configs.push(config); }
+    load(url, start) { return shakaLoad ? shakaLoad(url, start) : Promise.reject(new Error('no stream')); }
     getNetworkingEngine() { return { registerRequestFilter() {} }; }
     addEventListener() {}
     unload() { return Promise.resolve(); }
   }
-  const context = vm.createContext({
+  const context = vm.createContext(Object.assign({
     webapis: { avplay: av },
     shaka: { polyfill: { installAll() {} }, Player: ShakaPlayer, net: { NetworkingEngine: { RequestType: {} } }, util: { Error: { Category: {} } } },
     document: { body: el() },
     localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } },
     fetch: async () => ({ ok: true }), // the stream helper service answers its ping
     setTimeout, clearTimeout, Date, Math, JSON, Promise, encodeURIComponent
-  });
+  }, globals));
   for (const f of ['settings.js', 'proxy.js', 'player.js']) vm.runInContext(readFileSync('app/js/' + f, 'utf8'), context);
   const second = el();
   const video = Object.assign(el(), { cloneNode: () => second, parentNode: { insertBefore() {} } });
   await context.Player.init(video, el());
   context.Player.videos = [video, second];
+  context.Player.configs = configs;
   return context.Player;
 }
 
@@ -151,6 +153,48 @@ test('clear multi-feed replays play on Shaka; clear single-feed videos on AVPlay
   assert.equal(av.calls.find((c) => c[0] === 'open')[1], clear.url);
 });
 
+test('HDR uses Shaka even for a single feed, selecting HLG and resetting to AUTO for SDR', async () => {
+  const P = await player(fakeAvPlay(), undefined, () => Promise.resolve());
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); v.paused = false; });
+  const stream = { url: 'https://cdn/hdr.m3u8', hdr: true, multiFeed: false, info: { dynamic: false } };
+  await P.load(stream, null);
+  assert.equal(P.engineName(), 'shaka');
+  assert.equal(P.configs.at(-1).preferredVideoHdrLevel, 'HLG');
+  await P.load({ ...stream, hdr: undefined, multiFeed: true }, null);
+  assert.equal(P.configs.at(-1).preferredVideoHdrLevel, 'AUTO');
+  P.forceEngine = 'avplay';
+  await P.load(stream, null);
+  assert.equal(P.engineName(), 'avplay');
+});
+
+test('HDR capability requires TV HDR and HEVC support and caches the result', async () => {
+  let tvChecks = 0, codecChecks = 0;
+  const P = await player(fakeAvPlay(), undefined, undefined, {
+    webapis: { avinfo: { isHdrTvSupport: () => { tvChecks++; return true; } } },
+    MediaSource: { isTypeSupported: (type) => { codecChecks++; assert.equal(type, 'video/mp4; codecs="hvc1.2.4.L153.B0"'); return true; } }
+  });
+  assert.equal(P.hdrCapable(), true);
+  assert.equal(P.hdrCapable(), true);
+  assert.equal(tvChecks, 1);
+  assert.equal(codecChecks, 1);
+});
+
+for (const [name, webapis, MediaSource] of [
+  ['missing webapis', undefined, { isTypeSupported: () => true }],
+  ['missing avinfo', {}, { isTypeSupported: () => true }],
+  ['throwing avinfo', { avinfo: { isHdrTvSupport() { throw new Error('unsupported'); } } }, { isTypeSupported: () => true }],
+  ['SDR TV', { avinfo: { isHdrTvSupport: () => false } }, { isTypeSupported: () => true }],
+  ['missing MediaSource', { avinfo: { isHdrTvSupport: () => true } }, undefined],
+  ['unsupported HEVC', { avinfo: { isHdrTvSupport: () => true } }, { isTypeSupported: () => false }],
+  ['throwing MediaSource', { avinfo: { isHdrTvSupport: () => true } }, { isTypeSupported() { throw new Error('unsupported'); } }]
+]) {
+  test('HDR capability is false for ' + name, async () => {
+    const P = await player(fakeAvPlay(), undefined, undefined, { webapis, MediaSource });
+    assert.equal(P.hdrCapable(), false);
+    assert.equal(P.hdrCapable(), false);
+  });
+}
+
 test('a Shaka video that plays to its end reports it; the idle preload slot does not', async () => {
   const P = await player(fakeAvPlay());
   let ended = 0;
@@ -188,4 +232,57 @@ test('unloading waits for preparation, then stops and closes the native player',
   const order = names(av);
   assert.ok(order.indexOf('stop') > order.indexOf('prepareAsync'), order.join());
   assert.ok(order.indexOf('close') > order.indexOf('stop'));
+});
+
+test('an HDR video frozen on its first frame is loaded once more; one that plays is left alone', async () => {
+  for (const [frames, hdr, reloads] of [[0, true, 1], [25, true, 0], [0, false, 0]]) {
+    let loads = 0;
+    const timers = [];
+    const P = await player(fakeAvPlay(), undefined, () => { loads++; return Promise.resolve(); },
+      { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return 0; } });
+    P.forceEngine = 'shaka';
+    Object.assign(P.videos[0], { readyState: 4, play: () => Promise.resolve(), getVideoPlaybackQuality: () => ({ totalVideoFrames: frames }) });
+    await P.load({ url: 'https://cdn/hdr.m3u8', licenseUrl: '', multiFeed: true, hdr, info: { dynamic: false } }, 30);
+    const check = timers.find((t) => t.ms === 5000);
+    assert.equal(!!check, hdr);
+    if (check) check.fn();
+    await new Promise(setImmediate);
+    assert.equal(loads, 1 + reloads);
+  }
+});
+
+test('the frozen-HDR reload stands down after a stop, starts from a seek, and does not undo a pause', async () => {
+  const setup = async () => {
+    const loads = [], timers = [];
+    let release = null;
+    const P = await player(fakeAvPlay(), undefined, (url, start) => {
+      loads.push(start);
+      return loads.length === 1 ? Promise.resolve() : new Promise((r) => { release = r; });
+    }, { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return 0; } });
+    P.forceEngine = 'shaka';
+    let plays = 0;
+    Object.assign(P.videos[0], { readyState: 4, currentTime: 0, play: () => { plays++; return Promise.resolve(); },
+      pause() {}, getVideoPlaybackQuality: () => ({ totalVideoFrames: 0 }) });
+    await P.load({ url: 'https://cdn/hdr.m3u8', licenseUrl: '', multiFeed: true, hdr: true, info: { dynamic: false } }, 30);
+    return { P, loads, check: timers.find((t) => t.ms === 5000), plays: () => plays, release: () => release && release() };
+  };
+  // Stopped just before the check: no reload.
+  let t = await setup();
+  await t.P.unload();
+  t.check.fn();
+  assert.deepEqual(t.loads, [30]);
+  // Sought to 120 while frozen: the reload starts there.
+  t = await setup();
+  t.P.videos[0].currentTime = 120;
+  t.check.fn();
+  assert.deepEqual(t.loads, [30, 120]);
+  // Paused while the reload loads: it stays paused.
+  t = await setup();
+  t.P.videos[0].currentTime = 30;
+  t.check.fn();
+  const before = t.plays();
+  t.P.togglePause();
+  t.release();
+  await new Promise(setImmediate);
+  assert.equal(t.plays(), before);
 });

@@ -9,11 +9,14 @@ It checks:
 - **without signing in:** the API config, the menu, the season calendar, the weekend schedule,
   video details and onboard feeds, the links from pre-shows to sessions to post-shows, the
   standings from jolpica, and F1's live timing connection;
-- **signed in:** renewing the sign-in, the play API on the TV platform, the stream manifest and
-  its mapping to real time, the live audio fix (it downloads a real audio segment and runs the TV
-  service's fix on it), the timing archive (it loads the latest session with the app's timing
-  code), driver headshots and colours, and, while something is live, the live stream and
-  time-shifting.
+- **signed in:** renewing the sign-in, HLS or DASH playback on the TV platform, the manifest's
+  clock (including HLS program date-times), Premium HLG HDR resolution and its match to the SDR
+  clock, the audio fix on encrypted DASH (during live broadcasts while replays are clear HLS),
+  the latest timing archive session and Race/Sprint start, driver headshots and colours, and,
+  while something is live, the live stream and time-shifting;
+- **what F1 offers (changes):** device stream types, enabled platforms, video fields, feeds and
+  playback offset versions. Reports anything new F1 starts offering, or removes, once, then
+  saves the new baseline in `DATA_DIR/offer.json` so the next unchanged run passes again.
 
 ## Set up
 
