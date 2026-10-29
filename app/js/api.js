@@ -237,6 +237,36 @@ var F1Api = (function () {
     });
   }
 
+  /** The channel a feed plays: the one its playbackUrl names, or null for the video's main stream. */
+  function feedChannel(s) {
+    if (typeof s.playbackUrl !== 'string') return s.channelId || null;
+    var m = /[?&]channelId=([^&]+)/.exec(s.playbackUrl);
+    // Only INTERNATIONAL is the main stream; an onboard always has a channel of its own.
+    return m ? decodeURIComponent(m[1]) : s.type === 'obc' ? s.channelId || null : null;
+  }
+
+  /**
+   * A video's feeds, its main stream first: [{ title, type, channelId, hex, full, num }].
+   * INTERNATIONAL's playbackUrl names no channel: it is the main stream, and F1 rejects its channelId
+   * (1025) for most replays, so it names the first entry instead of being listed twice.
+   */
+  function feedsFrom(m) {
+    var main = { title: 'Main feed', type: 'Broadcast', channelId: null };
+    var feeds = [main];
+    ((m && m.additionalStreams) || []).forEach(function (s) {
+      var name = s.title || s.reportingName || (s.driverFirstName && (s.driverFirstName + ' ' + s.driverLastName)) || 'Feed';
+      var channelId = feedChannel(s);
+      if (!channelId) {
+        if (s.type !== 'obc' && main.title === 'Main feed' && !/^main/i.test(name)) main.title = name;
+        return;
+      }
+      feeds.push({ title: name, type: s.type === 'obc' ? (s.teamName || 'Onboard') : '', channelId: channelId, hex: s.hex || '',
+        full: s.driverFirstName ? s.driverFirstName + ' ' + s.driverLastName : '',
+        num: s.type === 'obc' && s.racingNumber != null ? String(s.racingNumber) : '' });
+    });
+    return feeds;
+  }
+
   function toMs(v) {
     if (v == null || v === '') return null;
     if (typeof v === 'number') return v;
@@ -312,8 +342,19 @@ var F1Api = (function () {
    * { dynamic, windowStart, windowEnd, epochAtZero (unix seconds at position 0), delay }.
    * F1's media timeline counts Unix time, so positions map to real clock time.
    */
+  /** A manifest's text; an error page (a CDN 503, say) is a failure, not a manifest. */
+  function manifest(url, re) {
+    return fetch(url).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.text();
+    }).then(function (text) {
+      if (!re.test(text)) throw new Error('Not a manifest');
+      return text;
+    });
+  }
+
   function dashInfo(url) {
-    return fetch(url).then(function (r) { return r.text(); }).then(function (mpd) {
+    return manifest(url, /<MPD\b/).then(function (mpd) {
       var attr = function (re) { var m = re.exec(mpd); return m ? m[1] : null; };
       var dynamic = attr(/<MPD\b[^>]*\stype="(\w+)"/) === 'dynamic';
       var periodStart = isoSeconds(attr(/<Period\b[^>]*\sstart="([^"]+)"/));
@@ -344,12 +385,11 @@ var F1Api = (function () {
    * which give the real clock time of segments; marks maps player positions to Unix seconds.
    */
   function hlsInfo(url) {
-    return fetch(url).then(function (r) { return r.text(); }).then(function (master) {
+    return manifest(url, /^\s*#EXTM3U/).then(function (master) {
       var lines = master.split('\n');
       for (var i = 0; i < lines.length - 1; i++) {
         if (lines[i].indexOf('#EXT-X-STREAM-INF') === 0) {
-          var media = new URL(lines[i + 1].trim(), url).toString();
-          return fetch(media).then(function (r) { return r.text(); });
+          return manifest(new URL(lines[i + 1].trim(), url).toString(), /^\s*#EXTM3U/);
         }
       }
       return master;
@@ -427,6 +467,7 @@ var F1Api = (function () {
     video: video,
     play: play,
     menu: menu,
+    feedsFrom: feedsFrom,
     scheduleFrom: scheduleFrom,
     seasonFrom: seasonFrom,
     streamInfo: streamInfo,

@@ -135,6 +135,8 @@ var Auth = (function () {
           if (cancelled) return;
           accountPost('/v1/account/Subscriber/RetrieveDeviceRendezvousStatus', { RendezvousCode: code }, true)
             .then(function (st) {
+              // Cancelled while this answer was on its way (the viewer chose to browse): stay out of it.
+              if (cancelled) return;
               var status = String(st.Status);
               if (status === STATUS.COMPLETE) {
                 update({ authKey: key });
@@ -168,10 +170,16 @@ var Auth = (function () {
     });
   }
 
-  /** Silent renewal for a paired TV; resolves null when not possible. */
+  /**
+   * Silent renewal for a paired TV: a fresh token, or null when F1 refuses the device key (removed from
+   * the account). A network or server error rejects, so a blip does not look like being signed out.
+   */
   function renew() {
     if (!isPaired()) return Promise.resolve(null);
-    return byDevice().catch(function () { return null; });
+    return byDevice().catch(function (e) {
+      if (e && (e.fault || (e.status >= 400 && e.status < 500) || /No token/.test(e.message))) return null;
+      throw e;
+    });
   }
 
   return {

@@ -88,3 +88,22 @@ test('an equal or older release does not offer an update', async () => {
     assert.equal((await updates.check(true)).available, false);
   }
 });
+
+test('a failed automatic check (the network not up yet) is tried again an hour later, not a day', async () => {
+  let online = false, now = Date.parse('2026-10-29T08:00:00Z');
+  let stored = '{}';
+  const context = vm.createContext({
+    fetch: async () => { if (!online) throw new Error('offline'); return release('v0.3.0'); },
+    localStorage: { getItem: () => stored, setItem: (k, v) => { stored = v; } },
+    tizen: { application: { getCurrentApplication: () => ({ appInfo: { version: '0.1.0' } }) } },
+    setTimeout: () => ({}), clearTimeout: () => {},
+    Date: class extends Date { static now() { return now; } }
+  });
+  vm.runInContext(readFileSync('app/js/updates.js', 'utf8'), context);
+  assert.equal((await context.Updates.check()).error, true);
+  online = true;
+  now += 30 * 60000;
+  assert.equal((await context.Updates.check()).latest, '');      // not yet
+  now += 31 * 60000;
+  assert.equal((await context.Updates.check()).latest, '0.3.0');
+});

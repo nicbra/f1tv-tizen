@@ -22,6 +22,7 @@ function emptyJob(path, token) {
     info: {},                              // SessionInfo
     lap: [], clock: [], part: [], track: [], sessionPart: 0,   // sessionPart: the qualifying part (1-3) TimingData is on
     hasStatus: false, startedAt: null,     // startedAt: UTC ms of the first SessionStatus 'Started' (a race's lights out)
+    clockStartedAt: null,                  // UTC ms the session clock first ran: lights out where there is no status (2018-2019)
     drivers: {}, timing: {}, stints: {},
     snaps: [], lastSnap: -1, changed: -1   // changed: time of the newest change not yet in a snapshot
   };
@@ -57,6 +58,7 @@ function apply(feed, t, d) {
       j.lap.push([t, d.CurrentLap != null ? d.CurrentLap : (prev ? prev[1] : 0), d.TotalLaps != null ? d.TotalLaps : (prev ? prev[2] : 0)]);
       break;
     case 'ExtrapolatedClock':
+      if (d.Extrapolating === true && j.clockStartedAt == null) j.clockStartedAt = Date.parse(d.Utc) || t;
       if (d.Remaining != null) {
         var p = d.Remaining.split(':');
         var prevC = last(j.clock);
@@ -169,23 +171,46 @@ function fetchFeed(feed) {
   });
 }
 
+/** UTC ms of offset 0 by a line's Utc field, or NaN. */
+function lineBase(l) {
+  try { return Date.parse(JSON.parse(l[2].slice(12)).Utc) - l[0]; } catch (e) { return NaN; }
+}
+
+function median(a) {
+  a.sort(function (x, y) { return x - y; });
+  return a[a.length >> 1];
+}
+
+// The session clock's Utc gives a base this many ms before the heartbeats' (2.06-2.09 s from 2019;
+// in 2018 0.1 s, but the 2018 videos line up with clock + 2 s too).
+var CLOCK_LEAD = 2000;
+
+/** True if a base lies within two days of the session's date in the archive path (".../2018-07-22_Race/"). */
+function plausible(path, base) {
+  var m = /(\d{4}-\d{2}-\d{2})_[^/]*\/?$/.exec(path || '');
+  return !m || Math.abs(base - Date.parse(m[1] + 'T12:00:00Z')) < 2 * 86400000;
+}
+
 /**
  * Applies the collected lines in time order. The heartbeats give the UTC time base: the median of
  * their Utc minus offset, because some archives start (and end) with a burst of buffered heartbeats
- * written at once with older Utc times, minutes off (Bahrain 2023 race: 5 min).
+ * written at once with older Utc times, minutes off (Bahrain 2023 race: 5 min). The 2018 archives up
+ * to Hungary have heartbeats rewritten a month later, and 2020 Austria FP1's are 3 days off; for those
+ * the base comes from the session clock instead.
  */
 function replayCollected() {
-  var j = job, lines = j.collect, bases = [];
+  var j = job, lines = j.collect, beats = [], clock = [];
   j.collect = null;
   lines.sort(function (a, b) { return a[0] - b[0]; });
   lines.forEach(function (l) {
-    if (l[1] !== 'Heartbeat') return;
-    try { var u = Date.parse(JSON.parse(l[2].slice(12)).Utc); } catch (e) { return; }
-    if (!isNaN(u)) bases.push(u - l[0]);
+    if (l[1] !== 'Heartbeat' && l[1] !== 'ExtrapolatedClock') return;
+    var b = lineBase(l);
+    if (!isNaN(b)) (l[1] === 'Heartbeat' ? beats : clock).push(b);
   });
-  if (!bases.length) throw new Error('No timing data for this session yet');
-  bases.sort(function (a, b) { return a - b; });
-  j.base = bases[bases.length >> 1];
+  if (!beats.length) throw new Error('No timing data for this session yet');
+  j.base = median(beats);
+  var fromClock = clock.length ? median(clock) + CLOCK_LEAD : null;
+  if (!plausible(j.path, j.base) && fromClock != null && plausible(j.path, fromClock)) j.base = fromClock;
   lines.forEach(function (l) {
     var data;
     try { data = JSON.parse(l[2].slice(12)); } catch (e) { return; }
@@ -242,8 +267,10 @@ function query(t) {
   }
   out.started = j.snaps.length ? t >= j.snaps[0][0] : false;
   // LapCount says lap 1 from the session's opening, an hour before the start; a race starts at its
-  // first 'Started' status. Without status data, or once lap 2 is on, it has started.
-  out.beforeStart = j.hasStatus && !(j.startedAt != null && t >= j.startedAt) && !(out.lap > 1);
+  // first 'Started' status. The 2018-2019 archives have no status: there the session clock starts
+  // 0.4-2 s after lights out (measured on 2020-2025 races). Once lap 2 is on, it has started.
+  var startedAt = j.hasStatus ? j.startedAt : j.clockStartedAt;
+  out.beforeStart = (j.hasStatus || j.clockStartedAt != null) && !(startedAt != null && t >= startedAt) && !(out.lap > 1);
   return out;
 }
 
@@ -253,6 +280,8 @@ function start(m) {
   loadAll().then(function () {
     if (job !== j) return;
     self.postMessage({ type: 'loaded', info: { type: j.info.Type, name: j.info.Name, drivers: Object.keys(j.drivers).length } });
+    // Live, with the archive already written as it goes: what comes after it arrives on the real-time feed.
+    if (m.live) { j.afterArchive = true; connect(j); }
   }).catch(function (err) {
     if (job !== j) return;
     // No archive yet: a live session. Follow F1's real-time feed instead.
@@ -265,6 +294,15 @@ function start(m) {
 
 var LIVE = 'https://livetiming.formula1.com/signalrcore';
 var RS = '\x1e';
+
+/** Archive folders compared as F1 might write them: slashes, case and accents (São Paulo). */
+function samePath(a, b) {
+  var n = function (p) {
+    p = String(p || '').replace(/^\/+|\/+$/g, '').toLowerCase();
+    return p.normalize ? p.normalize('NFC') : p;
+  };
+  return n(a) === n(b);
+}
 
 function startLive(m) {
   var j = job = emptyJob(m.path, m.token);
@@ -281,9 +319,23 @@ function connect(j) {
       var ws = new WebSocket('wss://livetiming.formula1.com/signalrcore?id=' + encodeURIComponent(n.connectionToken || n.connectionId));
       var handshaken = false, announced = false;
       j.ws = ws;
+      j.lastRx = Date.now();
+      // SignalR clients drop a connection that has been silent for 30 s (the server pings every 15 s), and
+      // one that never answers the handshake. A half-open socket never closes by itself.
+      function reconnect() {
+        ws.onclose = null;
+        clearInterval(j.keepAlive);
+        try { ws.close(); } catch (x) { /* closed */ }
+        if (job === j && !j.stopped) setTimeout(function () { connect(j); }, 1000);
+      }
+      j.keepAlive = setInterval(function () {
+        if (Date.now() - j.lastRx > 45000) return reconnect();
+        if (handshaken) try { ws.send(JSON.stringify({ type: 6 }) + RS); } catch (x) { /* closed */ }
+      }, 15000);
       ws.onopen = function () { ws.send(JSON.stringify({ protocol: 'json', version: 1 }) + RS); };
       ws.onmessage = function (e) {
         if (job !== j) return ws.close();
+        j.lastRx = Date.now();
         var frames = String(e.data).split(RS).filter(Boolean).map(function (f) {
           try { return JSON.parse(f); } catch (x) { return null; }
         });
@@ -291,11 +343,13 @@ function connect(j) {
           handshaken = true;
           frames.shift();
           ws.send(JSON.stringify({ type: 1, invocationId: '1', target: 'Subscribe', arguments: [FEEDS] }) + RS);
-          j.keepAlive = setInterval(function () { try { ws.send(JSON.stringify({ type: 6 }) + RS); } catch (x) { /* closed */ } }, 15000);
         }
         frames.forEach(function (msg) {
           if (!msg) return;
           if (msg.type === 3 && msg.result) {
+            var live = msg.result.SessionInfo;
+            // After an archive, only the same session's updates belong to it.
+            if (j.afterArchive && live && live.Path && !samePath(live.Path, j.path)) { j.stopped = true; return ws.close(); }
             // Full state at subscribe time.
             var t = Date.now();
             FEEDS.forEach(function (f) { if (msg.result[f]) apply(f, t, msg.result[f]); });
@@ -309,8 +363,8 @@ function connect(j) {
             apply(a[0], Date.parse(a[2]) || Date.now(), a[1]);
           }
         });
-        clearTimeout(j.flushTimer);
-        j.flushTimer = setTimeout(function () { flush(j); }, SNAPSHOT_MS);
+        // Within 3 s of the first unsnapshotted change; later messages (heartbeats) must not postpone it.
+        if (!j.flushTimer) j.flushTimer = setTimeout(function () { j.flushTimer = null; flush(j); }, SNAPSHOT_MS);
       };
       ws.onclose = function () {
         clearInterval(j.keepAlive);

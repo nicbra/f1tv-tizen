@@ -215,6 +215,27 @@ test('GET /mpd follows redirects and passes upstream errors through', async () =
   assert.equal(String(r.body), 'geo');
 });
 
+test('GET /mpd resolves segments against the address a redirect led to', async () => {
+  const src = 'https://cdn.formula1.com/entry/index.mpd';
+  const { s } = service({
+    [src]: { status: 302, headers: { location: '/actual/main/index.mpd' } },
+    'https://cdn.formula1.com/actual/main/index.mpd': { body: LIVE_MPD }
+  });
+  const body = String((await get(s, '/mpd?u=' + encodeURIComponent(src))).body);
+  assert.match(body, /<BaseURL>https:\/\/cdn\.formula1\.com\/actual\/main\/<\/BaseURL>/);
+  assert.doesNotMatch(body, /\/entry\//);
+});
+
+test('GET /mpd keeps the requested base when a redirect leaves formula1.com, which the audio proxy refuses', async () => {
+  const src = 'https://ott.formula1.com/live/index.mpd';
+  const { s } = service({
+    [src]: { status: 302, headers: { location: 'https://cdn.example.net/x/index.mpd' } },
+    'https://cdn.example.net/x/index.mpd': { body: LIVE_MPD }
+  });
+  const body = String((await get(s, '/mpd?u=' + encodeURIComponent(src))).body);
+  assert.match(body, /<BaseURL>https:\/\/ott\.formula1\.com\/live\/<\/BaseURL>/);
+});
+
 test('GET /mpd with shift time-shifts a live manifest', async () => {
   const src = 'https://cdn.formula1.com/live/index.mpd';
   const { s } = service({ [src]: { body: LIVE_MPD } });
@@ -230,6 +251,14 @@ test('GET /s/ fetches the segment from the CDN and fixes its sample count', asyn
   assert.equal(r.status, 200);
   assert.equal(r.headers['Content-Type'], 'video/iso.segment');
   assert.equal(sencCount(r.body), 280);
+});
+
+test('GET /s/ keeps the segment\'s query string', async () => {
+  const base = 'https://ott-video-cf.formula1.com/out/v1/Main/';
+  const { s, requested } = service({ [base + 'audio_eng_42.mp4?token=abc&n=1']: { body: segment() } });
+  const r = await get(s, '/s/' + b64url(base) + '/audio_eng_42.mp4?token=abc&n=1');
+  assert.deepEqual(requested, [base + 'audio_eng_42.mp4?token=abc&n=1']);
+  assert.equal(r.status, 200);
 });
 
 test('GET /s/ refuses hosts other than formula1.com', async () => {

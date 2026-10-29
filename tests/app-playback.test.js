@@ -19,7 +19,7 @@ function playback(load, capable = true, opts = {}) {
     }) },
     setTimeout: (fn, ms) => { timers.push({ fn, ms }); }, clearTimeout() {},
     F1Api: {
-      state: {}, isNotStarted: () => false,
+      state: {}, isNotStarted: () => false, savePosition: async () => {},
       play: async (id, channel, o) => {
         requests.push({ id, channel, hdr: o.hdr });
         if (opts.gate) await opts.gate(id);
@@ -28,7 +28,8 @@ function playback(load, capable = true, opts = {}) {
       streamInfo: async (url) => ({ dynamic: false, windowStart: 0, windowEnd: 600,
         encrypted: !!opts.encryptedHdr && url.includes('hdr') })
     },
-    Timing: { load() {}, label: () => '', supported: () => false },
+    Timing: { load() {}, label: () => '', supported: () => false, isReady: () => false },
+    Settings: { get: () => false },
     Player: {
       hdrCapable: () => capable, engineName: () => current ? 'shaka' : null,
       unload: async () => {}, stream: () => current,
@@ -41,7 +42,7 @@ function playback(load, capable = true, opts = {}) {
   // Expose the playback entry points without booting the browse/login screens.
   const source = readFileSync('app/js/app.js', 'utf8').replace("window.addEventListener('load', boot);", `
     ensureSession = function () { return Promise.resolve(true); };
-    testApp = { play: playFeed, update: updateOsd,
+    testApp = { play: playFeed, update: updateOsd, stop: stopPlayer,
       set: function (ctx) { feedsCtx = ctx; screen = 'feeds'; } };
   `);
   vm.runInContext(source, context);
@@ -92,6 +93,25 @@ test('a late HDR rejection does not disable HDR for the next video', async () =>
   await settle();
   assert.equal(next.hdrFailed, undefined);
   assert.equal(h.requests.length, 1);
+});
+
+test('stopping a video while it loads is not an error and keeps HDR for it', async () => {
+  let reject;
+  const h = playback(() => new Promise((resolve, fail) => { reject = fail; }));
+  const ctx = video();
+  h.app.set(ctx);
+  h.app.play(0, {});
+  await settle();
+  h.app.stop();
+  // Shaka rejects the load that unload() interrupted.
+  reject(new Error('Shaka Error 7000'));
+  await settle();
+  assert.equal(ctx.hdrFailed, undefined);
+  assert.equal(h.nodes.toast?.textContent, undefined);
+  assert.equal(h.requests.length, 1);
+  h.app.play(0, {});
+  await settle();
+  assert.equal(h.requests.at(-1).hdr, true);
 });
 
 test('an HDR stream that has not started after 25 s is retried in SDR, and the OSD reflects the current stream', async () => {

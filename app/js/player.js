@@ -10,8 +10,9 @@ var Player = (function () {
 
   function emit(name, arg) { if (listeners[name]) listeners[name](arg); }
 
-  // Shaka reports two-letter languages, AVPlay three-letter ones; settings may hold either.
-  var LANG3 = { en: 'eng', de: 'deu', fr: 'fra', nl: 'nld', pt: 'por', ja: 'jpn', es: 'spa', it: 'ita' };
+  // Shaka reports two-letter languages, AVPlay three-letter ones; settings may hold either. Team radio
+  // is "tea" in the replays' HLS and "teamradio" on AVPlay.
+  var LANG3 = { en: 'eng', de: 'deu', fr: 'fra', nl: 'nld', pt: 'por', ja: 'jpn', es: 'spa', it: 'ita', tea: 'teamradio' };
   function lang3(l) { return LANG3[l] || l; }
   function sameLang(a, b) { return !!a && !!b && lang3(a) === lang3(b); }
 
@@ -47,8 +48,41 @@ var Player = (function () {
       });
     }
 
+    /**
+     * F1's WebVTT cuts a subtitle at a segment's end and repeats it whole in the next segment, and
+     * Shaka keeps both copies, so the line showed twice. Some subtitles are cut to 1 ms and never
+     * showed. Merges the repeats and shows the cut ones for up to 3 s, until the next subtitle.
+     */
+    function tidyCues(track) {
+      if (track.kind !== 'subtitles' && track.kind !== 'captions') return;   // not metadata tracks
+      var list = function () { return Array.prototype.slice.call(track.cues || []); };
+      var seen = {};
+      list().forEach(function (c) {
+        var key = Math.round(c.startTime * 1000) + '|' + c.text, first = seen[key];
+        if (!first) { seen[key] = c; return; }
+        if (c.endTime > first.endTime) first.endTime = c.endTime;
+        track.removeCue(c);
+      });
+      var cues = list();
+      cues.forEach(function (c, i) {
+        if (!c.f1Cut && c.endTime - c.startTime >= 0.1) return;
+        c.f1Cut = true;   // rechecked as later subtitles arrive
+        var next = cues.slice(i + 1).filter(function (n) { return n.startTime > c.startTime; })[0];
+        c.endTime = Math.min(c.startTime + 3, next ? next.startTime : Infinity);
+      });
+    }
+
     function init() {
       shaka.polyfill.installAll();
+      var Simple = shaka.text && shaka.text.SimpleTextDisplayer;
+      if (Simple && !Simple.prototype.append.f1Tidy) {
+        var append = Simple.prototype.append;
+        Simple.prototype.append = function (cues) {
+          append.call(this, cues);
+          slots.forEach(function (s) { Array.prototype.forEach.call(s.v.textTracks || [], tidyCues); });
+        };
+        Simple.prototype.append.f1Tidy = true;
+      }
       // No autoplay: an element that starts by itself grabs the TV's single video decoder.
       els.video.autoplay = false;
       var second = els.video.cloneNode(false);
@@ -111,7 +145,10 @@ var Player = (function () {
         // From where it is now, which includes a seek made meanwhile.
         var at = slot.v.currentTime > 0 ? slot.v.currentTime : startTime;
         slot.p.load(stream.url, at == null ? null : at).then(function () {
-          if (gen !== generation || userPaused) return;
+          if (gen !== generation) return;
+          // A new load starts on the stream's default tracks (French subtitles on F1's replays).
+          applyPrefs(slot.p);
+          if (userPaused) return;
           slot.v.play().catch(function () {});
           keepPlaying(slot.v, 5000);
         }).catch(function () { /* the start watch in app.js falls back to SDR */ });
@@ -151,6 +188,26 @@ var Player = (function () {
       })();
     }
 
+    /**
+     * The TV decodes only one video, and no frame of a paused one: a feed switched to while paused
+     * plays, muted, from when the old feed has let go of the decoder until it shows a frame.
+     */
+    function showFrame(v) {
+      var t0 = Date.now();
+      (function check() {
+        if (V() !== v) return;
+        var q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
+        // Shown (or given up on), or the viewer pressed play meanwhile.
+        if (!userPaused || (q && q.totalVideoFrames > 0) || Date.now() - t0 > 5000) {
+          if (userPaused) v.pause();
+          v.muted = false;
+          return;
+        }
+        if (v.paused) v.play().catch(function () {});
+        setTimeout(check, 100);
+      })();
+    }
+
     function swap(stream, startTime) {
       var old = slots[cur], next = slots[1 - cur];
       generation++;
@@ -169,15 +226,15 @@ var Player = (function () {
         keepPlaying(next.v, 3000, true);
         return whenPlaying(next.v, 3000);
       }).then(function () {
-        next.v.muted = false;
+        var paused = userPaused;   // paused before or during the switch: the new feed stays paused
+        next.v.muted = paused;
         cur = 1 - cur;
         swapping = false;
-        userPaused = false;
         old.v.classList.add('hidden');
         old.v.style.zIndex = '';
         next.v.style.zIndex = '';
-        old.p.unload().then(function () { keepPlaying(next.v); });
-        keepPlaying(next.v);
+        old.p.unload().then(function () { if (paused) showFrame(next.v); else keepPlaying(next.v); });
+        if (!paused) keepPlaying(next.v);
       }, function (err) {
         swapping = false;
         next.v.classList.add('hidden');
@@ -187,7 +244,7 @@ var Player = (function () {
       });
     }
 
-    var LANG2 = { eng: 'en', deu: 'de', fra: 'fr', nld: 'nl', por: 'pt', jpn: 'ja', spa: 'es', ita: 'it' };
+    var LANG2 = { eng: 'en', deu: 'de', fra: 'fr', nld: 'nl', por: 'pt', jpn: 'ja', spa: 'es', ita: 'it', teamradio: 'tea' };
     function langOf(l) { return LANG2[l] || l; }
 
     function textTrack(player, l) {
@@ -222,7 +279,8 @@ var Player = (function () {
       position: function () { return V().currentTime; },
       bufferedEnd: function () { var b = V().buffered; return b.length ? b.end(b.length - 1) : 0; },
       seekTo: function (t, done) { V().currentTime = t; if (done) done(); },
-      paused: function () { return V().paused; },
+      // The viewer's pause counts even while showFrame plays a switched-to feed until it has a picture.
+      paused: function () { return userPaused || V().paused; },
       play: function () { userPaused = false; V().play(); },
       pause: function () { userPaused = true; V().pause(); }
     };
@@ -303,7 +361,11 @@ var Player = (function () {
       // Encrypted live DASH goes through the local service, which fixes the audio segments.
       if (s.licenseUrl && /\.mpd(\?|$)/.test(s.url)) {
         var langs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
-        return StreamProxy.ensure().then(function () { return open(s, StreamProxy.manifest(s.url, s.startDelay, langs)); });
+        return StreamProxy.ensure().then(function () {
+          // Stopped while the helper started: opening now would leave AVPlay open over the next video.
+          if (stream !== s) throw new Error('cancelled');
+          return open(s, StreamProxy.manifest(s.url, s.startDelay, langs));
+        });
       }
       return open(s, s.url);
     }
@@ -458,11 +520,12 @@ var Player = (function () {
     function seek(ms, done, maxTries) {
       var gen = ++seekGen, s = stream, tries = 0;
       quietUntil = Date.now() + 6000;
-      posMs = Math.max(0, clampLive(ms / 1000) * 1000);
+      // Its own target: playback reports overwrite posMs while a retry waits.
+      var target = posMs = Math.max(0, clampLive(ms / 1000) * 1000);
       (function attempt() {
         if (gen !== seekGen || s !== stream) return;
         try {
-          av.seekTo(Math.round(posMs), function () { if (gen === seekGen && done) done(true); }, function (e) {
+          av.seekTo(Math.round(target), function () { if (gen === seekGen && done) done(true); }, function (e) {
             if (gen !== seekGen || s !== stream) return;
             if (e && e.name === 'InvalidValuesError' && ++tries < (maxTries || 8)) return setTimeout(attempt, 500);
             if (done) done(false);
@@ -492,7 +555,9 @@ var Player = (function () {
       // The real live edge (wall clock minus the presentation delay), also when the stream is
       // time-shifted behind it.
       var edge = live && info ? Date.now() / 1000 - info.epochAtZero - info.delay : null;
-      if (w) return { start: w.start + 10, end: Math.max(w.end, edge || 0, posMs / 1000) };
+      // One live edge for both ends of the bar: where a fresh open would start (wall clock minus the delay), not
+      // AVPlay's window end, which is ~18 s further on when the stream was not time-shifted and behind it when it was.
+      if (w) return { start: w.start + 10, end: edge != null ? Math.max(edge, posMs / 1000) : Math.max(w.end, posMs / 1000) };
       if (edge != null) return { start: info.windowStart, end: Math.max(edge, posMs / 1000) };
       if (live) return { start: Math.max(0, posMs / 1000 - 3600), end: posMs / 1000 };
       return { start: 0, end: av.getDuration() / 1000 };
@@ -508,8 +573,8 @@ var Player = (function () {
       bufferedEnd: function () { return posMs / 1000; },
       seekTo: function (t, done) { seek(t * 1000, done); },
       paused: function () { return isPaused; },
-      play: function () { av.play(); isPaused = false; },
-      pause: function () { av.pause(); isPaused = true; },
+      play: function () { try { av.play(); } catch (e) { /* not ready: ensurePlaying retries */ } isPaused = false; },
+      pause: function () { try { av.pause(); } catch (e) { /* not ready yet */ } isPaused = true; },
       tracks: trackList,
       setAudio: selectAudio,
       setSubtitles: selectText,
@@ -613,8 +678,13 @@ var Player = (function () {
 
   function switchTo(stream, startTime) {
     if (engine === ShakaEngine && choose(stream) === ShakaEngine) {
+      var prev = current;
       current = stream;
-      return ShakaEngine.swap(stream, startTime);
+      // A failed switch leaves the previous feed playing, on its own clock.
+      return ShakaEngine.swap(stream, startTime).catch(function (e) {
+        if (current === stream) current = prev;
+        throw e;
+      });
     }
     return load(stream, startTime);
   }

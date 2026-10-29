@@ -331,6 +331,17 @@ async function runChecks() {
     return `${replay.title}: ${stream.streamType}, ${hls ? 'hls' : 'dash'}`;
   });
 
+  await check('every feed plays', async () => {
+    need(token && replay, 'needs sign-in and a replay');
+    const feeds = F1Api.feedsFrom((await F1Api.video(replay.contentId)).metadata);
+    // The broadcast feeds and one onboard, as the app lists them (INTERNATIONAL is the main stream).
+    const tried = feeds.filter((f) => !f.num).concat(feeds.filter((f) => f.num).slice(0, 1));
+    const failed = [];
+    for (const f of tried) await F1Api.play(replay.contentId, f.channelId).catch((e) => failed.push(`${f.title} (${e.message})`));
+    need(!failed.length, 'cannot play ' + failed.join(', '));
+    return tried.map((f) => f.title).join(', ');
+  });
+
   await check('stream manifest and clock', async () => {
     need(stream, 'needs a stream');
     const info = await F1Api.streamInfo(stream.url);

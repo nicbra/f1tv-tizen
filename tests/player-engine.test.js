@@ -3,10 +3,13 @@ const { readFileSync } = require('node:fs');
 const { test } = require('node:test');
 const vm = require('node:vm');
 
+// A video's text track: cues sorted by start time, as the browser keeps them.
+const textTrack = () => ({ kind: 'subtitles', cues: [], removeCue(c) { this.cues.splice(this.cues.indexOf(c), 1); } });
+
 const el = () => {
   const listeners = {};
   return {
-    classList: { add() {}, remove() {}, toggle() {} }, style: {},
+    classList: { add() {}, remove() {}, toggle() {} }, style: {}, textTracks: [textTrack()],
     addEventListener: (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); },
     fire: (type) => (listeners[type] || []).forEach((fn) => fn())
   };
@@ -43,19 +46,31 @@ function fakeAvPlay({ liveWindow = '', duration = 0 } = {}) {
 /** Loads the real settings, service launcher and player with a fake AVPlay and Shaka. shakaLoad: Shaka's load(). */
 async function player(av, storage, shakaLoad, globals) {
   const store = Object.assign({}, storage);
-  const configs = [];
+  const configs = [], languages = [];
+  // Shaka's SimpleTextDisplayer as far as it matters here: append() adds the cues to the video's track.
+  class SimpleTextDisplayer {
+    constructor(video) { this.track = video.textTracks[0]; }
+    append(cues) {
+      cues.forEach((c) => this.track.cues.push(Object.assign({}, c)));
+      this.track.cues.sort((a, b) => a.startTime - b.startTime);
+    }
+  }
   class ShakaPlayer {
     attach() { return Promise.resolve(); }
     resetConfiguration() {}
     configure(config) { configs.push(config); }
     load(url, start) { return shakaLoad ? shakaLoad(url, start) : Promise.reject(new Error('no stream')); }
     getNetworkingEngine() { return { registerRequestFilter() {} }; }
+    getBufferedInfo() { return { video: [{ start: 0, end: 10 }] }; }
+    selectAudioLanguage(l) { languages.push(['audio', l]); }
+    selectTextLanguage(l) { languages.push(['text', l]); }
+    setTextTrackVisibility(on) { languages.push(['subtitles', on]); }
     addEventListener() {}
     unload() { return Promise.resolve(); }
   }
   const context = vm.createContext(Object.assign({
     webapis: { avplay: av },
-    shaka: { polyfill: { installAll() {} }, Player: ShakaPlayer, net: { NetworkingEngine: { RequestType: {} } }, util: { Error: { Category: {} } } },
+    shaka: { polyfill: { installAll() {} }, Player: ShakaPlayer, text: { SimpleTextDisplayer }, net: { NetworkingEngine: { RequestType: {} } }, util: { Error: { Category: {} } } },
     document: { body: el() },
     localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } },
     fetch: async () => ({ ok: true }), // the stream helper service answers its ping
@@ -67,6 +82,8 @@ async function player(av, storage, shakaLoad, globals) {
   await context.Player.init(video, el());
   context.Player.videos = [video, second];
   context.Player.configs = configs;
+  context.Player.SimpleTextDisplayer = SimpleTextDisplayer;
+  context.Player.languages = languages;
   return context.Player;
 }
 
@@ -285,4 +302,163 @@ test('the frozen-HDR reload stands down after a stop, starts from a seek, and do
   t.release();
   await new Promise(setImmediate);
   assert.equal(t.plays(), before);
+});
+
+test('subtitles F1 repeats in the next segment show once, and ones cut to 1 ms show until the next', async () => {
+  const P = await player(fakeAvPlay());
+  const display = new P.SimpleTextDisplayer(P.videos[0]);
+  const cue = (start, end, text) => ({ startTime: start, endTime: end, text });
+  // Abu Dhabi 2025 qualifying: segments end at 80.64 and 86.4 s.
+  display.append([cue(73.626, 79.196, 'FOR THE CHAMPIONSHIP'), cue(79.197, 80.64, 'SESSION OF THE SEASON')]);
+  display.append([cue(79.197, 84.836, 'SESSION OF THE SEASON'), cue(84.836, 84.837, 'FINALE 58 LAPS')]);
+  const shown = () => P.videos[0].textTracks[0].cues.map((c) => [c.startTime, c.endTime, c.text]);
+  assert.deepEqual(shown(), [[73.626, 79.196, 'FOR THE CHAMPIONSHIP'], [79.197, 84.836, 'SESSION OF THE SEASON'],
+    [84.836, 87.836, 'FINALE 58 LAPS']]);
+  // The next subtitle cuts the 3 s short; an exact repeat of a whole cue is merged too.
+  display.append([cue(86.5, 89, 'AND WHO IS GOING TO BE ON POLE'), cue(79.197, 84.836, 'SESSION OF THE SEASON')]);
+  assert.deepEqual(shown().slice(1), [[79.197, 84.836, 'SESSION OF THE SEASON'], [84.836, 86.5, 'FINALE 58 LAPS'],
+    [86.5, 89, 'AND WHO IS GOING TO BE ON POLE']]);
+});
+
+test('the frozen-HDR reload keeps the viewer\'s commentary and subtitles', async () => {
+  // A new load starts on the stream's defaults; F1 marks French subtitles as the default.
+  const timers = [];
+  const P = await player(fakeAvPlay(), { 'f1tv.settings': JSON.stringify({ audio: 'deu', subtitles: 'eng' }) },
+    () => Promise.resolve(), { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return 0; } });
+  P.forceEngine = 'shaka';
+  Object.assign(P.videos[0], { readyState: 4, currentTime: 0, play: () => Promise.resolve(), getVideoPlaybackQuality: () => ({ totalVideoFrames: 0 }) });
+  await P.load({ url: 'https://cdn/hdr.m3u8', licenseUrl: '', multiFeed: true, hdr: true, info: { dynamic: false } }, 30);
+  const first = P.languages.splice(0);
+  assert.deepEqual(first, [['audio', 'de'], ['text', 'en'], ['subtitles', true]]);
+  timers.find((t) => t.ms === 5000).fn();
+  await new Promise(setImmediate);
+  assert.deepEqual(P.languages, first);
+});
+
+test('a live stream stopped while the stream helper starts never opens AVPlay', async () => {
+  const av = fakeAvPlay();
+  let answer;
+  const P = await player(av, undefined, undefined, { fetch: () => new Promise((r) => { answer = r; }) });
+  const loading = P.load(LIVE, null);
+  await new Promise(setImmediate);
+  await P.unload();
+  answer({ ok: true });   // the helper's ping finally answers
+  await assert.rejects(loading, /cancelled/);
+  assert.equal(names(av).includes('open'), false);
+});
+
+test('an AVPlay seek retried after a refusal still goes to its target', async () => {
+  const av = fakeAvPlay({ duration: 6163000 });
+  let refusals = 1;
+  av.seekTo = (ms, ok, fail) => {
+    av.calls.push(['seekTo', ms]);
+    if (refusals-- > 0) setImmediate(() => fail({ name: 'InvalidValuesError' }));
+    else setImmediate(ok);
+  };
+  const P = await player(av);
+  const clear = { url: 'https://ott-video-fer-cf.formula1.com/x/index.m3u8', licenseUrl: '', multiFeed: false, info: { dynamic: false } };
+  await P.load(clear, null);
+  P.seekTo(120);
+  await new Promise(setImmediate);
+  av.listener.oncurrentplaytime(11000);   // playback goes on at 11 s before the retry
+  await new Promise((r) => setTimeout(r, 600));
+  assert.deepEqual(av.calls.filter((c) => c[0] === 'seekTo').map((c) => c[1]), [120000, 120000]);
+});
+
+// ---------- Shaka feed switches (with videos that play, pause and count decoded frames) ----------
+
+const FEED = { url: 'https://ott-video-fer-cf.formula1.com/x/index.m3u8', licenseUrl: '', multiFeed: true, info: { dynamic: false } };
+const videoFake = (v, frames) => Object.assign(v, { paused: true, muted: false, readyState: 4, currentTime: 0,
+  play() { v.paused = false; return Promise.resolve(); }, pause() { v.paused = true; }, removeEventListener() {},
+  getVideoPlaybackQuality: () => ({ totalVideoFrames: frames() }) });
+
+test('a failed Shaka feed switch leaves the previous feed as the current stream', async () => {
+  let loads = 0, fail;
+  const P = await player(fakeAvPlay(), undefined, () => (loads++ ? new Promise((_, rej) => { fail = rej; }) : Promise.resolve()));
+  P.forceEngine = 'shaka';
+  P.videos.forEach((v) => videoFake(v, () => 0));
+  await P.load(FEED, null);
+  const next = Object.assign({}, FEED, { url: FEED.url.replace('x', 'y') });
+  const sw = P.switchTo(next, null);
+  assert.equal(P.stream(), next);        // current while it loads, for the clock of what is about to show
+  await new Promise(setImmediate);
+  fail(new Error('Shaka Error 1001'));
+  await assert.rejects(sw, /1001/);
+  assert.equal(P.stream(), FEED);
+});
+
+test('a Shaka feed switch made while paused stays paused, playing muted only until a frame shows', async () => {
+  const timers = [];
+  let frames = 0;
+  const P = await player(fakeAvPlay(), undefined, () => Promise.resolve(), { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; } });
+  P.forceEngine = 'shaka';
+  const [a, b] = P.videos;
+  P.videos.forEach((v) => videoFake(v, () => frames));
+  await P.load(FEED, null);
+  P.togglePause();                       // the viewer pauses
+  assert.equal(a.paused, true);
+  await P.switchTo(Object.assign({}, FEED, { url: FEED.url.replace('x', 'y') }), null);
+  await new Promise(setImmediate);
+  assert.equal(b.muted, true, 'the new feed is audible while the viewer has paused');
+  assert.equal(P.isPaused(), true, 'reported playing while the viewer has paused');
+  timers.splice(0).forEach((t) => t.fn());
+  assert.equal(b.paused, false, 'no frame to show yet: it plays on, muted');
+  assert.equal(b.muted, true);
+  frames = 1;
+  timers.splice(0).forEach((t) => t.fn());
+  assert.equal(b.paused, true);
+  assert.equal(b.muted, false);
+  P.togglePause();                       // play again
+  assert.equal(b.paused, false);
+});
+
+test('pressing play while a paused Shaka switch is still finding a frame lets it play, with sound', async () => {
+  const timers = [];
+  const P = await player(fakeAvPlay(), undefined, () => Promise.resolve(), { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; } });
+  P.forceEngine = 'shaka';
+  const [, b] = P.videos;
+  P.videos.forEach((v) => videoFake(v, () => 0));
+  await P.load(FEED, null);
+  P.togglePause();
+  await P.switchTo(Object.assign({}, FEED, { url: FEED.url.replace('x', 'y') }), null);
+  await new Promise(setImmediate);
+  P.togglePause();                       // play, before a frame was shown
+  timers.splice(0).forEach((t) => t.fn());
+  assert.equal(b.paused, false);
+  assert.equal(b.muted, false);
+  assert.equal(P.isPaused(), false);
+});
+
+test('the frozen-HDR reload keeps the viewer\'s subtitles also when they pause while it reloads', async () => {
+  const timers = [];
+  let loads = 0, release;
+  const P = await player(fakeAvPlay(), { 'f1tv.settings': JSON.stringify({ subtitles: 'eng' }) },
+    () => (loads++ ? new Promise((r) => { release = r; }) : Promise.resolve()),
+    { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return 0; } });
+  P.forceEngine = 'shaka';
+  Object.assign(P.videos[0], { readyState: 4, currentTime: 0, paused: false, play: () => Promise.resolve(), pause() {},
+    getVideoPlaybackQuality: () => ({ totalVideoFrames: 0 }) });
+  await P.load({ url: 'https://cdn/hdr.m3u8', licenseUrl: '', multiFeed: true, hdr: true, info: { dynamic: false } }, 30);
+  P.languages.splice(0);
+  timers.find((t) => t.ms === 5000).fn();   // frozen: it reloads
+  P.togglePause();                          // and the viewer pauses before the reload is done
+  release();
+  await new Promise(setImmediate);
+  assert.ok(P.languages.some((l) => l[0] === 'text' && l[1] === 'en'), 'the reload is left on the stream\'s default subtitles');
+});
+
+test('team radio chosen on one engine is found on the other ("tea" in HLS, "teamradio" on AVPlay)', async () => {
+  // Shaka, with the choice made on AVPlay.
+  const P = await player(fakeAvPlay(), { 'f1tv.settings': JSON.stringify({ audio: 'teamradio' }) }, () => Promise.resolve());
+  P.forceEngine = 'shaka';
+  Object.assign(P.videos[0], { play: () => Promise.resolve() });
+  await P.load({ url: 'https://cdn/onboard.m3u8', licenseUrl: '', multiFeed: true, info: { dynamic: false } }, null);
+  assert.deepEqual(P.languages[0], ['audio', 'tea']);
+  // AVPlay, with the choice made on Shaka.
+  const av = fakeAvPlay();
+  av.getTotalTrackInfo = () => [{ type: 'AUDIO', index: 0, extra_info: '{"language":"eng"}' }, { type: 'AUDIO', index: 3, extra_info: '{"language":"teamradio"}' }];
+  av.setSelectTrack = (type, i) => av.calls.push(['setSelectTrack', type, i]);
+  const A = await player(av, { 'f1tv.settings': JSON.stringify({ audio: 'tea' }) });
+  await A.load({ url: 'https://cdn/single.m3u8', licenseUrl: '', multiFeed: false, info: { dynamic: false } }, null);
+  assert.deepEqual(av.calls.find((c) => c[0] === 'setSelectTrack'), ['setSelectTrack', 'AUDIO', 3]);
 });

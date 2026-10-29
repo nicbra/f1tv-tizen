@@ -20,12 +20,21 @@ function line(sec, data) {
 const stream = (...lines) => lines.join('\n') + '\n';
 
 // feeds: { FeedName: text }. Anything else is a 404. status overrides: { FeedName: httpStatus }.
-function harness(feeds, status) {
+// timers: an array that collects setTimeout callbacks ({ fn, ms }) instead of dropping them.
+function harness(feeds, status, path = PATH, timers, now) {
   const messages = [];
   const urls = [];
+  const sockets = [];
   const self = { postMessage: (m) => messages.push(JSON.parse(JSON.stringify(m))) };
+  // F1's SignalR Core endpoint: negotiate answers a token; the test drives the socket.
+  class WebSocket {
+    constructor(url) { this.url = url; this.sent = []; this.closed = false; sockets.push(this); }
+    send(text) { this.sent.push(text); }
+    close() { this.closed = true; if (this.onclose) this.onclose(); }
+  }
   const fetch = async (url) => {
     urls.push(url);
+    if (/\/negotiate/.test(url)) return { ok: true, status: 200, text: async () => JSON.stringify({ connectionToken: 'c1' }) };
     const m = /([A-Za-z]+)\.jsonStream$/.exec(url);
     const feed = m && m[1];
     if (status && status[feed]) return { ok: false, status: status[feed], text: async () => '' };
@@ -33,8 +42,10 @@ function harness(feeds, status) {
     return { ok: false, status: 404, text: async () => '' };
   };
   const context = vm.createContext({
-    self, fetch,
-    setTimeout: () => ({}), clearTimeout: () => {},
+    self, fetch, WebSocket,
+    // The worker stamps live state with Date.now(); `now` puts that next to the test's data.
+    Date: now ? class extends Date { static now() { return now(); } } : Date,
+    setTimeout: (fn, ms) => { if (timers) timers.push({ fn, ms }); return {}; }, clearTimeout: () => {},
     setInterval: () => ({}), clearInterval: () => {}
   });
   vm.runInContext(SOURCE, context);
@@ -49,8 +60,8 @@ function harness(feeds, status) {
   };
   let nextId = 1;
   const api = {
-    messages, urls,
-    load: (live) => self.onmessage({ data: { cmd: 'load', path: PATH, token: 'tok', live: !!live } }),
+    messages, urls, sockets,
+    load: (live) => self.onmessage({ data: { cmd: 'load', path, token: 'tok', live: !!live } }),
     loaded: () => waitFor((m) => m.type === 'loaded' || m.type === 'error'),
     stop: () => self.onmessage({ data: { cmd: 'stop' } }),
     ask: (t) => {
@@ -62,8 +73,8 @@ function harness(feeds, status) {
   return api;
 }
 
-async function loadedWorker(feeds) {
-  const w = harness(feeds);
+async function loadedWorker(feeds, path) {
+  const w = harness(feeds, null, path);
   w.load();
   const res = await w.loaded();
   assert.equal(res.type, 'loaded', JSON.stringify(res));
@@ -152,6 +163,33 @@ test('buffered heartbeats with old Utc times at the start and end do not shift t
   });
   assert.equal(w.ask(at(320) - 1).standings, undefined);
   assert.equal(w.ask(at(320)).standings.length, 1);
+});
+
+test('heartbeats rewritten weeks later give way to the session clock for the UTC base', async () => {
+  // Like Germany 2018: every heartbeat says 2018-08-23, a month after the race; the clock has the real time.
+  const later = (sec) => new Date(at(sec) + 31 * 86400000).toISOString();
+  const feeds = {
+    ...base(),
+    Heartbeat: stream(line(15, { Utc: later(15) }), line(3000, { Utc: later(300) })),
+    ExtrapolatedClock: stream(line(1, { Utc: iso(1), Remaining: '02:00:00', Extrapolating: false }),
+      line(400, { Utc: iso(400), Remaining: '01:59:59', Extrapolating: true })),
+    TimingData: stream(line(320, { Lines: { 1: { Position: '1' } } }))
+  };
+  const w = await loadedWorker(feeds, '2024/2024-05-05_Test_Grand_Prix/2024-05-05_Race/');
+  // The clock's base runs 2 s before the heartbeats' in sound archives; the tower keeps the heartbeat timeline.
+  assert.equal(w.ask(at(322) - 1).standings, undefined);
+  assert.equal(w.ask(at(322)).standings.length, 1);
+});
+
+test('heartbeats on the session date are kept even when the session clock disagrees', async () => {
+  // Like Spain 2025 FP3: the clock is 6 minutes off, the heartbeats are right.
+  const w = await loadedWorker({
+    ...base(),
+    ExtrapolatedClock: stream(line(1, { Utc: iso(-359), Remaining: '01:00:00', Extrapolating: false })),
+    TimingData: stream(line(20, { Lines: { 1: { Position: '1' } } }))
+  }, '2024/2024-05-05_Test_Grand_Prix/2024-05-05_Race/');
+  assert.equal(w.ask(at(20) - 1).standings, undefined);
+  assert.equal(w.ask(at(20)).standings.length, 1);
 });
 
 test('a query returns state as of that time, not later data', async () => {
@@ -445,6 +483,17 @@ test('without status data a race counts as started', async () => {
   assert.equal(w.ask(at(20)).beforeStart, false);
 });
 
+test('without status data (2018-2019) a race starts when its session clock starts to run', async () => {
+  const w = await loadedWorker({
+    ...base(),
+    LapCount: stream(line(10, { CurrentLap: 1, TotalLaps: 58 })),
+    ExtrapolatedClock: stream(line(5, { Utc: iso(5), Remaining: '02:00:00', Extrapolating: false }),
+      line(420, { Utc: iso(420), Remaining: '01:59:59', Extrapolating: true }))
+  });
+  assert.equal(w.ask(at(300)).beforeStart, true);
+  assert.equal(w.ask(at(420)).beforeStart, false);
+});
+
 test('a race without a Started status counts as started from lap 2', async () => {
   const w = await loadedWorker({
     ...base(),
@@ -546,4 +595,230 @@ test('a lap in the new qualifying part replaces the old times', async () => {
   ));
   const s = w.ask(at(51));
   assert.deepEqual([row(s, '44').gap, row(s, '44').best, row(s, '44').old], ['+0.100', '1:31.900', false]);
+});
+
+// ---------- live sessions whose archive is already readable ----------
+
+const RS = '\x1e';
+const frame = (...msgs) => msgs.map((m) => JSON.stringify(m)).join(RS) + RS;
+
+async function liveAfterArchive(livePath = PATH, timers) {
+  const w = harness({ ...base(), TimingData: stream(line(20, { Lines: { 1: { Position: '1', NumberOfLaps: 3 } } })),
+    LapCount: stream(line(20, { CurrentLap: 3, TotalLaps: 50 })) }, null, PATH, timers, () => at(590));
+  w.load(true);
+  assert.equal((await w.loaded()).type, 'loaded');
+  for (let i = 0; i < 50 && !w.sockets.length; i++) await new Promise(setImmediate);
+  const ws = w.sockets[0];
+  assert.ok(ws, 'the live feed was not joined after the archive');
+  ws.onopen();
+  ws.onmessage({ data: '{}' + RS });   // handshake answer
+  ws.onmessage({ data: frame({ type: 3, invocationId: '1', result: { SessionInfo: { Path: livePath } } }) });
+  return { w, ws };
+}
+
+test('a live session whose archive is readable goes on with the real-time feed after it', async () => {
+  const { w, ws } = await liveAfterArchive();
+  assert.match(ws.sent.join(''), /"target":"Subscribe"/);
+  ws.onmessage({ data: frame({ type: 1, target: 'feed', arguments: ['LapCount', { CurrentLap: 7 }, iso(600)] },
+    { type: 1, target: 'feed', arguments: ['TimingData', { Lines: { 1: { NumberOfLaps: 7 } } }, iso(600)] }) });
+  assert.equal(w.ask(at(30)).lap, 3);     // the archive
+  const later = w.ask(at(601));
+  assert.equal(later.lap, 7);             // the real-time feed
+  assert.equal(row(later, '1').laps, 7);
+});
+
+test('the real-time feed is left alone when it carries another session than the archive', async () => {
+  const { w, ws } = await liveAfterArchive('2024/other-gp/Race/');
+  assert.equal(ws.closed, true);
+  assert.equal(w.ask(at(30)).lap, 3);
+});
+
+test('a tyre change on the real-time feed shows within 3 s, however many heartbeats follow', async () => {
+  const timers = [];
+  const { w, ws } = await liveAfterArchive(PATH, timers);
+  timers.splice(0).forEach((t) => t.fn());   // the flush of the subscribe answer
+  ws.onmessage({ data: frame({ type: 1, target: 'feed', arguments: ['TimingAppData', { Lines: { 1: { Stints: { 0: { Compound: 'HARD' } } } } }, iso(700)] }) });
+  for (let s = 1; s <= 5; s++) ws.onmessage({ data: frame({ type: 1, target: 'feed', arguments: ['Heartbeat', { Utc: iso(700 + s) }, iso(700 + s)] }) });
+  const flushes = timers.filter((t) => t.ms === 3000);
+  assert.equal(flushes.length, 1, 'the flush was postponed by each heartbeat');
+  flushes[0].fn();
+  assert.equal(row(w.ask(at(706)), '1').tyre, 'H');
+});
+
+test('a foreign real-time session is dropped for good: no reconnect', async () => {
+  const timers = [];
+  const { w, ws } = await liveAfterArchive('2024/other-gp/Race/', timers);
+  assert.equal(ws.closed, true);
+  timers.splice(0).forEach((t) => t.fn());
+  for (let i = 0; i < 10; i++) await new Promise(setImmediate);
+  assert.equal(w.sockets.length, 1, 'it joined the real-time feed again');
+});
+
+test('live before the archive exists: joins the real-time feed and answers from it', async () => {
+  const w = harness({}, null, PATH, null, () => at(590));
+  w.load(true);
+  for (let i = 0; i < 50 && !w.sockets.length; i++) await new Promise(setImmediate);
+  const ws = w.sockets[0];
+  assert.ok(ws, 'no real-time feed');
+  ws.onopen();
+  ws.onmessage({ data: '{}' + RS });
+  ws.onmessage({ data: frame({ type: 3, invocationId: '1', result: { SessionInfo: { Path: PATH, Type: 'Race', Name: 'Test GP' },
+    LapCount: { CurrentLap: 4, TotalLaps: 50 } } }) });
+  const loaded = await w.loaded();
+  assert.equal(loaded.type, 'loaded');
+  assert.equal(loaded.info.live, true);
+  assert.equal(w.ask(at(590)).lap, 4);
+});
+
+test('heartbeats off by weeks stay when the session clock is off as well', async () => {
+  const later = (sec) => new Date(at(sec) + 31 * 86400000).toISOString();
+  const w = await loadedWorker({
+    ...base(),
+    Heartbeat: stream(line(15, { Utc: later(15) }), line(3000, { Utc: later(3000) })),
+    ExtrapolatedClock: stream(line(1, { Utc: later(1), Remaining: '02:00:00', Extrapolating: false })),
+    TimingData: stream(line(320, { Lines: { 1: { Position: '1' } } }))
+  }, '2024/2024-05-05_Test_Grand_Prix/2024-05-05_Race/');
+  assert.equal(w.ask(at(320) + 31 * 86400000 - 1).standings, undefined);
+  assert.equal(w.ask(at(320) + 31 * 86400000).standings.length, 1);
+});
+
+test('the race starts at the first time the clock runs, not the last', async () => {
+  const w = await loadedWorker({
+    ...base(),
+    LapCount: stream(line(10, { CurrentLap: 1, TotalLaps: 58 })),
+    ExtrapolatedClock: stream(line(5, { Utc: iso(5), Remaining: '02:00:00', Extrapolating: false }),
+      line(420, { Utc: iso(420), Remaining: '01:59:59', Extrapolating: true }),
+      line(900, { Utc: iso(900), Remaining: '01:50:00', Extrapolating: false }),
+      line(1500, { Utc: iso(1500), Remaining: '01:50:00', Extrapolating: true }))
+  });
+  assert.equal(w.ask(at(1000)).beforeStart, false);
+});
+
+test('where the archive has the status, the clock does not decide the start', async () => {
+  const w = await loadedWorker({
+    ...base(),
+    LapCount: stream(line(10, { CurrentLap: 1, TotalLaps: 58 })),
+    SessionStatus: stream(line(410, { Status: 'Started' })),
+    SessionData: stream(line(410, { StatusSeries: { 1: { Utc: iso(410), SessionStatus: 'Started' } } })),
+    ExtrapolatedClock: stream(line(5, { Utc: iso(5), Remaining: '02:00:00', Extrapolating: false }),
+      line(422, { Utc: iso(422), Remaining: '01:59:59', Extrapolating: true }))
+  });
+  assert.equal(w.ask(at(415)).beforeStart, false);
+});
+
+test('the real-time feed is joined when its session path differs only in slashes, case or accents', async () => {
+  const { ws } = await liveAfterArchive('/' + PATH.toUpperCase());
+  assert.equal(ws.closed, false);
+  // São Paulo: F1 may write the accent decomposed (S, a, combining tilde).
+  const sao = '2024/2024-11-03_São_Paulo_Grand_Prix/2024-11-03_Race/';
+  const w = harness({ ...base(), TimingData: stream(line(20, { Lines: { 1: { Position: '1' } } })) }, null, sao, null, () => at(590));
+  w.load(true);
+  await w.loaded();
+  for (let i = 0; i < 50 && !w.sockets.length; i++) await new Promise(setImmediate);
+  const s2 = w.sockets[0];
+  s2.onopen();
+  s2.onmessage({ data: '{}' + RS });
+  s2.onmessage({ data: frame({ type: 3, invocationId: '1', result: { SessionInfo: { Path: sao.normalize('NFD') } } }) });
+  assert.equal(s2.closed, false);
+});
+
+// ---------- the real-time feed on a fake clock (from the third review) ----------
+
+// The worker on a fake clock with real timers semantics, a fake negotiate and a socket the test drives.
+function liveWorker() {
+  let now = Date.parse('2026-10-25T14:00:00Z'), seq = 0;
+  const timers = [], sockets = [], messages = [];
+  const add = (fn, ms, every) => { const t = { id: ++seq, fn, at: now + ms, every: every ? ms : 0 }; timers.push(t); return t.id; };
+  const clear = (id) => { const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); };
+  class WebSocket {
+    constructor(url) { this.url = url; this.sent = []; this.closed = false; sockets.push(this); }
+    send(text) { this.sent.push(text); }
+    close() { this.closed = true; if (this.onclose) this.onclose(); }
+  }
+  const self = { postMessage: (m) => messages.push(JSON.parse(JSON.stringify(m))) };
+  const context = vm.createContext({
+    self, WebSocket,
+    fetch: async (url) => ({ ok: true, status: /negotiate/.test(url) ? 200 : 404, text: async () => JSON.stringify({ connectionToken: 'c' }) }),
+    Date: class extends Date { static now() { return now; } },
+    setTimeout: (fn, ms) => add(fn, ms, false), clearTimeout: clear, setInterval: (fn, ms) => add(fn, ms, true), clearInterval: clear
+  });
+  vm.runInContext(SOURCE, context);
+  const settle = async () => { for (let i = 0; i < 10; i++) await new Promise(setImmediate); };
+  async function advance(ms) {
+    const end = now + ms;
+    for (;;) {
+      await settle();
+      const due = timers.filter((t) => t.at <= end).sort((a, b) => a.at - b.at || a.id - b.id)[0];
+      if (!due) break;
+      now = Math.max(now, due.at);
+      if (due.every) due.at += due.every; else clear(due.id);
+      due.fn();
+    }
+    now = end;
+    await settle();
+  }
+  return { self, sockets, messages, advance, settle,
+    start: async () => {
+      self.onmessage({ data: { cmd: 'load', path: '2026/x/', token: 't', live: true } });   // no archive: 404s -> real-time feed
+      await settle();
+      const ws = sockets[0];
+      ws.onopen(); ws.onmessage({ data: '{}' + RS });
+      ws.onmessage({ data: frame({ type: 3, invocationId: '1', result: { SessionInfo: { Path: '2026/x/', Type: 'Practice' } } }) });
+      return ws;
+    } };
+}
+
+test('the real-time feed is joined and pinged every 15 s', async () => {
+  const w = liveWorker();
+  const ws = await w.start();
+  await w.advance(31000);
+  assert.equal(ws.sent.filter((s) => s === '{"type":6}' + RS).length, 2);
+});
+
+test('a real-time connection that goes silent without closing (a half-open socket) is replaced', async () => {
+  const w = liveWorker();
+  const ws = await w.start();
+  // The server (or the TV\'s network) stops delivering anything: no heartbeat for 10 minutes, and no close event.
+  await w.advance(10 * 60000);
+  assert.ok(w.sockets.length > 1 || ws.closed, 'still waiting on the dead socket after 10 min of silence (SignalR clients give up after 30 s without a server frame)');
+});
+
+test('a socket that opens but never answers the handshake is replaced', async () => {
+  const w = liveWorker();
+  w.self.onmessage({ data: { cmd: 'load', path: '2026/x/', token: 't', live: true } });
+  await w.settle();
+  w.sockets[0].onopen();
+  await w.advance(5 * 60000);
+  assert.ok(w.sockets.length > 1 || w.sockets[0].closed, 'waited 5 min for a handshake answer');
+});
+
+test('after the server closes the socket it reconnects after 5 s, subscribes again and keeps one keep-alive timer', async () => {
+  const w = liveWorker();
+  const ws = await w.start();
+  ws.close();
+  await w.advance(5100);
+  assert.equal(w.sockets.length, 2);
+  const ws2 = w.sockets[1];
+  ws2.onopen(); ws2.onmessage({ data: '{}' + RS });
+  assert.match(ws2.sent.join(''), /"target":"Subscribe"/);
+  const before = ws.sent.length;
+  await w.advance(31000);
+  assert.equal(ws.sent.length, before, 'the old socket is still pinged');
+  assert.equal(ws2.sent.filter((s) => s === '{"type":6}' + RS).length, 2);
+});
+
+test('the qualifying part is right after a reconnect (SessionData series sent again)', async () => {
+  const w = liveWorker();
+  const ws = await w.start();
+  const series = (n) => { const o = {}; for (let i = 1; i <= n; i++) o[i - 1] = { Utc: new Date(Date.parse('2026-10-25T14:00:00Z') + i * 1200000).toISOString(), QualifyingPart: i }; return o; };
+  ws.onmessage({ data: frame({ type: 3, invocationId: '1', result: { SessionInfo: { Path: '2026/x/', Type: 'Qualifying' }, SessionData: { Series: series(2) } } }) });
+  ws.close();
+  await w.advance(5100);
+  const ws2 = w.sockets[1];
+  ws2.onopen(); ws2.onmessage({ data: '{}' + RS });
+  ws2.onmessage({ data: frame({ type: 3, invocationId: '1', result: { SessionInfo: { Path: '2026/x/', Type: 'Qualifying' }, SessionData: { Series: series(3) } } }) });
+  const ask = (t) => { const id = Math.random(); w.self.onmessage({ data: { cmd: 'query', id, t } }); return w.messages.filter((m) => m.type === 'state' && m.id === id)[0].state; };
+  // After the third part has started, everyone should see Q3; between part 1 and 2 it should be Q1.
+  assert.equal(ask(Date.parse('2026-10-25T14:00:00Z') + 3 * 1200000 + 1000).part, 3);
+  assert.equal(ask(Date.parse('2026-10-25T14:00:00Z') + 1.5 * 1200000).part, 1);
 });

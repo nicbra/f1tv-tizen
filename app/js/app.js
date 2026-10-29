@@ -7,6 +7,7 @@
   var grid = null;         // focus grid of the current screen
   var backStack = [];      // functions that restore the previous screen
   var navTabs = [];
+  var currentTab = 0;      // the page tab shown last (Schedule, Standings and the account return to it)
   var currentPage = null;  // { title, load, kind } shown on the browse screen
   var feedsCtx = null;     // { contentId, title, image, feeds, index, live, start }
   var osdTimer = null;
@@ -18,21 +19,27 @@
   var liveFocus = false;   // the LIVE button in the time bar is highlighted (▼ in live streams)
   var panel = null;        // { grid, timer } while the watch-options panel is open
   var timingState = null;  // latest timing state for the playing position
+  var towerHold = false;   // a fresh load is running: the player's clock still belongs to the last stream
   var subtitleTimer = null;
   var accountGrid = null;
   var checkingUpdate = false;
   var playbackFeedbackTimer = null;
   var seasonUri = null;    // the season page, which links every race weekend's page
+  var seasonTitle = '';    // its menu title, such as "2026 Season"
   var upNext = null;       // { ctx, ev, timer, left } while the "Up next" card is shown
+  var navSeq = 0;          // bumped by every screen change, so a load that finishes after the viewer moved on is dropped
 
   var DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   var LANG_NAMES = { eng: 'English', deu: 'Deutsch', fra: 'Français', nld: 'Nederlands', por: 'Português',
-    jpn: '日本語', spa: 'Español', ita: 'Italiano', fx: 'Track sound only', tea: 'Team radio' };
+    jpn: '日本語', spa: 'Español', ita: 'Italiano', fx: 'Track sound only', tea: 'Team radio', teamradio: 'Team radio' };
   var MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
   // helpers
 
   function show(name) {
+    navSeq++;
+    // A feed asked for while another loaded is dropped once the viewer goes anywhere but the player.
+    if (name !== 'player') queuedFeed = null;
     hidePlaybackFeedback();
     ['start', 'login', 'browse', 'list', 'chart', 'feeds', 'player'].forEach(function (n) {
       $('screen-' + n).classList.toggle('hidden', n !== name);
@@ -75,7 +82,9 @@
   function when(ms) {
     var now = Date.now();
     if (sameDay(ms, now)) return 'today ' + hhmm(ms);
-    if (sameDay(ms, now + 86400000)) return 'tomorrow ' + hhmm(ms);
+    var tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);   // not +24 h, which misses a day when the clocks change
+    if (sameDay(ms, tomorrow.getTime())) return 'tomorrow ' + hhmm(ms);
     return dayDate(ms) + ' ' + hhmm(ms);
   }
 
@@ -141,9 +150,14 @@
 
   // login
 
-  function showLogin(reason) {
+  /** back: where BACK goes (a viewer who was browsing); without it, BACK exits (signing in is required). */
+  function showLogin(reason, back) {
     show('login');
-    backStack = [];
+    backStack = back ? [function () {
+      if (loginJob && loginJob.cancel) loginJob.cancel();
+      loginJob = null;
+      back();
+    }] : [];
     if (loginJob && loginJob.cancel) loginJob.cancel();
     $('login-title').textContent = 'Sign in to F1 TV';
     $('login-text').textContent = 'Scan the QR code, or visit ' +
@@ -164,7 +178,7 @@
       $('login-code').textContent = code;
       $('login-hint').textContent = 'Expired codes refresh automatically.';
       showQr(Auth.pairUrl(code));
-      $('login-status').textContent = 'Waiting for confirmation…';
+      $('login-status').textContent = (reason ? reason + ' ' : '') + 'Waiting for confirmation…';
     });
     loginJob.then(onToken).catch(function (e) {
       $('login-status').textContent = 'Could not get a code: ' + e.message;
@@ -218,6 +232,7 @@
       var find = function (re) { return menu.filter(function (m) { return re.test(m.title); })[0]; };
       var home = find(/^home$/i), season = find(/season/i);
       seasonUri = season ? season.uri : null;
+      seasonTitle = season ? season.title : '';
       navTabs = [{ title: 'Home', kind: 'home', load: home ? page(home.uri) : byId(F1Api.HOME_PAGE_ID) }];
       if (season) navTabs.push({ title: 'Schedule', run: function () { openCalendar(season.uri); } });
       navTabs.push({ title: 'Standings', run: function () { openStandings(); } });
@@ -229,7 +244,7 @@
       var who = Auth.profile();
       navTabs.push(Auth.token()
         ? { title: who.firstName || 'Account', account: true, run: openAccount }
-        : { title: 'Sign in', account: true, run: function () { showLogin(); } });
+        : { title: 'Sign in', account: true, run: function () { showLogin(null, function () { show('browse'); openTab(0); }); } });
 
       var nav = $('topnav');
       nav.innerHTML = '';
@@ -254,12 +269,15 @@
   }
 
   function openTab(i) {
-    var t = navTabs[i];
+    var t = navTabs[i], from = currentTab;
+    // BACK from a tab goes to the tab it was opened from, or Home; BACK on Home exits.
     backStack = [];
     if (t.run) {
-      backStack.push(function () { show('browse'); openTab(0); });
+      backStack.push(function () { show('browse'); openTab(from); });
       return t.run();
     }
+    if (i !== 0) backStack.push(function () { show('browse'); openTab(0); });
+    currentTab = i;
     markTab(i);
     show('browse');
     currentPage = { title: t.title, load: t.load, kind: t.kind, root: true };
@@ -280,12 +298,16 @@
     var rails = $('rails');
     rails.innerHTML = '';
     rails.appendChild(el('div', 'empty', 'Loading…'));
+    // The last page's tiles are gone; until this one loads only the top nav works.
+    buildBrowseGrid([]);
+    var seq = navSeq;
     pg.load().then(function (containers) {
-      if (currentPage !== pg) return;
+      if (currentPage !== pg || seq !== navSeq) return;
       var list = pageRails(pg, containers);
       pg.layout = railsLayout(list);
       drawRails(list, focus);
     }).catch(function (e) {
+      if (currentPage !== pg || seq !== navSeq) return;
       rails.innerHTML = '';
       rails.appendChild(el('div', 'empty', 'Could not load: ' + e.message));
       buildBrowseGrid([], focus);
@@ -314,12 +336,31 @@
       var list = pageRails(pg, containers), layout = railsLayout(list);
       if (layout !== pg.layout) {
         pg.layout = layout;
-        return drawRails(list, { r: grid.r, c: grid.c.slice() });
+        return drawRails(list, sameTileFocus(list));
       }
       var fresh = [];
       list.forEach(function (r) { fresh = fresh.concat(r.tiles); });
       Array.prototype.forEach.call($('rails').querySelectorAll('.tile'), function (e, i) { if (fresh[i]) updateTile(e, fresh[i]); });
     }).catch(function () { /* keep what is shown */ });
+  }
+
+  /** After a refresh: the focus on the tile it was on, wherever that has moved; else the same place. */
+  function sameTileFocus(list) {
+    var focus = { r: grid.r, c: grid.c.slice() }, cur = grid.current(), t = cur && cur._tile;
+    var key = t && (t.contentId || t.uri);
+    if (!key) return focus;
+    // Its rail's title, to prefer the same tile in the same rail when a video is in two rails.
+    var oldRail = cur.parentNode && cur.parentNode.parentNode, oldTitle = oldRail && oldRail.querySelector('.rail-title');
+    var railTitle = oldTitle ? oldTitle.textContent : '';
+    var best = null;
+    list.forEach(function (rail, r) {
+      rail.tiles.forEach(function (tile, c) {
+        if ((tile.contentId || tile.uri) !== key) return;
+        if (!best || (rail.title === railTitle && best.title !== railTitle)) best = { r: r + 1, c: c, title: rail.title };
+      });
+    });
+    if (best) { focus.r = best.r; focus.c[best.r] = best.c; }
+    return focus;
   }
 
   function updateTile(e, t) {
@@ -380,7 +421,10 @@
       return scheduleTile(ev);
     });
     if (!found) focus = tiles.length - 1;
-    return { title: 'This weekend' + (weekend.meeting ? ' · ' + weekend.meeting : ''), tiles: tiles, focus: focus };
+    // An archived weekend's page has the same schedule: "This weekend" only while it is (or just was) on.
+    var last = weekend.events[weekend.events.length - 1];
+    var current = found || (last && Date.now() - (last.end || last.start + 2 * 3600000) < 3 * 86400000);
+    return { title: (current ? 'This weekend' : 'Broadcasts') + (weekend.meeting ? ' · ' + weekend.meeting : ''), tiles: tiles, focus: focus };
   }
 
   function scheduleTile(ev) {
@@ -389,7 +433,7 @@
       : st === 'upcoming' ? { text: capitalise(when(ev.start)), cls: 'soon' } : { text: 'Replay', cls: 'done' };
     return {
       title: ev.title,
-      sub: ev.series + ' · ' + dayDate(ev.start) + ' ' + hhmm(ev.start),
+      sub: [ev.series, dayDate(ev.start) + ' ' + hhmm(ev.start)].filter(Boolean).join(' · '),
       image: ev.pictureUrl,
       contentId: ev.contentId,
       badge: badge,
@@ -534,36 +578,55 @@
     $('list-title').textContent = 'Schedule';
     $('list-sub').textContent = 'Loading the calendar…';
     $('list-inner').innerHTML = '';
+    grid = null;
+    var seq = navSeq;
     F1Api.pageByUri(seasonUri).then(function (containers) {
-      var meetings = F1Api.seasonFrom(containers);
-      var now = Date.now(), focus = -1, rows = [];
-      meetings.forEach(function (mt) {
-        var endDay = (mt.end || mt.start) + 86400000;
-        var current = mt.start <= now && now < endDay;
-        var past = !current && endDay <= now;
-        if (focus < 0 && !past) focus = rows.length;
-        // Meeting dates are whole UTC days (end at 23:59:59Z), so read them in UTC.
-        var s0 = new Date(mt.start), s1 = new Date(mt.end || mt.start);
-        var range = mt.start ? s0.getUTCDate() + '–' + s1.getUTCDate() + ' ' + MONTHS[s1.getUTCMonth()] : '';
-        rows.push({
-          when: mt.test ? 'Testing' : (mt.round ? 'Round ' + mt.round : ''),
-          what: mt.country || mt.name,
-          sub: mt.name + (range ? ' · ' + range : ''),
-          badge: current ? 'This weekend' : past ? 'Replays' : until(mt.start).replace(/^in /, ''),
-          badgeCls: current ? 'live' : '',
-          past: past,
-          run: function (idx) {
-            backStack.push(function () { openCalendarAt(idx, rows); });
-            openWeekend(mt);
-          }
-        });
-      });
-      openCalendarAt(focus < 0 ? rows.length - 1 : focus, rows);
-    }).catch(function (e) { $('list-sub').textContent = 'Could not load the calendar: ' + e.message; });
+      if (seq !== navSeq) return;   // the viewer went back meanwhile
+      showCalendar(F1Api.seasonFrom(containers));
+    }).catch(function (e) { if (seq === navSeq) $('list-sub').textContent = 'Could not load the calendar: ' + e.message; });
   }
 
-  function openCalendarAt(focus, rows) {
-    renderList({ title: 'Schedule', sub: new Date().getFullYear() + ' season · times in your local time zone', rows: rows }, focus);
+  /** "2026 season": the season the menu lists (in January that can be the past year). */
+  function seasonLabel() {
+    var y = /^\d{4}/.exec(seasonTitle);
+    return (y ? y[0] : new Date().getFullYear()) + ' season';
+  }
+
+  /** "5–7 Dec", "30 Oct – 1 Nov" or "5 Dec". Meeting dates are whole UTC days (end at 23:59:59Z): read in UTC. */
+  function dateRange(start, end) {
+    var a = new Date(start), b = new Date(end || start);
+    var d1 = a.getUTCDate(), m1 = MONTHS[a.getUTCMonth()], d2 = b.getUTCDate(), m2 = MONTHS[b.getUTCMonth()];
+    if (d1 === d2 && m1 === m2) return d2 + ' ' + m2;
+    return m1 === m2 ? d1 + '–' + d2 + ' ' + m2 : d1 + ' ' + m1 + ' – ' + d2 + ' ' + m2;
+  }
+
+  /**
+   * The season's meetings. Built each time it is shown, so BACK to it shows today's badges. A meeting
+   * without dates comes last, with no badge.
+   */
+  function showCalendar(meetings, focusIndex) {
+    var now = Date.now(), focus = -1, rows = [];
+    var ordered = meetings.filter(function (m) { return m.start; }).concat(meetings.filter(function (m) { return !m.start; }));
+    ordered.forEach(function (mt) {
+      var dated = !!mt.start, endDay = (mt.end || mt.start) + 86400000;
+      var current = dated && mt.start <= now && now < endDay;
+      var past = dated && !current && endDay <= now;
+      if (focus < 0 && dated && !past) focus = rows.length;
+      rows.push({
+        when: mt.test ? 'Testing' : (mt.round ? 'Round ' + mt.round : ''),
+        what: mt.country || mt.name,
+        sub: mt.name + (dated ? ' · ' + dateRange(mt.start, mt.end) : ''),
+        badge: !dated ? '' : current ? 'This weekend' : past ? 'Replays' : until(mt.start).replace(/^in /, ''),
+        badgeCls: current ? 'live' : '',
+        past: past,
+        run: function (idx) {
+          backStack.push(function () { showCalendar(meetings, idx); });
+          openWeekend(mt);
+        }
+      });
+    });
+    var sub = rows.length ? seasonLabel() + ' · times in your local time zone' : 'No race weekends listed yet';
+    renderList({ title: 'Schedule', sub: sub, rows: rows }, focusIndex != null ? focusIndex : focus < 0 ? rows.length - 1 : focus);
   }
 
   function openWeekend(mt) {
@@ -571,10 +634,18 @@
     $('list-title').textContent = mt.country || mt.name;
     $('list-sub').textContent = 'Loading…';
     $('list-inner').innerHTML = '';
+    grid = null;
+    var seq = navSeq;
     F1Api.pageByUri(mt.uri).then(function (containers) {
-      var sched = F1Api.scheduleFrom(containers);
-      var rows = [], lastDay = null, focus = -1, count = 0;
-      (sched ? sched.events : []).forEach(function (ev) {
+      if (seq !== navSeq) return;
+      showWeekend(mt, F1Api.scheduleFrom(containers));
+    }).catch(function (e) { if (seq === navSeq) $('list-sub').textContent = 'Could not load: ' + e.message; });
+  }
+
+  /** A weekend's broadcasts. Built each time it is shown, so BACK to it shows the badges as they are now. */
+  function showWeekend(mt, sched, focusIndex) {
+      var rows = [], lastDay = null, focus = -1, count = 0, events = sched ? sched.events : [];
+      events.forEach(function (ev) {
         var d = dayDate(ev.start);
         if (d !== lastDay) { rows.push({ day: d }); lastDay = d; }
         var st = status(ev);
@@ -588,22 +659,20 @@
           badgeCls: st === 'live' ? 'live pulse' : '',
           past: st === 'done',
           run: function (idx) {
-            var restore = function () { renderList(spec, idx); };
-            openFeeds(ev.contentId, { title: ev.title, image: ev.pictureUrl, event: ev }, restore);
+            openFeeds(ev.contentId, scheduleTile(ev), function () { showWeekend(mt, sched, idx); });
           }
         });
       });
       rows.push({ what: 'All videos from this weekend', sub: 'Shows, press conferences and more', run: function (idx) {
-        backStack.push(function () { renderList(spec, idx); });
+        backStack.push(function () { showWeekend(mt, sched, idx); });
         show('browse');
         markTab(-1);
         currentPage = { title: mt.country || mt.name, load: function () { return F1Api.pageByUri(mt.uri); } };
         renderPage(currentPage);
       } });
       var spec = { title: mt.country || mt.name, sub: mt.name + ' · times in your local time zone', image: mt.pictureUrl, rows: rows };
-      if (!sched) spec.sub = 'No broadcast schedule published yet';
-      renderList(spec, focus < 0 ? 0 : focus);
-    }).catch(function (e) { $('list-sub').textContent = 'Could not load: ' + e.message; });
+      if (!events.length) spec.sub = 'No broadcast schedule published yet';
+      renderList(spec, focusIndex != null ? focusIndex : focus < 0 ? 0 : focus);
   }
 
   // standings and driver pages
@@ -615,8 +684,11 @@
     $('list-title').textContent = 'Standings';
     $('list-sub').textContent = 'Loading…';
     $('list-inner').innerHTML = '';
+    grid = null;
+    var seq = navSeq;
     Promise.all([Stats.driverStandings(), Stats.constructorStandings(), Stats.lastRace(), Stats.driverInfo(F1Api.state.ascendon)])
       .then(function (all) {
+        if (seq !== navSeq) return;
         var ds = all[0], cs = all[1], last = all[2], info = all[3];
         var teamColour = {};
         ds.drivers.forEach(function (d) { var i = info[d.code]; if (i && i.colour) teamColour[d.teamId] = i.colour; });
@@ -647,19 +719,19 @@
             }
           });
         });
-        renderList({ title: 'Standings', sub: new Date().getFullYear() + ' season' + (last ? ' · after round ' + last.round + ' (' + last.name + ')' : ''), rows: rows }, focus || 0);
+        renderList({ title: 'Standings', sub: seasonLabel() + (last ? ' · after round ' + last.round + ' (' + last.name + ')' : ''), rows: rows }, focus || 0);
       })
-      .catch(function (e) { $('list-sub').textContent = 'Could not load the standings: ' + e.message; });
+      .catch(function (e) { if (seq === navSeq) $('list-sub').textContent = 'Could not load the standings: ' + e.message; });
   }
 
-  function openTeam(team, drivers, info) {
+  function openTeam(team, drivers, info, focus) {
     var rows = drivers.filter(function (d) { return d.teamId === team.id; }).map(function (d) {
       var i = info[d.code] || {};
       return { when: place(d.pos), colour: i.colour || '', img: i.headshot || '', what: d.first + ' ' + d.last,
         sub: d.wins ? d.wins + (d.wins === 1 ? ' win' : ' wins') : '', badge: d.points + ' pts',
-        run: function (idx) { backStack.push(function () { openTeam(team, drivers, info); }); openDriver(d, i); } };
+        run: function (idx) { backStack.push(function () { openTeam(team, drivers, info, idx); }); openDriver(d, i); } };
     });
-    renderList({ title: team.name, sub: place(team.pos) + ' in the constructors\' championship · ' + team.points + ' pts', rows: rows }, 0);
+    renderList({ title: team.name, sub: place(team.pos) + ' in the constructors\' championship · ' + team.points + ' pts', rows: rows }, focus || 0);
   }
 
   function svgEl(tag, attrs) {
@@ -715,16 +787,20 @@
   function openBattle(mode) {
     show('chart');
     grid = null;
+    battle = null;   // the last chart's keys must not redraw it while this one loads
+    var seq = navSeq;
     $('chart-sub').textContent = 'Loading…';
     $('chart-plot').innerHTML = '';
     $('chart-legend').innerHTML = '';
     $('chart-readout').innerHTML = '';
     Promise.all([Stats.seasonProgress(), Stats.driverInfo(F1Api.state.ascendon), Stats.driverStandings(), Stats.constructorStandings()])
       .then(function (all) {
+        if (seq !== navSeq) return;
+        if (!all[0].rounds.length) { $('chart-sub').textContent = 'No races yet this season.'; return; }
         battle = { data: all[0], info: all[1], ds: all[2], cs: all[3], mode: mode, idx: all[0].rounds.length - 1 };
         drawBattle();
       })
-      .catch(function (e) { $('chart-sub').textContent = 'Could not load the season: ' + e.message; });
+      .catch(function (e) { if (seq === navSeq) $('chart-sub').textContent = 'Could not load the season: ' + e.message; });
   }
 
   // Short labels for the chart's line ends and readout (jolpica constructor ids).
@@ -890,7 +966,10 @@
     $('list-title').textContent = d.first + ' ' + d.last;
     $('list-sub').textContent = 'Loading the season…';
     $('list-inner').innerHTML = '';
+    grid = null;
+    var seq = navSeq;
     Stats.driverSeason(d.id).then(function (races) {
+      if (seq !== navSeq) return;
       var sum = Stats.summary(races);
       var card = el('div', 'driver-card');
       var face = el('div', 'driver-face');
@@ -924,8 +1003,8 @@
         if (r.sprint) bits.push('sprint ' + (r.sprint.pos ? place(r.sprint.pos) : 'DNF') + (r.sprint.points ? ' (+' + r.sprint.points + ')' : ''));
         var pts = r.points + (r.sprint ? r.sprint.points : 0);
         rows.push({
-          when: 'R' + r.round, what: r.name + '  ·  ' + (r.pos ? place(r.pos) : (r.posText === 'D' ? 'DSQ' : 'DNF')),
-          sub: bits.join(' · ') + (r.pos ? '' : (bits.length ? ' · ' : '') + r.status),
+          when: 'R' + r.round, what: r.name + '  ·  ' + (r.pending ? 'Grand Prix to come' : r.pos ? place(r.pos) : (r.posText === 'D' ? 'DSQ' : 'DNF')),
+          sub: bits.concat(r.pos || r.pending ? [] : [r.status]).filter(Boolean).join(' · '),
           badge: pts ? '+' + pts + ' pts' : '0 pts', badgeCls: r.pos === 1 ? 'live' : '',
           round: r.round, run: function () {}
         });
@@ -937,15 +1016,15 @@
         onFocus: function (row) { chart.highlight(row && row.round); }
       }, 0);
       chart.highlight(races.length ? races[races.length - 1].round : null);
-    }).catch(function (e) { $('list-sub').textContent = 'Could not load the season: ' + e.message; });
+    }).catch(function (e) { if (seq === navSeq) $('list-sub').textContent = 'Could not load the season: ' + e.message; });
   }
 
   function checkForUpdate() {
     if (!Settings.get('updates')) return;
     Updates.check().then(function (u) {
       if (u.available && Updates.firstNotice(u.latest)) {
-        toast('F1 TV ' + u.latest + ' is available. Run the installer on your computer again to update. ' +
-          'Details under your name → About.', 12000, 'notice');
+        toast('F1 TV ' + u.latest + ' is available. Run the installer on your computer again to update.' +
+          (Auth.token() ? ' Details under your name → About.' : ''), 12000, 'notice');
       }
     });
   }
@@ -1025,30 +1104,31 @@
     $('feeds-hero').style.backgroundImage = hero ? 'url("' + hero + '")' : '';
     $('feeds-hero').classList.toggle('spoiler', !spoilerSafe(tile));
     grid = new Focus.Grid([]);
+    var seq = navSeq;
 
     F1Api.video(contentId).then(function (v) {
+      if (seq !== navSeq) return;   // the viewer went back before the video's details arrived
       var m = v.metadata || {};
-      var extra = (m.additionalStreams || []).map(function (s) {
-        var name = s.title || s.reportingName || (s.driverFirstName && (s.driverFirstName + ' ' + s.driverLastName)) || 'Feed';
-        var type = s.type === 'obc' ? (s.teamName || 'Onboard') : '';
-        var full = s.driverFirstName ? s.driverFirstName + ' ' + s.driverLastName : '';
-        return { title: name, type: type, channelId: s.channelId || null, hex: s.hex || '', full: full,
-          num: s.type === 'obc' && s.racingNumber != null ? String(s.racingNumber) : '' };
-      });
-      var feeds = [{ title: 'Main feed', type: 'Broadcast', channelId: null }].concat(
-        extra.filter(function (f) { return !/^main/i.test(f.title) || f.channelId; })
-      );
+      var feeds = F1Api.feedsFrom(m);
       var ev = tile.event;
+      // The video's own subtype is newer than a weekend list that has stayed open since it was live.
+      var live = m.contentSubtype === 'LIVE' ? true : m.contentSubtype === 'REPLAY' ? false
+        : ev ? status(ev) === 'live' : !!(tile.badge && tile.badge.text === 'LIVE');
       feedsCtx = { contentId: contentId, title: tile.title, image: tile.image, feeds: feeds, index: 0,
-        live: ev ? status(ev) !== 'done' : (m.contentSubtype === 'LIVE' || !!(tile.badge && tile.badge.text === 'LIVE')),
-        start: ev ? ev.start : null };
+        live: live, start: ev ? ev.start : null,
+        // Not on air yet: played as live once its start has come (the play API says if it is too early).
+        upcoming: !live && m.contentSubtype !== 'REPLAY' && !!ev && status(ev) === 'upcoming' };
       var emf = m.emfAttributes || {};
       feedsCtx.timingMeta = {
-        title: m.titleBrief || tile.title, series: emf.Series || (ev && ev.series) || '',
+        title: Timing.sessionName(m.titleBrief || tile.title), series: emf.Series || (ev && ev.series) || '',
+        year: m.year, sessionKey: emf.MeetingSessionKey,
         meeting: emf.Meeting_Name || (ev && ev.meeting) || '', meetingKey: emf.MeetingKey || (ev && ev.meetingKey),
         start: +emf.sessionStartDate || (ev && ev.start), endIso: emf.sessionEndTime || (ev && ev.endIso) || '',
         meetingEnd: ev && ev.meetingEnd
       };
+      // The last video's timing must not be applied to this one while its stream loads.
+      Timing.stop();
+      timingState = null;
       feedsCtx.subtype = m.contentSubtype;
       // The race weekend for the line under the title in the player, such as "United States Grand Prix 2026".
       var weekend = emf.Meeting_Name || emf.Global_Meeting_Name;
@@ -1058,13 +1138,14 @@
       var next = emf.multipartEvent === 'true' && emf.multipartEventNextHouseId;
       feedsCtx.nextPart = { houseId: next && next !== m.externalId ? next : null, end: +emf.sessionEndDate || 0 };
       feedsCtx.duration = m.duration;
-      var resumeReady = Promise.resolve();
+      var resumeReady = feedsCtx.resumeReady = Promise.resolve();
       if (!feedsCtx.live) {
         resumeReady = F1Api.resumePosition(contentId, m.duration).then(function (pos) {
-          if (!feedsCtx || feedsCtx.contentId !== contentId || pos < 60 || (m.duration && pos > m.duration - 120)) return;
+          if (!feedsCtx || feedsCtx.contentId !== contentId || !resumable(pos, m.duration)) return;
           feedsCtx.resume = pos;
           $('feeds-sub').textContent += ' · Watched to ' + fmtTime(pos);
         });
+        feedsCtx.resumeReady = resumeReady;
       }
       var subParts = [emf.Meeting_Name];
       if (feedsCtx.live) subParts.push('LIVE now');
@@ -1096,7 +1177,7 @@
         resumeReady.then(function () { if (feedsCtx === ctx && screen === 'feeds') chooseStart(0); });
       }
     }).catch(function (e) {
-      $('feeds-sub').textContent = 'Could not load: ' + e.message;
+      if (seq === navSeq) $('feeds-sub').textContent = 'Could not load: ' + e.message;
     });
   }
 
@@ -1107,7 +1188,24 @@
     return n;
   }
 
+  /** A saved position worth offering to continue from: not within the first minute or the last two. */
+  function resumable(pos, duration) {
+    return pos >= 60 && !(duration && pos > duration - 120);
+  }
+
   function chooseStart(i) {
+    var ctx = feedsCtx;
+    if (ctx.starting) return;   // OK pressed again while the saved position is on its way
+    ctx.starting = true;
+    // A quick OK must not miss the saved position, but a slow answer is not worth waiting long for.
+    Promise.race([ctx.resumeReady, new Promise(function (r) { setTimeout(r, 3000); })]).then(function () {
+      ctx.starting = false;
+      if (feedsCtx === ctx && screen === 'feeds' && !dialog) startFrom(i);
+    });
+  }
+
+  function startFrom(i) {
+    if (feedsCtx.upcoming && Date.now() >= feedsCtx.start) feedsCtx.live = true;
     if (!feedsCtx.live && feedsCtx.resume && i === 0) {
       return ask('Continue watching?', 'You stopped at ' + fmtTime(feedsCtx.resume) + '.', [
         { label: 'Continue from ' + fmtTime(feedsCtx.resume), value: 'resume' }, { label: 'Start over', value: 'start' }
@@ -1128,7 +1226,9 @@
   // player
 
   var loadingFeed = false;   // a playFeed load is running
+  var playerExits = 0;       // counts leavePlayer calls: a load that outlives one was abandoned by the viewer
   var queuedFeed = null;     // the latest request made meanwhile: [i, opts]
+  var switchPause = null;    // during a feed switch: whether the viewer wants it paused (keys pressed meanwhile count)
 
   /**
    * opts: fromStart (broadcast start), startAt (player seconds), switching (same moment).
@@ -1158,23 +1258,36 @@
 
   function loadFeed(i, opts) {
     opts = opts || {};
-    var ctx = feedsCtx;
+    var ctx = feedsCtx, exits = playerExits, seq = navSeq;
     var f = feedsCtx.feeds[i];
     var playing = screen === 'player' && Player.engineName();
-    var from = opts.switching && playing ? { wall: Player.wallClock(Player.position()), at: Date.now() } : null;
-    feedsCtx.index = i;
+    var from = opts.switching && playing ? { wall: Player.wallClock(Player.position()), at: Date.now(),
+      pos: Player.position(), paused: Player.isPaused(), index: feedsCtx.index, stream: Player.stream() } : null;
+    switchPause = from ? from.paused : null;
     return ensureSession().then(function (ok) {
-      if (!ok) return showLogin('Sign in to watch.');
+      // Gone back meanwhile (renewing the session can take a while).
+      if (feedsCtx !== ctx || exits !== playerExits || seq !== navSeq) return;
+      if (!ok) {
+        // Signed out (the device key was refused): stop what plays, and let BACK return to browsing.
+        if (screen === 'player') stopPlayer();
+        return showLogin('Sign in to watch.', snapshot());
+      }
+      feedsCtx.index = i;   // only now: a failed session check leaves the current feed as it is
       show('player');
       scrub = null;
       $('osd-title').textContent = feedsCtx.title;
       $('osd-event').textContent = feedsCtx.event;
       $('osd-feed').textContent = feedLabel();
       if (from) toast('Switching to ' + (f.full || f.title) + '…', 2500);
-      else $('spinner').classList.remove('hidden');
+      else {
+        $('spinner').classList.remove('hidden');
+        towerHold = true;
+        timingState = null;
+        renderTower();
+      }
       showOsd();
       var stream;
-      return (from ? Promise.resolve() : Player.unload())
+      return (from || playing ? Promise.resolve() : Player.unload())
         .then(function () { return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted() }); })
         .then(function (s) {
           stream = s;
@@ -1198,33 +1311,52 @@
             if (shift > 5) stream.startDelay = shift;
             start = null;
           }
-          if (!from) return Player.load(stream, start);
+          if (!from) return Player.load(stream, start).then(function () { feedsCtx.playing = i; });
           var t0 = Date.now();
           return Player.switchTo(stream, start).then(function () {
+            feedsCtx.playing = i;
             // Learn how long a switch takes so the next one lands on the same moment.
-            switchLead = Math.max(0.5, Math.min(8, (switchLead + (Date.now() - t0) / 1000) / 2));
+            if (!from.paused) switchLead = Math.max(0.5, Math.min(8, (switchLead + (Date.now() - t0) / 1000) / 2));
+            // Paused or playing as the viewer last chose, also with a key pressed during the switch
+            // (AVPlay reopens playing; Shaka carries the pause over).
+            var want = switchPause;
+            switchPause = null;
+            if (want != null && want !== Player.isPaused()) Player.togglePause();
           });
         })
         .then(function () {
           $('spinner').classList.add('hidden');
+          towerHold = false;
           Timing.load(feedsCtx.timingMeta, F1Api.state.ascendon, feedsCtx.live);
-          if (stream && Player.stream() === stream && !opts.retry) watchStart(stream);
+          if (stream && Player.stream() === stream && !opts.retry) watchStart(stream, opts);
         })
         .catch(function (e) {
           $('spinner').classList.add('hidden');
-          if (feedsCtx !== ctx || (e && e.message === 'cancelled')) return;
+          towerHold = false;
+          // Stopped by the viewer while it loaded (Shaka rejects the interrupted load): no error, and no
+          // reason to give up on HDR for this video.
+          if (feedsCtx !== ctx || exits !== playerExits || (e && e.message === 'cancelled')) return;
+          // A failed switch leaves the previous feed playing: it is still the current one (not
+          // feedsCtx.index, which a superseded switch may have moved on).
+          if (from && Player.stream() === from.stream) {
+            feedsCtx.index = feedsCtx.playing != null ? feedsCtx.playing : from.index;
+            $('osd-feed').textContent = feedLabel(from.stream);
+          }
           if (stream && stream.hdr && !feedsCtx.hdrFailed) {
             feedsCtx.hdrFailed = true;
             // Queue the SDR retry behind this load; a newer feed request still wins.
             if (!queuedFeed && screen === 'player') playFeed(i, opts);
             return;
           }
-          if (F1Api.isNotStarted(e)) {
+          if (F1Api.isNotStarted(e) && feedsCtx.playing == null) {
             stopPlayer();
             return toast(feedsCtx.title + (feedsCtx.start ? ' starts ' + when(feedsCtx.start) + '.' : ' hasn\'t started yet.'), 8000);
           }
           toast('Could not play: ' + (e.message || e), 8000);
         });
+    }, function (e) {
+      // The session could not be checked (no network): say so instead of doing nothing.
+      if (feedsCtx === ctx && exits === playerExits && seq === navSeq) toast('Could not reach F1 TV: ' + (e.message || e), 8000);
     });
   }
 
@@ -1232,19 +1364,25 @@
    * Retry once if playback hasn't started after 15 s; an HDR stream gets 25 s, since its first
    * segments have taken ~20 s when the CDN had to fetch them, and its retry falls back to SDR.
    */
-  function watchStart(stream) {
+  function watchStart(stream, opts) {
     var from = Player.position(), ctx = feedsCtx;
     setTimeout(function () {
       // A newer load or another video has taken over; it has its own watch.
       if (feedsCtx !== ctx || loadingFeed) return;
       if (screen !== 'player' || Player.stream() !== stream || Player.isPaused() || stream.retried) return;
-      if (Player.position() > from + 0.5) return;
+      // Moved either way: it plays (the viewer may have jumped back).
+      if (Math.abs(Player.position() - from) > 0.5) return;
       toast('The video didn\'t start, trying again…', 3000);
       // Through playFeed so it queues behind any other load instead of racing it.
-      var wall = Player.wallClock(from);
+      // AVPlay reports no position until it plays: 0 is no moment of the stream, so the retry repeats the request.
+      var wall = from > 0 ? Player.wallClock(from) : null;
       if (stream.hdr) feedsCtx.hdrFailed = true;
-      playFeed(feedsCtx.index, Player.isLive() ? (wall ? { liveAt: wall, retry: true } : { retry: true })
-        : { startAt: from || null, retry: true });
+      var again = {};
+      Object.keys(opts || {}).forEach(function (k) { if (k !== 'switching') again[k] = opts[k]; });   // a fresh load
+      again.retry = true;
+      if (Player.isLive() && wall) again = { liveAt: wall, retry: true };
+      else if (!Player.isLive() && from) again = { startAt: from, retry: true };
+      playFeed(feedsCtx.index, again);
     }, stream.hdr ? 25000 : 15000);
   }
 
@@ -1260,10 +1398,12 @@
       if (at != null && info) at = Math.max(at, info.windowStart + (info.dynamic ? 15 : 0));
       if (at != null && (!info || at < info.windowEnd)) return at;
     }
-    if (from && from.wall) {
-      var wall = from.wall + (Date.now() - from.at) / 1000 + switchLead;
-      var p = Player.positionAt(wall, info);
+    if (from) {
+      var ahead = from.paused ? 0 : (Date.now() - from.at) / 1000 + switchLead;
+      var p = from.wall ? Player.positionAt(from.wall + ahead, info) : null;
       if (p != null && p >= info.windowStart && p <= info.windowEnd) return p;
+      // No clock to line the feeds up (or no manifest facts): replays share a timeline, so the same position.
+      if (p == null && !(info && info.dynamic) && !feedsCtx.live && from.pos > 0) return from.pos + ahead;
     }
     // A little after the window start: the player's own DVR window begins a few seconds later.
     if (opts.fromStart && info && info.dynamic) return info.windowStart + 15;
@@ -1291,7 +1431,7 @@
   }
 
   // The live player itself runs ~25-50 s behind real time; within this margin counts as live.
-  var LIVE_MARGIN = 60;
+  var LIVE_MARGIN = 12;   // live plays ~29 s behind real time: 4 s behind the edge (wall clock minus the 25 s delay)
 
   /** Label for a position: offset or behind-live time, plus the real clock time when known. */
   function posLabel(pos, r, live) {
@@ -1386,7 +1526,9 @@
     // service, see playFeed): that plays in ~3 s, a seek within the live window in ~5 s.
     if (Player.isLive() && Player.engineName() === 'avplay') {
       scrub = null;
-      var toLive = Player.range().end - p < LIVE_MARGIN;
+      // Only a jump forward can land "at live"; a jump back from live is a real rewind.
+      var back = p < Player.position() - 3;
+      var toLive = !back && Player.range().end - p < LIVE_MARGIN;
       if (toLive && behindLive() < LIVE_MARGIN) return updateOsd(); // already live: nothing to do
       return goLive(toLive ? null : Player.wallClock(p));
     }
@@ -1414,8 +1556,9 @@
   function checkPending() {
     if (!pending) return;
     var pos = Player.position();
+    // Playing, it has arrived once it moves on from there; paused, once it is there.
     var arrived = Math.abs(pos - pending.pos) < 4 && Date.now() - pending.since > 150 &&
-      pending.lastPos != null && pos > pending.lastPos;
+      pending.lastPos != null && (pos > pending.lastPos || Player.isPaused());
     pending.lastPos = pos;
     if (arrived || Date.now() - pending.since > 10000) {
       pending = null;
@@ -1430,16 +1573,19 @@
   }
 
   function saveProgress() {
-    if (screen !== 'player' || !feedsCtx || feedsCtx.live || feedsCtx.index !== 0 || !Player.engineName()) return;
+    // Not mid-switch: the position would be the other feed's.
+    if (screen !== 'player' || !feedsCtx || feedsCtx.live || feedsCtx.index !== 0 || !Player.engineName() || loadingFeed) return;
     var pos = Player.position() - Player.range().start;
     if (pos > 30) {
       F1Api.savePosition(feedsCtx.contentId, pos, feedsCtx.subtype);
-      feedsCtx.resume = pos;
+      feedsCtx.resume = resumable(pos, feedsCtx.duration) ? pos : null;
     }
   }
 
   /** Stops playback and clears the player's overlays, staying on the player screen. */
   function leavePlayer() {
+    playerExits++;
+    queuedFeed = null;   // a feed switch asked for while loading must not restart playback
     liveFocus = false;
     saveProgress();
     if (scrub) scrubCancel();
@@ -1519,7 +1665,12 @@
     if (key === K.RIGHT) return scrubMove(1);
     if (key === K.RW) return scrubMove(-1, true);
     if (key === K.FF) return scrubMove(1, true);
-    if (key === K.ENTER || key === K.PLAY_PAUSE || key === K.PLAY || key === K.PAUSE) return togglePause();
+    if (switchPause != null && (key === K.PLAY || key === K.PAUSE || key === K.ENTER || key === K.PLAY_PAUSE)) {
+      switchPause = key === K.PLAY ? false : key === K.PAUSE ? true : !switchPause;
+    }
+    if (key === K.PLAY) return Player.isPaused() ? togglePause() : null;
+    if (key === K.PAUSE) return Player.isPaused() ? null : togglePause();
+    if (key === K.ENTER || key === K.PLAY_PAUSE) return togglePause();
     if (key === K.DOWN && Player.isLive()) { liveFocus = true; return updateOsd(); }
     if (key === K.UP || key === K.DOWN) return openPanel();
     if (key === K.CH_UP) return switchFeed(-1);
@@ -1539,11 +1690,27 @@
   // up next: the following part of a pre-show / session / post-show event
 
   /** The broadcast schedule of the race weekend with this MeetingKey. */
-  function weekendSchedule(meetingKey) {
-    if (!seasonUri) return Promise.resolve(null);
-    return F1Api.pageByUri(seasonUri).then(function (containers) {
-      var mt = F1Api.seasonFrom(containers).filter(function (x) { return String(x.key) === String(meetingKey); })[0];
-      return mt ? F1Api.pageByUri(mt.uri).then(F1Api.scheduleFrom) : null;
+  function weekendSchedule(meetingKey, year) {
+    return seasonPage(year).then(function (uri) {
+      return uri && F1Api.pageByUri(uri).then(function (containers) {
+        var mt = F1Api.seasonFrom(containers).filter(function (x) { return String(x.key) === String(meetingKey); })[0];
+        return mt ? F1Api.pageByUri(mt.uri).then(F1Api.scheduleFrom) : null;
+      });
+    }).then(function (sched) { return sched || null; });
+  }
+
+  /** A season's page: the menu's current season, or the archive's "2025 Season" and so on. */
+  function seasonPage(year) {
+    if (!year || seasonTitle.indexOf(String(year)) === 0) return Promise.resolve(seasonUri);
+    return F1Api.page(F1Api.ARCHIVE_PAGE_ID).then(function (containers) {
+      var uri = null;
+      (containers || []).forEach(function (c) {
+        ((c.retrieveItems && c.retrieveItems.resultObj && c.retrieveItems.resultObj.containers) || []).forEach(function (it) {
+          var a = (it.actions || [])[0] || {};
+          if (!uri && (it.metadata || {}).title === year + ' Season' && /\/PAGE\//.test(a.uri || '')) uri = a.uri;
+        });
+      });
+      return uri;
     });
   }
 
@@ -1556,12 +1723,19 @@
   function checkNextPart() {
     var ctx = feedsCtx, n = ctx && ctx.nextPart;
     if (screen !== 'player' || !n || n.offered || !n.end || loadingFeed || !Player.isLive()) return;
+    if (n.over == null) {
+      // Real time is past the scheduled end: find out when F1 stops listing the broadcast as live.
+      if (Date.now() < n.end || Date.now() < (n.checkAt || 0)) return;
+      n.checkAt = Date.now() + 30000;
+      F1Api.video(ctx.contentId).then(function (v) {
+        if (feedsCtx === ctx && n.over == null && (v.metadata || {}).contentSubtype !== 'LIVE') n.over = Date.now();
+      }).catch(function () { /* try again later */ });
+      return;
+    }
+    // The broadcast is over (about when F1 said so; the poll can be 30 s late). A viewer behind live
+    // still has its last minutes ahead: offer the next part when their moment gets there, not before.
     var wall = Player.wallClock(Player.position());
-    if (!wall || wall * 1000 < n.end || Date.now() < (n.checkAt || 0)) return;
-    n.checkAt = Date.now() + 30000;
-    F1Api.video(ctx.contentId).then(function (v) {
-      if (feedsCtx === ctx && screen === 'player' && (v.metadata || {}).contentSubtype !== 'LIVE') offerNextPart();
-    }).catch(function () { /* try again later */ });
+    if (wall && wall * 1000 >= n.end && wall * 1000 >= n.over - 35000) offerNextPart();
   }
 
   /**
@@ -1575,7 +1749,7 @@
     var missing = function () { if (onMissing) onMissing(); else showEnded(ctx); };
     if (!n.houseId) { missing(); return true; }
     (function lookUp() {
-      weekendSchedule(ctx.timingMeta.meetingKey).then(function (sched) {
+      weekendSchedule(ctx.timingMeta.meetingKey, ctx.timingMeta.year).then(function (sched) {
         if (feedsCtx !== ctx || screen !== 'player' || n.dismissed) return;
         var ev = sched && sched.events.filter(function (e) { return e.houseId === n.houseId; })[0];
         if (!ev) return missing();
@@ -1589,7 +1763,9 @@
 
   /** The card counts down from 10 s and then plays the next part; one not yet on air shows its start time. */
   function showUpNext(ctx, ev) {
+    var first = !upNext;   // later calls only refresh a part not on air yet, every 30 s
     clearUpNext();
+    if (first) closePanel();   // it would take BACK and OK from the card
     var st = status(ev), u = upNext = { ctx: ctx, ev: ev, left: st === 'upcoming' ? null : 10 };
     $('upnext-label').textContent = 'Next';
     $('upnext').classList.remove('hidden');
@@ -1644,7 +1820,7 @@
     clearUpNext();
     leavePlayer();
     // BACK from the next part returns to wherever the previous part was opened from.
-    openFeeds(ev.contentId, { title: ev.title, image: ev.pictureUrl, event: ev }, backStack.pop(), { at: wall });
+    openFeeds(ev.contentId, scheduleTile(ev), backStack.pop(), { at: wall });
   }
 
   // watch options panel (feeds, timing, commentary, subtitles)
@@ -1820,10 +1996,20 @@
   }
 
   function timingTick() {
-    if (screen !== 'player' || !Timing.isReady()) return;
-    var wall = Player.wallClock(Player.position());
+    if (screen !== 'player' || towerHold) return;
+    // No timing for this video, or not loaded yet: clear the tower rather than leave it frozen.
+    if (!Timing.isReady()) {
+      if (timingState) { timingState = null; renderTower(); }
+      return;
+    }
+    var wall = Player.wallClock(Player.position()), ctx = feedsCtx;
     if (!wall) return;
-    timingAt(wall).then(function (st) { timingState = st; renderTower(); });
+    timingAt(wall).then(function (st) {
+      // Answered after the viewer moved on to another video or load.
+      if (feedsCtx !== ctx || towerHold) return;
+      timingState = st;
+      renderTower();
+    });
   }
 
   var towerSig = '';
@@ -1953,7 +2139,7 @@
     if (screen === 'chart') { e.preventDefault(); return chartKey(key); }
     if (key === K.BACK) {
       e.preventDefault();
-      if (screen === 'login' || !backStack.length) return exitApp();
+      if (!backStack.length) return exitApp();
       return goBack();
     }
     if (key === K.EXIT) return exitApp();
@@ -1988,7 +2174,10 @@
     // During a jump the pending-seek logic owns the spinner (it waits a moment before showing it).
     Player.on('buffering', function (b) { if (!pending) $('spinner').classList.toggle('hidden', !b); });
     setInterval(checkPending, 100);
-    Player.on('ended', function () { if (screen === 'player' && !offerNextPart(stopPlayer)) stopPlayer(); });
+    Player.on('ended', function () {
+      if (screen !== 'player' || upNext) return;   // the "Next" / "Broadcast ended" card is counting down already
+      if (!offerNextPart(stopPlayer)) stopPlayer();
+    });
     Player.on('subtitle', showSubtitle);
     setInterval(timingTick, 250);   // often, so the session clock ticks with the on-screen one
     setInterval(saveProgress, 30000);

@@ -230,6 +230,37 @@ test('menu collects every entry that links to a page, however deeply nested', as
   ]);
 });
 
+// additionalStreams as the video API sends them (2023-2026 replays; before 2023 WIF is the default feed and there is no PRES).
+const stream = (title, identifier, channelId, extra) => Object.assign({ title, identifier, type: 'additional', channelId,
+  playbackUrl: 'CONTENT/PLAY?' + (identifier === 'WIF' ? '' : 'channelId=' + channelId + '&') + 'contentId=1000006399' }, extra);
+
+test('feedsFrom plays INTERNATIONAL as the main stream instead of by its channel, which F1 rejects', () => {
+  const { F1Api } = api();
+  const feeds = F1Api.feedsFrom({ additionalStreams: [
+    stream('F1 LIVE', 'PRES', 1033, { default: true }), stream('INTERNATIONAL', 'WIF', 1025), stream('TRACKER', 'TRACKER', 1003),
+    stream('VER', 'OBC', 1009, { type: 'obc', racingNumber: 1, teamName: 'Red Bull Racing', hex: '#3671C6',
+      driverFirstName: 'Max', driverLastName: 'Verstappen' })
+  ] });
+  assert.deepEqual(plain(feeds.map((f) => [f.title, f.type, f.channelId])), [
+    ['INTERNATIONAL', 'Broadcast', null], ['F1 LIVE', '', '1033'], ['TRACKER', '', '1003'], ['VER', 'Red Bull Racing', '1009']]);
+  assert.deepEqual(plain(feeds[3]), { title: 'VER', type: 'Red Bull Racing', channelId: '1009', hex: '#3671C6',
+    full: 'Max Verstappen', num: '1' });
+});
+
+test('feedsFrom keeps an onboard whose playbackUrl names no channel, by its channelId', () => {
+  const { F1Api } = api();
+  const feeds = F1Api.feedsFrom({ additionalStreams: [stream('INTERNATIONAL', 'WIF', 1025),
+    { title: 'VER', identifier: 'OBC', type: 'obc', channelId: 1009, racingNumber: 1, playbackUrl: 'CONTENT/PLAY?contentId=1' }] });
+  assert.deepEqual(plain(feeds.map((f) => [f.title, f.channelId])), [['INTERNATIONAL', null], ['VER', 1009]]);
+});
+
+test('feedsFrom keeps the main feed alone for single-feed videos, and falls back to channelId without a playbackUrl', () => {
+  const { F1Api } = api();
+  assert.deepEqual(plain(F1Api.feedsFrom({})), [{ title: 'Main feed', type: 'Broadcast', channelId: null }]);
+  const feeds = F1Api.feedsFrom({ additionalStreams: [{ title: 'MAIN', channelId: null }, { title: 'PIT LANE', channelId: 1002 }] });
+  assert.deepEqual(plain(feeds.map((f) => [f.title, f.channelId])), [['Main feed', null], ['PIT LANE', 1002]]);
+});
+
 const event = (id, title, start, extra) => ({ id, metadata: Object.assign({ contentId: id, titleBrief: title, contentSubtype: 'REPLAY',
   emfAttributes: { Series: 'FORMULA 1', sessionStartDate: String(start), Meeting_Name: 'United States Grand Prix', MeetingKey: '1300' } }, extra) });
 
@@ -321,6 +352,20 @@ test('streamInfo reports keys in the variant playlist, which a clear master does
   const media = '#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://key"\n#EXTINF:6.0,\na.mp4\n#EXT-X-ENDLIST\n';
   const { F1Api } = api((url) => ({ body: url.endsWith('/low/index.m3u8') ? media : master }));
   assert.equal((await F1Api.streamInfo('https://cdn/race/index.m3u8')).encrypted, true);
+});
+
+test('streamInfo rejects error pages instead of reading them as manifests', async () => {
+  // A CDN 503 page would read as a live HLS playlist (no ENDLIST) or a static DASH one.
+  const page = '<html><body>Service Unavailable</body></html>';
+  const { F1Api } = api(() => ({ status: 503, body: page }));
+  await assert.rejects(F1Api.streamInfo('https://cdn/race/index.m3u8'), /HTTP 503/);
+  await assert.rejects(F1Api.streamInfo('https://cdn/live/index.mpd'), /HTTP 503/);
+  const { F1Api: ok200 } = api(() => ({ body: page }));
+  await assert.rejects(ok200.streamInfo('https://cdn/race/index.m3u8'), /Not a manifest/);
+  // A failing variant playlist behind a good master.
+  const { F1Api: variant } = api((url) => url.endsWith('index.m3u8')
+    ? { body: '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv/1080.m3u8\n' } : { status: 503, body: page });
+  await assert.rejects(variant.streamInfo('https://cdn/race/index.m3u8'), /HTTP 503/);
 });
 
 test('streamInfo treats an HLS playlist without an end as live', async () => {

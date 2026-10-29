@@ -51,7 +51,7 @@ var Updates = (function () {
       })
       .catch(function () {
         c = load();
-        c.at = Date.now();
+        c.at = Date.now() - DAY + 3600000;   // failed (the network not up yet, say): try again in an hour
         save(c);
         var result = status();
         result.error = true;

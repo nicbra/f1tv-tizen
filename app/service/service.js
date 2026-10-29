@@ -18,6 +18,7 @@ var PORT = 18765;
 var UA = 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/537.36 (KHTML, like Gecko) TV Safari/537.36';
 var server = null;
 
+/** cb(err, status, body, headers, finalUrl): finalUrl is where redirects led. */
 function fetchBuffer(target, redirects, cb) {
   var opts = urlLib.parse(target);
   opts.headers = { 'User-Agent': UA };
@@ -29,7 +30,7 @@ function fetchBuffer(target, redirects, cb) {
     }
     var chunks = [];
     res.on('data', function (c) { chunks.push(c); });
-    res.on('end', function () { cb(null, res.statusCode, Buffer.concat(chunks), res.headers); });
+    res.on('end', function () { cb(null, res.statusCode, Buffer.concat(chunks), res.headers, target); });
     res.on('error', function (e) { cb(e); });
   });
   req.setTimeout(15000, function () { req.abort(); });
@@ -178,10 +179,13 @@ function handle(req, res) {
 
   if (u.pathname === '/mpd' && u.query.u) {
     var manifestUrl = String(u.query.u);
-    return fetchBuffer(manifestUrl, 3, function (err, status, body) {
+    return fetchBuffer(manifestUrl, 3, function (err, status, body, headers, finalUrl) {
       if (err) return send(res, 502, toBuf(String(err)));
       if (status !== 200) return send(res, status, body);
-      var mpd = rewriteManifest(body.toString('utf8'), manifestUrl);
+      // Segments are relative to where a redirect led, not to the requested address; but the audio
+      // proxy only fetches from formula1.com, so a redirect elsewhere keeps the requested base.
+      var base = /^https:\/\/[a-z0-9.-]+\.formula1\.com\//.test(finalUrl || '') ? finalUrl : manifestUrl;
+      var mpd = rewriteManifest(body.toString('utf8'), base);
       if (+u.query.shift > 0) mpd = timeShift(mpd, +u.query.shift, Date.now());
       if (u.query.audio || u.query.text) mpd = preferLanguages(mpd, { audio: u.query.audio, text: u.query.text });
       send(res, 200, toBuf(mpd, 'utf8'), 'application/dash+xml');
@@ -190,7 +194,7 @@ function handle(req, res) {
 
   var m = /^\/s\/([^/]+)\/(.+)$/.exec(u.pathname);
   if (m) {
-    var target = b64urlDecode(m[1]) + m[2];
+    var target = b64urlDecode(m[1]) + m[2] + (u.search || '');   // keep a segment's query (CDN tokens)
     if (!/^https:\/\/[a-z0-9.-]+\.formula1\.com\//.test(target)) return send(res, 403, toBuf('forbidden'));
     return fetchBuffer(target, 3, function (err, status, body, headers) {
       if (err) return send(res, 502, toBuf(String(err)));

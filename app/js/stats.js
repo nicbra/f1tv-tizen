@@ -60,10 +60,19 @@ var Stats = (function () {
     }).catch(function () { return null; });
   }
 
-  // Classified finishers are "Finished" or lapped ("+1 Lap", "Lapped"); anything else is a DNF/DSQ.
-  function classified(status) { return /^(Finished|Lapped|\+\d+ Laps?)$/.test(status || ''); }
+  /**
+   * Classified: a numeric positionText, as F1 classifies a car that retired late in the race ("R" is
+   * retired, "D" disqualified). Without one, the status: "Finished" or lapped ("+1 Lap", "Lapped").
+   */
+  function classified(res) {
+    if (res.positionText != null && res.positionText !== '') return /^\d+$/.test(res.positionText);
+    return /^(Finished|Lapped|\+\d+ Laps?)$/.test(res.status || '');
+  }
 
-  /** A driver's season: [{ round, name, country, pos, grid, points, status, fastest, quali, sprint }]. */
+  /**
+   * A driver's season: [{ round, name, country, pos, grid, points, status, fastest, quali, sprint, pending }].
+   * pending: a sprint weekend's Saturday, with the sprint's result but the Grand Prix still to come.
+   */
   function driverSeason(id) {
     return Promise.all([
       get('/drivers/' + id + '/results.json'),
@@ -71,34 +80,45 @@ var Stats = (function () {
       get('/drivers/' + id + '/sprint.json').catch(function () { return null; })
     ]).then(function (all) {
       var quali = {}, sprint = {};
-      ((all[1] && all[1].RaceTable.Races) || []).forEach(function (r) { quali[r.round] = +r.QualifyingResults[0].position; });
-      ((all[2] && all[2].RaceTable.Races) || []).forEach(function (r) {
-        var s = r.SprintResults[0];
-        sprint[r.round] = { pos: +s.position || null, points: +s.points || 0 };
+      ((all[1] && all[1].RaceTable.Races) || []).forEach(function (r) {
+        var q = (r.QualifyingResults || [])[0];   // a round can come without a row
+        if (q) quali[r.round] = +q.position;
       });
-      return all[0].RaceTable.Races.map(function (r) {
+      ((all[2] && all[2].RaceTable.Races) || []).forEach(function (r) {
+        var s = (r.SprintResults || [])[0];
+        if (s) sprint[r.round] = { pos: +s.position || null, points: +s.points || 0 };
+      });
+      var races = all[0].RaceTable.Races.map(function (r) {
         var res = r.Results[0];
         return {
           round: +r.round, name: shortRace(r.raceName), country: r.Circuit.Location.country,
-          pos: classified(res.status) ? +res.position : null, posText: res.positionText,
+          pos: classified(res) ? +res.position : null, posText: res.positionText,
           grid: +res.grid || null, points: +res.points || 0, status: res.status,
           fastest: !!(res.FastestLap && res.FastestLap.rank === '1'),
           quali: quali[r.round] || null, sprint: sprint[r.round] || null
         };
       });
+      ((all[2] && all[2].RaceTable.Races) || []).forEach(function (r) {
+        if (!sprint[r.round] || races.some(function (x) { return x.round === +r.round; })) return;
+        races.push({ round: +r.round, name: shortRace(r.raceName), country: r.Circuit.Location.country,
+          pos: null, posText: '', grid: null, points: 0, status: '', fastest: false,
+          quali: quali[r.round] || null, sprint: sprint[r.round], pending: true });
+      });
+      return races.sort(function (a, b) { return a.round - b.round; });
     });
   }
 
   function summary(races) {
     var s = { wins: 0, podiums: 0, poles: 0, fastestLaps: 0, dnfs: 0, best: null, finishes: 0, sum: 0, points: 0 };
     races.forEach(function (r) {
+      if (r.quali === 1) s.poles++;
+      s.points += r.points + (r.sprint ? r.sprint.points : 0);
+      if (r.pending) return;   // the Grand Prix is still to come: no finish, no DNF
       if (r.pos === 1) s.wins++;
       if (r.pos && r.pos <= 3) s.podiums++;
-      if (r.quali === 1) s.poles++;
       if (r.fastest) s.fastestLaps++;
       if (!r.pos) s.dnfs++;
       else { s.finishes++; s.sum += r.pos; s.best = s.best ? Math.min(s.best, r.pos) : r.pos; }
-      s.points += r.points + (r.sprint ? r.sprint.points : 0);
     });
     s.avg = s.finishes ? s.sum / s.finishes : null;
     return s;
@@ -136,7 +156,10 @@ var Stats = (function () {
         if (!d.Tla) return;
         byCode[d.Tla] = { colour: d.TeamColour ? '#' + d.TeamColour : '', headshot: d.HeadshotUrl || '', team: d.TeamName || '' };
       });
-      try { localStorage.setItem(INFO_KEY, JSON.stringify({ at: Date.now(), byCode: byCode })); } catch (e) { /* full */ }
+      // Not when the latest session has no driver list yet: ask again next time rather than for a day.
+      if (Object.keys(byCode).length) {
+        try { localStorage.setItem(INFO_KEY, JSON.stringify({ at: Date.now(), byCode: byCode })); } catch (e) { /* full */ }
+      }
       return byCode;
     }).catch(function () { return {}; });
   }

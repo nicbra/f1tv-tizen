@@ -168,19 +168,39 @@ test('driverSeason merges race results with quali, sprint, fastest lap and grid'
   assert.equal(s[3].quali, 1);
 });
 
-test('driverSeason counts Finished, +N Lap(s) and Lapped as classified and everything else as DNF', async () => {
+test('driverSeason gives classified drivers their place, also after a late retirement, and others none', async () => {
   const { stats } = load(seasonRoutes());
   const s = plain(await stats.driverSeason('max_verstappen'));
   assert.deepEqual(s.map((r) => r.pos), [1, 5, 6, null]);
   assert.equal(s[3].posText, 'R');
 
-  const statuses = ['Finished', '+1 Lap', '+2 Laps', 'Lapped', 'Disqualified', 'Retired', 'Accident', 'Finished early'];
-  const rows = statuses.map((status, i) => Object.assign(race(i + 1, 'X Grand Prix'), {
-    Results: [{ position: String(i + 1), positionText: String(i + 1), grid: '1', points: '0', status }]
+  // jolpica's positionText: a number when classified, R retired, D disqualified, E excluded, W withdrew.
+  const results = [['Finished', '1'], ['+1 Lap', '2'], ['+2 Laps', '3'], ['Lapped', '4'], ['Engine', '15'], ['Disqualified', 'D'],
+    ['Retired', 'R'], ['Accident', 'R'], ['Excluded', 'E'], ['Finished', ''], ['Accident', '']];
+  const rows = results.map(([status, positionText], i) => Object.assign(race(i + 1, 'X Grand Prix'), {
+    Results: [{ position: String(i + 1), positionText, grid: '1', points: '0', status }]
   }));
   const t = load({ '/drivers/x/results.json': raceTable(rows) });
   const pos = plain(await t.stats.driverSeason('x')).map((r) => r.pos);
-  assert.deepEqual(pos, [1, 2, 3, 4, null, null, null, null]);
+  // Without a positionText the status decides.
+  assert.deepEqual(pos, [1, 2, 3, 4, 5, null, null, null, null, 10, null]);
+});
+
+test('driverSeason includes a sprint weekend\'s Saturday, before its Grand Prix has a result', async () => {
+  const routes = seasonRoutes();
+  routes['/drivers/max_verstappen/sprint.json'] = raceTable([
+    Object.assign({}, race(5, 'Miami Grand Prix'), { SprintResults: [{ position: '1', points: '8' }] })
+  ]);
+  routes['/drivers/max_verstappen/qualifying.json'] = raceTable([Object.assign({}, race(5, 'Miami Grand Prix'), { QualifyingResults: [{ position: '1' }] })]);
+  const { stats } = load(routes);
+  const s = await stats.driverSeason('max_verstappen');
+  assert.deepEqual(plain(s.map((r) => r.round)), [1, 2, 3, 4, 5]);
+  assert.deepEqual(plain(s[4]), { round: 5, name: 'Miami GP', country: 'Australia', pos: null, posText: '', grid: null, points: 0,
+    status: '', fastest: false, quali: 1, sprint: { pos: 1, points: 8 }, pending: true });
+  const sum = stats.summary(s);
+  assert.equal(sum.points, 25 + 10 + 8 + 0 + 8);
+  assert.equal(sum.dnfs, 1);   // Bahrain only: the Miami Grand Prix has not been run
+  assert.equal(sum.poles, 1);
 });
 
 test('driverSeason still works when qualifying and sprint data fail to load', async () => {
@@ -422,4 +442,23 @@ test('seasonProgress follows the page size the API actually answers with', async
   const p = plain(await stats.seasonProgress());
   assert.deepEqual(offsets, [0, 30, 60]);
   assert.equal(p.rounds.length, 3);
+});
+
+test('driverInfo does not keep an empty answer for a day when the latest session has no driver list yet', async () => {
+  const routes = timingRoutes();
+  delete routes[TIMING + new Date().getUTCFullYear() + '/m2/Qualifying/DriverList.jsonStream'];   // 404 (403 on F1's storage)
+  const { stats, store } = load(routes);
+  assert.deepEqual(plain(await stats.driverInfo('tok')), {});
+  assert.equal(store['f1tv.drivers'], undefined);
+});
+
+test('driverSeason copes with a round that has no qualifying or sprint row', async () => {
+  const routes = seasonRoutes();
+  routes['/drivers/max_verstappen/qualifying.json'] = raceTable([Object.assign(race(1, 'Australian Grand Prix'), { QualifyingResults: [] })]);
+  routes['/drivers/max_verstappen/sprint.json'] = raceTable([Object.assign(race(2, 'Chinese Grand Prix'), { SprintResults: [] })]);
+  const { stats } = load(routes);
+  const s = plain(await stats.driverSeason('max_verstappen'));
+  assert.equal(s.length, 4);
+  assert.equal(s[0].quali, null);
+  assert.equal(s[1].sprint, null);
 });

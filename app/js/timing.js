@@ -1,7 +1,7 @@
 /* Finds the session's timing archive and queries timing-worker.js at the video's timestamp. */
 var Timing = (function () {
   var BASE = 'https://livetiming.formula1.com/static/';
-  var SESSIONS = /^(Practice [123]|Qualifying|Sprint Qualifying|Sprint Shootout|Sprint|Race)$/;
+  var SESSIONS = ['Practice 1', 'Practice 2', 'Practice 3', 'Qualifying', 'Sprint Qualifying', 'Sprint Shootout', 'Sprint', 'Race'];
   var worker = null;
   var loadedKey = null;
   var ready = false;
@@ -11,11 +11,23 @@ var Timing = (function () {
   function onMessage(e) {
     var m = e.data;
     if (m.type === 'loaded') ready = true;
+    else if (m.type === 'error') failed(loadedKey);
     else if (m.type === 'state' && waiting[m.id]) { waiting[m.id](m.state); delete waiting[m.id]; }
   }
 
+  /**
+   * The timing archive's name for a session video's title, or the title if it names none. Besides
+   * "Qualifying", F1 TV has "F1 Qualifying", "Qualifying Replay", "Sprint shootout",
+   * "2018 Monaco Grand Prix - Full Race" and "2018 Australian GP - F1 FP2".
+   */
+  function sessionName(title) {
+    var t = String(title || '').split(' - ').pop().replace(/^(F1|Full) /i, '').replace(/ Replay$/i, '')
+      .replace(/^FP([123])$/i, 'Practice $1');
+    return SESSIONS.filter(function (s) { return s.toLowerCase() === t.toLowerCase(); })[0] || t;
+  }
+
   function supported(meta) {
-    return !!meta && /FORMULA 1/i.test(meta.series || '') && SESSIONS.test(meta.title || '');
+    return !!meta && /FORMULA 1/i.test(meta.series || '') && SESSIONS.indexOf(sessionName(meta.title)) >= 0;
   }
 
   function isoDate(ms) { return new Date(ms).toISOString().slice(0, 10); }
@@ -26,20 +38,41 @@ var Timing = (function () {
     return m ? (m[1] === '-' ? -1 : 1) * ((+m[2]) * 60 + (+m[3])) * 60000 : 0;
   }
 
-  /** Archive folder for a session: from the season index, or built from the meeting name and dates. */
+  /**
+   * Archive folder for a session: from the season index (by session key, then name), or built from the
+   * meeting name and dates. Replays before 2021 have no start date, only the year.
+   */
   function resolvePath(meta, token) {
-    var year = new Date(meta.start).getUTCFullYear();
-    return fetch(BASE + year + '/Index.json', { headers: { Authorization: 'Bearer ' + token } })
+    var year = +meta.year || new Date(meta.start).getUTCFullYear();
+    var name = sessionName(meta.title);
+    var auth = { headers: { Authorization: 'Bearer ' + token } };
+    return fetch(BASE + year + '/Index.json', auth)
       .then(function (r) { return r.ok ? r.text() : ''; })
       .then(function (text) {
-        var idx = text ? JSON.parse(text.replace(/^﻿/, '')) : { Meetings: [] };
+        var idx = text ? JSON.parse(text.replace(/^\uFEFF/, '')) : { Meetings: [] };
         var mt = idx.Meetings.filter(function (x) { return String(x.Key) === String(meta.meetingKey); })[0];
-        var s = mt && mt.Sessions.filter(function (x) { return x.Name.toLowerCase() === meta.title.toLowerCase() && x.Path; })[0];
+        var sessions = (mt ? mt.Sessions : []).filter(function (x) { return x.Path; });
+        var s = sessions.filter(function (x) { return meta.sessionKey && String(x.Key) === String(meta.sessionKey); })[0] ||
+          sessions.filter(function (x) { return x.Name.toLowerCase() === name.toLowerCase(); })[0];
         if (s) return s.Path;
-        // Not indexed yet (the current weekend): folders are named after local session and race dates.
+        if (!meta.start) throw new Error('No timing archive for this session');
+        // Not indexed (the current weekend, 2022, early 2024): folders are named after local session and race dates.
         var sessionDay = isoDate(meta.start + trackOffset(meta.endIso));
-        var raceDay = meta.meetingEnd ? isoDate(meta.meetingEnd) : nextSunday(sessionDay);
-        return year + '/' + raceDay + '_' + meta.meeting.replace(/ /g, '_') + '/' + sessionDay + '_' + meta.title.replace(/ /g, '_') + '/';
+        var folder = function (raceDay) {
+          // F1 TV says "Emilia-Romagna Grand Prix" (2024); the archive, Emilia_Romagna_Grand_Prix.
+          return year + '/' + raceDay + '_' + meta.meeting.replace(/[ -]/g, '_') + '/' + sessionDay + '_' + name.replace(/ /g, '_') + '/';
+        };
+        if (meta.meetingEnd) return folder(isoDate(meta.meetingEnd));
+        if (name === 'Race') return folder(sessionDay);
+        // The race is on Sunday, or on Saturday (Bahrain and Saudi Arabia 2024, Las Vegas): take the folder that exists.
+        var sunday = nextSunday(sessionDay), saturday = isoDate(Date.parse(sunday + 'T12:00:00Z') - 86400000);
+        if (saturday < sessionDay) return folder(sunday);
+        var exists = function (path) {
+          return fetch(BASE + path + 'SessionInfo.jsonStream', auth).then(function (r) { return r.ok; }, function () { return false; });
+        };
+        return exists(folder(sunday)).then(function (ok) {
+          return ok ? folder(sunday) : exists(folder(saturday)).then(function (sat) { return folder(sat ? saturday : sunday); });
+        });
       });
   }
 
@@ -50,16 +83,32 @@ var Timing = (function () {
   }
 
   /** Starts loading timing for a session. meta: { title, series, meeting, meetingKey, start, endIso, meetingEnd } */
+  var failure = { key: null, at: 0 };
+
+  /**
+   * No timing for this session (2022 and others have none), or a network error: a load a minute
+   * later tries again, not every feed switch.
+   */
+  function failed(key) {
+    if (key == null || loadedKey !== key) return;
+    loadedKey = null;
+    failure = { key: key, at: Date.now() };
+  }
+
   function load(meta, token, live) {
     if (!supported(meta)) { stop(); return; }
     var key = meta.meetingKey + '/' + meta.title;
-    if (key === loadedKey) return;
+    if (key === loadedKey || (key === failure.key && Date.now() - failure.at < 60000)) return;
     stop();
     loadedKey = key;
     if (!worker) { worker = new Worker('js/timing-worker.js'); worker.onmessage = onMessage; }
     resolvePath(meta, token).then(function (path) {
       if (loadedKey === key) worker.postMessage({ cmd: 'load', path: path, token: token, live: !!live });
-    }).catch(function () { /* no timing for this session */ });
+    }).catch(function () {
+      // The real-time feed needs no archive path: a live session still gets its tower.
+      if (live && loadedKey === key) worker.postMessage({ cmd: 'load', path: '', token: token, live: true });
+      else failed(key);
+    });
   }
 
   /** Resolves with the timing state at UTC ms t, or null. */
@@ -98,5 +147,5 @@ var Timing = (function () {
     return parts.join(' · ');
   }
 
-  return { load: load, query: query, stop: stop, label: label, supported: supported, isReady: function () { return ready; } };
+  return { load: load, query: query, stop: stop, label: label, supported: supported, sessionName: sessionName, isReady: function () { return ready; } };
 })();

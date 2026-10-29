@@ -14,7 +14,7 @@ function auth(route, stored) {
     const path = url.replace('https://api.formula1.com', '');
     const body = init.body ? JSON.parse(init.body) : null;
     calls.push({ path, body, headers: init.headers });
-    const r = route ? route(path, body, init.headers) : null;
+    const r = route ? await route(path, body, init.headers) : null;
     const text = JSON.stringify(r && r.body !== undefined ? r.body : r);
     return { ok: !(r && r.status >= 400), status: (r && r.status) || 200, text: async () => text };
   };
@@ -135,10 +135,35 @@ test('cancel stops pairing', async () => {
   assert.ok(polls <= seen + 1);
 });
 
+test('a confirmation that arrives after cancelling does not sign in', async () => {
+  let answer;
+  const ok = account({ pending: 0 });
+  const { Auth, saved } = auth((path, body) => path.endsWith('Status') ? new Promise((r) => { answer = () => r(ok(path, body)); }) : ok(path, body));
+  let signedIn = false;
+  const job = Auth.pair(() => {});
+  job.then(() => { signedIn = true; });
+  for (let i = 0; i < 5 && !answer; i++) await new Promise((r) => setImmediate(r));
+  job.cancel();     // "Browse without signing in" while the status request is out
+  answer();         // which then says the code was confirmed
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(signedIn, false);
+  assert.equal(saved().authKey, undefined);
+  assert.equal(Auth.token(), null);
+});
+
 test('renew trades the device key for a fresh token, and gives null when it cannot', async () => {
   const { Auth } = auth(account(), { authKey: 'KEY1', deviceId: 'tizen-1' });
   assert.ok(await Auth.renew());
   assert.equal(await auth(account(), {}).Auth.renew(), null);
   const { Auth: revoked } = auth(() => ({ status: 401, body: { message: 'revoked' } }), { authKey: 'K', deviceId: 'd' });
   assert.equal(await revoked.renew(), null);
+});
+
+test('renew rejects on a network or server error, so a blip does not look like being signed out', async () => {
+  const { Auth: offline } = auth(() => { throw new TypeError('Failed to fetch'); }, { authKey: 'K', deviceId: 'd' });
+  await assert.rejects(offline.renew(), /Failed to fetch/);
+  const { Auth: down } = auth(() => ({ status: 503, body: { message: 'unavailable' } }), { authKey: 'K', deviceId: 'd' });
+  await assert.rejects(down.renew(), /unavailable/);
+  const { Auth: fault } = auth(() => ({ Fault: { Code: 1, Message: 'Device not found' } }), { authKey: 'K', deviceId: 'd' });
+  assert.equal(await fault.renew(), null);
 });

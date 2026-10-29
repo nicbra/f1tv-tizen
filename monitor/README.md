@@ -9,7 +9,8 @@ It checks:
 - **without signing in:** the API config, the menu, the season calendar, the weekend schedule,
   video details and onboard feeds, the links from pre-shows to sessions to post-shows, the
   standings from jolpica, and F1's live timing connection;
-- **signed in:** renewing the sign-in, HLS or DASH playback on the TV platform, the manifest's
+- **signed in:** renewing the sign-in, HLS or DASH playback on the TV platform, that every
+  broadcast feed and an onboard of the latest replay play, the manifest's
   clock (including HLS program date-times), Premium HLG HDR resolution and its match to the SDR
   clock, the audio fix on encrypted DASH (during live broadcasts while replays are clear HLS),
   the latest timing archive session and Race/Sprint start, driver headshots and colours, and,
