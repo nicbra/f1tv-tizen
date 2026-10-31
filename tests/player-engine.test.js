@@ -527,6 +527,34 @@ test('team radio chosen on one engine is found on the other ("tea" in HLS, "team
   assert.deepEqual(av.calls.find((c) => c[0] === 'setSelectTrack'), ['setSelectTrack', 'AUDIO', 3]);
 });
 
+test('commentary is selected again once playing when AVPlay refuses it in READY (Tizen 9)', async () => {
+  const av = fakeAvPlay();
+  let audio = 0;
+  av.getTotalTrackInfo = () => [{ type: 'AUDIO', index: 0, extra_info: '{"language":"eng"}' }, { type: 'AUDIO', index: 2, extra_info: '{"language":"deu"}' }];
+  av.getCurrentStreamInfo = () => [{ type: 'AUDIO', index: audio, extra_info: audio === 2 ? '{"language":"deu"}' : '{"language":"eng"}' }];
+  av.setSelectTrack = (type, i) => {
+    if (av.getState() !== 'PLAYING') throw new Error('PLAYER_ERROR_INVALID_STATE');
+    av.calls.push(['setSelectTrack', type, i]);
+    audio = i;
+  };
+  const P = await player(av, { 'f1tv.settings': JSON.stringify({ audio: 'deu' }) });
+  await P.load({ url: 'https://cdn/single.m3u8', licenseUrl: '', multiFeed: false, info: { dynamic: false } }, null);
+  await new Promise(setImmediate);
+  assert.deepEqual(av.calls.filter((c) => c[0] === 'setSelectTrack'), [['setSelectTrack', 'AUDIO', 2]]);
+});
+
+test('commentary already applied in READY is not selected again once playing', async () => {
+  const av = fakeAvPlay();
+  let audio = 0;
+  av.getTotalTrackInfo = () => [{ type: 'AUDIO', index: 0, extra_info: '{"language":"eng"}' }, { type: 'AUDIO', index: 2, extra_info: '{"language":"deu"}' }];
+  av.getCurrentStreamInfo = () => [{ type: 'AUDIO', index: audio, extra_info: audio === 2 ? '{"language":"deu"}' : '{"language":"eng"}' }];
+  av.setSelectTrack = (type, i) => { av.calls.push(['setSelectTrack', type, i]); audio = i; };
+  const P = await player(av, { 'f1tv.settings': JSON.stringify({ audio: 'deu' }) });
+  await P.load({ url: 'https://cdn/single.m3u8', licenseUrl: '', multiFeed: false, info: { dynamic: false } }, null);
+  await new Promise(setImmediate);
+  assert.equal(av.calls.filter((c) => c[0] === 'setSelectTrack').length, 1);
+});
+
 test('authorized encrypted HDR uses native playback and the prepared HLG manifest', async () => {
   const av=fakeAvPlay();
   const P=await player(av,undefined,()=>Promise.resolve());

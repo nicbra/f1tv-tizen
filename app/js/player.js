@@ -491,6 +491,7 @@ var Player = (function () {
             // Live streams start where the manifest's presentation delay puts them (see StreamProxy.manifest).
             av.play();
             ensurePlaying(s);
+            applyAudioWhenPlaying(s);
             applyTextWhenPlaying(s);
             if (startAt != null && !live && !seekFirst) seek(startAt * 1000, null, 16);
             resolve();
@@ -622,6 +623,27 @@ var Player = (function () {
         try { info = JSON.parse((cur && cur.extra_info) || '{}'); } catch (e) { /* unknown */ }
         if (!sameLang(info.track_lang, want)) selectText(want);
       }, 1200);
+    }
+
+    /**
+     * Tizen 9 refuses setSelectTrack('AUDIO') in READY with
+     * PLAYER_ERROR_INVALID_STATE, so the choice made before play() is lost there. Once playing,
+     * select the commentary again if the current track isn't it.
+     */
+    function applyAudioWhenPlaying(s) {
+      var tries = 0;
+      (function check() {
+        if (stream !== s || ++tries > 20) return;
+        var st = '';
+        try { st = av.getState(); } catch (e) { return; }
+        if (st !== 'PLAYING' && st !== 'PAUSED') return setTimeout(check, 400);
+        var want = Settings.get('audio'), cur = null;
+        if (!want) return;
+        try { cur = av.getCurrentStreamInfo().filter(function (t) { return t.type === 'AUDIO'; })[0]; } catch (e) { /* unknown */ }
+        var info = {};
+        try { info = JSON.parse((cur && cur.extra_info) || '{}'); } catch (e) { /* unknown */ }
+        if (!sameLang(info.language, want)) selectAudio(want);
+      })();
     }
 
     /** Re-issues play() if AVPlay stays READY/PAUSED after starting (and the viewer didn't pause). */
