@@ -1,4 +1,4 @@
-/* Encrypted HLG VOD over native DASH. No decryption or licence handling here. */
+/* Encrypted HLG (replays and live) over native DASH. No decryption or licence handling here. */
 var HdrStream = (function () {
   var LOCAL = 'http://127.0.0.1:18765';
   function fail(why) { throw new Error('HDR: ' + why); }
@@ -22,6 +22,68 @@ var HdrStream = (function () {
     if (raw.indexOf(before) < 0) return fail('Widevine identifier missing from initialization metadata');
     return btoa(raw.split(before).join(binary(kid)));
   }
+  function kind(set) {
+    var head = set.slice(0, set.indexOf('>')), type = attr(head, 'contentType');
+    return type === 'application' && /^(stpp|wvtt)/.test(attr(head, 'codecs')) ? 'text' : type;
+  }
+  /** The official video's CBCS Widevine metadata: { kid, pssh }. */
+  function widevine(video) {
+    var kid = /\bcenc:default_KID="([^"]+)"/.exec(video);
+    var wv = (video.match(/<ContentProtection\b[^>]*>[\s\S]*?<\/ContentProtection>/g) || []).filter(function (s) { return /urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed/.test(s); })[0];
+    var pssh = wv && /<cenc:pssh\b[^>]*>([^<]+)<\/cenc:pssh>/.exec(wv);
+    if (!kid || !pssh || !/value="cbcs"/.test(video)) return fail('unsupported Widevine protection');
+    return { kid: id(kid[1]), pssh: pssh[1].trim() };
+  }
+  /** HLS key lines must all name the media's own key, as Apple's SAMPLE-AES. */
+  function checkKeys(lines, kid) {
+    if (!lines.length) return fail('missing CBCS declaration');
+    lines.forEach(function (line) {
+      var a = attrs(line.slice(line.indexOf(':') + 1));
+      if (a.METHOD !== 'SAMPLE-AES' || a.KEYFORMAT !== 'com.apple.streamingkeydelivery' || id(a.URI || '') !== kid) return fail('inconsistent CBCS keys');
+    });
+  }
+  function runsOf(timeline) {
+    var runs = [];
+    (timeline || '').replace(/<S\b([^>]*)\/>/g, function (all, s) {
+      runs.push({ t: attr(s, 't') === '' ? null : +attr(s, 't'), d: +attr(s, 'd'), r: attr(s, 'r') === '' ? 0 : +attr(s, 'r') });
+      return all;
+    });
+    return runs;
+  }
+  /** Media time (ticks) of segment `number` on a SegmentTimeline, or null outside it. */
+  function timeOf(clock, number) {
+    var t = 0, n = clock.startNumber;
+    for (var i = 0; i < clock.runs.length; i++) {
+      var run = clock.runs[i], count = run.r + 1;
+      if (run.t != null) t = run.t;
+      if (number < n + count) return number >= n ? t + (number - n) * run.d : null;
+      n += count;
+      t += count * run.d;
+    }
+    return null;
+  }
+  function isoSeconds(d) {
+    var m = /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?$/.exec(d || '');
+    return m ? +(m[1] || 0) * 86400 + +(m[2] || 0) * 3600 + +(m[3] || 0) * 60 + +(m[4] || 0) : 0;
+  }
+  /** fetch() for one preparation, all of it aborted after 12 s. */
+  function fetcher() {
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    function get(url, bytes, range) {
+      return fetch(url, { signal: controller ? controller.signal : undefined, headers: range ? { Range: 'bytes=0-65535' } : {} }).then(function (r) {
+        if (!r.ok) return fail('media request failed (' + r.status + ')');
+        return bytes ? r.arrayBuffer().then(function (b) { return new Uint8Array(b); }) :
+          r.text().then(function (body) { return { body: body, url: r.url || url }; });
+      });
+    }
+    function deadline(work) {
+      return new Promise(function (resolve, reject) {
+        var timer = setTimeout(function () { if (controller) controller.abort(); reject(new Error('HDR preparation timed out')); }, 12000);
+        work.then(function (value) { clearTimeout(timer); resolve(value); }, function (e) { clearTimeout(timer); if (controller) controller.abort(); reject(e); });
+      });
+    }
+    return { get: get, deadline: deadline };
+  }
   function official(mpd, url, langs) {
     if (!/<MPD\b[^>]*\btype="static"/.test(mpd) || (mpd.match(/<Period\b/g) || []).length !== 1 || /<BaseURL\b/.test(mpd)) return fail('unsupported Widevine VOD layout');
     var period = /<Period\b([^>]*)>/.exec(mpd);
@@ -34,21 +96,14 @@ var HdrStream = (function () {
     }
     if (period && attr(period[1], 'start') && !/^PT0(?:\.0+)?S$/.test(attr(period[1], 'start'))) return fail('unsupported period origin');
     var sets = mpd.match(/<AdaptationSet\b[\s\S]*?<\/AdaptationSet>/g) || [];
-    var video = sets.filter(function (s) { return attr(s.slice(0, s.indexOf('>')), 'contentType') === 'video'; })[0];
+    var video = sets.filter(function (s) { return kind(s) === 'video'; })[0];
     if (!video) return fail('missing Widevine video metadata');
-    var kid = /\bcenc:default_KID="([^"]+)"/.exec(video);
-    var wv = (video.match(/<ContentProtection\b[^>]*>[\s\S]*?<\/ContentProtection>/g) || []).filter(function (s) { return /urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed/.test(s); })[0];
-    var pssh = wv && /<cenc:pssh\b[^>]*>([^<]+)<\/cenc:pssh>/.exec(wv);
-    var template = /<SegmentTemplate\b([^>]*)>/.exec(video);
-    if (!kid || !pssh || !template || !/value="cbcs"/.test(video)) return fail('unsupported Widevine protection');
+    var protection = widevine(video), template = /<SegmentTemplate\b([^>]*)>/.exec(video);
+    if (!template) return fail('unsupported Widevine protection');
     var timescale = +attr(template[1], 'timescale') || 1, offset = +attr(template[1], 'presentationTimeOffset');
     if (!(offset > 0)) return fail('missing source presentation clock');
     var base = new URL('.', url).toString();
     var encoded = btoa(base).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-    function kind(s) {
-      var head = s.slice(0, s.indexOf('>')), type = attr(head, 'contentType');
-      return type === 'application' && /^(stpp|wvtt)/.test(attr(head, 'codecs')) ? 'text' : type;
-    }
     var audio = sets.filter(function (s) { return kind(s) === 'audio'; });
     if (!audio.length) return fail('missing commentary');
     // Preserve complete official adaptations, including their distinct DRM metadata and clocks.
@@ -60,7 +115,7 @@ var HdrStream = (function () {
     if (pick) audio = [pick].concat(audio.filter(function (s) { return s !== pick; }));
     // Subtitles stay out of AVPlay's manifest: the app shows them (ttml.js).
     var subtitles = sets.filter(function (s) { return kind(s) === 'text'; }).map(function (s) { return subtitle(s, base); }).filter(Boolean);
-    return { kid: id(kid[1]), pssh: pssh[1].trim(), epoch: offset / timescale, others: audio.join(''), subtitles: subtitles,
+    return { kid: protection.kid, pssh: protection.pssh, epoch: offset / timescale, others: audio.join(''), subtitles: subtitles,
       namespaces: Object.keys(bindings).filter(function (p) { return p !== 'cenc'; }).map(function (p) { return ' xmlns:' + p + '="' + bindings[p] + '"'; }).join('') };
   }
   /** An stpp subtitle set's segment addressing (for ttml.js), or null for other formats. */
@@ -68,11 +123,7 @@ var HdrStream = (function () {
     var head = set.slice(0, set.indexOf('>')), rep = /<Representation\b([^>]*)>/.exec(set);
     var template = /<SegmentTemplate\b([^>]*?)(?:\/>|>([\s\S]*?)<\/SegmentTemplate>)/.exec(set);
     if (!rep || !template || !/^stpp/.test(attr(head, 'codecs') || attr(rep[1], 'codecs'))) return null;
-    var own = /<BaseURL>([^<]*)<\/BaseURL>/.exec(set), a = template[1], runs = [];
-    (template[2] || '').replace(/<S\b([^>]*)\/>/g, function (all, s) {
-      runs.push({ t: attr(s, 't') === '' ? null : +attr(s, 't'), d: +attr(s, 'd'), r: attr(s, 'r') === '' ? 0 : +attr(s, 'r') });
-      return all;
-    });
+    var own = /<BaseURL>([^<]*)<\/BaseURL>/.exec(set), a = template[1], runs = runsOf(template[2]);
     if (!attr(a, 'media') || (!runs.length && !(+attr(a, 'duration') > 0))) return null;
     return { lang: attr(head, 'lang') || attr(rep[1], 'lang'), base: own ? new URL(own[1].trim(), base).toString() : base,
       id: attr(rep[1], 'id'), bandwidth: attr(rep[1], 'bandwidth'), media: attr(a, 'media').replace(/&amp;/g, '&'),
@@ -97,32 +148,20 @@ var HdrStream = (function () {
     });
   }
   function build(stream, langs) {
-    var controller = typeof AbortController === 'function' ? new AbortController() : null;
-    var timer;
-    function get(url, bytes, range) {
-      return fetch(url, { signal: controller ? controller.signal : undefined, headers: range ? { Range: 'bytes=0-65535' } : {} }).then(function (r) {
-        if (!r.ok) return fail('media request failed (' + r.status + ')');
-        return bytes ? r.arrayBuffer().then(function (b) { return new Uint8Array(b); }) :
-          r.text().then(function (body) { return { body: body, url: r.url || url }; });
-      });
-    }
-    var work = Promise.all([get(stream.url), get(stream.widevineManifestUrl)]).then(function (sources) {
+    var io = fetcher(), get = io.get;
+    return io.deadline(Promise.all([get(stream.url), get(stream.widevineManifestUrl)]).then(function (sources) {
       var source = official(sources[1].body, sources[1].url, langs || {});
       return Promise.all(variants(sources[0].body).map(function (v, i) {
         var playlistUrl = new URL(v.uri, sources[0].url).toString();
         return get(playlistUrl).then(function (response) {
           playlistUrl = response.url;
           var parsed = CmafDash.playlist(response.body);
-          if (!parsed.keys.length) return fail('missing CBCS declaration');
           var segments = parsed.segments.map(function (s) { return { url: new URL(s.uri, playlistUrl).toString(), duration: s.duration }; });
           var init = new URL(parsed.init, playlistUrl).toString();
           return Promise.all([get(init, true), get(segments[0].url, true, true)]).then(function (data) {
             var timing = CmafDash.timing(data[0], data[1]), protection = CmafDash.encryption(data[0]);
             if (!protection || protection.scheme !== 'cbcs') return fail('unsupported media encryption');
-            parsed.keys.forEach(function (line) {
-              var a = attrs(line.slice(line.indexOf(':') + 1));
-              if (a.METHOD !== 'SAMPLE-AES' || a.KEYFORMAT !== 'com.apple.streamingkeydelivery' || id(a.URI || '') !== protection.kid) return fail('inconsistent CBCS keys');
-            });
+            checkKeys(parsed.keys, protection.kid);
             if (Math.abs(timing.baseTime / timing.timescale - source.epoch) > 0.1) return fail('audio/video clocks differ');
             return { type: 'video', id: 'hlg' + i, hdr: true, width: v.width, height: v.height, codecs: v.codec,
               bandwidth: +v.a.BANDWIDTH, timing: timing, init: init, segments: segments,
@@ -134,11 +173,77 @@ var HdrStream = (function () {
         return { mpd: mpd.replace('<MPD ', '<MPD' + source.namespaces + ' ').replace('</Period>', source.others + '</Period>'),
           subtitles: source.subtitles };
       });
-    });
-    return new Promise(function (resolve, reject) {
-      timer = setTimeout(function () { if (controller) controller.abort(); reject(new Error('HDR preparation timed out')); }, 12000);
-      work.then(function (value) { clearTimeout(timer); resolve(value); }, function (e) { clearTimeout(timer); if (controller) controller.abort(); reject(e); });
-    });
+    }));
   }
-  return { build: build };
+
+  /**
+   * Live: the HLG ladder as a video AdaptationSet for the stream helper, which puts it in place of the
+   * official SDR video on every manifest refresh, with that video's current SegmentTimeline where
+   * <!--timeline--> stands. F1 numbers and times the HLS and DASH segments alike (FP3, Mexico 2026);
+   * that is checked here on a recent segment. Resolves { adaptation, subtitles }.
+   */
+  function live(stream) {
+    var io = fetcher();
+    return io.deadline(Promise.all([io.get(stream.url), io.get(stream.widevineManifestUrl)]).then(function (sources) {
+      var mpd = sources[1].body, period = /<Period\b([^>]*)>/.exec(mpd);
+      if (!/<MPD\b[^>]*\btype="dynamic"/.test(mpd) || (mpd.match(/<Period\b/g) || []).length !== 1 || /<BaseURL\b/.test(mpd)) return fail('unsupported Widevine live layout');
+      // F1's live manifests bind cenc where it is used, not on the root: the HLG set declares its own.
+      if (/\sxmlns:cenc="(?!urn:mpeg:cenc:2013")/.test(mpd)) return fail('ambiguous XML namespaces');
+      var sets = mpd.match(/<AdaptationSet\b[\s\S]*?<\/AdaptationSet>/g) || [];
+      var video = sets.filter(function (s) { return kind(s) === 'video'; })[0];
+      if (!video) return fail('missing Widevine video metadata');
+      var source = widevine(video), template = /<SegmentTemplate\b([^>]*)>([\s\S]*?)<\/SegmentTemplate>/.exec(video);
+      if (!template || !/\$Number\$/.test(attr(template[1], 'media')) || !/<SegmentTimeline>/.test(template[2])) return fail('unsupported live addressing');
+      var clock = { timescale: +attr(template[1], 'timescale') || 1, offset: +attr(template[1], 'presentationTimeOffset') || 0,
+        startNumber: attr(template[1], 'startNumber') === '' ? 1 : +attr(template[1], 'startNumber'), runs: runsOf(template[2]) };
+      var periodStart = isoSeconds(period ? attr(period[1], 'start') : '');
+      var base = new URL('.', sources[1].url).toString();
+      var subtitles = sets.filter(function (s) { return kind(s) === 'text'; }).map(function (s) { return subtitle(s, base); }).filter(Boolean).map(function (t) {
+        // The timeline grows while live; player positions count from the period start.
+        if (t.runs.length) t.runs[t.runs.length - 1].r = -1;
+        t.offset -= periodStart * t.timescale;
+        return t;
+      });
+      return Promise.all(variants(sources[0].body).map(function (v, i) {
+        var playlistUrl = new URL(v.uri, sources[0].url).toString();
+        return io.get(playlistUrl).then(function (response) {
+          playlistUrl = response.url;
+          var text = response.body, map = /^#EXT-X-MAP:.*URI="([^"]+)"/m.exec(text);
+          var uris = text.split(/\r?\n/).filter(function (l) { return l.trim() && l.charAt(0) !== '#'; })
+            .map(function (l) { return new URL(l.trim(), playlistUrl).toString(); });
+          if (!/^#EXTM3U\s/.test(text) || !map || uris.length < 4 || /^#EXT-X-(?:DISCONTINUITY\s*$|BYTERANGE:)/m.test(text)) return fail('unsupported live playlist');
+          // A few segments back from the newest: complete on the CDN.
+          var recent = uris.slice(-4, -1), pattern = CmafDash.template(recent);
+          if (!pattern) return fail('unsupported live segment names');
+          var init = new URL(map[1], playlistUrl).toString();
+          return Promise.all([io.get(init, true), i ? null : io.get(recent[0], true, true)]).then(function (data) {
+            var protection = CmafDash.encryption(data[0]);
+            if (!protection || protection.scheme !== 'cbcs') return fail('unsupported media encryption');
+            checkKeys(text.match(/^#EXT-X-KEY:.*$/gm) || [], protection.kid);
+            if (data[1]) {
+              var timing = CmafDash.timing(data[0], data[1]);
+              if (timing.timescale !== clock.timescale || timing.baseTime !== timeOf(clock, pattern.startNumber)) return fail('HLS and DASH timelines differ');
+            }
+            return { v: v, kid: protection.kid, init: init, media: pattern.media };
+          });
+        });
+      })).then(function (tracks) {
+        // One adaptation set: the qualities that share the top quality's key.
+        var kid = tracks[0].kid;
+        var reps = tracks.filter(function (t) { return t.kid === kid; }).map(function (t, i) {
+          return '<Representation id="hlg' + i + '" bandwidth="' + (+t.v.a.BANDWIDTH) + '" codecs="' + xml(t.v.codec) + '" width="' + t.v.width + '" height="' + t.v.height + '">' +
+            '<SegmentTemplate timescale="' + clock.timescale + '" presentationTimeOffset="' + clock.offset + '" startNumber="' + clock.startNumber +
+            '" initialization="' + xml(t.init) + '" media="' + xml(t.media) + '"><!--timeline--></SegmentTemplate></Representation>';
+        });
+        return {
+          adaptation: '<AdaptationSet xmlns:cenc="urn:mpeg:cenc:2013" contentType="video" mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">' +
+            '<ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cbcs" cenc:default_KID="' + kid + '"/>' +
+            '<ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"><cenc:pssh>' + xml(psshFor(source, kid)) + '</cenc:pssh></ContentProtection>' +
+            '<EssentialProperty schemeIdUri="urn:mpeg:mpegB:cicp:TransferCharacteristics" value="18"/>' + reps.join('') + '</AdaptationSet>',
+          subtitles: subtitles
+        };
+      });
+    }));
+  }
+  return { build: build, live: live };
 })();

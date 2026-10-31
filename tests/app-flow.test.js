@@ -900,6 +900,22 @@ test('turning the timing overlay off in the account settings keeps the tower hid
   assert.match(app.$('osd-feed').textContent, /Lap 10\/58/);   // the lap still shows in the bar
 });
 
+test('the account settings offer 4K HDR on HDR TVs only, and switching it off is remembered', async () => {
+  const plain = await boot();
+  await plain.press('UP');
+  await plain.pick(/^Nicholas$/, ['RIGHT']);
+  assert.ok(!/4K HDR/.test(plain.$('screen-list').textContent), 'not on a TV without HDR');
+  const app = await boot();
+  app.player.hdrCapable = () => true;
+  await app.press('UP');
+  await app.pick(/^Nicholas$/, ['RIGHT']);
+  await app.moveTo(/^4K HDR/, ['DOWN']);
+  assert.match(app.focused(), /On$/);
+  await app.press('ENTER');
+  assert.match(app.focused(), /^4K HDR.*Off$/);
+  assert.equal(app.context.Settings.get('hdr'), false);
+});
+
 // ---------- the timing tower ----------
 
 const driverRow = (pos, tla, extra) => Object.assign({ num: String(pos), pos, tla, colour: '#123456', gap: '', interval: '', best: '',

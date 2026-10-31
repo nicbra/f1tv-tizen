@@ -15,10 +15,9 @@ BV. I have shamelessly added the F1 logo in the app.
 
 ## What you get
 
-- Video quality up to 4K 50 Hz in HDR (HLG) on TVs that support it,
-  and with a subscription that gives you this. HDR playback stays within the HLG quality ladder
-  while adapting to bandwidth and seeking. Premium encrypted replays use the TV’s native Widevine player when compatible HLG media
-  is available. Unsupported offers and HDR failures fall back to SDR.
+- Video quality up to 4K 50 Hz in HDR (HLG) on TVs that support it, with F1 TV Premium: replays
+  and live sessions. A short failure is retried in HDR; otherwise the video plays in SDR. You can
+  switch 4K HDR off in the settings (your name in the top bar).
 - All of F1 TV's feeds: the main broadcast, F1 Live, an onboard camera for each driver, the
   tracker and the data channel. Switching feeds keeps you at the same moment of the session.
 - A timing tower in sync with the video: positions, gaps, lap times, tyres, pit stops and track

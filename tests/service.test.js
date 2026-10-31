@@ -297,3 +297,49 @@ test('prepared VOD manifests have distinct bounded loopback URLs', async () => {
   for(let i=0;i<5;i++)await post(s,'/vod/new'+i+'.mpd',one);
   assert.equal((await get(s,'/vod/one.mpd')).status,404);
 });
+
+// Live HDR: a live manifest as F1 sends it (FP3, Mexico 2026), and the app's HLG set for it.
+const LIVE_HDR_MPD = '<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" xmlns:cenc="urn:mpeg:cenc:2013" type="dynamic" availabilityStartTime="2024-01-01T00:00:00Z" minimumUpdatePeriod="PT6S">' +
+  '<Period id="1" start="PT24830H49M49.440S">' +
+  '<AdaptationSet contentType="video" mimeType="video/mp4"><SegmentTemplate timescale="50000" media="v_$RepresentationID$_$Number$.mp4" initialization="v_init.mp4" startNumber="311365738" presentationTimeOffset="89672909472000">' +
+  '<SegmentTimeline><S t="89673332256000" d="288000" r="738"/></SegmentTimeline></SegmentTemplate><Representation id="SDR_5" bandwidth="6144000" height="1080"/></AdaptationSet>' +
+  '<AdaptationSet contentType="audio" lang="eng"><SegmentTemplate timescale="48000" media="a_$Number$.mp4" startNumber="311365738"><SegmentTimeline><S t="86086398965760" d="276480" r="738"/></SegmentTimeline></SegmentTemplate><Representation id="A" bandwidth="128000"/></AdaptationSet>' +
+  '<AdaptationSet contentType="application" codecs="stpp" lang="eng"><SegmentTemplate timescale="50000" media="t_$Number$.mp4" startNumber="311365738"><SegmentTimeline><S t="89673332256000" d="288000" r="738"/></SegmentTimeline></SegmentTemplate><Representation id="T" bandwidth="256"/></AdaptationSet>' +
+  '<AdaptationSet contentType="video" mimeType="video/mp4"><EssentialProperty schemeIdUri="http://dashif.org/guidelines/trickmode" value="1"/><Representation id="TRICK" bandwidth="33333"/></AdaptationSet>' +
+  '</Period></MPD>';
+const HLG_SET = '<AdaptationSet contentType="video" mimeType="video/mp4"><Representation id="hlg0" bandwidth="18000000">' +
+  '<SegmentTemplate timescale="50000" presentationTimeOffset="89672909472000" startNumber="311365738" media="https://ott-video-cf.formula1.com/hdr/seg_$Number$.mp4"><!--timeline--></SegmentTemplate></Representation></AdaptationSet>';
+
+test('live HDR: the stored HLG set replaces the official video, on the official timeline of each refresh', async () => {
+  const live = 'https://ott-video-cf.formula1.com/v2/x/Main/index.mpd';
+  const { s } = service({ [live]: { body: LIVE_HDR_MPD } });
+  assert.equal((await post(s, '/hdr/abc-1', HLG_SET)).status, 201);
+  assert.equal((await post(s, '/hdr/bad', '<AdaptationSet>no timeline</AdaptationSet>')).status, 400);
+  assert.equal((await get(s, '/hdr/abc-1')).status, 404, 'stored sets are for the manifest only');
+  const r = await get(s, '/mpd?u=' + encodeURIComponent(live) + '&audio=eng&hdr=abc-1&notext=1');
+  assert.equal(r.status, 200);
+  const mpd = r.body.toString();
+  assert.ok(mpd.includes('<Representation id="hlg0" bandwidth="18000000"><SegmentTemplate timescale="50000" presentationTimeOffset="89672909472000" startNumber="311365738" media="https://ott-video-cf.formula1.com/hdr/seg_$Number$.mp4"><SegmentTimeline><S t="89673332256000" d="288000" r="738"/></SegmentTimeline></SegmentTemplate>'));
+  assert.ok(!mpd.includes('SDR_5'), 'the SDR video is gone');
+  assert.ok(mpd.includes('TRICK'), 'other video sets (trick play) stay');
+  assert.ok(!mpd.includes('codecs="stpp"'), 'subtitles are the app\'s');
+  assert.match(mpd, /contentType="audio" lang="eng"><BaseURL>http:\/\/127\.0\.0\.1:18765\/s\//);
+  // Without the stored set (e.g. after the helper restarted) the manifest fails, and the app falls back.
+  assert.equal((await get(s, '/mpd?u=' + encodeURIComponent(live) + '&hdr=gone')).status, 502);
+});
+
+test('live HDR: a time-shifted start trims the HLG timeline like the rest', async () => {
+  const live = 'https://ott-video-cf.formula1.com/v2/x/Main/index.mpd';
+  const { s } = service({ [live]: { body: LIVE_HDR_MPD } });
+  await post(s, '/hdr/abc-2', HLG_SET);
+  const realNow = Date.now;
+  // The timeline's end: 739 segments from 1793466645.12 (Unix seconds); ask for 10 minutes behind it.
+  const end = (89673332256000 + 739 * 288000) / 50000 - 1793458189.44 + Date.parse('2024-01-01T00:00:00Z') / 1000 + 89390989.44;
+  try {
+    Date.now = () => end * 1000;
+    const mpd = (await get(s, '/mpd?u=' + encodeURIComponent(live) + '&shift=600&hdr=abc-2')).body.toString();
+    const hlg = /<Representation id="hlg0"[\s\S]*?<S t="89673332256000" d="288000" r="(\d+)"\/>/.exec(mpd);
+    assert.ok(hlg, 'the HLG video is still there');
+    assert.ok(Math.abs(+hlg[1] - (738 - 600 / 5.76)) <= 1, 'trimmed to 10 minutes behind: r=' + hlg[1]);
+  } finally { Date.now = realNow; }
+});

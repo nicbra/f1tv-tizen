@@ -412,7 +412,8 @@ var Player = (function () {
       if (captions) { captions.stop(); captions = null; }
       if (s.hdrEncrypted) {
         var prefs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
-        return StreamProxy.hdrManifest(s, prefs).then(function (prepared) {
+        var prepare = s.info && s.info.dynamic ? StreamProxy.hdrLive(s, s.startDelay, prefs) : StreamProxy.hdrManifest(s, prefs);
+        return prepare.then(function (prepared) {
           if (stream !== s) throw new Error('cancelled');
           captions = subtitleReader(prepared.subtitles);
           return open(s, prepared.url);

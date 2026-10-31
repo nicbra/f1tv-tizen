@@ -5,7 +5,7 @@ const vm = require('node:vm');
 
 // opts: encryptedHdr (keys in the HDR variant playlist), gate(contentId) (a promise the play request waits for).
 function playback(load, capable = true, opts = {}) {
-  const nodes = {}, requests = [], loads = [], timers = [];
+  const nodes = {}, requests = [], loads = [], timers = [], infos = [];
   let current = null, paused = false;
   function start(stream, position, switching) {
     current = stream;
@@ -26,11 +26,11 @@ function playback(load, capable = true, opts = {}) {
         if (opts.gate) await opts.gate(id);
         return o.hdr ? { url: 'https://cdn/hdr.m3u8', hdr: true, channel, ...(opts.authorizedHdr ? {hdrEncrypted:true,licenseUrl:'https://lic/wv',widevineManifestUrl:'https://cdn/sdr.mpd'} : {}) } : { url: 'https://cdn/stream.m3u8', channel };
       },
-      streamInfo: async (url) => ({ dynamic: false, windowStart: 0, windowEnd: 600,
+      streamInfo: async (url) => (infos.push(url), { dynamic: false, windowStart: 0, windowEnd: 600,
         encrypted: !!opts.encryptedHdr && url.includes('hdr') })
     },
     Timing: { load() {}, label: () => '', supported: () => false, isReady: () => false },
-    Settings: { get: () => false },
+    Settings: { get: (k) => (opts.settings && k in opts.settings ? opts.settings[k] : k === 'hdr') },
     Player: {
       hdrCapable: () => capable, engineName: () => current ? 'shaka' : null,
       unload: async () => {}, stream: () => current,
@@ -47,7 +47,7 @@ function playback(load, capable = true, opts = {}) {
       set: function (ctx) { feedsCtx = ctx; screen = 'feeds'; } };
   `);
   vm.runInContext(source, context);
-  return { app: context.testApp, nodes, requests, loads, timers, pause: () => {paused=true;}, isPaused: () => paused };
+  return { app: context.testApp, nodes, requests, loads, timers, infos, pause: () => {paused=true;}, isPaused: () => paused };
 }
 
 const video = (extra) => ({ contentId: '42', index: 0, live: false,
@@ -134,13 +134,15 @@ test('an HDR stream that has not started after 25 s is retried in SDR, and the O
   assert.equal(h.nodes['osd-feed'].textContent, 'Main');
 });
 
-test('single-feed HDR shows only HDR, while live and incapable playback request SDR', async () => {
-  for (const [live, capable, expected] of [[false, true, 'HDR'], [true, true, ''], [false, false, '']]) {
+test('single-feed HDR shows only HDR; incapable playback requests SDR, and live plays SDR without native HDR', async () => {
+  for (const [live, capable, asked, expected] of [[false, true, true, 'HDR'], [true, true, true, ''], [false, false, false, '']]) {
     const h = playback(undefined, capable);
     h.app.set(video({ live, feeds: [{ title: 'Documentary' }] }));
     h.app.play(0, {});
-    await settle();
-    assert.equal(h.requests[0].hdr, !!expected);
+    for (let i = 0; i < 5; i++) await settle();
+    assert.equal(h.requests[0].hdr, asked);
+    assert.equal(h.loads.length, 1);
+    assert.equal(!!h.loads[0].stream.hdr, !!expected);
     assert.equal(h.nodes['osd-feed'].textContent, expected);
     h.app.update();
     assert.equal(h.nodes['osd-feed'].textContent, expected);
@@ -165,7 +167,7 @@ test('a video\'s start watch does nothing once another video is loading', async 
   h.app.play(0, {});
   for (let i = 0; i < 3; i++) await settle();
   const watch = h.timers.find((t) => t.ms === 25000);
-  const next = video({ contentId: 'next', live: true });
+  const next = video({ contentId: 'next' });
   h.app.set(next);
   h.app.play(0, { fromStart: true });
   await settle();
@@ -238,4 +240,23 @@ test('an HDR offer the app turns down is not retried', async () => {
   for (let i = 0; i < 8; i++) await settle();
   assert.deepEqual(h.requests.map((r) => r.hdr), [true, false]);
   assert.equal(ctx.hdrFailed, true);
+});
+
+test('live sessions ask for HDR too, and time a live HDR stream on the official live DASH', async () => {
+  const h = playback(null, true, { encryptedHdr: true, authorizedHdr: true });
+  const ctx = video({ live: true }); h.app.set(ctx); h.app.play(0, {});
+  for (let i = 0; i < 5; i++) await settle();
+  assert.deepEqual(h.requests.map((r) => r.hdr), [true]);
+  assert.deepEqual(h.infos, ['https://cdn/sdr.mpd']);
+  assert.equal(h.loads.at(-1).stream.hdrEncrypted, true);
+});
+
+test('with 4K HDR switched off in Settings, every video asks for SDR', async () => {
+  const h = playback(null, true, { encryptedHdr: true, authorizedHdr: true, settings: { hdr: false } });
+  for (const live of [false, true]) {
+    h.app.set(video({ live, contentId: 'v' + live })); h.app.play(0, {});
+    for (let i = 0; i < 5; i++) await settle();
+  }
+  assert.deepEqual(h.requests.map((r) => r.hdr), [false, false]);
+  assert.ok(h.loads.every((l) => !l.stream.hdr));
 });

@@ -630,3 +630,18 @@ test('a stall at the locked quality reopens the replay where it was, with AVPlay
   try { av.listener.onbufferingstart(); await new Promise((r) => setTimeout(r, 20)); } finally { Date.now = realNow; }
   assert.equal(av.calls.filter((c) => c[0] === 'open').length, 2);
 });
+
+test('live native HDR opens the helper\'s live manifest with the HLG video, time-shifted like SDR live', async () => {
+  const av = fakeAvPlay({ liveWindow: '1000|2000' });
+  const P = await player(av, { 'f1tv.settings': JSON.stringify({ audio: 'deu' }) });
+  let asked = null;
+  P.context.StreamProxy.hdrManifest = async () => { throw new Error('the replay builder is not for live'); };
+  P.context.StreamProxy.hdrLive = async (s, shift, langs) => { asked = { shift, langs }; return { url: 'http://127.0.0.1:18765/mpd?u=x&hdr=1&notext=1', subtitles: [] }; };
+  const s = Object.assign({}, LIVE, { url: 'https://cdn/live/master.m3u8', hdr: true, hdrEncrypted: true, widevineManifestUrl: LIVE.url, startDelay: 600 });
+  await P.load(s, null);
+  assert.equal(P.engineName(), 'avplay');
+  assert.deepEqual(JSON.parse(JSON.stringify(asked)), { shift: 600, langs: { audio: 'deu', text: '' } });
+  assert.equal(av.calls.find((c) => c[0] === 'open')[1], 'http://127.0.0.1:18765/mpd?u=x&hdr=1&notext=1');
+  assert.equal(P.isLive(), true);
+  assert.equal(av.calls.filter((c) => c[0] === 'setStreamingProperty')[0][2], 'STARTBITRATE=HIGHEST');   // never locked
+});

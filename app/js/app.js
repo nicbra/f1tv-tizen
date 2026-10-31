@@ -1066,7 +1066,12 @@
       rows: [
         { day: 'Settings' },
         toggle('spoilerFree', 'Spoiler-free mode', 'Blur replay and highlight artwork.'),
-        toggle('timing', 'Live timing overlay', 'Show the timing tower. Change its view under ▲ Watch options.'),
+        toggle('timing', 'Live timing overlay', 'Show the timing tower. Change its view under ▲ Watch options.')
+      ].concat(Player.hdrCapable() ? [
+        toggle('hdr', '4K HDR', /^PREMIUM/i.test((F1Api.state.location && F1Api.state.location.entitlement) || '')
+          ? 'Play in 4K HDR where F1 offers it. Off: always SDR, as with F1 TV Pro.'
+          : 'Needs F1 TV Premium. Off: always SDR.')
+      ] : []).concat([
         { day: 'Account' },
         { what: 'Sign out of this TV', run: function () {
           ask('Sign out?', 'You\'ll need to sign in again to watch.', [
@@ -1085,7 +1090,7 @@
         { what: checkingUpdate ? 'Checking for updates…' : 'Check for updates now', run: checkForUpdateNow },
         toggle('updates', 'Automatic update checks', 'Check for new versions daily.'),
         { info: true, what: 'Unofficial F1 TV app', sub: 'Not affiliated with Formula 1.' }
-      ]
+      ])
     }, focus || 0);
     accountGrid = grid;
   }
@@ -1250,7 +1255,8 @@
   var HDR_TRIES = 3;   // HDR failures before a video stays SDR
 
   function hdrWanted() {
-    return !feedsCtx.live && !feedsCtx.hdrFailed && Player.hdrCapable();
+    // Live too: F1's live HLG plays as native DASH through the helper (HdrStream.live).
+    return Settings.get('hdr') && !feedsCtx.hdrFailed && Player.hdrCapable();
   }
 
   function feedLabel(stream) {
@@ -1298,13 +1304,17 @@
           stream = s;
           stream.live = feedsCtx.live;
           stream.multiFeed = feedsCtx.feeds.length > 1;
-          return F1Api.streamInfo(stream.url).then(function (info) { stream.info = info; }, function () {});
+          // Live HDR plays on the official live DASH timeline (the helper swaps in the HLG video).
+          var timeline = stream.hdrEncrypted && stream.live ? stream.widevineManifestUrl : stream.url;
+          return F1Api.streamInfo(timeline).then(function (info) { stream.info = info; }, function () {});
         })
         .then(function () {
           // Superseded by a newer request, or the viewer left the player while it loaded.
           if (feedsCtx.index !== i || queuedFeed || screen !== 'player') return;
           // Keys in the variant playlist: not playable here; the catch below falls back to SDR.
           if (stream.hdr && stream.info && stream.info.encrypted && !stream.hdrEncrypted) throw new Error('encrypted HDR stream');
+          // Live HDR plays only natively, on the official live timeline (HdrStream.live).
+          if (stream.hdr && stream.live && !stream.hdrEncrypted) throw new Error('HDR: live needs the native path');
           $('osd-feed').textContent = feedLabel(stream);
           var start = startPosition(stream.info, opts, from);
           // Live (dynamic) streams on AVPlay can't seek at start-up; instead the local service

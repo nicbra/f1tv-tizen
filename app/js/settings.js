@@ -7,6 +7,7 @@ var Settings = (function () {
     audio: 'eng',        // preferred commentary track (language code, 'fx' = track sound only)
     subtitles: '',       // subtitle language, '' = off
     spoilerFree: false,  // blur the artwork of replays and highlights
+    hdr: true,           // 4K HDR where the subscription and TV allow it; off: always SDR
     updates: true        // look for a newer release on GitHub once a day
   };
   var values = {};

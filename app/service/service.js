@@ -7,6 +7,9 @@
  *   GET /mpd?u=<url>[&shift=<seconds>][&audio=eng][&text=eng] -> rewritten manifest
  *       shift delays the live edge; audio/text put the preferred tracks first for AVPlay.
  *   GET /s/<b64 base>/<file> -> segment with its sample count patched if needed
+ *   POST/GET /vod/<id>.mpd -> a replay manifest the app prepared (native HDR replays)
+ *   POST /hdr/<id> -> a live HLG video AdaptationSet; /mpd?...&hdr=<id> puts it in place of the
+ *       official video, with that video's current SegmentTimeline; &notext=1 drops subtitle sets
  */
 'use strict';
 
@@ -128,6 +131,20 @@ function timeShift(mpd, shift, nowMs) {
   return mpd.replace(/availabilityStartTime="[^"]*"/, 'availabilityStartTime="' + new Date(ast + shift * 1000).toISOString() + '"');
 }
 
+/**
+ * Live HDR: the official video AdaptationSet (the first one) becomes the stored HLG set, whose
+ * templates take the official SegmentTimeline of this refresh. F1 numbers and times both alike.
+ */
+function useHdrVideo(mpd, adaptation) {
+  var sets = [], re = /<AdaptationSet\b[\s\S]*?<\/AdaptationSet>/g, m;
+  while ((m = re.exec(mpd))) sets.push({ text: m[0], at: m.index });
+  var video = sets.filter(function (b) { return /\scontentType="video"/.test(b.text.slice(0, b.text.indexOf('>'))); })[0];
+  var timeline = video && /<SegmentTimeline>[\s\S]*?<\/SegmentTimeline>/.exec(video.text);
+  if (!timeline) return null;
+  var hdr = adaptation.split('<!--timeline-->').join(timeline[0]);
+  return mpd.slice(0, video.at) + hdr + mpd.slice(video.at + video.text.length);
+}
+
 function setKind(block) {
   if (/contentType="audio"/.test(block)) return 'audio';
   if (/contentType="text"/.test(block) || /codecs="stpp/.test(block) || /codecs="wvtt/.test(block)) return 'text';
@@ -178,7 +195,7 @@ function handle(req, res) {
   var u = urlLib.parse(req.url, true);
   if (u.pathname === '/ping') return send(res, 200, toBuf('ok'));
 
-  if (/^\/vod\/[a-z0-9-]{1,64}\.mpd$/.test(u.pathname)) {
+  if (/^\/(?:vod\/[a-z0-9-]{1,64}\.mpd|hdr\/[a-z0-9-]{1,64})$/.test(u.pathname)) {
     vodManifests = vodManifests.filter(function (m) { return Date.now() - m.at < 6 * 3600000; });
     if (req.method === 'POST') {
       var chunks = [], size = 0;
@@ -186,7 +203,9 @@ function handle(req, res) {
       req.on('end', function () {
         if (size > 2 * 1024 * 1024) return send(res, 413, toBuf('manifest too large'));
         var body = Buffer.concat(chunks);
-        if (!/<MPD\b[^>]*\btype="static"/.test(body.toString('utf8'))) return send(res, 400, toBuf('requires VOD MPD'));
+        var text = body.toString('utf8');
+        if (/^\/vod\//.test(u.pathname) ? !/<MPD\b[^>]*\btype="static"/.test(text) :
+          !/^<AdaptationSet\b[\s\S]*<!--timeline-->[\s\S]*<\/AdaptationSet>$/.test(text)) return send(res, 400, toBuf('unexpected body'));
         vodManifests = vodManifests.filter(function (m) { return m.path !== u.pathname; });
         vodManifests.push({ path: u.pathname, at: Date.now(), body: body });
         if (vodManifests.length > 4) vodManifests.shift();
@@ -195,7 +214,7 @@ function handle(req, res) {
       return;
     }
     var saved = vodManifests.filter(function (m) { return m.path === u.pathname; })[0];
-    if (!saved) return send(res, 404, toBuf('not found'));
+    if (!saved || !/^\/vod\//.test(u.pathname)) return send(res, 404, toBuf('not found'));
     saved.at = Date.now();
     return send(res, 200, saved.body, 'application/dash+xml');
   }
@@ -208,7 +227,16 @@ function handle(req, res) {
       // Segments are relative to where a redirect led, not to the requested address; but the audio
       // proxy only fetches from formula1.com, so a redirect elsewhere keeps the requested base.
       var base = /^https:\/\/[a-z0-9.-]+\.formula1\.com\//.test(finalUrl || '') ? finalUrl : manifestUrl;
-      var mpd = rewriteManifest(body.toString('utf8'), base);
+      var mpd = body.toString('utf8');
+      if (u.query.hdr) {
+        var stored = vodManifests.filter(function (m) { return m.path === '/hdr/' + u.query.hdr; })[0];
+        mpd = stored ? useHdrVideo(mpd, stored.body.toString('utf8')) : null;
+        // Fails the manifest, so the player reports it and the app plays SDR.
+        if (!mpd) return send(res, 502, toBuf('no HDR video for this manifest'));
+        stored.at = Date.now();
+      }
+      if (u.query.notext) mpd = mpd.replace(/<AdaptationSet\b[\s\S]*?<\/AdaptationSet>/g, function (b) { return setKind(b) === 'text' ? '' : b; });
+      mpd = rewriteManifest(mpd, base);
       if (+u.query.shift > 0) mpd = timeShift(mpd, +u.query.shift, Date.now());
       if (u.query.audio || u.query.text) mpd = preferLanguages(mpd, { audio: u.query.audio, text: u.query.text });
       send(res, 200, toBuf(mpd, 'utf8'), 'application/dash+xml');
@@ -237,6 +265,7 @@ function start() {
 }
 
 module.exports.onStart = start;
+module.exports.useHdrVideo = useHdrVideo;
 module.exports.onRequest = start;
 module.exports.onExit = function () {
   if (server) server.close();

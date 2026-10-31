@@ -55,5 +55,21 @@ var StreamProxy = (function () {
     });
   }
 
-  return { ensure: ensure, manifest: manifest, hdrManifest: hdrManifest };
+  /**
+   * Live HDR: the official live manifest through the helper as usual (time shift, audio fix, languages),
+   * with the HLG video in place of the SDR one and without subtitle sets (the app shows those).
+   * Resolves { url, subtitles }.
+   */
+  function hdrLive(stream, shift, langs) {
+    return ensure().then(function () { return HdrStream.live(stream); }).then(function (built) {
+      var id = Date.now().toString(36) + '-' + (++vodSequence);
+      return fetch(BASE + '/hdr/' + id, { method: 'POST', body: built.adaptation }).then(function (r) {
+        if (!r.ok) throw new Error('Could not prepare HDR manifest');
+        return { url: manifest(stream.widevineManifestUrl, shift, { audio: langs && langs.audio }) + '&hdr=' + id + '&notext=1',
+          subtitles: built.subtitles };
+      });
+    });
+  }
+
+  return { ensure: ensure, manifest: manifest, hdrManifest: hdrManifest, hdrLive: hdrLive };
 })();
