@@ -22,8 +22,9 @@ function playback(load, capable = true, opts = {}) {
     F1Api: {
       state: {}, isNotStarted: () => false, savePosition: async () => {},
       play: async (id, channel, o) => {
-        requests.push({ id, channel, hdr: o.hdr });
+        requests.push({ id, channel, hdr: o.hdr, cenc: o.cenc });
         if (opts.gate) await opts.gate(id);
+        if (o.cenc && !o.hdr) return { url: 'https://cdn/cast.mpd', cenc: true, channel };
         return o.hdr ? { url: 'https://cdn/hdr.m3u8', hdr: true, channel, ...(opts.authorizedHdr ? {hdrEncrypted:true,licenseUrl:'https://lic/wv',widevineManifestUrl:'https://cdn/sdr.mpd'} : {}) } : { url: 'https://cdn/stream.m3u8', channel };
       },
       streamInfo: async (url) => (infos.push(url), { dynamic: false, windowStart: 0, windowEnd: 600,
@@ -32,7 +33,7 @@ function playback(load, capable = true, opts = {}) {
     Timing: { load() {}, label: () => '', supported: () => false, isReady: () => false },
     Settings: { get: (k) => (opts.settings && k in opts.settings ? opts.settings[k] : k === 'hdr') },
     Player: {
-      hdrCapable: () => capable, engineName: () => current ? 'shaka' : null,
+      hdrCapable: () => capable, cencCapable: () => !!opts.cencCapable, engineName: () => current ? 'shaka' : null,
       unload: async () => {}, stream: () => current,
       load: (s, p) => start(s, p, false), switchTo: (s, p) => start(s, p, true),
       position: () => opts.position ? opts.position(current) : 120, wallClock: () => null, isLive: () => false, isPaused: () => paused, togglePause: () => { paused = !paused; },
@@ -71,7 +72,7 @@ test('HDR load and switch failures retry the same feed in SDR with the same star
     for (let i = 0; i < 5; i++) await settle();
     assert.equal(ctx.hdrFailed, true);
     assert.deepEqual(h.requests.slice(-2), [
-      { id: '42', channel: 'car', hdr: true }, { id: '42', channel: 'car', hdr: false }
+      { id: '42', channel: 'car', hdr: true, cenc: false }, { id: '42', channel: 'car', hdr: false, cenc: false }
     ]);
     assert.deepEqual(h.loads.slice(-2).map((l) => [l.position, l.switching]), [[87, switching], [87, switching]]);
     assert.doesNotMatch(h.nodes.toast?.textContent || '', /Could not play/);
@@ -259,4 +260,23 @@ test('with 4K HDR switched off in Settings, every video asks for SDR', async () 
   }
   assert.deepEqual(h.requests.map((r) => r.hdr), [false, false]);
   assert.ok(h.loads.every((l) => !l.stream.hdr));
+});
+
+test('replays ask for the cenc stream when the browser can decrypt it; a failed one plays the usual stream, at the same moment', async () => {
+  const h = playback(async (stream) => { if (stream.cenc) throw new Error('Shaka error 6007'); }, true, { cencCapable: true, settings: { hdr: false } });
+  const ctx = video(); h.app.set(ctx); h.app.play(0, { startAt: 600 });
+  for (let i = 0; i < 8; i++) await settle();
+  assert.deepEqual(h.requests.map((r) => r.cenc), [true, false]);
+  assert.equal(ctx.cencFailed, true);
+  assert.equal(h.loads.at(-1).position, 600);
+  assert.equal(h.loads.at(-1).stream.cenc, undefined);
+});
+
+test('live sessions, and browsers without cenc, keep the usual request', async () => {
+  for (const [live, cencCapable] of [[true, true], [false, false]]) {
+    const h = playback(null, true, { cencCapable, settings: { hdr: false } });
+    h.app.set(video({ live })); h.app.play(0, {});
+    for (let i = 0; i < 3; i++) await settle();
+    assert.deepEqual(h.requests.map((r) => r.cenc), [false]);
+  }
 });

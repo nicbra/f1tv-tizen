@@ -342,6 +342,15 @@ test('streamInfo lists a DASH manifest\'s video bitrates, lowest first, without 
   assert.deepEqual(plain((await F1Api.streamInfo('https://cdn/vod/index.mpd')).videoBitrates), [512000, 3645440, 6144000]);
 });
 
+test('streamInfo finds the video bitrates of highlights, whose sets only give a mimeType', async () => {
+  const vod = `<MPD type="static" minBufferTime="PT30S" profiles="urn:mpeg:dash:profile:isoff-main:2011" mediaPresentationDuration="PT9M26.378S"><Period>
+<AdaptationSet mimeType="video/mp4" frameRate="50/1" segmentAlignment="true"><SegmentTemplate timescale="90000" duration="2700000" startNumber="1"/>
+<Representation id="1" bandwidth="6000000" height="1080" codecs="avc1.4d402a"/><Representation id="2" bandwidth="256000" height="270" codecs="avc1.4d401e"/></AdaptationSet>
+<AdaptationSet mimeType="audio/mp4" lang="eng"><Representation id="a" bandwidth="96000" codecs="mp4a.40.2"/></AdaptationSet></Period></MPD>`;
+  const { F1Api } = api(() => ({ body: vod }));
+  assert.deepEqual(plain((await F1Api.streamInfo('https://cdn/highlights/index.mpd')).videoBitrates), [256000, 6000000]);
+});
+
 test('streamInfo follows an HLS master playlist and maps positions to program date-times', async () => {
   const master = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nlow/index.m3u8\n';
   const media = ['#EXTM3U', '#EXT-X-PLAYLIST-TYPE:VOD', '#EXT-X-PROGRAM-DATE-TIME:2026-10-11T11:55:00.000Z', '#EXTINF:6.0,', 'a.mp4',
@@ -435,4 +444,69 @@ test('Premium CBCS HDR uses the normal Widevine authorization and keeps its sour
   assert.equal(s.licenseHeaders.entitlementtoken, 'HDR_ENT');
   assert.equal(s.licenseHeaders.customdata, 'NORMAL_DRM');
   assert.equal(calls.filter(c=>c.url.includes('/CONTENT/PLAY')).length, 2);
+});
+
+// Chromecast's cenc stream: an extra request for replays whose usual stream is cbcs Widevine DASH.
+const castRoute = (cast) => (url, init) => {
+  if (!/\/CONTENT\/PLAY\?/.test(url)) return null;
+  const device = init.headers['x-f1-device-info'];
+  if (device === 'device=chromecast;') return typeof cast === 'function' ? cast() : { body: { resultObj: cast } };
+  return { body: { resultObj: { url: 'https://cdn/web.mpd', streamType: 'SDR_HD_DASHWV_SINGLE', laURL: 'https://lic/web', entitlementToken: 'WEB_ENT' } } };
+};
+const CAST = { url: 'https://cdn/cast.mpd', streamType: 'SDR_HD_DASHWV_SINGLE_CENC', laURL: 'https://lic/cast', entitlementToken: 'CAST_ENT' };
+
+test('play uses Chromecast\'s cenc stream when asked, with its own licence URL and token', async () => {
+  const { F1Api, calls } = api(castRoute(CAST));
+  const s = await F1Api.play('42', '1033', { cenc: true });
+  assert.equal(s.cenc, true);
+  assert.equal(s.url, 'https://cdn/cast.mpd');
+  assert.equal(s.licenseUrl, 'https://lic/cast');
+  assert.equal(s.licenseHeaders.entitlementtoken, 'CAST_ENT');
+  assert.deepEqual(calls.map((c) => c.init.headers['x-f1-device-info'].split(';')[0]), ['device=web', 'device=chromecast']);
+  assert.match(calls[1].url, /BIG_SCREEN_DASH\/ALL\/CONTENT\/PLAY\?contentId=42.*channelId=1033/);
+});
+
+for (const [name, cast] of [
+  ['answers cbcs', Object.assign({}, CAST, { streamType: 'SDR_HD_DASHWV_SINGLE' })],
+  ['answers HLS', Object.assign({}, CAST, { url: 'https://cdn/cast.m3u8' })],
+  ['fails', () => ({ status: 500, body: { message: 'Failed to evaluate stream rule' } })]
+]) {
+  test('play keeps the usual stream when Chromecast ' + name, async () => {
+    const { F1Api } = api(castRoute(cast));
+    const s = await F1Api.play('42', null, { cenc: true });
+    assert.equal(s.cenc, undefined);
+    assert.equal(s.url, 'https://cdn/web.mpd');
+    assert.equal(s.licenseUrl, 'https://lic/web');
+  });
+}
+
+test('play makes no Chromecast request unless asked, or for clear streams', async () => {
+  const { F1Api, calls } = api(castRoute(CAST));
+  await F1Api.play('42');
+  assert.equal(calls.length, 1);
+  const clear = api((url) => /PLAY/.test(url) ? { body: { resultObj: { url: 'https://cdn/clear.mpd', streamType: 'DASH' } } } : null);
+  assert.equal((await clear.F1Api.play('42', null, { cenc: true })).cenc, undefined);
+  assert.equal(clear.calls.length, 1);
+});
+
+test('play asks for HDR first; the Chromecast cenc request only comes when HDR has nothing', async () => {
+  // Premium with an HDR answer: the HDR stream, and no Chromecast request.
+  const master = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=18000000,RESOLUTION=3840x2160,VIDEO-RANGE=HLG\nv.m3u8\n';
+  const route = (hdrAnswer) => (url, init) => {
+    if (url === 'https://cdn/hdr.m3u8') return { body: master };
+    if (!/\/CONTENT\/PLAY\?/.test(url)) return null;
+    const device = init.headers['x-f1-device-info'];
+    if (device === 'device=tvos;') return { body: { resultObj: hdrAnswer } };
+    return castRoute(CAST)(url, init);
+  };
+  const premium = (r) => { const a = api(r); a.F1Api.state.location = { entitlement: 'PREMIUM' }; return a; };
+  const withHdr = premium(route({ url: 'https://cdn/hdr.m3u8', streamType: 'HDR_UHD_CMAF' }));
+  const s = await withHdr.F1Api.play('42', null, { hdr: true, cenc: true });
+  assert.equal(s.hdr, true);
+  assert.equal(s.cenc, undefined);
+  assert.ok(!withHdr.calls.some((c) => (c.init.headers || {})['x-f1-device-info'] === 'device=chromecast;'));
+  // No HDR for this video (tvOS answers SDR): then the cenc stream.
+  const noHdr = premium(route({ url: 'https://cdn/sdr.m3u8', streamType: 'SDR_HD_CMAF' }));
+  assert.equal((await noHdr.F1Api.play('42', null, { hdr: true, cenc: true })).cenc, true);
+  assert.equal(noHdr.calls.filter((c) => /PLAY/.test(c.url))[0].init.headers['x-f1-device-info'], 'device=tvos;');
 });

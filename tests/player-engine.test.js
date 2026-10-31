@@ -607,17 +607,21 @@ test('SDR replays are locked to their top quality; live, HDR and stall-prone sta
 
 test('a stall at the locked quality reopens the replay where it was, with AVPlay choosing again', async () => {
   const av = fakeAvPlay({ duration: 6163000 });
-  const store = {};
-  const P = await player(av, store);
+  const timers = [];
+  const P = await player(av, {}, undefined, { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; } });
   const replay = Object.assign({}, REPLAY, { info: Object.assign({}, REPLAY.info, { videoBitrates: [2048000, 6144000] }) });
   await P.load(replay, null);
   const realNow = Date.now;
-  try {
-    Date.now = () => realNow() + 60000;   // well past the start's quiet period
-    av.listener.oncurrentplaytime(754000);
-    av.listener.onbufferingstart();
-    await new Promise((r) => setTimeout(r, 20));
-  } finally { Date.now = realNow; }
+  const stall = async (offset) => {
+    Date.now = () => realNow() + offset;   // well past the start's quiet period
+    try {
+      av.listener.onbufferingstart();
+      timers.filter((t) => t.ms === 2000).at(-1).fn();   // still buffering 2 s later
+      await new Promise((r) => setImmediate(r));
+    } finally { Date.now = realNow; }
+  };
+  av.listener.oncurrentplaytime(754000);
+  await stall(60000);
   const opens = av.calls.filter((c) => c[0] === 'open');
   assert.equal(opens.length, 2);
   assert.equal(opens[1][1], opens[0][1]);
@@ -626,9 +630,27 @@ test('a stall at the locked quality reopens the replay where it was, with AVPlay
   assert.deepEqual(av.calls.filter((c) => c[0] === 'seekTo').at(-1), ['seekTo', 754000]);
   assert.ok(names(av).lastIndexOf('stop') < names(av).lastIndexOf('open'));
   // A stall once it is no longer locked does not reopen it again.
-  Date.now = () => realNow() + 120000;
-  try { av.listener.onbufferingstart(); await new Promise((r) => setTimeout(r, 20)); } finally { Date.now = realNow; }
+  await stall(120000);
   assert.equal(av.calls.filter((c) => c[0] === 'open').length, 2);
+});
+
+test('brief buffering is not a stall: the next start keeps the top quality and the lock stays', async () => {
+  const av = fakeAvPlay({ duration: 6163000 });
+  const timers = [], store = {};
+  const P = await player(av, store, undefined, { setTimeout: (fn, ms) => { timers.push({ fn, ms, cleared: false }); return timers.length; },
+    clearTimeout: (id) => { if (timers[id - 1]) timers[id - 1].cleared = true; } });
+  const replay = Object.assign({}, REPLAY, { info: Object.assign({}, REPLAY.info, { videoBitrates: [2048000, 6144000] }) });
+  await P.load(replay, null);
+  const realNow = Date.now;
+  Date.now = () => realNow() + 30000;
+  try {
+    av.listener.onbufferingstart();
+    av.listener.onbufferingcomplete();   // a 100 ms blip
+  } finally { Date.now = realNow; }
+  const check = timers.filter((t) => t.ms === 2000).at(-1);
+  assert.equal(check.cleared, true);
+  assert.equal(store['f1tv.startLevel'], undefined);
+  assert.equal(av.calls.filter((c) => c[0] === 'open').length, 1);
 });
 
 test('live native HDR opens the helper\'s live manifest with the HLG video, time-shifted like SDR live', async () => {
@@ -644,4 +666,43 @@ test('live native HDR opens the helper\'s live manifest with the HLG video, time
   assert.equal(av.calls.find((c) => c[0] === 'open')[1], 'http://127.0.0.1:18765/mpd?u=x&hdr=1&notext=1');
   assert.equal(P.isLive(), true);
   assert.equal(av.calls.filter((c) => c[0] === 'setStreamingProperty')[0][2], 'STARTBITRATE=HIGHEST');   // never locked
+});
+
+test('Chromecast\'s cenc stream plays on Shaka, with its licence; the usual cbcs stream stays on AVPlay', async () => {
+  const P = await player(fakeAvPlay({ duration: 6163000 }), undefined, () => Promise.resolve());
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); });
+  await P.load(Object.assign({}, REPLAY, { cenc: true, multiFeed: true }), 600);
+  assert.equal(P.engineName(), 'shaka');
+  assert.deepEqual(JSON.parse(JSON.stringify(P.configs.at(-1).drm)), { servers: { 'com.widevine.alpha': REPLAY.licenseUrl } });
+  await P.load(REPLAY, 600);
+  assert.equal(P.engineName(), 'avplay');
+});
+
+test('the first cenc video, stalled before any data (readyState 1), is loaded once more; a clear one still buffering is not', async () => {
+  for (const [cenc, readyState, reloads] of [[true, 1, 1], [false, 1, 0], [true, 4, 1]]) {
+    let loads = 0;
+    const timers = [];
+    const P = await player(fakeAvPlay(), undefined, () => { loads++; return Promise.resolve(); },
+      { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return 0; } });
+    P.forceEngine = 'shaka';
+    Object.assign(P.videos[0], { readyState, play: () => Promise.resolve(), getVideoPlaybackQuality: () => ({ totalVideoFrames: 0 }) });
+    await P.load({ url: 'https://cdn/x.mpd', licenseUrl: 'https://lic', multiFeed: true, cenc, hdr: !cenc, info: { dynamic: false } }, 600);
+    const check = timers.find((t) => t.ms === 5000);
+    if (check) check.fn();
+    await new Promise(setImmediate);
+    assert.equal(loads, 1 + reloads, JSON.stringify({ cenc, readyState }));
+  }
+});
+
+test('cenc feed switches load in place instead of preloading beside the playing feed', async () => {
+  const urls = [];
+  const P = await player(fakeAvPlay(), undefined, (url) => { urls.push(url); return Promise.resolve(); });
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); });
+  const feed = (n) => Object.assign({}, REPLAY, { url: 'https://cdn/' + n + '.mpd', cenc: true, multiFeed: true });
+  await P.load(feed('main'), 600);
+  await P.switchTo(feed('onboard'), 610);
+  assert.equal(P.engineName(), 'shaka');
+  assert.deepEqual(urls, ['https://cdn/main.mpd', 'https://cdn/onboard.mpd']);
+  assert.equal(P.stream().url, 'https://cdn/onboard.mpd');
+  assert.notEqual(P.videos[1].muted, true, 'the second element (preloading) was never used');
 });

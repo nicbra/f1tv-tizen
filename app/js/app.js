@@ -1254,6 +1254,11 @@
 
   var HDR_TRIES = 3;   // HDR failures before a video stays SDR
 
+  /** Replays' DRM streams in cenc on Shaka (see F1Api cencOffer); after a failure, AVPlay as before. */
+  function cencWanted() {
+    return !feedsCtx.live && !feedsCtx.cencFailed && !!(Player.cencCapable && Player.cencCapable());
+  }
+
   function hdrWanted() {
     // Live too: F1's live HLG plays as native DASH through the helper (HdrStream.live).
     return Settings.get('hdr') && !feedsCtx.hdrFailed && Player.hdrCapable();
@@ -1299,7 +1304,7 @@
       showOsd();
       var stream;
       return (from || playing ? Promise.resolve() : Player.unload())
-        .then(function () { return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted() }); })
+        .then(function () { return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(), cenc: cencWanted() }); })
         .then(function (s) {
           stream = s;
           stream.live = feedsCtx.live;
@@ -1357,14 +1362,20 @@
             feedsCtx.index = feedsCtx.playing != null ? feedsCtx.playing : from.index;
             $('osd-feed').textContent = feedLabel(from.stream);
           }
-          if (stream && stream.hdr && !feedsCtx.hdrFailed) {
-            feedsCtx.hdrFailures = (feedsCtx.hdrFailures || 0) + 1;
-            // The video's first failure (a CDN or licence blip, typically) gets HDR again at once; after
-            // that, SDR for now. Queue the retry behind this load; a newer feed request still wins.
-            // An offer this app turned down (unusable keys, an unsupported layout) would fail the same way.
-            var refused = /^encrypted HDR stream$|^HDR: (?!media request failed)/.test((e && e.message) || '');
-            if (refused || opts.hdrRetry || feedsCtx.hdrFailures > 1) feedsCtx.hdrFailed = true;
-            var recovery = Object.assign({}, opts, { hdrRetry: true });
+          var hdrFailure = stream && stream.hdr && !feedsCtx.hdrFailed;
+          if (hdrFailure || (stream && stream.cenc && !feedsCtx.cencFailed)) {
+            if (hdrFailure) {
+              feedsCtx.hdrFailures = (feedsCtx.hdrFailures || 0) + 1;
+              // The video's first failure (a CDN or licence blip, typically) gets HDR again at once; after
+              // that, SDR for now. An offer this app turned down (unusable keys, an unsupported layout)
+              // would fail the same way.
+              var refused = /^encrypted HDR stream$|^HDR: (?!media request failed)/.test((e && e.message) || '');
+              if (refused || opts.hdrRetry || feedsCtx.hdrFailures > 1) feedsCtx.hdrFailed = true;
+            } else {
+              feedsCtx.cencFailed = true;   // this video plays the usual cbcs stream on AVPlay from now on
+            }
+            // Queue the retry behind this load; a newer feed request still wins.
+            var recovery = Object.assign({}, opts, hdrFailure ? { hdrRetry: true } : {});
             if (from) recovery.switchPaused = switchPause != null ? switchPause : from.paused;
             // Native preparation replaces the outgoing player. Its failed stream reports zero,
             // so retain the outgoing moment rather than deriving a new target from that zero.
@@ -1405,6 +1416,7 @@
       // AVPlay reports no position until it plays: 0 is no moment of the stream, so the retry repeats the request.
       var wall = from > 0 ? Player.wallClock(from) : null;
       if (stream.hdr) { feedsCtx.hdrFailed = true; feedsCtx.hdrFailures = (feedsCtx.hdrFailures || 0) + 1; }
+      else if (stream.cenc) feedsCtx.cencFailed = true;
       var again = {};
       Object.keys(opts || {}).forEach(function (k) { if (k !== 'switching') again[k] = opts[k]; });   // a fresh load
       again.retry = true;

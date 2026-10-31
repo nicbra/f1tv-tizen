@@ -186,6 +186,20 @@ var F1Api = (function () {
     });
   }
 
+  /**
+   * F1 encrypts its DRM streams for the web with cbcs, which only AVPlay can decrypt on Samsung TVs; asked
+   * as a Chromecast, it gives the same stream with cenc, which the browser (Shaka) can. An extra request,
+   * like Premium's HDR one: its answer is used only when it is cenc Widevine DASH, otherwise `normal`.
+   */
+  function cencOffer(normal, contentId, channelId) {
+    if (!/WV/i.test(normal.streamType || '') || /CENC/i.test(normal.streamType) || !/\.mpd(\?|$)/.test(normal.url || '')) return Promise.resolve(normal);
+    return playOn(normal.platform, contentId, channelId, 'device=chromecast;').then(function (r) {
+      if (!/WV/i.test(r.streamType || '') || !/_CENC$/i.test(r.streamType) || !/\.mpd(\?|$)/.test(r.url)) return normal;
+      r.cenc = true;
+      return r;
+    }, function () { return normal; });
+  }
+
   /** Resolves the manifest URL, license URL and required license headers. */
   function play(contentId, channelId, opts) {
     var i = 0;
@@ -209,6 +223,7 @@ var F1Api = (function () {
             widevineManifestUrl: normal.url, entitlementToken: hdr.entitlementToken || normal.entitlementToken });
         });
       }) : next();
+    if (opts && opts.cenc) request = request.then(function (r) { return r.hdr ? r : cencOffer(r, contentId, channelId); });
     return request.then(function (r) {
       var la = r.laURL || r.laUrl || '';
       if (!la && (/WV/i.test(r.streamType || '') || r.hdrEncrypted)) {
@@ -231,6 +246,7 @@ var F1Api = (function () {
         licenseHeaders: licenseHeaders
       };
       if (r.hdr) stream.hdr = true;
+      if (r.cenc) stream.cenc = true;
       if (r.hdrEncrypted) { stream.hdrEncrypted = true; stream.widevineManifestUrl = r.widevineManifestUrl; }
       return stream;
     });
@@ -385,7 +401,8 @@ var F1Api = (function () {
       var windowStart = periodStart + (t0 - pto) / ts;
       var ast = Date.parse(attr(/availabilityStartTime="([^"]+)"/) || '') / 1000 || 0;
       var segDur = (+attr(/<SegmentTemplate\b[^>]*\sduration="(\d+)"/) || +attr(/<S\b[^>]*\sd="(\d+)"/) || 0) / ts;
-      var video = (/<AdaptationSet\b[^>]*contentType="video"[\s\S]*?<\/AdaptationSet>/.exec(mpd) || [''])[0];
+      // Session replays say contentType="video"; highlights only mimeType="video/mp4".
+      var video = (/<AdaptationSet\b[^>]*(?:contentType="video"|mimeType="video\/)[\s\S]*?<\/AdaptationSet>/.exec(mpd) || [''])[0];
       return {
         // The video qualities' declared bitrates, lowest first.
         videoBitrates: (video.match(/<Representation\b[^>]*>/g) || []).map(function (r) {

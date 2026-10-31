@@ -10,6 +10,7 @@
  *   POST/GET /vod/<id>.mpd -> a replay manifest the app prepared (native HDR replays)
  *   POST /hdr/<id> -> a live HLG video AdaptationSet; /mpd?...&hdr=<id> puts it in place of the
  *       official video, with that video's current SegmentTimeline; &notext=1 drops subtitle sets
+ *   GET /log -> the last requests (kind, CDN host, status, time, error; no paths or tokens), for diagnosis
  */
 'use strict';
 
@@ -21,6 +22,39 @@ var PORT = 18765;
 var UA = 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/537.36 (KHTML, like Gecko) TV Safari/537.36';
 var server = null;
 var vodManifests = [];
+var recent = [];   // the last requests: AVPlay's requests here are otherwise invisible to the app
+
+/**
+ * F1's CDNs, the only hosts the helper fetches from. F1 hands out a CDN per play request: its own
+ * (ott-video-cf / ott-video-fl.formula1.com) or Akamai (f1prodlive.akamaized.net, Qualifying
+ * 2026-10-31). Refusing Akamai's audio made AVPlay fail with PLAYER_ERROR_CONNECTION_FAILED.
+ */
+function f1Cdn(url) {
+  return /^https:\/\/(?:[a-z0-9-]+\.)+formula1\.com\//.test(url || '') || /^https:\/\/f1prod[a-z0-9-]*\.akamaized\.net\//.test(url || '');
+}
+
+function kindOf(u) {
+  if (u.pathname === '/mpd') return u.query.hdr ? 'live-hdr-mpd' : 'mpd';
+  if (/^\/s\//.test(u.pathname)) return 'audio';
+  if (/^\/vod\//.test(u.pathname)) return 'vod-mpd';
+  if (/^\/hdr\//.test(u.pathname)) return 'hdr-set';
+  return u.pathname === '/ping' || u.pathname === '/log' ? null : 'other';
+}
+
+/** Records each answered request (not /ping or /log) in `recent`. */
+function logged(req, res, u) {
+  var kind = kindOf(u), t0 = Date.now();
+  if (!kind) return res;
+  var head = res.writeHead;
+  res.writeHead = function (status) {
+    var host = '';
+    try { host = u.pathname === '/mpd' ? urlLib.parse(String(u.query.u)).host : /^\/s\/([^/]+)\//.test(u.pathname) ? urlLib.parse(b64urlDecode(RegExp.$1)).host : ''; } catch (e) { /* no host */ }
+    recent.push({ at: new Date(t0).toISOString(), kind: kind, method: req.method || 'GET', host: host, status: status, ms: Date.now() - t0 });
+    if (recent.length > 60) recent.shift();
+    return head.apply(res, arguments);
+  };
+  return res;
+}
 
 /** cb(err, status, body, headers, finalUrl): finalUrl is where redirects led. */
 function fetchBuffer(target, redirects, cb) {
@@ -194,6 +228,8 @@ function send(res, status, body, type) {
 function handle(req, res) {
   var u = urlLib.parse(req.url, true);
   if (u.pathname === '/ping') return send(res, 200, toBuf('ok'));
+  if (u.pathname === '/log') return send(res, 200, toBuf(JSON.stringify(recent)), 'application/json');
+  res = logged(req, res, u);
 
   if (/^\/(?:vod\/[a-z0-9-]{1,64}\.mpd|hdr\/[a-z0-9-]{1,64})$/.test(u.pathname)) {
     vodManifests = vodManifests.filter(function (m) { return Date.now() - m.at < 6 * 3600000; });
@@ -225,8 +261,8 @@ function handle(req, res) {
       if (err) return send(res, 502, toBuf(String(err)));
       if (status !== 200) return send(res, status, body);
       // Segments are relative to where a redirect led, not to the requested address; but the audio
-      // proxy only fetches from formula1.com, so a redirect elsewhere keeps the requested base.
-      var base = /^https:\/\/[a-z0-9.-]+\.formula1\.com\//.test(finalUrl || '') ? finalUrl : manifestUrl;
+      // proxy only fetches from F1's CDNs, so a redirect elsewhere keeps the requested base.
+      var base = f1Cdn(finalUrl) ? finalUrl : manifestUrl;
       var mpd = body.toString('utf8');
       if (u.query.hdr) {
         var stored = vodManifests.filter(function (m) { return m.path === '/hdr/' + u.query.hdr; })[0];
@@ -246,7 +282,7 @@ function handle(req, res) {
   var m = /^\/s\/([^/]+)\/(.+)$/.exec(u.pathname);
   if (m) {
     var target = b64urlDecode(m[1]) + m[2] + (u.search || '');   // keep a segment's query (CDN tokens)
-    if (!/^https:\/\/[a-z0-9.-]+\.formula1\.com\//.test(target)) return send(res, 403, toBuf('forbidden'));
+    if (!f1Cdn(target)) return send(res, 403, toBuf('forbidden'));
     return fetchBuffer(target, 3, function (err, status, body, headers) {
       if (err) return send(res, 502, toBuf(String(err)));
       if (status !== 200) return send(res, status, body);

@@ -165,19 +165,21 @@ var Player = (function () {
         // Resetting another video element can cancel play(); keepPlaying retries it.
         var started = slot.v.play();
         keepPlaying(slot.v, 5000);
-        if (stream.hdr) reloadIfFrozen(slot, stream, startTime, gen);
+        if (stream.hdr || stream.cenc) reloadIfFrozen(slot, stream, startTime, gen);
         return started && started.catch(function () {});
       });
     }
 
     /**
      * The first HDR video after the app starts can stay frozen on this TV (the screen switching to
-     * HDR, presumably): data buffered, not one frame decoded. Loading it again starts it.
+     * HDR, presumably): data buffered, not one frame decoded. Loading it again starts it. The first
+     * encrypted (cenc) video after the start stalls earlier, at readyState 1 (the browser's DRM
+     * starting up, presumably); loading it again plays it too (Mexico FP3 replay, 2026-10-31).
      */
     function reloadIfFrozen(slot, stream, startTime, gen) {
       setTimeout(function () {
         var q = slot.v.getVideoPlaybackQuality ? slot.v.getVideoPlaybackQuality() : null;
-        if (gen !== generation || userPaused || !q || q.totalVideoFrames > 0 || slot.v.readyState < 3) return;
+        if (gen !== generation || userPaused || !q || q.totalVideoFrames > 0 || (slot.v.readyState < 3 && !stream.cenc)) return;
         // From where it is now, which includes a seek made meanwhile.
         var at = slot.v.currentTime > 0 ? slot.v.currentTime : startTime;
         slot.p.load(stream.url, at == null ? null : at).then(function () {
@@ -436,6 +438,7 @@ var Player = (function () {
     var recentLines = {};   // subtitle text -> when AVPlay last sent it
 
     function open(s, url) {
+      clearTimeout(stallTimer);
       isPaused = false;
       posMs = 0;
       recentLines = {};
@@ -448,13 +451,8 @@ var Player = (function () {
         openedAt = Date.now();
         quietUntil = openedAt + 6000;
         av.setListener({
-          onbufferingstart: function () {
-            emit('buffering', true);
-            noteBuffering(s);
-            // A stall at the locked top quality: hand the choice back to AVPlay (outside its callback).
-            if (pinned && started && !isPaused && Date.now() >= quietUntil) setTimeout(function () { release(s); }, 0);
-          },
-          onbufferingcomplete: function () { emit('buffering', false); },
+          onbufferingstart: function () { emit('buffering', true); bufferingStarted(s); },
+          onbufferingcomplete: function () { emit('buffering', false); clearTimeout(stallTimer); },
           oncurrentplaytime: function (ms) { posMs = ms; noteSmooth(s); },
           onstreamcompleted: function () { emit('ended'); },
           onerror: function (e) { emit('error', 'Player error: ' + e); },
@@ -562,9 +560,27 @@ var Player = (function () {
       try { localStorage.setItem(LEVEL_KEY, String(l)); } catch (e) { /* storage unavailable */ }
     }
 
-    /** Buffering while playing (not right after opening or a seek) soon after the start: a stall. */
-    function noteBuffering(s) {
-      if (levelNoted === s || isPaused || Date.now() < quietUntil || Date.now() - openedAt > 90000) return;
+    /*
+     * A stall is buffering that lasts STALL_MS, not right after opening or a seek. AVPlay also reports
+     * blips of 50-150 ms (live HDR, between segments); counting those pushed every start down to the
+     * lowest quality, so each feed switch or seek began at 270p (Qualifying, 2026-10-31).
+     */
+    var STALL_MS = 2000, stallTimer = null;
+
+    function bufferingStarted(s) {
+      var at = Date.now();
+      clearTimeout(stallTimer);
+      stallTimer = setTimeout(function () {
+        if (stream !== s || isPaused || at < quietUntil) return;
+        noteBuffering(s, at);
+        // A stall at the locked top quality: hand the choice back to AVPlay.
+        if (pinned && started) release(s);
+      }, STALL_MS);
+    }
+
+    /** A stall soon after the start lowers the next start's quality. */
+    function noteBuffering(s, at) {
+      if (levelNoted === s || at - openedAt > 90000) return;
       levelNoted = s;
       setStartLevel(Math.min(2, startLevel() + 1));
     }
@@ -650,6 +666,7 @@ var Player = (function () {
     function unload() {
       var wait = preparing || Promise.resolve();
       stream = null;
+      clearTimeout(stallTimer);
       if (captions) { captions.stop(); captions = null; }
       els.av.classList.add('hidden');
       document.body.classList.remove('avplay');
@@ -708,7 +725,23 @@ var Player = (function () {
   function init(videoEl, avEl) {
     els.video = videoEl;
     els.av = avEl;
+    probeCenc();
     return ShakaEngine.init();
+  }
+
+  /*
+   * Whether the browser's Widevine decrypts cenc streams (Tizen 6 does; it refuses F1's usual cbcs).
+   * Asked once at start-up, long before the first video.
+   */
+  var cencSupport = false;
+
+  function probeCenc() {
+    try {
+      navigator.requestMediaKeySystemAccess('com.widevine.alpha', [{ initDataTypes: ['cenc'],
+        videoCapabilities: [{ contentType: 'video/mp4; codecs="avc1.4d402a"', encryptionScheme: 'cenc' }],
+        audioCapabilities: [{ contentType: 'audio/mp4; codecs="mp4a.40.2"', encryptionScheme: 'cenc' }] }])
+        .then(function () { cencSupport = true; }, function () { /* AVPlay only */ });
+    } catch (e) { /* no EME */ }
   }
 
   var hdrSupport = null;
@@ -729,6 +762,8 @@ var Player = (function () {
   function choose(stream) {
     if (Player.forceEngine) return engines[Player.forceEngine];
     if (stream.hdrEncrypted && stream.licenseUrl && hasAvPlay()) return AvEngine;
+    // F1's cenc stream (asked as a Chromecast): the browser decrypts it, so Shaka plays it.
+    if (stream.cenc) return ShakaEngine;
     // AVPlay picks SDR variants from HDR playlists; Shaka can be told to prefer HLG.
     if (stream.hdr) return ShakaEngine;
     if (!hasAvPlay()) return ShakaEngine;
@@ -789,7 +824,9 @@ var Player = (function () {
   }
 
   function switchTo(stream, startTime) {
-    if (engine === ShakaEngine && choose(stream) === ShakaEngine) {
+    // Encrypted feeds can't be preloaded beside the playing one: the TV has one secure decoder, and the
+    // preloaded cenc feed barely moves (164 frames in 9 s, Mexico FP3). They load like AVPlay's.
+    if (engine === ShakaEngine && choose(stream) === ShakaEngine && !stream.cenc && !(current && current.cenc)) {
       var prev = current;
       current = stream;
       // A failed switch leaves the previous feed playing, on its own clock.
@@ -813,6 +850,7 @@ var Player = (function () {
   return {
     init: init,
     hdrCapable: hdrCapable,
+    cencCapable: function () { return cencSupport; },
     load: load,
     unload: unload,
     seekBy: seekBy,

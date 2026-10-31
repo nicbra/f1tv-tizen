@@ -65,8 +65,14 @@ var StreamProxy = (function () {
       var id = Date.now().toString(36) + '-' + (++vodSequence);
       return fetch(BASE + '/hdr/' + id, { method: 'POST', body: built.adaptation }).then(function (r) {
         if (!r.ok) throw new Error('Could not prepare HDR manifest');
-        return { url: manifest(stream.widevineManifestUrl, shift, { audio: langs && langs.audio }) + '&hdr=' + id + '&notext=1',
-          subtitles: built.subtitles };
+        var url = manifest(stream.widevineManifestUrl, shift, { audio: langs && langs.audio }) + '&hdr=' + id + '&notext=1';
+        // A first pass through the helper, as AVPlay will make it: it checks the HLG swap, and warms the
+        // helper's connection to the CDN (AVPlay gives up after ~5 s; 2026-10-31 Qualifying, right after
+        // the helper restarted). A failure here is a temporary one: the app tries HDR once more.
+        return fetch(url, { cache: 'no-store' }).then(function (check) {
+          if (!check.ok) throw new Error('HDR live manifest answered ' + check.status);
+          return { url: url, subtitles: built.subtitles };
+        });
       });
     });
   }

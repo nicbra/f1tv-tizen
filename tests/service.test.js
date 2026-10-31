@@ -261,9 +261,10 @@ test('GET /s/ keeps the segment\'s query string', async () => {
   assert.equal(r.status, 200);
 });
 
-test('GET /s/ refuses hosts other than formula1.com', async () => {
+test('GET /s/ refuses hosts other than F1\'s CDNs', async () => {
   const { s, requested } = service();
-  for (const base of ['https://evil.example/', 'http://ott.formula1.com/', 'https://formula1.com.evil.example/']) {
+  for (const base of ['https://evil.example/', 'http://ott.formula1.com/', 'https://formula1.com.evil.example/',
+    'https://someone.akamaized.net/', 'https://f1prodlive.akamaized.net.evil.example/']) {
     const r = await get(s, '/s/' + b64url(base) + '/x.mp4');
     assert.equal(r.status, 403, base);
   }
@@ -342,4 +343,28 @@ test('live HDR: a time-shifted start trims the HLG timeline like the rest', asyn
     assert.ok(hlg, 'the HLG video is still there');
     assert.ok(Math.abs(+hlg[1] - (738 - 600 / 5.76)) <= 1, 'trimmed to 10 minutes behind: r=' + hlg[1]);
   } finally { Date.now = realNow; }
+});
+
+test('GET /log lists recent requests by kind and CDN host, without paths or tokens', async () => {
+  const live = 'https://ott-video-cf.formula1.com/v2/pa_TOKEN/Main/index.mpd?secret=1';
+  const { s } = service({ [live]: { body: LIVE_HDR_MPD } });
+  await post(s, '/hdr/abc-3', HLG_SET);
+  await get(s, '/mpd?u=' + encodeURIComponent(live) + '&hdr=abc-3');
+  await get(s, '/mpd?u=' + encodeURIComponent(live) + '&hdr=missing');
+  await get(s, '/ping');
+  const log = JSON.parse((await get(s, '/log')).body.toString());
+  assert.deepEqual(log.map((r) => [r.kind, r.status, r.host]), [['hdr-set', 201, ''], ['live-hdr-mpd', 200, 'ott-video-cf.formula1.com'], ['live-hdr-mpd', 502, 'ott-video-cf.formula1.com']]);
+  assert.ok(!JSON.stringify(log).includes('TOKEN') && !JSON.stringify(log).includes('secret'));
+  assert.ok(log.every((r) => typeof r.ms === 'number'));
+});
+
+test('F1\'s Akamai CDN is served like its own: audio segments and live manifests', async () => {
+  const live = 'https://f1prodlive.akamaized.net/v2/x/Main/index.mpd';
+  const seg = 'https://f1prodlive.akamaized.net/v2/x/Main/a_1.mp4';
+  const { s } = service({ [live]: { body: LIVE_HDR_MPD }, [seg]: { body: segment({ trunCount: 4 }) } });
+  await post(s, '/hdr/akamai', HLG_SET);
+  const mpd = await get(s, '/mpd?u=' + encodeURIComponent(live) + '&hdr=akamai&notext=1');
+  assert.equal(mpd.status, 200);
+  assert.ok(mpd.body.toString().includes('/s/' + b64url('https://f1prodlive.akamaized.net/v2/x/Main/') + '/'));
+  assert.equal((await get(s, '/s/' + b64url('https://f1prodlive.akamaized.net/v2/x/Main/') + '/a_1.mp4')).status, 200);
 });
