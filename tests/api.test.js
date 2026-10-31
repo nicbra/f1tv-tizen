@@ -332,6 +332,16 @@ test('streamInfo maps a replay DASH manifest to real clock time through its pres
   assert.equal(info.segDur, 30);
 });
 
+test('streamInfo lists a DASH manifest\'s video bitrates, lowest first, without the audio', async () => {
+  const vod = `<MPD type="static"><Period start="PT0S">
+<AdaptationSet contentType="audio"><Representation id="a" bandwidth="192000"/></AdaptationSet>
+<AdaptationSet contentType="video" mimeType="video/mp4"><SegmentTemplate timescale="1000" presentationTimeOffset="0"><SegmentTimeline><S t="0" d="5760" r="3"/></SegmentTimeline></SegmentTemplate>
+<Representation id="v5" bandwidth="6144000" width="1920" height="1080"/><Representation id="v1" bandwidth="512000" width="480" height="270"/>
+<Representation id="v4" bandwidth="3645440" width="1280" height="720"/></AdaptationSet></Period></MPD>`;
+  const { F1Api } = api(() => ({ body: vod }));
+  assert.deepEqual(plain((await F1Api.streamInfo('https://cdn/vod/index.mpd')).videoBitrates), [512000, 3645440, 6144000]);
+});
+
 test('streamInfo follows an HLS master playlist and maps positions to program date-times', async () => {
   const master = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nlow/index.m3u8\n';
   const media = ['#EXTM3U', '#EXT-X-PLAYLIST-TYPE:VOD', '#EXT-X-PROGRAM-DATE-TIME:2026-10-11T11:55:00.000Z', '#EXTINF:6.0,', 'a.mp4',
@@ -408,4 +418,21 @@ test('imageUrl sizes F1 image ids through the image resizer and keeps full URLs'
   assert.equal(F1Api.imageUrl('1000010403_abc', 384, 216), 'https://f1tv.formula1.com/image-resizer/image/1000010403_abc?w=384&h=216&q=HI&o=L');
   assert.equal(F1Api.imageUrl('https://media.formula1.com/x.png', 1, 1), 'https://media.formula1.com/x.png');
   assert.equal(F1Api.imageUrl('', 1, 1), '');
+});
+
+test('Premium CBCS HDR uses the normal Widevine authorization and keeps its source manifest', async () => {
+  const encrypted = { ...HDR, streamType: 'HDR_UHD_CMAFFP', entitlementToken: 'HDR_ENT', laURL:'https://lic/fairplay' };
+  const { F1Api, calls } = premium((url, init) => ({ body: url === HDR.url
+    ? MASTER + '#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.apple.streamingkeydelivery",URI="skd://00112233-4455-6677-8899-aabbccddeeff"\n'
+    : { resultObj: init.headers['x-f1-device-info'] === 'device=tvos;' ? encrypted
+      : { url:'https://cdn/sdr.mpd', streamType:'SDR_HD_DASHWV_SINGLE', drmToken:'NORMAL_DRM' } } }));
+  const s = await F1Api.play('42', '1033', { hdr:true });
+  assert.equal(s.hdr, true);
+  assert.equal(s.hdrEncrypted, true);
+  assert.equal(s.url, HDR.url);
+  assert.equal(s.widevineManifestUrl, 'https://cdn/sdr.mpd');
+  assert.match(s.licenseUrl, /LA\/widevine\?contentId=42&channelId=1033$/);
+  assert.equal(s.licenseHeaders.entitlementtoken, 'HDR_ENT');
+  assert.equal(s.licenseHeaders.customdata, 'NORMAL_DRM');
+  assert.equal(calls.filter(c=>c.url.includes('/CONTENT/PLAY')).length, 2);
 });

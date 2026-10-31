@@ -19,6 +19,10 @@ It checks:
   playback offset versions. Reports anything new F1 starts offering, or removes, once, then
   saves the new baseline in `DATA_DIR/offer.json` so the next unchanged run passes again.
 
+The schedule check always uses the current weekend. Replay checks use its latest completed F1
+session, or the latest available session from an earlier weekend if nothing has aired yet.
+The **replay selection** result names the session and meeting being tested.
+
 ## Set up
 
 On the NUC, with Docker and Docker Compose installed:
@@ -69,3 +73,31 @@ Without Docker, Node.js 18 or newer runs it directly: `node monitor/check.js pai
 
 Removing the NUC from your F1 account's devices stops the signed-in checks; run `pair` again to
 add it back.
+
+## Diagnostic files
+
+Every check run also appends JSON Lines to `/data/logs/YYYY-MM-DD.jsonl` in the Docker data
+volume (`DATA_DIR/logs/` when running directly). Files use UTC dates, survive container rebuilds,
+and are kept for 14 days. Set `LOG_KEEP_DAYS` to change that. Each console report prints the
+file path; each record has a `runId` to distinguish scheduled and manual runs.
+
+Files include the selected replay's content ID and meeting, check attempts, retries, errors and
+stacks, request URLs, device headers, HTTP statuses and timings, redacted PLAY responses,
+HLS encryption methods/key formats and HLG resolutions, DASH protection types, and the previous
+and current offer snapshots. A `http.start` without a matching response or error shows where a
+request stopped making progress. Account tokens and signed URL query values are redacted;
+manifest summaries omit key URIs, PSSH payloads and segment URLs.
+
+Read or copy a day's diagnostics on the NUC:
+
+```sh
+docker compose -f monitor/compose.yaml exec -T f1tv-monitor cat /data/logs/2026-10-31.jsonl
+docker compose -f monitor/compose.yaml cp f1tv-monitor:/data/logs/2026-10-31.jsonl ./monitor-debug.jsonl
+```
+
+For an HDR fallback, find `http.response` records in the `4K HDR (Premium)` check with
+`device=tvos;`, then any manifest summary and the `hdr.result` record. They show whether F1
+offered SDR, an HDR response with a licence URL, or a playlist with encryption keys. The final
+`hdr.result` names the stream the app actually selected. An `HDR_…` stream type alone doesn't
+establish that the app can play it: supported CBCS offers are also checked through the app's native DASH converter. Unsupported encryption still fails this check.
+These are API and manifest checks; the monitor does not decode video or acquire DRM licences.

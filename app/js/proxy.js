@@ -1,6 +1,7 @@
 /* Starts the app's background service (service/service.js) and builds URLs through it. */
 var StreamProxy = (function () {
   var BASE = 'http://127.0.0.1:18765';
+  var vodSequence = 0;
 
   function ping() {
     return fetch(BASE + '/ping', { cache: 'no-store' }).then(function (r) { return r.ok; }, function () { return false; });
@@ -43,5 +44,16 @@ var StreamProxy = (function () {
       (langs.text ? '&text=' + encodeURIComponent(langs.text) : '');
   }
 
-  return { ensure: ensure, manifest: manifest };
+  /** Resolves { url, subtitles }: the local manifest for AVPlay, and the subtitles the app shows itself. */
+  function hdrManifest(stream, langs) {
+    return ensure().then(function () { return HdrStream.build(stream, langs); }).then(function (built) {
+      var target = BASE + '/vod/' + Date.now().toString(36) + '-' + (++vodSequence) + '.mpd';
+      return fetch(target, { method: 'POST', body: built.mpd }).then(function (r) {
+        if (!r.ok) throw new Error('Could not prepare HDR manifest');
+        return { url: target, subtitles: built.subtitles };
+      });
+    });
+  }
+
+  return { ensure: ensure, manifest: manifest, hdrManifest: hdrManifest };
 })();

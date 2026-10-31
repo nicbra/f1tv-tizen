@@ -4,6 +4,7 @@ WORKDIR /app
 COPY app/js app/js
 COPY app/service app/service
 COPY monitor/check.js monitor/check.js
+COPY monitor/diagnostics.js monitor/diagnostics.js
 ENV DATA_DIR=/data
 RUN mkdir /data && chown node:node /data
 VOLUME /data

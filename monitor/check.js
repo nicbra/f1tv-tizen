@@ -9,13 +9,14 @@
  *
  * Environment: DATA_DIR (sign-in and state, default monitor/data), CHECK_EVERY (hours, default 6),
  * NOTIFY_URL (an ntfy topic URL or a Discord webhook), NOTIFY_ON (change | always), and for testing
- * F1TV_TOKEN (a subscription token to use instead of the paired sign-in).
+ * F1TV_TOKEN (a subscription token to use instead of the paired sign-in), LOG_KEEP_DAYS (default 14).
  */
 'use strict';
 
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
+const { createDiagnostics, errorInfo } = require('./diagnostics');
 
 const ROOT = path.join(__dirname, '..');
 const DATA = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -41,12 +42,12 @@ function fileStorage(file) {
 }
 
 /** The app's API client, sign-in and statistics, loaded as they run on the TV. */
-function app() {
+function app(request = fetch) {
   const ctx = vm.createContext({
-    fetch, URL, atob, btoa, console, setTimeout, clearTimeout, Promise, Date, JSON, Math,
+    fetch: request, URL, atob, btoa, AbortController, console, setTimeout, clearTimeout, Promise, Date, JSON, Math,
     localStorage: fileStorage(path.join(DATA, 'storage.json'))
   });
-  for (const f of ['settings.js', 'api.js', 'auth.js', 'stats.js']) vm.runInContext(read('app/js/' + f), ctx, { filename: f });
+  for (const f of ['settings.js', 'api.js', 'auth.js', 'stats.js', 'cmaf.js', 'hdr.js']) vm.runInContext(read('app/js/' + f), ctx, { filename: f });
   return ctx;
 }
 
@@ -58,10 +59,10 @@ function service() {
 }
 
 /** Loads a session from F1's timing archive with the app's timing worker; resolves with a query function. */
-function timingWorker(sessionPath, token) {
+function timingWorker(sessionPath, token, request = fetch) {
   const messages = [];
   const self = { postMessage: (m) => messages.push(m) };
-  const ctx = vm.createContext({ self, fetch, console, setTimeout, clearTimeout, setInterval, clearInterval, Date, JSON, Math });
+  const ctx = vm.createContext({ self, fetch: request, console, setTimeout, clearTimeout, setInterval, clearInterval, Date, JSON, Math });
   vm.runInContext(read('app/js/timing-worker.js'), ctx, { filename: 'timing-worker.js' });
   // Observe the first heartbeat without changing how the worker builds its median clock.
   let firstHeartbeat = null;
@@ -193,9 +194,9 @@ function offerDiff(before, after) {
   return changes;
 }
 
-async function archiveSessions(token) {
+async function archiveSessions(token, request = fetch) {
   const year = new Date().getUTCFullYear();
-  const r = await fetch(`https://livetiming.formula1.com/static/${year}/Index.json`, { headers: { Authorization: 'Bearer ' + token } });
+  const r = await request(`https://livetiming.formula1.com/static/${year}/Index.json`, { headers: { Authorization: 'Bearer ' + token } });
   need(r.ok, 'Index.json answered HTTP ' + r.status);
   const index = JSON.parse((await r.text()).replace(/^\uFEFF/, ''));
   const sessions = [];
@@ -203,31 +204,72 @@ async function archiveSessions(token) {
   return sessions;
 }
 
-async function text(url) {
-  const r = await fetch(url);
+async function text(url, request = fetch) {
+  const r = await request(url);
   if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + url.split('?')[0].slice(0, 80));
   return r.text();
 }
 
 function need(condition, message) { if (!condition) throw new Error(message); }
 
+async function hdrTransport(hdr, info, build) {
+  if (!info.encrypted) return 'clear HLS';
+  need(hdr.hdrEncrypted && hdr.licenseUrl && hdr.widevineManifestUrl && build, 'unsupported encrypted HDR offer');
+  await build(hdr);
+  return 'Widevine CBCS';
+}
+
+/** A quiet Thursday still exercises playback using the most recent completed F1 session. */
+async function replayForChecks(api, meetings, meeting, schedule, now = Date.now()) {
+  const pick = (events, source) => {
+    const event = events.filter((e) => /FORMULA 1/.test(e.series) && SESSIONS.test(e.title) && e.subtype === 'REPLAY')
+      .sort((a, b) => a.start - b.start).pop();
+    return event ? { ...event, meetingName: source.name } : undefined;
+  };
+  const current = pick(schedule.events, meeting);
+  if (current) return current;
+  const previous = meetings.filter((m) => m.key !== meeting.key && !m.test && m.start < meeting.start && m.start <= now)
+    .sort((a, b) => b.start - a.start);
+  for (const source of previous) {
+    const older = api.scheduleFrom(await api.pageByUri(source.uri));
+    const replay = pick((older || {}).events || [], source);
+    if (replay) return replay;
+  }
+}
+
 /** Runs every check; returns [{ name, ok, detail }]. */
-async function runChecks() {
+async function runChecks(diagnostics) {
+  const { log, withContext, fetch } = diagnostics;
   const results = [];
   // Rate limits, server errors and network blips get one retry a minute later before they count.
   const transient = /HTTP (429|5\d\d)|fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up/;
   const check = async (name, fn, retry = true) => {
     for (let attempt = 1; ; attempt++) {
-      try { return results.push({ name, ok: true, detail: (await fn()) || '' }); }
-      catch (e) {
-        if (retry && attempt === 1 && transient.test(e.message)) { await new Promise((r) => setTimeout(r, +process.env.RETRY_WAIT || 60000)); continue; }
-        return results.push({ name, ok: false, detail: e.message });
-      }
+      const result = await withContext({ check: name, attempt }, async () => {
+        const started = Date.now();
+        log('check.start');
+        try {
+          const detail = (await fn()) || '';
+          log('check.result', { ok: true, detail, durationMs: Date.now() - started });
+          return { name, ok: true, detail };
+        } catch (e) {
+          log('check.error', { error: errorInfo(e), durationMs: Date.now() - started });
+          if (retry && attempt === 1 && (transient.test(e.message) || e.status === 429 || e.status >= 500)) {
+            const waitMs = +process.env.RETRY_WAIT || 60000;
+            log('check.retry', { waitMs });
+            await new Promise((r) => setTimeout(r, waitMs));
+            return null;
+          }
+          log('check.result', { ok: false, detail: e.message, durationMs: Date.now() - started });
+          return { name, ok: false, detail: e.message };
+        }
+      });
+      if (result) return results.push(result);
     }
   };
-  const { F1Api, Auth, Stats } = app();
+  const { F1Api, Auth, Stats, HdrStream } = app(fetch);
   const svc = service();
-  let season, meeting, schedule, replay, token, stream;
+  let season, meetings, meeting, schedule, replay, token, stream;
 
   // ---------- public: what the app shows before signing in ----------
 
@@ -249,7 +291,7 @@ async function runChecks() {
 
   await check('season calendar', async () => {
     need(season, 'needs the menu');
-    const meetings = F1Api.seasonFrom(await F1Api.pageByUri(season.uri));
+    meetings = F1Api.seasonFrom(await F1Api.pageByUri(season.uri));
     need(meetings.length >= 10, `only ${meetings.length} meetings`);
     need(meetings.every((m) => m.start && m.uri && m.key), 'meetings without dates, pages or keys');
     meeting = meetings.filter((m) => m.start <= Date.now()).pop() || meetings[0];
@@ -262,12 +304,23 @@ async function runChecks() {
     need(schedule && schedule.events.length >= 3, 'no broadcast schedule on the weekend page');
     need(schedule.events.every((e) => e.contentId && e.start && e.houseId), 'events without ids, start times or house ids');
     const f1 = schedule.events.filter((e) => /FORMULA 1/.test(e.series) && SESSIONS.test(e.title));
-    replay = f1.filter((e) => e.subtype === 'REPLAY').pop();
-    return `${schedule.events.length} broadcasts, ${f1.length} F1 sessions` + (replay ? `; latest replay: ${replay.title}` : '');
+    log('schedule', { meeting: meeting.name, events: schedule.events.map((e) => ({
+      title: e.title, contentId: e.contentId, series: e.series, subtype: e.subtype, start: e.start
+    })) });
+    return `${schedule.events.length} broadcasts, ${f1.length} F1 sessions`;
+  });
+
+  await check('replay selection', async () => {
+    need(meetings && meeting && schedule, 'needs the calendar and schedule');
+    replay = await replayForChecks(F1Api, meetings, meeting, schedule);
+    need(replay, 'no F1 session replay in the season yet');
+    log('replay.selected', { contentId: replay.contentId, title: replay.title, start: replay.start,
+      meeting: replay.meetingName, currentMeeting: meeting.name, previousWeekend: replay.meetingName !== meeting.name });
+    return `${replay.title} (${replay.meetingName})`;
   });
 
   await check('video details and feeds', async () => {
-    need(replay, 'no F1 session replay this weekend yet');
+    need(replay, 'needs an F1 session replay');
     const m = (await F1Api.video(replay.contentId)).metadata || {};
     const emf = m.emfAttributes || {};
     need(emf.MeetingKey && +emf.sessionStartDate > 1e12, 'no MeetingKey or sessionStartDate');
@@ -319,6 +372,7 @@ async function runChecks() {
     need(token, 'the device key no longer gives a token (removed from the account?)');
     await F1Api.login(token);
     need(F1Api.state.entitlement, 'no entitlement token');
+    log('account.tier', { tier: (F1Api.state.location || {}).entitlement, product: Auth.profile().product });
     return Auth.profile().product || 'signed in';
   });
 
@@ -364,7 +418,7 @@ async function runChecks() {
       audio = await F1Api.play(live.contentId);
     }
     need(/\.mpd(\?|$)/.test(audio.url) && audio.licenseUrl, 'needs an encrypted DASH stream to check the audio fix');
-    const mpd = await text(audio.url);
+    const mpd = await text(audio.url, fetch);
     const rewritten = svc.preferLanguages(svc.rewriteManifest(mpd, audio.url), { audio: 'eng' });
     need(/contentType="audio"[^>]*lang="eng[^"]*"[^>]*><BaseURL>http:\/\/127\.0\.0\.1/.test(rewritten) ||
       /contentType="audio"[^>]*><BaseURL>http:\/\/127\.0\.0\.1/.test(rewritten), 'audio sets were not routed through the service');
@@ -383,10 +437,10 @@ async function runChecks() {
 
   await check('timing archive', async () => {
     need(token, 'needs sign-in');
-    const sessions = await archiveSessions(token);
+    const sessions = await archiveSessions(token, fetch);
     const last = sessions.pop();
     need(last, 'no sessions in the archive index');
-    const w = await timingWorker(last.Path, token);
+    const w = await timingWorker(last.Path, token, fetch);
     need(w.snaps.length > 10, 'almost no timing snapshots');
     const mid = w.snaps[Math.floor(w.snaps.length * 0.8)][0];
     const st = w.query(mid);
@@ -399,9 +453,9 @@ async function runChecks() {
 
   await check('race start in the timing data', async () => {
     need(token, 'needs sign-in');
-    const last = (await archiveSessions(token)).filter((s) => /^(Race|Sprint)$/.test(s.Name)).pop();
+    const last = (await archiveSessions(token, fetch)).filter((s) => /^(Race|Sprint)$/.test(s.Name)).pop();
     need(last, 'no Race or Sprint in the archive index');
-    const w = await timingWorker(last.Path, token);
+    const w = await timingWorker(last.Path, token, fetch);
     need(Number.isFinite(w.startedAt) && w.startedAt > 0, 'no race start in SessionData (tower cannot show lights out)');
     const before = w.query(w.startedAt - 60000), after = w.query(w.startedAt + 60000);
     need(before && before.beforeStart === true, 'tower thinks the race has started a minute before lights out');
@@ -416,17 +470,20 @@ async function runChecks() {
     if ((F1Api.state.location || {}).entitlement === 'PRO') return 'Pro account: no HDR to check';
     need(replay, 'needs a replay');
     const hdr = await F1Api.play(replay.contentId, null, { hdr: true });
-    need(hdr.hdr === true, 'the app has fallen back to SDR for Premium');
-    const variants = hlgVariants(await text(hdr.url));
+    log('hdr.result', { contentId: replay.contentId, tier: (F1Api.state.location || {}).entitlement,
+      hdr: hdr.hdr === true, streamType: hdr.streamType, platform: hdr.platform });
+    need(hdr.hdr === true, `the app has fallen back to SDR for Premium (${hdr.streamType}); see diagnostic log`);
+    const variants = hlgVariants(await text(hdr.url, fetch));
     need(variants.length, 'no HLG video variants (Premium HDR is missing)');
     const sdr = stream || await F1Api.play(replay.contentId);
     const hdrInfo = await F1Api.streamInfo(hdr.url), sdrInfo = await F1Api.streamInfo(sdr.url);
-    need(!hdrInfo.encrypted, 'the HDR variant playlists are encrypted (the app falls back to SDR)');
+    const transport = await hdrTransport(hdr, hdrInfo, HdrStream.build);
+    log('hdr.transport', { transport, encrypted: !!hdrInfo.encrypted });
     need(variants[0].height >= 2160, `HDR tops out at ${variants[0].width}x${variants[0].height}: no more 4K`);
     need(hdrInfo.epochAtZero > 1e9 && sdrInfo.epochAtZero > 1e9, 'HDR or SDR has no video clock (tower cannot sync)');
     const offset = Math.abs(hdrInfo.epochAtZero - sdrInfo.epochAtZero);
     need(offset <= 1, `HDR and SDR clocks differ by ${offset.toFixed(1)} s (tower is out of sync)`);
-    return `${replay.title}: HLG ${variants[0].width}x${variants[0].height}; SDR clock within ${offset.toFixed(1)} s`;
+    return `${replay.title}: HLG ${variants[0].width}x${variants[0].height}, ${transport}; SDR clock within ${offset.toFixed(1)} s`;
   });
 
   await check(OFFER_CHECK, async () => {
@@ -453,6 +510,7 @@ async function runChecks() {
     try { previous = JSON.parse(fs.readFileSync(file, 'utf8')); }
     catch (e) { if (e.code !== 'ENOENT') throw e; }
     const changes = previous ? offerDiff(previous, snapshot) : [];
+    log('offer.comparison', { contentId: replay.contentId, previous, current: snapshot, changes });
     fs.mkdirSync(DATA, { recursive: true });
     fs.writeFileSync(file, JSON.stringify(snapshot, null, 1), { mode: 0o600 });
     need(!changes.length, changes.join('; '));
@@ -472,7 +530,7 @@ async function runChecks() {
       const s = await F1Api.play(live.contentId);
       const info = await F1Api.streamInfo(s.url);
       need(info.dynamic, 'a live broadcast with a static manifest');
-      const shifted = svc.timeShift(await text(s.url), 300, Date.now());
+      const shifted = svc.timeShift(await text(s.url, fetch), 300, Date.now());
       need(/<S\b/.test(shifted), 'nothing left after time-shifting 5 minutes');
       return `${live.title}: live, time-shift ok`;
     });
@@ -503,21 +561,34 @@ function failingKeys(results) {
 
 /** Notifies when the set of failing checks changes (or every run with NOTIFY_ON=always). */
 async function runAndNotify() {
-  const results = await runChecks();
-  const failing = failingKeys(results);
-  const stateFile = path.join(DATA, 'state.json');
-  let previous = null;
-  try { previous = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch (e) { /* first run */ }
-  console.log(`\n${new Date().toISOString()}\n${report(results)}`);
-  const changed = !previous || previous.failing.join('|') !== failing.join('|');
-  if (changed || process.env.NOTIFY_ON === 'always') {
-    const title = failing.length ? `F1 TV monitor: ${failing.length} check${failing.length > 1 ? 's' : ''} failing`
-      : previous && previous.failing.length ? 'F1 TV monitor: all checks pass again' : 'F1 TV monitor: all checks pass';
-    await notify(title, report(failing.length ? results.filter((r) => !r.ok) : results)).catch((e) => console.error('notification failed: ' + e.message));
+  const diagnostics = createDiagnostics(DATA);
+  const { log } = diagnostics;
+  log('run.start', { node: process.version });
+  try {
+    const results = await runChecks(diagnostics);
+    const failing = failingKeys(results);
+    const stateFile = path.join(DATA, 'state.json');
+    let previous = null;
+    try { previous = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch (e) { /* first run */ }
+    log('run.results', { results, failing });
+    console.log(`\n${new Date().toISOString()}\n${report(results)}\nDiagnostics: ${diagnostics.file}`);
+    const changed = !previous || previous.failing.join('|') !== failing.join('|');
+    if (changed || process.env.NOTIFY_ON === 'always') {
+      const title = failing.length ? `F1 TV monitor: ${failing.length} check${failing.length > 1 ? 's' : ''} failing`
+        : previous && previous.failing.length ? 'F1 TV monitor: all checks pass again' : 'F1 TV monitor: all checks pass';
+      await notify(title, report(failing.length ? results.filter((r) => !r.ok) : results)).catch((e) => {
+        log('notification.error', { error: errorInfo(e) });
+        console.error('notification failed: ' + e.message);
+      });
+    }
+    fs.mkdirSync(DATA, { recursive: true });
+    fs.writeFileSync(stateFile, JSON.stringify({ at: new Date().toISOString(), failing }));
+    log('run.end', { failing: failing.length });
+    return failing.length;
+  } catch (error) {
+    log('run.error', { error: errorInfo(error) });
+    throw error;
   }
-  fs.mkdirSync(DATA, { recursive: true });
-  fs.writeFileSync(stateFile, JSON.stringify({ at: new Date().toISOString(), failing }));
-  return failing.length;
 }
 
 async function pair() {
@@ -541,4 +612,4 @@ async function main(mode) {
 
 if (require.main === module) main(process.argv[2]).catch((e) => { console.error(e); process.exitCode = 1; });
 
-module.exports = { audioSegmentUrl, sencCount, hlgVariants, heartbeatBase, offerSnapshot, offerDiff, timingWorker, failingKeys };
+module.exports = { audioSegmentUrl, sencCount, hlgVariants, heartbeatBase, offerSnapshot, offerDiff, timingWorker, failingKeys, replayForChecks, hdrTransport };

@@ -30,9 +30,38 @@ var Player = (function () {
     function P() { return slots[cur].p; }
     function V() { return slots[cur].v; }
 
+    /**
+     * HLG must be a constraint, not just a preference: Shaka can otherwise select an SDR variant
+     * from F1's mixed master after a seek or an adaptation, making the TV change picture modes.
+     * Leave media playlists, audio, subtitles, clocks and signed URIs as supplied by F1.
+     */
+    function hlgMaster(master) {
+      if (!/^#EXTM3U\s/.test(master) || !/^#EXT-X-STREAM-INF:/m.test(master)) return master;
+      var lines = master.split(/\r?\n/), out = [], keep = true, variants = 0;
+      lines.forEach(function (line) {
+        if (/^#EXT-X-STREAM-INF:/.test(line)) {
+          var range = '', re = /(?:^|,)\s*([\w-]+)=("[^"]*"|[^,]*)/g, m;
+          while ((m = re.exec(line.slice(18)))) {
+            if (m[1] === 'VIDEO-RANGE') range = m[2].replace(/^"|"$/g, '').trim();
+          }
+          keep = range === 'HLG';
+          if (keep) { variants++; out.push(line); }
+        } else if (/^#EXT-X-I-FRAME-STREAM-INF:/.test(line)) {
+          // Trick-play renditions do not always declare their colour range.
+        } else if (line.trim() && line.trim().charAt(0) !== '#') {
+          if (keep) out.push(line);
+          keep = true;
+        } else {
+          out.push(line);
+        }
+      });
+      if (!variants) throw new Error('HDR playlist has no HLG variants');
+      return out.join('\n');
+    }
+
     function makeSlot(video) {
       var player = new shaka.Player();
-      var slot = { p: player, v: video };
+      var slot = { p: player, v: video, hdr: false };
       return player.attach(video).then(function () {
         player.getNetworkingEngine().registerRequestFilter(function (type, request) {
           if (type === shaka.net.NetworkingEngine.RequestType.LICENSE) {
@@ -40,6 +69,11 @@ var Player = (function () {
               if (licenseHeaders[k]) request.headers[k] = licenseHeaders[k];
             });
           }
+        });
+        player.getNetworkingEngine().registerResponseFilter(function (type, response) {
+          if (!slot.hdr || type !== shaka.net.NetworkingEngine.RequestType.MANIFEST) return;
+          var text = shaka.util.StringUtils.fromUTF8(response.data);
+          response.data = shaka.util.StringUtils.toUTF8(hlgMaster(text));
         });
         player.addEventListener('error', function (ev) { if (slots[cur] === slot) emit('error', describe(ev.detail)); });
         player.addEventListener('buffering', function (ev) { if (slots[cur] === slot) emit('buffering', ev.buffering); });
@@ -98,7 +132,9 @@ var Player = (function () {
       return 'Playback error ' + err.code + (err.data && err.data[0] ? ': ' + String(err.data[0]).slice(0, 120) : '');
     }
 
-    function configure(player, stream) {
+    function configure(slot, stream) {
+      var player = slot.p;
+      slot.hdr = stream.hdr === true;
       licenseHeaders = stream.licenseHeaders || {};
       var drm = stream.licenseUrl ? { servers: { 'com.widevine.alpha': stream.licenseUrl } } : {};
       player.resetConfiguration();
@@ -120,7 +156,7 @@ var Player = (function () {
 
     function load(stream, startTime) {
       var slot = slots[cur], gen = ++generation;
-      configure(slot.p, stream);
+      configure(slot, stream);
       slot.v.muted = false;
       slot.v.classList.remove('hidden');
       userPaused = false;
@@ -211,7 +247,7 @@ var Player = (function () {
     function swap(stream, startTime) {
       var old = slots[cur], next = slots[1 - cur];
       generation++;
-      configure(next.p, stream);
+      configure(next, stream);
       next.v.muted = true;
       swapping = true;
       return next.p.load(stream.url, startTime == null ? null : startTime).then(function () {
@@ -327,6 +363,19 @@ var Player = (function () {
       }
     }
 
+    var captions = null;   // native HDR: the app's own subtitles (ttml.js), not AVPlay's
+
+    function subtitleReader(list) {
+      if (!list || !list.length || typeof Ttml === 'undefined') return null;
+      return Ttml.reader(list, {
+        position: function () {
+          try { var ms = av.getCurrentTime(); return ms > 0 ? ms / 1000 : null; } catch (e) { return null; }
+        },
+        show: function (cue) { emit('subtitle', cue); },
+        same: sameLang
+      });
+    }
+
     function trackList() {
       var out = { audio: [], text: [] };
       try {
@@ -337,6 +386,7 @@ var Player = (function () {
           if (t.type === 'TEXT') out.text.push({ index: t.index, lang: info.track_lang || '' });
         });
       } catch (e) { /* not prepared yet */ }
+      if (captions) out.text = captions.langs().map(function (lang, i) { return { index: i, lang: lang }; });
       return out;
     }
 
@@ -346,6 +396,7 @@ var Player = (function () {
     }
 
     function selectText(lang) {
+      if (captions) return captions.select(lang || null);
       var t = lang && trackList().text.filter(function (x) { return sameLang(x.lang, lang); })[0];
       try {
         if (!t) { av.setSilentSubtitle(true); emit('subtitle', null); return; }
@@ -358,6 +409,15 @@ var Player = (function () {
       stream = s;
       av = webapis.avplay;
       startAt = startTime;
+      if (captions) { captions.stop(); captions = null; }
+      if (s.hdrEncrypted) {
+        var prefs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
+        return StreamProxy.hdrManifest(s, prefs).then(function (prepared) {
+          if (stream !== s) throw new Error('cancelled');
+          captions = subtitleReader(prepared.subtitles);
+          return open(s, prepared.url);
+        });
+      }
       // Encrypted live DASH goes through the local service, which fixes the audio segments.
       if (s.licenseUrl && /\.mpd(\?|$)/.test(s.url)) {
         var langs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
@@ -372,9 +432,14 @@ var Player = (function () {
 
     var preparing = null;   // settles when the current prepareAsync has finished either way
 
+    var recentLines = {};   // subtitle text -> when AVPlay last sent it
+
     function open(s, url) {
       isPaused = false;
       posMs = 0;
+      recentLines = {};
+      openedUrl = url;
+      started = false;
       els.av.classList.remove('hidden');
       document.body.classList.add('avplay');
       return new Promise(function (resolve, reject) {
@@ -382,20 +447,34 @@ var Player = (function () {
         openedAt = Date.now();
         quietUntil = openedAt + 6000;
         av.setListener({
-          onbufferingstart: function () { emit('buffering', true); noteBuffering(s); },
+          onbufferingstart: function () {
+            emit('buffering', true);
+            noteBuffering(s);
+            // A stall at the locked top quality: hand the choice back to AVPlay (outside its callback).
+            if (pinned && started && !isPaused && Date.now() >= quietUntil) setTimeout(function () { release(s); }, 0);
+          },
           onbufferingcomplete: function () { emit('buffering', false); },
           oncurrentplaytime: function (ms) { posMs = ms; noteSmooth(s); },
           onstreamcompleted: function () { emit('ended'); },
           onerror: function (e) { emit('error', 'Player error: ' + e); },
           onsubtitlechange: function (duration, text) {
-            emit('subtitle', { text: String(text || '').replace(/\u0000/g, '').trim(), ms: +duration || 3000 });
+            text = String(text || '').replace(/\u0000/g, '').trim();
+            // At each segment boundary AVPlay sends the new segment's earlier lines again (F1 repeats
+            // cues across segments), which flashed old lines: show a line once.
+            var now = Date.now();
+            Object.keys(recentLines).forEach(function (t) { if (now - recentLines[t] > 15000) delete recentLines[t]; });
+            if (text && recentLines[text]) return;
+            if (text) recentLines[text] = now;
+            emit('subtitle', { text: text, ms: +duration || 3000 });
           },
           ondrmevent: onDrm
         });
         if (s.licenseUrl) {
-          av.setDrm('WIDEVINE_CDM', 'SetProperties', JSON.stringify({ AppSession: 'f1tv-' + Date.now() }));
+          var properties = { AppSession: 'f1tv-' + Date.now() };
+          if (s.hdrEncrypted) properties.DataType = 'MPEG-DASH';
+          av.setDrm('WIDEVINE_CDM', 'SetProperties', JSON.stringify(properties));
         }
-        tune();
+        tune(s);
         av.setDisplayRect(0, 0, 1920, 1080);
         av.setDisplayMethod('PLAYER_DISPLAY_MODE_LETTER_BOX');
         var settle;
@@ -406,6 +485,7 @@ var Player = (function () {
             settle();
             // Unloaded or replaced while preparing: don't start (unload() closes the player).
             if (stream !== s) return reject(new Error('cancelled'));
+            started = true;
             var d = av.getDuration();
             live = s.info ? s.info.dynamic : (!!s.live || !d || d <= 0);
             selectAudio(Settings.get('audio'));
@@ -430,8 +510,35 @@ var Player = (function () {
     // Samsung requires at least 4 s of buffering after a seek.
     var tuning = { resumeBuffer: 4 };
 
-    function tune() {
-      try { av.setStreamingProperty('ADAPTIVE_INFO', 'STARTBITRATE=' + START_LEVELS[startLevel()]); } catch (e) { /* keep default */ }
+    /*
+     * AVPlay's own choice on F1's SDR DASH replays drops from 1080p to 720p, 540p and even 270p every
+     * minute or two with a fast connection (80 Mbit/s measured, no buffering); the HDR stream holds
+     * 2160p. So an SDR replay is locked to its top quality, as long as starts at the top have been
+     * smooth (start level 0). A stall while locked reopens it at the same moment with AVPlay choosing.
+     */
+    var pinned = 0, openedUrl = null, started = false;
+
+    function pinFor(s) {
+      var rates = s.info && !s.info.dynamic && !s.hdr && !s.unpinned && s.info.videoBitrates;
+      return rates && rates.length > 1 && startLevel() === 0 ? rates[rates.length - 1] : 0;
+    }
+
+    function release(s) {
+      if (stream !== s || !pinned || !started) return;
+      pinned = 0;
+      s.unpinned = true;
+      setStartLevel(Math.max(1, startLevel()));
+      startAt = posMs / 1000;
+      try { av.stop(); } catch (e) { /* not playing */ }
+      try { av.close(); } catch (e) { /* already closed */ }
+      open(s, openedUrl).catch(function (e) { if (stream === s) emit('error', 'Could not reopen: ' + e.message); });
+    }
+
+    function tune(s) {
+      pinned = pinFor(s);
+      var adaptive = 'STARTBITRATE=' + START_LEVELS[startLevel()];
+      if (pinned) adaptive = 'BITRATES=' + pinned + '~' + pinned * 2 + '|' + adaptive;
+      try { av.setStreamingProperty('ADAPTIVE_INFO', adaptive); } catch (e) { /* keep default */ }
       try {
         if (tuning.resumeBuffer) av.setBufferingParam('PLAYER_BUFFER_FOR_RESUME', 'PLAYER_BUFFER_SIZE_IN_SECOND', tuning.resumeBuffer);
       } catch (e) { /* older firmware: keep defaults */ }
@@ -488,6 +595,7 @@ var Player = (function () {
      */
     function applyTextWhenPlaying(s) {
       var want = Settings.get('subtitles');
+      if (captions) return captions.select(want || null);
       try { av.setSilentSubtitle(!want); } catch (e) { /* not ready */ }
       setTimeout(function () {
         if (stream !== s || !want) return;
@@ -520,6 +628,7 @@ var Player = (function () {
     function seek(ms, done, maxTries) {
       var gen = ++seekGen, s = stream, tries = 0;
       quietUntil = Date.now() + 6000;
+      recentLines = {};   // lines heard before the seek may come again
       // Its own target: playback reports overwrite posMs while a retry waits.
       var target = posMs = Math.max(0, clampLive(ms / 1000) * 1000);
       (function attempt() {
@@ -540,6 +649,7 @@ var Player = (function () {
     function unload() {
       var wait = preparing || Promise.resolve();
       stream = null;
+      if (captions) { captions.stop(); captions = null; }
       els.av.classList.add('hidden');
       document.body.classList.remove('avplay');
       return wait.then(function () {
@@ -617,6 +727,7 @@ var Player = (function () {
    */
   function choose(stream) {
     if (Player.forceEngine) return engines[Player.forceEngine];
+    if (stream.hdrEncrypted && stream.licenseUrl && hasAvPlay()) return AvEngine;
     // AVPlay picks SDR variants from HDR playlists; Shaka can be told to prefer HLG.
     if (stream.hdr) return ShakaEngine;
     if (!hasAvPlay()) return ShakaEngine;

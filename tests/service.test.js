@@ -275,3 +275,25 @@ test('unknown paths, and /mpd without a URL, are 404', async () => {
   assert.equal((await get(s, '/nope')).status, 404);
   assert.equal((await get(s, '/mpd')).status, 404);
 });
+
+function post(s, path, body) {
+  return new Promise(resolve => {
+    const req = new EventEmitter(); req.url=path; req.method='POST';
+    const res={writeHead(status, headers){this.status=status;this.headers=headers;},end(body){resolve({status:this.status,headers:this.headers,body});}};
+    s.handle(req,res);
+    req.emit('data',Buffer.from(body)); req.emit('end');
+  });
+}
+test('prepared VOD manifests have distinct bounded loopback URLs', async () => {
+  const {s}=service();
+  const one='<MPD type="static"><Period id="one"/></MPD>', two='<MPD type="static"><Period id="two"/></MPD>';
+  assert.equal((await post(s,'/vod/one.mpd',one)).status,201);
+  assert.equal((await post(s,'/vod/two.mpd',two)).status,201);
+  assert.equal((await get(s,'/vod/one.mpd')).body.toString(),one);
+  assert.equal((await get(s,'/vod/two.mpd')).body.toString(),two);
+  assert.equal((await get(s,'/vod/missing.mpd')).status,404);
+  assert.equal((await post(s,'/vod/bad.mpd','not a manifest')).status,400);
+  assert.equal((await post(s,'/vod/big.mpd','x'.repeat(2*1024*1024+1))).status,413);
+  for(let i=0;i<5;i++)await post(s,'/vod/new'+i+'.mpd',one);
+  assert.equal((await get(s,'/vod/one.mpd')).status,404);
+});

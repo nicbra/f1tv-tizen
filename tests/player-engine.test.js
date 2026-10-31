@@ -34,6 +34,7 @@ function fakeAvPlay({ liveWindow = '', duration = 0 } = {}) {
     getDuration: () => duration,
     getTotalTrackInfo: () => [],
     getCurrentStreamInfo: () => [],
+    getCurrentTime: () => av.time || 0,
     play: () => { calls.push(['play']); state = 'PLAYING'; },
     pause() {}, setSilentSubtitle() {},
     getState: () => state,
@@ -44,9 +45,9 @@ function fakeAvPlay({ liveWindow = '', duration = 0 } = {}) {
 }
 
 /** Loads the real settings, service launcher and player with a fake AVPlay and Shaka. shakaLoad: Shaka's load(). */
-async function player(av, storage, shakaLoad, globals) {
+async function player(av, storage, shakaLoad, globals, manifest) {
   const store = Object.assign({}, storage);
-  const configs = [], languages = [];
+  const configs = [], languages = [], manifests = [];
   // Shaka's SimpleTextDisplayer as far as it matters here: append() adds the cues to the video's track.
   class SimpleTextDisplayer {
     constructor(video) { this.track = video.textTracks[0]; }
@@ -56,11 +57,19 @@ async function player(av, storage, shakaLoad, globals) {
     }
   }
   class ShakaPlayer {
+    constructor() { this.responseFilters = []; }
     attach() { return Promise.resolve(); }
     resetConfiguration() {}
     configure(config) { configs.push(config); }
-    load(url, start) { return shakaLoad ? shakaLoad(url, start) : Promise.reject(new Error('no stream')); }
-    getNetworkingEngine() { return { registerRequestFilter() {} }; }
+    async load(url, start) {
+      if (manifest != null) {
+        const response = { data: Buffer.from(manifest), uri: url };
+        for (const filter of this.responseFilters) await filter(0, response);
+        manifests.push(Buffer.from(response.data).toString('utf8'));
+      }
+      return shakaLoad ? shakaLoad(url, start) : Promise.reject(new Error('no stream'));
+    }
+    getNetworkingEngine() { return { registerRequestFilter() {}, registerResponseFilter: (fn) => this.responseFilters.push(fn) }; }
     getBufferedInfo() { return { video: [{ start: 0, end: 10 }] }; }
     selectAudioLanguage(l) { languages.push(['audio', l]); }
     selectTextLanguage(l) { languages.push(['text', l]); }
@@ -70,13 +79,15 @@ async function player(av, storage, shakaLoad, globals) {
   }
   const context = vm.createContext(Object.assign({
     webapis: { avplay: av },
-    shaka: { polyfill: { installAll() {} }, Player: ShakaPlayer, text: { SimpleTextDisplayer }, net: { NetworkingEngine: { RequestType: {} } }, util: { Error: { Category: {} } } },
+    shaka: { polyfill: { installAll() {} }, Player: ShakaPlayer, text: { SimpleTextDisplayer },
+      net: { NetworkingEngine: { RequestType: { MANIFEST: 0, LICENSE: 2 } } },
+      util: { Error: { Category: {} }, StringUtils: { fromUTF8: (b) => Buffer.from(b).toString('utf8'), toUTF8: (s) => Buffer.from(s) } } },
     document: { body: el() },
     localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } },
     fetch: async () => ({ ok: true }), // the stream helper service answers its ping
-    setTimeout, clearTimeout, Date, Math, JSON, Promise, encodeURIComponent
+    setTimeout, clearTimeout, setInterval, clearInterval, Date, Math, JSON, Promise, encodeURIComponent, URL, TextDecoder
   }, globals));
-  for (const f of ['settings.js', 'proxy.js', 'player.js']) vm.runInContext(readFileSync('app/js/' + f, 'utf8'), context);
+  for (const f of ['settings.js', 'proxy.js', 'ttml.js', 'player.js']) vm.runInContext(readFileSync('app/js/' + f, 'utf8'), context);
   const second = el();
   const video = Object.assign(el(), { cloneNode: () => second, parentNode: { insertBefore() {} } });
   await context.Player.init(video, el());
@@ -84,6 +95,8 @@ async function player(av, storage, shakaLoad, globals) {
   context.Player.configs = configs;
   context.Player.SimpleTextDisplayer = SimpleTextDisplayer;
   context.Player.languages = languages;
+  context.Player.manifests = manifests;
+  context.Player.context = context;
   return context.Player;
 }
 
@@ -182,6 +195,57 @@ test('HDR uses Shaka even for a single feed, selecting HLG and resetting to AUTO
   P.forceEngine = 'avplay';
   await P.load(stream, null);
   assert.equal(P.engineName(), 'avplay');
+});
+
+const MIXED_HDR = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",URI="audio/en.m3u8"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Norwegian",URI="subs/no.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=7000000,CODECS="hvc1.2.4.L123.B0,mp4a.40.2",RESOLUTION=1920x1080,VIDEO-RANGE=HLG,AUDIO="audio",SUBTITLES="subs"
+hdr/hd.m3u8?signature=keep-this
+#EXT-X-STREAM-INF:BANDWIDTH=18000000,CODECS="hvc1.2.4.L153.B0,mp4a.40.2",RESOLUTION=3840x2160,VIDEO-RANGE="HLG",AUDIO="audio",SUBTITLES="subs"
+hdr/uhd.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=9000000,CODECS="hvc1.1.6.L150.B0,mp4a.40.2",RESOLUTION=2880x1620,VIDEO-RANGE=SDR
+sdr/1620.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="fake,VIDEO-RANGE=HLG,codec",RESOLUTION=480x270
+unknown/270.m3u8
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=500000,VIDEO-RANGE=SDR,URI="sdr/iframe.m3u8"
+`;
+const HLG_MASTER = MIXED_HDR.slice(0, MIXED_HDR.indexOf('#EXT-X-STREAM-INF:BANDWIDTH=9000000'));
+
+test('HDR playback exposes only HLG qualities to adaptation, preserving signed URLs, audio and subtitles', async () => {
+  const P = await player(fakeAvPlay(), undefined, () => Promise.resolve(), undefined, MIXED_HDR.replace(/\n/g, '\r\n'));
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); v.paused = false; });
+  await P.load({ url: 'https://cdn/hdr.m3u8', hdr: true }, null);
+  assert.equal(P.manifests[0].replace(/\r\n/g, '\n'), HLG_MASTER);
+  // Reusing the same slot for normal playback must restore the entire original ladder.
+  await P.load({ url: 'https://cdn/sdr.m3u8', multiFeed: true }, null);
+  assert.equal(P.manifests[1], MIXED_HDR.replace(/\n/g, '\r\n'));
+});
+
+test('an HDR feed switch filters the idle slot as well as the initial load', async () => {
+  const P = await player(fakeAvPlay(), undefined, () => Promise.resolve(), undefined, MIXED_HDR);
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); v.paused = false; v.readyState = 4; v.currentTime = 0; });
+  const stream = { url: 'https://cdn/main.m3u8', hdr: true, multiFeed: true };
+  await P.load(stream, 50);
+  await P.switchTo({ ...stream, url: 'https://cdn/onboard.m3u8' }, 50);
+  assert.deepEqual(P.manifests, [HLG_MASTER, HLG_MASTER]);
+});
+
+test('HDR masters without HLG fail for the existing SDR fallback instead of silently selecting SDR', async () => {
+  const master = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,VIDEO-RANGE=SDR\nsdr.m3u8\n';
+  const P = await player(fakeAvPlay(), undefined, () => Promise.resolve(), undefined, master);
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); v.paused = false; });
+  await assert.rejects(P.load({ url: 'https://cdn/hdr.m3u8', hdr: true }, null), /HLG/);
+});
+
+test('HDR media playlists retain their timing, discontinuities and encryption tags', async () => {
+  const media = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-KEY:METHOD=NONE\n' +
+    '#EXT-X-PROGRAM-DATE-TIME:2026-10-29T18:00:00Z\n#EXTINF:5.76,\na.m4s\n#EXT-X-DISCONTINUITY\n#EXT-X-ENDLIST\n';
+  const P = await player(fakeAvPlay(), undefined, () => Promise.resolve(), undefined, media);
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); v.paused = false; });
+  await P.load({ url: 'https://cdn/hdr/2160.m3u8', hdr: true }, null);
+  assert.equal(P.manifests[0], media);
 });
 
 test('HDR capability requires TV HDR and HEVC support and caches the result', async () => {
@@ -461,4 +525,108 @@ test('team radio chosen on one engine is found on the other ("tea" in HLS, "team
   const A = await player(av, { 'f1tv.settings': JSON.stringify({ audio: 'tea' }) });
   await A.load({ url: 'https://cdn/single.m3u8', licenseUrl: '', multiFeed: false, info: { dynamic: false } }, null);
   assert.deepEqual(av.calls.find((c) => c[0] === 'setSelectTrack'), ['setSelectTrack', 'AUDIO', 3]);
+});
+
+test('authorized encrypted HDR uses native playback and the prepared HLG manifest', async () => {
+  const av=fakeAvPlay();
+  const P=await player(av,undefined,()=>Promise.resolve());
+  P.videos.forEach(v=>{v.play=()=>Promise.resolve();});
+  let prepared;
+  P.context.StreamProxy.hdrManifest=async s=>{prepared=s;return {url:'http://127.0.0.1:18765/vod/hlg.mpd',subtitles:[]};};
+  const s={url:'https://cdn/hdr.m3u8',hdr:true,hdrEncrypted:true,widevineManifestUrl:'https://cdn/sdr.mpd',licenseUrl:'https://lic/wv',info:{dynamic:false}};
+  await P.load(s,12);
+  assert.equal(P.engineName(),'avplay');
+  assert.equal(prepared,s);
+  assert.equal(av.calls.find(c=>c[0]==='open')[1],'http://127.0.0.1:18765/vod/hlg.mpd');
+});
+
+test('native HDR shows its subtitles itself, at the player position, and switches them off', async () => {
+  // AVPlay's own renderer loops over one segment's lines above 1080p: the app reads the segments.
+  const doc = '<?xml version="1.0"?><tt xmlns="http://www.w3.org/ns/ttml" ttp:timeBase="media"><body><div>' +
+    '<p begin="10:00:01.000" end="10:00:03.000">First line</p><p begin="10:00:04.000" end="10:00:05.500">Second<br/>line</p></div></body></tt>';
+  const fetched = [];
+  const av = fakeAvPlay();
+  const P = await player(av, { 'f1tv.settings': JSON.stringify({ subtitles: 'en' }) }, () => Promise.resolve(), {
+    fetch: async (url) => {
+      fetched.push(url);
+      return url.includes('/subs/') ? { ok: true, arrayBuffer: async () => Uint8Array.from(Buffer.from('\0\0mdat' + doc)).buffer } : { ok: true };
+    }
+  });
+  const shown = [];
+  P.on('subtitle', (s) => shown.push(s));
+  const subtitles = [{ lang: 'eng', base: 'https://cdn/subs/', id: 'S1', media: 'seg_$RepresentationID$_$Number$.mp4',
+    timescale: 1000, offset: 36000000, startNumber: 1, runs: [{ t: 36000000, d: 6000, r: 9 }] }];
+  P.context.StreamProxy.hdrManifest = async () => ({ url: 'http://127.0.0.1:18765/vod/hlg.mpd', subtitles });
+  av.time = 1500;
+  await P.load({ url: 'https://cdn/hdr.m3u8', hdr: true, hdrEncrypted: true, licenseUrl: 'https://lic/wv', info: { dynamic: false } }, null);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(P.tracks().text.map((t) => t.lang), ['eng']);
+  assert.equal(fetched.filter((u) => u.includes('/subs/'))[0], 'https://cdn/subs/seg_S1_1.mp4');
+  assert.equal(shown.at(-1).text, 'First line');
+  av.time = 4200;
+  await new Promise((r) => setTimeout(r, 250));
+  assert.equal(shown.at(-1).text, 'Second\nline');
+  P.setSubtitles('');
+  assert.equal(shown.at(-1), null);
+  await P.unload();
+});
+
+test('AVPlay subtitles: lines resent at a segment boundary are not flashed again, but come back after a seek', async () => {
+  const av = fakeAvPlay();
+  const P = await player(av);
+  const shown = [];
+  P.on('subtitle', (s) => shown.push(s.text));
+  await P.load(REPLAY, null);
+  const say = (text) => av.listener.onsubtitlechange(2000, text + '\u0000');
+  say('one'); say('two');
+  // The next segment repeats its earlier cues before the new one.
+  say('one'); say('two'); say('three');
+  assert.deepEqual(shown, ['one', 'two', 'three']);
+  P.seekTo(100);
+  say('two');
+  assert.deepEqual(shown, ['one', 'two', 'three', 'two']);
+});
+
+test('SDR replays are locked to their top quality; live, HDR and stall-prone starts are not', async () => {
+  const LADDER = [512000, 911360, 2048000, 3645440, 6144000];
+  const replay = Object.assign({}, REPLAY, { info: Object.assign({}, REPLAY.info, { videoBitrates: LADDER }) });
+  const adaptive = (av) => av.calls.find((c) => c[0] === 'setStreamingProperty')[2];
+  const av = fakeAvPlay({ duration: 6163000 });
+  await (await player(av)).load(replay, null);
+  assert.equal(adaptive(av), 'BITRATES=6144000~12288000|STARTBITRATE=HIGHEST');
+  const live = fakeAvPlay();
+  await (await player(live)).load(Object.assign({}, LIVE, { info: Object.assign({}, LIVE.info, { videoBitrates: LADDER }) }), null);
+  assert.equal(adaptive(live), 'STARTBITRATE=HIGHEST');
+  const slow = fakeAvPlay({ duration: 6163000 });
+  await (await player(slow, { 'f1tv.startLevel': '1' })).load(replay, null);
+  assert.equal(adaptive(slow), 'STARTBITRATE=AVERAGE');
+  const unknown = fakeAvPlay({ duration: 6163000 });
+  await (await player(unknown)).load(REPLAY, null);   // no ladder known: as before
+  assert.equal(adaptive(unknown), 'STARTBITRATE=HIGHEST');
+});
+
+test('a stall at the locked quality reopens the replay where it was, with AVPlay choosing again', async () => {
+  const av = fakeAvPlay({ duration: 6163000 });
+  const store = {};
+  const P = await player(av, store);
+  const replay = Object.assign({}, REPLAY, { info: Object.assign({}, REPLAY.info, { videoBitrates: [2048000, 6144000] }) });
+  await P.load(replay, null);
+  const realNow = Date.now;
+  try {
+    Date.now = () => realNow() + 60000;   // well past the start's quiet period
+    av.listener.oncurrentplaytime(754000);
+    av.listener.onbufferingstart();
+    await new Promise((r) => setTimeout(r, 20));
+  } finally { Date.now = realNow; }
+  const opens = av.calls.filter((c) => c[0] === 'open');
+  assert.equal(opens.length, 2);
+  assert.equal(opens[1][1], opens[0][1]);
+  const props = av.calls.filter((c) => c[0] === 'setStreamingProperty').map((c) => c[2]);
+  assert.equal(props.at(-1), 'STARTBITRATE=AVERAGE');
+  assert.deepEqual(av.calls.filter((c) => c[0] === 'seekTo').at(-1), ['seekTo', 754000]);
+  assert.ok(names(av).lastIndexOf('stop') < names(av).lastIndexOf('open'));
+  // A stall once it is no longer locked does not reopen it again.
+  Date.now = () => realNow() + 120000;
+  try { av.listener.onbufferingstart(); await new Promise((r) => setTimeout(r, 20)); } finally { Date.now = realNow; }
+  assert.equal(av.calls.filter((c) => c[0] === 'open').length, 2);
 });

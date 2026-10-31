@@ -148,18 +148,25 @@ var F1Api = (function () {
   }
 
   /**
-   * Premium's 4K HDR stream, which F1 gives the Apple TV app: clear HLS with HLG and SDR variants.
+   * Premium's HLG offer. Clear HLS stays on Shaka; supported CBCS uses the normal Widevine offer.
    * Null unless it is that (for Pro, or old replays, tvOS gets SDR), so the caller can fall back.
    */
   function playHdr(contentId, channelId) {
     var ask = playOn(PLAY_PLATFORMS[0], contentId, channelId, 'device=tvos;').then(function (r) {
       if (!/^HDR_/.test(r.streamType || '') || typeof r.url !== 'string' ||
-          !/\.m3u8(\?|$)/.test(r.url) || r.laURL || r.laUrl) return null;
+          !/\.m3u8(\?|$)/.test(r.url) || ((r.laURL || r.laUrl) && !/CMAFFP/.test(r.streamType))) return null;
       // tvOS may receive FairPlay streams, which this player cannot decrypt.
       return fetch(r.url).then(function (res) {
         if (!res.ok) return null;
         return res.text().then(function (master) {
-          if (!/^#EXTM3U\s/.test(master) || hasKeys(master)) return null;
+          if (!/^#EXTM3U\s/.test(master)) return null;
+          if (hasKeys(master)) {
+            var keys = master.match(/^#EXT-X-(?:SESSION-)?KEY:.*$/gm) || [];
+            if (!/CMAFFP/.test(r.streamType) || !keys.length || !keys.every(function (k) {
+              return /[:,]METHOD=SAMPLE-AES(?:,|$)/.test(k) && /KEYFORMAT="com\.apple\.streamingkeydelivery"/.test(k) && /URI="skd:\/\//.test(k);
+            })) return null;
+            r.hdrEncrypted = true;
+          } else if (r.laURL || r.laUrl) return null;
           r.hdr = true;
           return r;
         });
@@ -193,10 +200,18 @@ var F1Api = (function () {
     }
     // Only for Premium: Pro accounts, and accounts whose tier is unknown, keep exactly today's request.
     var request = opts && opts.hdr && /^PREMIUM/i.test((state.location && state.location.entitlement) || '')
-      ? playHdr(contentId, channelId).then(function (r) { return r || next(); }) : next();
+      ? playHdr(contentId, channelId).then(function (hdr) {
+        if (!hdr) return next();
+        if (!hdr.hdrEncrypted) return hdr;
+        return next().then(function (normal) {
+          if (!/WV/i.test(normal.streamType || '') || !/\.mpd(\?|$)/.test(normal.url)) return normal;
+          return Object.assign({}, normal, { url: hdr.url, streamType: hdr.streamType, hdr: true, hdrEncrypted: true,
+            widevineManifestUrl: normal.url, entitlementToken: hdr.entitlementToken || normal.entitlementToken });
+        });
+      }) : next();
     return request.then(function (r) {
       var la = r.laURL || r.laUrl || '';
-      if (!la && /WV/i.test(r.streamType || '')) {
+      if (!la && (/WV/i.test(r.streamType || '') || r.hdrEncrypted)) {
         // Newer VODs omit laURL; the web player falls back to this endpoint.
         la = [BASE, '2.0', 'R', LANG, r.platform, 'ALL/CONTENT/LA/widevine'].join('/') +
           '?contentId=' + encodeURIComponent(contentId) +
@@ -216,6 +231,7 @@ var F1Api = (function () {
         licenseHeaders: licenseHeaders
       };
       if (r.hdr) stream.hdr = true;
+      if (r.hdrEncrypted) { stream.hdrEncrypted = true; stream.widevineManifestUrl = r.widevineManifestUrl; }
       return stream;
     });
   }
@@ -369,7 +385,12 @@ var F1Api = (function () {
       var windowStart = periodStart + (t0 - pto) / ts;
       var ast = Date.parse(attr(/availabilityStartTime="([^"]+)"/) || '') / 1000 || 0;
       var segDur = (+attr(/<SegmentTemplate\b[^>]*\sduration="(\d+)"/) || +attr(/<S\b[^>]*\sd="(\d+)"/) || 0) / ts;
+      var video = (/<AdaptationSet\b[^>]*contentType="video"[\s\S]*?<\/AdaptationSet>/.exec(mpd) || [''])[0];
       return {
+        // The video qualities' declared bitrates, lowest first.
+        videoBitrates: (video.match(/<Representation\b[^>]*>/g) || []).map(function (r) {
+          return +((/\sbandwidth="(\d+)"/.exec(r) || [])[1] || 0);
+        }).filter(function (b) { return b > 0; }).sort(function (a, b) { return a - b; }),
         dynamic: dynamic,
         segDur: segDur,
         windowStart: windowStart,

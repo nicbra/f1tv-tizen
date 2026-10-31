@@ -2,3 +2,4 @@
 !app/js
 !app/service
 !monitor/check.js
+!monitor/diagnostics.js

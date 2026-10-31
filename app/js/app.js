@@ -1247,6 +1247,8 @@
     loadFeed(i, opts).then(done, done);
   }
 
+  var HDR_TRIES = 3;   // HDR failures before a video stays SDR
+
   function hdrWanted() {
     return !feedsCtx.live && !feedsCtx.hdrFailed && Player.hdrCapable();
   }
@@ -1259,11 +1261,14 @@
   function loadFeed(i, opts) {
     opts = opts || {};
     var ctx = feedsCtx, exits = playerExits, seq = navSeq;
+    // After an HDR failure this video plays SDR; the viewer's next feed switch tries HDR again,
+    // until it has failed HDR_TRIES times.
+    if (opts.switching && !opts.hdrRetry && feedsCtx.hdrFailed && (feedsCtx.hdrFailures || 0) < HDR_TRIES) feedsCtx.hdrFailed = false;
     var f = feedsCtx.feeds[i];
     var playing = screen === 'player' && Player.engineName();
     var from = opts.switching && playing ? { wall: Player.wallClock(Player.position()), at: Date.now(),
       pos: Player.position(), paused: Player.isPaused(), index: feedsCtx.index, stream: Player.stream() } : null;
-    switchPause = from ? from.paused : null;
+    switchPause = from ? (opts.switchPaused != null ? opts.switchPaused : from.paused) : null;
     return ensureSession().then(function (ok) {
       // Gone back meanwhile (renewing the session can take a while).
       if (feedsCtx !== ctx || exits !== playerExits || seq !== navSeq) return;
@@ -1299,7 +1304,7 @@
           // Superseded by a newer request, or the viewer left the player while it loaded.
           if (feedsCtx.index !== i || queuedFeed || screen !== 'player') return;
           // Keys in the variant playlist: not playable here; the catch below falls back to SDR.
-          if (stream.hdr && stream.info && stream.info.encrypted) throw new Error('encrypted HDR stream');
+          if (stream.hdr && stream.info && stream.info.encrypted && !stream.hdrEncrypted) throw new Error('encrypted HDR stream');
           $('osd-feed').textContent = feedLabel(stream);
           var start = startPosition(stream.info, opts, from);
           // Live (dynamic) streams on AVPlay can't seek at start-up; instead the local service
@@ -1343,9 +1348,22 @@
             $('osd-feed').textContent = feedLabel(from.stream);
           }
           if (stream && stream.hdr && !feedsCtx.hdrFailed) {
-            feedsCtx.hdrFailed = true;
-            // Queue the SDR retry behind this load; a newer feed request still wins.
-            if (!queuedFeed && screen === 'player') playFeed(i, opts);
+            feedsCtx.hdrFailures = (feedsCtx.hdrFailures || 0) + 1;
+            // The video's first failure (a CDN or licence blip, typically) gets HDR again at once; after
+            // that, SDR for now. Queue the retry behind this load; a newer feed request still wins.
+            // An offer this app turned down (unusable keys, an unsupported layout) would fail the same way.
+            var refused = /^encrypted HDR stream$|^HDR: (?!media request failed)/.test((e && e.message) || '');
+            if (refused || opts.hdrRetry || feedsCtx.hdrFailures > 1) feedsCtx.hdrFailed = true;
+            var recovery = Object.assign({}, opts, { hdrRetry: true });
+            if (from) recovery.switchPaused = switchPause != null ? switchPause : from.paused;
+            // Native preparation replaces the outgoing player. Its failed stream reports zero,
+            // so retain the outgoing moment rather than deriving a new target from that zero.
+            if (from && recovery.startAt == null && recovery.liveAt == null) {
+              var ahead = from.paused ? 0 : (Date.now() - from.at) / 1000 + switchLead;
+              if (from.wall) recovery.liveAt = from.wall + ahead;
+              else recovery.startAt = from.pos + ahead;
+            }
+            if (!queuedFeed && screen === 'player') playFeed(i, recovery);
             return;
           }
           if (F1Api.isNotStarted(e) && feedsCtx.playing == null) {
@@ -1376,7 +1394,7 @@
       // Through playFeed so it queues behind any other load instead of racing it.
       // AVPlay reports no position until it plays: 0 is no moment of the stream, so the retry repeats the request.
       var wall = from > 0 ? Player.wallClock(from) : null;
-      if (stream.hdr) feedsCtx.hdrFailed = true;
+      if (stream.hdr) { feedsCtx.hdrFailed = true; feedsCtx.hdrFailures = (feedsCtx.hdrFailures || 0) + 1; }
       var again = {};
       Object.keys(opts || {}).forEach(function (k) { if (k !== 'switching') again[k] = opts[k]; });   // a fresh load
       again.retry = true;

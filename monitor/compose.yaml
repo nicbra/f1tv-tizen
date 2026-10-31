@@ -8,9 +8,10 @@ services:
       # Where to send a message when checks start or stop failing (ntfy topic URL or Discord webhook).
       NOTIFY_URL: https://ntfy.sh/f1tv-monitor-change-this-to-something-random
       CHECK_EVERY: 6        # hours between checks
+      LOG_KEEP_DAYS: 14     # daily diagnostic files kept in /data/logs
       TZ: Europe/Oslo
     volumes:
-      - data:/data          # the sign-in and the last results
+      - data:/data          # the sign-in, results and diagnostic logs
 
 volumes:
   data:

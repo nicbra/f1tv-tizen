@@ -358,7 +358,7 @@ async function boot(options = {}) {
     class ShakaPlayer {
       attach() { return Promise.resolve(); } resetConfiguration() {} configure() {}
       load() { return Promise.reject(new Error('no Shaka in this test')); }
-      getNetworkingEngine() { return { registerRequestFilter() {} }; }
+      getNetworkingEngine() { return { registerRequestFilter() {}, registerResponseFilter() {} }; }
       addEventListener() {} unload() { return Promise.resolve(); }
     }
     Object.assign(context, { webapis: { avplay: options.av }, atob, btoa, Uint8Array, MediaSource: { isTypeSupported: () => false },

@@ -17,6 +17,7 @@ var urlLib = require('url');
 var PORT = 18765;
 var UA = 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/537.36 (KHTML, like Gecko) TV Safari/537.36';
 var server = null;
+var vodManifests = [];
 
 /** cb(err, status, body, headers, finalUrl): finalUrl is where redirects led. */
 function fetchBuffer(target, redirects, cb) {
@@ -176,6 +177,28 @@ function send(res, status, body, type) {
 function handle(req, res) {
   var u = urlLib.parse(req.url, true);
   if (u.pathname === '/ping') return send(res, 200, toBuf('ok'));
+
+  if (/^\/vod\/[a-z0-9-]{1,64}\.mpd$/.test(u.pathname)) {
+    vodManifests = vodManifests.filter(function (m) { return Date.now() - m.at < 6 * 3600000; });
+    if (req.method === 'POST') {
+      var chunks = [], size = 0;
+      req.on('data', function (b) { size += b.length; if (size <= 2 * 1024 * 1024) chunks.push(b); });
+      req.on('end', function () {
+        if (size > 2 * 1024 * 1024) return send(res, 413, toBuf('manifest too large'));
+        var body = Buffer.concat(chunks);
+        if (!/<MPD\b[^>]*\btype="static"/.test(body.toString('utf8'))) return send(res, 400, toBuf('requires VOD MPD'));
+        vodManifests = vodManifests.filter(function (m) { return m.path !== u.pathname; });
+        vodManifests.push({ path: u.pathname, at: Date.now(), body: body });
+        if (vodManifests.length > 4) vodManifests.shift();
+        send(res, 201, toBuf('ok'));
+      });
+      return;
+    }
+    var saved = vodManifests.filter(function (m) { return m.path === u.pathname; })[0];
+    if (!saved) return send(res, 404, toBuf('not found'));
+    saved.at = Date.now();
+    return send(res, 200, saved.body, 'application/dash+xml');
+  }
 
   if (u.pathname === '/mpd' && u.query.u) {
     var manifestUrl = String(u.query.u);

@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { audioSegmentUrl, sencCount, hlgVariants, heartbeatBase, offerSnapshot, offerDiff, timingWorker, failingKeys } = require('../monitor/check.js');
+const { audioSegmentUrl, sencCount, hlgVariants, heartbeatBase, offerSnapshot, offerDiff, timingWorker, failingKeys, replayForChecks } = require('../monitor/check.js');
 
 const MPD = `<MPD type="dynamic"><Period id="1">
 <AdaptationSet contentType="video"><SegmentTemplate media="v_$RepresentationID$_$Number$.mp4" startNumber="100"/>
@@ -132,4 +132,47 @@ test('two different changes in a row count as different failures, so both notify
   assert.equal(a[0], 'menu');
   assert.notEqual(a.join('|'), b.join('|'));
   assert.deepEqual(failingKeys([{ name: 'menu', ok: true }]), []);
+});
+
+test('playback checks use the latest replay from an earlier weekend before the current weekend has replays', async () => {
+  const meetings = [
+    { key: '1', name: 'USA', start: 100, uri: '/usa' },
+    { key: '2', name: 'Mexico', start: 200, uri: '/mexico' },
+    { key: '3', name: 'Brazil', start: 400, uri: '/brazil' }
+  ];
+  const practice = { title: 'Practice 2', series: 'FORMULA 1', subtype: 'REPLAY', contentId: 'fp2', start: 110 };
+  const race = { ...practice, title: 'Race', contentId: 'race', start: 120 };
+  const api = {
+    pageByUri: async (uri) => { assert.equal(uri, '/usa'); return [race, practice]; },
+    scheduleFrom: (events) => ({ events })
+  };
+  const replay = await replayForChecks(api, meetings, meetings[1], { events: [
+    { ...practice, subtype: 'LIVE_EVENT', contentId: 'future' }
+  ] }, 300);
+  assert.equal(replay.contentId, 'race');
+  assert.equal(replay.meetingName, 'USA');
+});
+
+test('playback checks prefer a current F1 replay and ignore highlights and other series', async () => {
+  const meeting = { key: '2', name: 'Mexico', start: 200 };
+  const event = { title: 'Practice 2', series: 'FORMULA 1', subtype: 'REPLAY', contentId: 'fp2', start: 250 };
+  const replay = await replayForChecks({ pageByUri() { throw new Error('no fallback needed'); } }, [meeting], meeting, { events: [
+    event, { ...event, series: 'FORMULA 2', contentId: 'f2', start: 260 },
+    { ...event, title: 'Highlights', contentId: 'highlights', start: 270 }
+  ] }, 300);
+  assert.equal(replay.contentId, 'fp2');
+  assert.equal(replay.meetingName, 'Mexico');
+  assert.equal(await replayForChecks({}, [meeting], meeting, { events: [] }, 300), undefined);
+});
+
+test('HDR monitoring validates encrypted native addressing instead of calling every keyed playlist a fallback', async () => {
+ const {hdrTransport}=require('../monitor/check.js');
+ assert.equal(typeof hdrTransport,'function');
+ assert.equal(await hdrTransport({}, {encrypted:false}), 'clear HLS');
+ const hdr={hdrEncrypted:true,licenseUrl:'https://lic/wv',widevineManifestUrl:'https://cdn/sdr.mpd'};
+ let checked=false;
+ assert.equal(await hdrTransport(hdr,{encrypted:true},async s=>{assert.equal(s,hdr);checked=true;}),'Widevine CBCS');
+ assert.equal(checked,true);
+ await assert.rejects(hdrTransport({}, {encrypted:true}),/unsupported/);
+ await assert.rejects(hdrTransport(hdr,{encrypted:true},async()=>{throw new Error('clock mismatch')}),/clock mismatch/);
 });

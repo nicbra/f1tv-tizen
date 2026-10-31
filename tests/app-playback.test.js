@@ -6,9 +6,10 @@ const vm = require('node:vm');
 // opts: encryptedHdr (keys in the HDR variant playlist), gate(contentId) (a promise the play request waits for).
 function playback(load, capable = true, opts = {}) {
   const nodes = {}, requests = [], loads = [], timers = [];
-  let current = null;
+  let current = null, paused = false;
   function start(stream, position, switching) {
     current = stream;
+    paused = false;
     loads.push({ stream, position, switching });
     return load ? load(stream) : Promise.resolve();
   }
@@ -23,7 +24,7 @@ function playback(load, capable = true, opts = {}) {
       play: async (id, channel, o) => {
         requests.push({ id, channel, hdr: o.hdr });
         if (opts.gate) await opts.gate(id);
-        return o.hdr ? { url: 'https://cdn/hdr.m3u8', hdr: true } : { url: 'https://cdn/stream.m3u8' };
+        return o.hdr ? { url: 'https://cdn/hdr.m3u8', hdr: true, channel, ...(opts.authorizedHdr ? {hdrEncrypted:true,licenseUrl:'https://lic/wv',widevineManifestUrl:'https://cdn/sdr.mpd'} : {}) } : { url: 'https://cdn/stream.m3u8', channel };
       },
       streamInfo: async (url) => ({ dynamic: false, windowStart: 0, windowEnd: 600,
         encrypted: !!opts.encryptedHdr && url.includes('hdr') })
@@ -34,7 +35,7 @@ function playback(load, capable = true, opts = {}) {
       hdrCapable: () => capable, engineName: () => current ? 'shaka' : null,
       unload: async () => {}, stream: () => current,
       load: (s, p) => start(s, p, false), switchTo: (s, p) => start(s, p, true),
-      position: () => 120, wallClock: () => null, isLive: () => false, isPaused: () => false,
+      position: () => opts.position ? opts.position(current) : 120, wallClock: () => null, isLive: () => false, isPaused: () => paused, togglePause: () => { paused = !paused; },
       range: () => ({ start: 0, end: 600 }), bufferedEnd: () => 150,
       tracks: () => ({ audio: [], text: [] })
     }
@@ -46,7 +47,7 @@ function playback(load, capable = true, opts = {}) {
       set: function (ctx) { feedsCtx = ctx; screen = 'feeds'; } };
   `);
   vm.runInContext(source, context);
-  return { app: context.testApp, nodes, requests, loads, timers };
+  return { app: context.testApp, nodes, requests, loads, timers, pause: () => {paused=true;}, isPaused: () => paused };
 }
 
 const video = (extra) => ({ contentId: '42', index: 0, live: false,
@@ -173,4 +174,68 @@ test('a video\'s start watch does nothing once another video is loading', async 
   for (let i = 0; i < 3; i++) await settle();
   assert.equal(next.hdrFailed, undefined);
   assert.deepEqual(h.requests.map((r) => r.id), ['42', 'next']);
+});
+
+
+test('authorized CBCS HDR loads, and native preparation that fails twice recovers in SDR', async () => {
+ for (const fail of [false,true]) {
+  const h=playback(async stream=>{if(fail&&stream.hdr)throw new Error('Could not open stream: PLAYER_ERROR_CONNECTION_FAILED');},true,{encryptedHdr:true,authorizedHdr:true});
+  const ctx=video();h.app.set(ctx);h.app.play(0,{startAt:600});
+  for(let i=0;i<8;i++)await settle();
+  assert.deepEqual(h.requests.map(r=>r.hdr),fail?[true,true,false]:[true]);
+  assert.equal(!!h.loads.at(-1).stream.hdr,!fail);
+  assert.equal(h.loads.at(-1).position,600);
+  assert.equal(!!ctx.hdrFailed,fail);
+ }
+});
+
+
+test('a failed native HDR feed switch preserves the outgoing playback position for SDR', async () => {
+ const h=playback(async stream=>{if(stream.hdr&&stream.channel==='car')throw new Error('native prepare failed');},true,{authorizedHdr:true,encryptedHdr:true,position:s=>s&&s.channel==='main'?600:0});
+ const ctx=video();h.app.set(ctx);h.app.play(0,{});await settle();await settle();
+ h.app.play(1,{switching:true});for(let i=0;i<6;i++)await settle();
+ const last=h.loads.at(-1);assert.equal(last.stream.hdr,undefined);assert.ok(last.position>=600&&last.position<610,'recovery position '+last.position);
+});
+
+
+test('failed native HDR switching retains the viewer pause through SDR recovery', async () => {
+ const h=playback(async stream=>{if(stream.hdr&&stream.channel==='car')throw new Error('native prepare failed');},true,{authorizedHdr:true,encryptedHdr:true,position:s=>s&&s.channel==='main'?600:0});
+ h.app.set(video());h.app.play(0,{});await settle();await settle();h.pause();
+ h.app.play(1,{switching:true});for(let i=0;i<6;i++)await settle();
+ assert.equal(h.loads.at(-1).position,600);assert.equal(h.isPaused(),true);
+});
+
+test('one failed native HDR start is retried in HDR at once, and plays HDR', async () => {
+  let failures = 1;
+  const h = playback(async (stream) => { if (stream.hdr && failures-- > 0) throw new Error('Could not open stream: PLAYER_ERROR_CONNECTION_FAILED'); },
+    true, { encryptedHdr: true, authorizedHdr: true });
+  const ctx = video(); h.app.set(ctx); h.app.play(0, { startAt: 600 });
+  for (let i = 0; i < 8; i++) await settle();
+  assert.deepEqual(h.requests.map((r) => r.hdr), [true, true]);
+  assert.equal(h.loads.at(-1).stream.hdr, true);
+  assert.equal(h.loads.at(-1).position, 600);
+  assert.equal(!!ctx.hdrFailed, false);
+});
+
+test('after falling back to SDR, the next feed switch tries HDR again, until HDR has failed three times', async () => {
+  const h = playback(async (stream) => { if (stream.hdr) throw new Error('Could not open stream: PLAYER_ERROR_CONNECTION_FAILED'); },
+    true, { encryptedHdr: true, authorizedHdr: true });
+  const ctx = video(); h.app.set(ctx); h.app.play(0, {});
+  for (let i = 0; i < 8; i++) await settle();
+  assert.deepEqual(h.requests.map((r) => r.hdr), [true, true, false]);   // retried once, then SDR
+  h.app.play(1, { switching: true });
+  for (let i = 0; i < 8; i++) await settle();
+  assert.deepEqual(h.requests.slice(3).map((r) => r.hdr), [true, false]);   // third failure: SDR, no immediate retry
+  assert.equal(ctx.hdrFailures, 3);
+  h.app.play(0, { switching: true });
+  for (let i = 0; i < 8; i++) await settle();
+  assert.deepEqual(h.requests.slice(5).map((r) => r.hdr), [false]);   // given up for this video
+});
+
+test('an HDR offer the app turns down is not retried', async () => {
+  const h = playback(null, true, { encryptedHdr: true });
+  const ctx = video(); h.app.set(ctx); h.app.play(0, {});
+  for (let i = 0; i < 8; i++) await settle();
+  assert.deepEqual(h.requests.map((r) => r.hdr), [true, false]);
+  assert.equal(ctx.hdrFailed, true);
 });
