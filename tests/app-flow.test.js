@@ -863,38 +863,46 @@ async function premiumHdr() {
   const app = await boot();
   app.api.state.location = { entitlement: 'PREMIUM', groupId: 2 };
   app.player.hdrCapable = () => true;
-  app.context.HdrStream = { layouts: { grid2x2: [540, 540, 540, 540], side2: [1080, 540, 540], pip: [1080, 540] } };
+  vm.runInContext(readFileSync('app/js/layouts.js', 'utf8'), app.context, { filename: 'layouts.js' });
   return app;
 }
 
-test('watch options set up a multiview: layout, its feeds, and Show multiview', async () => {
+const premiumOffer = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '/hdr.m3u8', hdr: true, hdrEncrypted: true, licenseUrl: 'https://lic' });
+
+test('watch options open a multiview page: layouts as pictures, then a feed for each place', async () => {
   const app = await premiumHdr();
   await play(app, 'Race');
   await app.press('UP');
-  const rows = () => app.$('panel-list').children.map((e) => e.textContent);
-  assert.ok(rows().includes('Multiview'));
-  await app.moveTo(/^Layout/, ['UP']);
-  assert.match(app.focused(), /Off/);
-  await app.press('RIGHT');   // from Off to the layout used last (Big + 2 at first)
-  await app.advance(50);
-  assert.match(app.focused(), /^Layout‹ Big \+ 2 ›/);
-  const at = rows().indexOf('Layout‹ Big + 2 ›');
-  assert.deepEqual(rows().slice(at + 1, at + 5).map((r) => r.replace(/‹.*/, '')), ['Big', 'Small 1', 'Small 2', 'Show multiview']);
-  assert.match(rows()[at + 1], /INTERNATIONAL/, 'the current feed is the big one');
-  // ◀ ▶ on a position picks another feed, never one already in the layout.
-  await app.press('DOWN', 'DOWN', 'RIGHT');
-  const small1 = app.focused();
-  assert.ok(!/INTERNATIONAL/.test(small1));
-  assert.notEqual(small1.replace(/^Small 1/, ''), rows()[at + 3].replace(/^Small 2/, ''));
-  // Show it: every feed's Premium offer, then the player gets one grid stream.
-  app.net.play = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '/hdr.m3u8', hdr: true, hdrEncrypted: true, licenseUrl: 'https://lic' });
+  await app.moveTo(/^Multiview/, ['UP']);
+  assert.match(app.focused(), /^MultiviewOff/);
+  await app.press('ENTER');
+  assert.equal(app.$('panel-title').textContent, 'Multiview');
+  assert.ok(app.$('panel').classList.contains('wide'));
+  assert.equal(app.focused(), 'One feed', 'the current choice is focused');
+  // Layouts that need more feeds than the video has are left out (this race has three).
+  assert.ok(!/2×2/.test(app.$('panel-list').textContent));
+  await app.moveTo(/^Big \+ 2$/, ['RIGHT']);
+  await app.press('ENTER');
+  // The chosen layout, larger, with the current feed in the big place.
+  assert.match(app.focused(), /INTERNATIONAL/);
+  await app.press('DOWN');
+  const before = app.focused();
+  await app.press('RIGHT');
+  assert.notEqual(app.focused(), before);
+  assert.ok(!/INTERNATIONAL/.test(app.focused()), 'a feed is never in two places');
+  // BACK returns to watch options, OK there comes back with the choices kept.
+  await app.press('BACK');
+  assert.equal(app.$('panel-title').textContent, 'Watch options');
+  await app.press('ENTER');
+  assert.equal(app.focused(), 'Big + 2');
+  app.net.play = premiumOffer;
   await app.pick(/^Show multiview/, ['DOWN']);
   await app.advance(3000);
   const s = app.player.current;
   assert.equal(s.grid.layout, 'side2');
   assert.equal(s.grid.streams.length, 3);
   assert.equal(app.context.Settings.get('multiview'), 'side2');
-  assert.match(app.$('osd-feed').textContent, /^Multiview · Big \+ 2 · HDR/);
+  assert.match(app.$('osd-feed').textContent, /^Multiview · 3 feeds · HDR/);
   // A feed from the list plays alone again.
   await app.press('UP');
   await app.pick(/^1VER/, ['DOWN']);
@@ -906,9 +914,8 @@ test('a multiview without 4K HDR offers falls back to the big feed alone', async
   const app = await premiumHdr();
   await play(app, 'Race');
   await app.press('UP');
-  await app.moveTo(/^Layout/, ['UP']);
-  await app.press('RIGHT');
-  await app.advance(50);
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
   await app.pick(/^Show multiview/, ['DOWN']);   // the stub's offers are plain HLS
   await app.advance(3000);
   assert.ok(!app.player.current.grid);
@@ -921,7 +928,7 @@ test('no multiview without Premium', async () => {
   app.api.state.location = { entitlement: 'PRO', groupId: 2 };
   await play(app, 'Race');
   await app.press('UP');
-  assert.ok(!app.$('panel-list').children.some((e) => e.textContent === 'Multiview'));
+  assert.ok(!app.$('panel-list').children.some((e) => /^Multiview/.test(e.textContent)));
 });
 
 test('the Up next card closes watch options, and BACK dismisses it', async () => {

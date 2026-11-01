@@ -245,10 +245,6 @@ var HdrStream = (function () {
       });
     }));
   }
-  /** Multiview layouts (service/stitch-hevc.js LAYOUTS): the height of each feed, big ones first. */
-  var LAYOUT_FEEDS = { grid2x2: [540, 540, 540, 540], grid2x2hd: [1080, 1080, 1080, 1080], pip: [1080, 540],
-    side2: [1080, 540, 540], side5: [1080, 540, 540, 540, 540, 540], side3: [1620, 540, 540, 540], pip3: [1620, 540], pip4: [2160, 540] };
-
   /**
    * Multiview (experiment): the feeds' HEVC video arranged in a layout by the stream helper
    * (service/stitch-hevc.js), with the first feed's commentary. streams: the feeds' Premium offers
@@ -256,7 +252,7 @@ var HdrStream = (function () {
    */
   function grid(streams, layout, opts) {
     opts = opts || {};
-    var heights = LAYOUT_FEEDS[layout];
+    var known = typeof MultiviewLayouts !== 'undefined' && MultiviewLayouts.layouts[layout], heights = known && known.feeds;
     if (!heights || heights.length !== streams.length) return Promise.reject(new Error('HDR: layout ' + layout + ' needs ' + (heights ? heights.length : '?') + ' feeds'));
     var io = fetcher(20000), get = io.get, range = opts.range || 'HLG', id = opts.id;
     var first = streams[0];
@@ -312,5 +308,5 @@ var HdrStream = (function () {
     }));
   }
 
-  return { build: build, live: live, grid: grid, layouts: LAYOUT_FEEDS };
+  return { build: build, live: live, grid: grid };
 })();

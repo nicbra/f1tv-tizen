@@ -217,25 +217,8 @@ function cellHeader(rbsp, s, address, grid, filterEdges) {
 
 // --- layouts ---
 
-/*
- * A layout: { cols, rows, cells: [[feed, tile], ...] in reading order }. Every cell is one 960x544 tile
- * (a 540p feed has tile 0; a 1080p feed tiles 0-3: top left, top right, bottom left, bottom right).
- */
-var LAYOUTS = {
-  grid2x2: { feeds: [540, 540, 540, 540], cols: 2, rows: 2, cells: [[0, 0], [1, 0], [2, 0], [3, 0]] },
-  grid2x2hd: { feeds: [1080, 1080, 1080, 1080], cols: 4, rows: 4, cells: [
-    [0, 0], [0, 1], [1, 0], [1, 1], [0, 2], [0, 3], [1, 2], [1, 3],
-    [2, 0], [2, 1], [3, 0], [3, 1], [2, 2], [2, 3], [3, 2], [3, 3]] },
-  pip: { feeds: [1080, 540], cols: 2, rows: 2, cells: [[0, 0], [0, 1], [0, 2], [1, 0]] },
-  side2: { feeds: [1080, 540, 540], cols: 3, rows: 2, cells: [[0, 0], [0, 1], [1, 0], [0, 2], [0, 3], [2, 0]] },
-  side5: { feeds: [1080, 540, 540, 540, 540, 540], cols: 3, rows: 3, cells: [[0, 0], [0, 1], [1, 0], [0, 2], [0, 3], [2, 0], [3, 0], [4, 0], [5, 0]] },
-  // 1620p is 3x3 tiles: big left with three small ones beside it, or a third-width inset.
-  side3: { feeds: [1620, 540, 540, 540], cols: 4, rows: 3, cells: [[0, 0], [0, 1], [0, 2], [1, 0], [0, 3], [0, 4], [0, 5], [2, 0], [0, 6], [0, 7], [0, 8], [3, 0]] },
-  pip3: { feeds: [1620, 540], cols: 3, rows: 3, cells: [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4], [0, 5], [0, 6], [0, 7], [1, 0]] },
-  // 2160p is 4x4 tiles: a quarter-width inset over a 4K picture.
-  pip4: { feeds: [2160, 540], cols: 4, rows: 4, cells: [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4], [0, 5], [0, 6], [0, 7],
-    [0, 8], [0, 9], [0, 10], [0, 11], [0, 12], [0, 13], [0, 14], [1, 0]] }
-};
+// Layouts: { feeds, cols, rows, cells: [[feed, tile], ...] in reading order } (shared with the app).
+var LAYOUTS = require('../js/layouts.js').layouts;
 
 function validLayout(l) {
   if (!l || !(l.cols >= 1 && l.rows >= 1) || !l.cells || l.cells.length !== l.cols * l.rows) fail('bad layout');

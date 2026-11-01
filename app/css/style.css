@@ -268,98 +268,22 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .feed.focused .feed-name small { color: var(--text); }
 .panel-hint { position: absolute; bottom: 16px; left: 26px; right: 26px; font-size: 17px; }
 
-/* Timing tower */
-/* Align with F1's 2026 broadcast tower: x 90, y 44-1034, width 246, rows starting at y 179. */
-.tower { position: absolute; left: 90px; top: 44px; width: 246px; height: 990px; display: flex; flex-direction: column;
-  background: rgba(21, 21, 30, 0.98); font-size: 20px; overflow: hidden; }
-.tower-head { flex: none; height: 135px; display: flex; flex-direction: column; justify-content: center; align-items: center;
-  border-bottom: 2px solid var(--line); }
-.tower-name { font-size: 17px; color: var(--muted); text-transform: uppercase; }
-.tower-value { font-size: 30px; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; }
-.tower-view { font-size: 14px; color: var(--muted); text-transform: uppercase; margin-top: 6px; }
-.tower-flag { margin-top: 6px; padding: 1px 10px; font-size: 16px; font-weight: 800; }
-.tower-flag.yellow { background: #f5d200; color: #000; }
-.tower-flag.sc, .tower-flag.vsc { background: #ff9d00; color: #000; }
-.tower-flag.red { background: var(--red); }
-#tower-rows { flex: 1; display: flex; flex-direction: column; }
-.tower-row { flex: 1; min-height: 0; display: flex; align-items: center; padding: 0 10px; }
-.tower-row.out { opacity: 0.45; }
-.tw-pos { width: 26px; text-align: right; margin-right: 8px; color: var(--muted); font-variant-numeric: tabular-nums; }
-.tw-bar { width: 4px; height: 20px; margin-right: 8px; }
-.tw-tla { width: 50px; font-weight: 700; }
-.tw-val { flex: 1; text-align: right; font-size: 19px; font-variant-numeric: tabular-nums; color: #cdcdcd; white-space: nowrap; }
-.tw-val.up { color: #3ccf6e; } .tw-val.down { color: #ff5a4f; } .tw-val.pit, .tw-val.old { color: var(--muted); }
-.tw-tyre { width: 22px; height: 22px; margin-left: 8px; border-radius: 50%; border: 3px solid var(--grey); font-size: 11px;
-  line-height: 16px; text-align: center; font-weight: 800; flex: none; }
-.tyre-S { border-color: #e10600; } .tyre-M { border-color: #ffd12e; } .tyre-H { border-color: #f0f0f0; }
-.tyre-I { border-color: #43b02a; } .tyre-W { border-color: #0067ad; }
-
-/* Subtitles and seeker info */
-.subtitle { position: absolute; left: 50%; bottom: 90px; transition: bottom 0.2s ease-out; transform: translateX(-50%); max-width: 1400px;
-  background: rgba(0, 0, 0, 0.78); padding: 8px 22px; font-size: 38px; text-align: center; line-height: 1.3; }
-.bubble-info { font-size: 20px; font-weight: 600; color: var(--muted); margin-top: 2px; }
-
-/* Brand: logo image and "TV" */
-.brand-logo { height: 40px; vertical-align: middle; }
-.brand .brand-tv { font-style: normal; font-weight: 400; margin-left: 8px; vertical-align: middle; font-size: 38px; }
-.login-box .brand-logo { height: 64px; }
-.login-box .brand .brand-tv { font-size: 56px; }
-
-/* Live markers */
-@keyframes livePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
-.tile-badge.live:before, .list-row .badge.live:before { content: ''; display: inline-block; width: 10px; height: 10px;
-  border-radius: 50%; background: #fff; margin-right: 8px; vertical-align: 1px; animation: livePulse 1.4s ease-in-out infinite; }
-.topnav .nav-item.has-live:after { content: ''; display: inline-block; width: 10px; height: 10px; border-radius: 50%;
-  background: var(--red); margin-left: 10px; vertical-align: 3px; animation: livePulse 1.4s ease-in-out infinite; }
-
-.osd-visible .subtitle { bottom: 270px; }
-/* Narrow subtitles to clear the tower (x 90-336). */
-.tower-on .subtitle { max-width: 1160px; }
-
-/* Standings and driver pages */
-.list-row .row-colour { width: 6px; height: 40px; margin-right: 18px; background: var(--grey); flex: none; }
-.list-row .row-face { width: 56px; height: 56px; border-radius: 50%; margin-right: 18px; flex: none;
-  background: var(--surface) center top / cover no-repeat; }
-.driver-header { margin-bottom: 10px; }
-.driver-card { display: flex; align-items: center; margin-bottom: 26px; }
-.driver-face { width: 190px; height: 190px; border-radius: 50%; background: var(--surface) center top / cover no-repeat; flex: none; }
-.driver-number { font-size: 120px; font-weight: 700; font-style: italic; width: 230px; text-align: center; color: var(--text); }
-.stat-tiles { display: flex; flex-wrap: wrap; flex: 1; }
-.stat-tile { width: 138px; margin: 8px 12px 8px 0; padding: 14px 14px; background: var(--surface-a); }
-.stat-value { font-size: 40px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.stat-label { font-size: 19px; color: var(--muted); margin-top: 4px; }
-.chart-title { font-size: 22px; color: var(--muted); text-transform: uppercase; letter-spacing: 2px; margin: 6px 0 8px; }
-.points-chart { display: block; }
-.points-chart .axis { stroke: rgba(255, 255, 255, 0.18); stroke-width: 1; }
-.points-chart .bar { transition: opacity 0.15s; }
-.points-chart .bar.dim { opacity: 0.4; }
-.points-chart .bar.zero { fill: rgba(255, 255, 255, 0.25); }
-.points-chart .tick { fill: var(--muted); font-size: 18px; text-anchor: middle; }
-.points-chart .value { fill: var(--text); font-size: 20px; font-weight: 700; text-anchor: middle; }
-.list-row.compact .when { width: 90px; }
-
-/* Championship battle */
-.chart-legend { position: absolute; left: 120px; top: 268px; right: 420px; display: flex; flex-wrap: wrap; }
-.legend-item { display: inline-flex; align-items: center; margin: 0 28px 10px 0; font-size: 22px; color: var(--text); }
-.legend-item svg { margin-right: 10px; }
-.chart-plot { position: absolute; left: 120px; top: 330px; }
-.battle-chart .grid { stroke: rgba(255, 255, 255, 0.07); stroke-width: 1; }
-.battle-chart .axis { stroke: rgba(255, 255, 255, 0.22); stroke-width: 1; }
-.battle-chart .ytick { fill: var(--muted); font-size: 18px; text-anchor: end; }
-.battle-chart .xtick { fill: var(--muted); font-size: 18px; text-anchor: middle; }
-.battle-chart .line { fill: none; stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; }
-.battle-chart .crosshair { stroke: rgba(255, 255, 255, 0.35); stroke-width: 2; stroke-dasharray: 4 6; }
-.battle-chart .marker { stroke: var(--bg); stroke-width: 2; }
-.battle-chart .endlabel { fill: var(--text); font-size: 20px; font-weight: 700; }
-.chart-readout { position: absolute; right: 120px; top: 330px; width: 300px; padding: 22px 24px; background: var(--surface-a); }
-.readout-round { font-size: 22px; color: var(--muted); }
-.readout-name { font-size: 30px; font-weight: 700; margin: 4px 0 16px; }
-.readout-row { display: flex; align-items: center; height: 44px; font-size: 24px; }
-.readout-pos { width: 30px; color: var(--muted); }
-.readout-swatch { width: 26px; height: 0; border-top: 4px solid var(--grey); margin-right: 12px; }
-.readout-swatch.dashed { border-top-style: dashed; }
-.readout-swatch.dotted { border-top-style: dotted; }
-.readout-label { flex: 1; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.readout-pts { width: 60px; text-align: right; font-variant-numeric: tabular-nums; }
-.readout-gain { width: 56px; text-align: right; color: var(--muted); font-size: 20px; }
-.chart-hint { position: absolute; left: 120px; bottom: 40px; }
+/* Multiview page of watch options: layouts as diagrams of the TV screen (experiment) */
+.panel.wide { width: 680px; }
+.mv-thumbs { padding: 2px 20px 6px; }
+.mv-screen { position: relative; display: inline-block; vertical-align: top; background: #000; }
+.mv-picture { position: absolute; background: #161a21; }
+.mv-cell { position: absolute; box-sizing: border-box; background: #3a414e; border: 2px solid #000; overflow: hidden; }
+.mv-thumb { width: 136px; height: 77px; margin: 6px; outline: 3px solid transparent; outline-offset: 2px; }
+.mv-thumb.chosen { outline-color: rgba(255, 255, 255, 0.55); }
+.mv-thumb.focused { outline-color: var(--red); }
+.mv-thumb .mv-cell { border-width: 1px; }
+.mv-name { display: none; }
+.mv-badge { position: absolute; right: 4px; bottom: 3px; font-size: 12px; font-weight: 700; line-height: 16px; padding: 0 4px; background: var(--red); border-radius: 2px; }
+.mv-preview { display: block; width: 600px; height: 338px; margin: 6px 26px 14px; }
+.mv-preview .mv-cell { display: flex; align-items: center; justify-content: center; text-align: center; font-size: 18px; padding: 4px; }
+.mv-preview .mv-cell.focused { background: var(--red); }
+.mv-feed { display: flex; align-items: center; white-space: nowrap; overflow: hidden; }
+.mv-feed .feed-num { margin-right: 6px; }
+.mv-mini { width: 56px; height: 32px; vertical-align: middle; }
+.mv-mini .mv-cell { border-width: 1px; }

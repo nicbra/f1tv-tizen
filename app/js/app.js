@@ -1269,22 +1269,41 @@
    * (service/stitch-hevc.js), from F1's Premium 4K HDR offers. feedsCtx.multiview = { layout, slots }
    * while it plays; slots are feed indexes in the layout's order (the big one first).
    */
-  var MV_LAYOUTS = ['grid2x2', 'grid2x2hd', 'pip', 'pip3', 'pip4', 'side2', 'side5'];
-  var MV_NAMES = { off: 'Off', grid2x2: '2×2', grid2x2hd: '2×2 HD', pip: 'Picture in picture ½', pip3: 'Picture in picture ⅓',
-    pip4: 'Picture in picture ¼ (4K)', side2: 'Big + 2', side5: 'Big + 5' };
+  // Names for the player bar and screen readers; the multiview page shows the layouts as diagrams.
+  var MV_NAMES = { off: 'One feed', grid2x2: '2×2', grid2x2hd: '2×2 HD', pip: 'Picture in picture ½', pip3: 'Picture in picture ⅓',
+    pip4: 'Picture in picture ¼', side2: 'Big + 2', side5: 'Big + 5' };
 
-  function mvHeights(layout) { return typeof HdrStream !== 'undefined' && HdrStream.layouts ? HdrStream.layouts[layout] : null; }
+  function mvLayouts() { return typeof MultiviewLayouts !== 'undefined' ? MultiviewLayouts : null; }
+
+  function mvHeights(layout) { var L = mvLayouts(), l = L && L.layouts[layout]; return l ? l.feeds : null; }
 
   function multiviewAvailable() {
     return !!feedsCtx && !feedsCtx.live && feedsCtx.feeds.length > 1 && Settings.get('hdr') && Player.hdrCapable() &&
-      /^PREMIUM/i.test((F1Api.state.location && F1Api.state.location.entitlement) || '') && !!mvHeights('grid2x2');
+      /^PREMIUM/i.test((F1Api.state.location && F1Api.state.location.entitlement) || '') && !!mvLayouts();
   }
 
-  function mvSlotName(layout, k) {
-    var heights = mvHeights(layout);
-    if (heights.every(function (x) { return x === heights[0]; })) return ['Top left', 'Top right', 'Bottom left', 'Bottom right'][k] || 'Feed ' + (k + 1);
-    if (/^pip/.test(layout)) return k ? 'Inset' : 'Main';
-    return k ? 'Small ' + k : 'Big';
+  /**
+   * A layout's diagram as the TV shows it: the picture letterboxed on a 16:9 screen, a cell per feed
+   * (in feed order, an inset after the feed it covers). Returns { box, cells }.
+   */
+  function mvDiagram(layout, cls) {
+    var box = el('div', 'mv-screen ' + cls), pic = el('div', 'mv-picture'), cells = [];
+    var sh = layout === 'off' ? { width: 1920, height: 1080, cols: 1, rows: 1, rects: [{ x: 0, y: 0, w: 1, h: 1 }] } : mvLayouts().shape(layout);
+    var aspect = (sh.width / sh.height) / (16 / 9);
+    if (aspect >= 1) { pic.style.width = '100%'; pic.style.height = (100 / aspect) + '%'; pic.style.left = '0'; pic.style.top = (50 - 50 / aspect) + '%'; }
+    else { pic.style.height = '100%'; pic.style.width = (100 * aspect) + '%'; pic.style.top = '0'; pic.style.left = (50 - 50 * aspect) + '%'; }
+    sh.rects.forEach(function (r) {
+      var c = el('div', 'mv-cell');
+      c.style.left = (100 * r.x / sh.cols) + '%';
+      c.style.top = (100 * r.y / sh.rows) + '%';
+      c.style.width = (100 * r.w / sh.cols) + '%';
+      c.style.height = (100 * r.h / sh.rows) + '%';
+      pic.appendChild(c);
+      cells.push(c);
+    });
+    box.appendChild(pic);
+    if (sh.width >= 3840) box.appendChild(el('span', 'mv-badge', '4K'));
+    return { box: box, cells: cells };
   }
 
   /** A layout's feeds: those chosen so far, else the current feed, then the next unused ones. */
@@ -1313,7 +1332,7 @@
 
   function feedLabel(stream) {
     var grid = stream ? stream.grid : feedsCtx.multiview;
-    if (grid) return 'Multiview · ' + MV_NAMES[grid.layout] + ' · HDR';
+    if (grid) return 'Multiview · ' + (mvHeights(grid.layout) || []).length + ' feeds · HDR';
     var title = feedsCtx.feeds.length > 1 ? feedsCtx.feeds[feedsCtx.index].title : '';
     return title + (stream && stream.hdr ? (title ? ' · HDR' : 'HDR') : '');
   }
@@ -1967,6 +1986,9 @@
     var box = $('panel-list');
     box.innerHTML = '';
     box.style.transform = '';
+    $('panel').classList.remove('wide');
+    $('panel-title').textContent = 'Watch options';
+    $('panel-hint').textContent = '▲ ▼ choose · OK select · ◀ ▶ change · BACK close';
     var rows = [], focusRow = -1;
     var opts = panelOptions();
 
@@ -2035,46 +2057,17 @@
     }
 
     if (multiviewAvailable()) {
-      var active = feedsCtx.multiview;
-      if (!mvDraft) mvDraft = { layout: active ? active.layout : 'off', slots: active ? active.slots.slice() : null };
-      var draft = mvDraft, count = feedsCtx.feeds.length;
-      var layouts = ['off'].concat(MV_LAYOUTS.filter(function (l) { var h = mvHeights(l); return h && h.length <= count; }));
-      box.appendChild(el('div', 'panel-head', 'Multiview'));
-      setting('Layout', function () { return MV_NAMES[draft.layout]; }, function (dir) {
-        var remembered = Settings.get('multiview');
-        // From Off, ▶ goes to the layout used last.
-        draft.layout = draft.layout === 'off' && dir > 0 && layouts.indexOf(remembered) > 0 ? remembered : cycleValue(layouts, draft.layout, dir);
-        if (draft.layout !== 'off') Settings.set('multiview', draft.layout);
-        setTimeout(function () { if (panel) openPanel('layout'); }, 0);
-      }, 'layout');
-      if (draft.layout !== 'off') {
-        draft.slots = mvSlots(draft.layout, draft.slots);
-        draft.slots.forEach(function (idx, k) {
-          setting(mvSlotName(draft.layout, k), function () {
-            var fd = feedsCtx.feeds[draft.slots[k]];
-            return fd.full || fd.title;
-          }, function (dir) {
-            // The next feed not shown elsewhere in the layout.
-            var next = draft.slots[k];
-            for (var n = 0; n < count; n++) {
-              next = (next + dir + count) % count;
-              if (draft.slots.indexOf(next) < 0) break;
-            }
-            draft.slots[k] = next;
-          }, 'slot' + k);
-        });
-        action(active ? 'Show this multiview' : 'Show multiview', function () {
-          closePanel();
-          feedsCtx.multiview = { layout: draft.layout, slots: draft.slots.slice() };
-          playFeed(draft.slots[0], { switching: true });
-        });
-      } else if (active) {
-        action('Back to one feed', function () {
-          closePanel();
-          feedsCtx.multiview = null;
-          playFeed(active.slots[0], { switching: true });
-        });
-      }
+      // One row here; the layouts and their feeds have a page of their own.
+      var mvRow = el('div', 'panel-row setting');
+      var mvValue = el('span', 'panel-value');
+      mvRow.appendChild(el('span', 'panel-label', 'Multiview'));
+      if (feedsCtx.multiview) mvValue.appendChild(mvDiagram(feedsCtx.multiview.layout, 'mv-mini').box);
+      else mvValue.textContent = 'Off ›';
+      mvRow.appendChild(mvValue);
+      mvRow._action = function () { openMultiview(); };
+      if (focus === 'multiview') focusRow = rows.length;
+      box.appendChild(mvRow);
+      rows.push([mvRow]);
     }
 
     var feeds = opts.feeds;
@@ -2114,7 +2107,117 @@
     });
     g.r = focusRow >= 0 ? focusRow : current;
     if (panel) clearTimeout(panel.timer);   // rebuilt while open
-    panel = { grid: g, timer: null };
+    panel = { grid: g, timer: null, page: 'main' };
+    $('panel').classList.remove('hidden');
+    $('osd').classList.add('hidden');
+    $('screen-player').classList.remove('osd-visible');
+    g.apply();
+    armPanel();
+  }
+
+  /**
+   * The multiview page of watch options: the layouts as diagrams (OK chooses one), then the chosen
+   * layout larger with a feed in each place (▲ ▼ move between them, ◀ ▶ change the feed), and Show.
+   * focus: 'layout:<name>' or 'slot<k>'.
+   */
+  function openMultiview(focus) {
+    var box = $('panel-list');
+    box.innerHTML = '';
+    box.style.transform = '';
+    $('panel').classList.add('wide');
+    $('panel-title').textContent = 'Multiview';
+    $('panel-hint').textContent = 'OK choose · ◀ ▶ change a feed · BACK watch options';
+    var active = feedsCtx.multiview, count = feedsCtx.feeds.length, rows = [], focusRow = -1, focusCol = 0;
+    if (!mvDraft) mvDraft = { layout: active ? active.layout : 'off', slots: active ? active.slots.slice() : null };
+    var draft = mvDraft;
+    if (!focus) focus = 'layout:' + draft.layout;
+    var names = ['off'].concat(mvLayouts().order.filter(function (l) { var h = mvHeights(l); return h && h.length <= count; }));
+
+    box.appendChild(el('div', 'panel-head', 'Layout'));
+    var strip = el('div', 'mv-thumbs'), row = null;
+    box.appendChild(strip);
+    names.forEach(function (n, i) {
+      if (i % 4 === 0) { row = []; rows.push(row); }
+      var t = mvDiagram(n, 'mv-thumb' + (n === draft.layout ? ' chosen' : '')).box;
+      t.appendChild(el('span', 'mv-name', MV_NAMES[n]));
+      t._layout = n;
+      t._anchor = strip;
+      if (focus === 'layout:' + n) { focusRow = rows.length - 1; focusCol = row.length; }
+      strip.appendChild(t);
+      row.push(t);
+    });
+
+    function action(label, run) {
+      var e = el('div', 'panel-row setting go-live');
+      e.appendChild(el('span', 'panel-label', label));
+      e._action = run;
+      box.appendChild(e);
+      rows.push([e]);
+    }
+
+    if (draft.layout !== 'off') {
+      draft.slots = mvSlots(draft.layout, draft.slots);
+      box.appendChild(el('div', 'panel-head', 'Feeds'));
+      var d = mvDiagram(draft.layout, 'mv-preview');
+      box.appendChild(d.box);
+      d.cells.forEach(function (c, k) {
+        c._anchor = d.box;
+        c._refresh = function () {
+          var fd = feedsCtx.feeds[draft.slots[k]];
+          c.innerHTML = '';
+          var label = el('span', 'mv-feed');
+          if (fd.num) label.appendChild(feedNumber(fd));
+          label.appendChild(el('span', '', fd.title));
+          c.appendChild(label);
+        };
+        c._cycle = function (dir) {
+          // The next feed not shown elsewhere in the layout.
+          var next = draft.slots[k];
+          for (var n = 0; n < count; n++) {
+            next = (next + dir + count) % count;
+            if (draft.slots.indexOf(next) < 0) break;
+          }
+          draft.slots[k] = next;
+          c._refresh();
+        };
+        c._refresh();
+        if (focus === 'slot' + k) focusRow = rows.length;
+        rows.push([c]);
+      });
+      action(active ? 'Show this multiview' : 'Show multiview', function () {
+        closePanel();
+        feedsCtx.multiview = { layout: draft.layout, slots: draft.slots.slice() };
+        playFeed(draft.slots[0], { switching: true });
+      });
+    } else if (active) {
+      action('Back to one feed', function () {
+        closePanel();
+        feedsCtx.multiview = null;
+        playFeed(active.slots[0], { switching: true });
+      });
+    }
+
+    var g = new Focus.Grid(rows, {
+      onSelect: function (e) {
+        if (e._layout) {
+          if (e._layout !== draft.layout) {
+            draft.layout = e._layout;
+            if (e._layout !== 'off') Settings.set('multiview', e._layout);
+          }
+          return openMultiview(e._layout === 'off' ? 'layout:off' : 'slot0');
+        }
+        if (e._action) return e._action();
+        if (e._cycle) return e._cycle(1);
+      },
+      onMove: function (r, c, e) {
+        var top = (e._anchor || e).offsetTop, view = $('panel-list').parentNode.clientHeight;
+        box.style.transform = 'translateY(' + (-Math.max(0, top - view / 3)) + 'px)';
+      }
+    });
+    g.r = focusRow >= 0 ? focusRow : 0;
+    g.c[g.r] = focusRow >= 0 ? focusCol : 0;
+    if (panel) clearTimeout(panel.timer);
+    panel = { grid: g, timer: null, page: 'multiview' };
     $('panel').classList.remove('hidden');
     $('osd').classList.add('hidden');
     $('screen-player').classList.remove('osd-visible');
@@ -2124,7 +2227,8 @@
 
   function armPanel() {
     clearTimeout(panel.timer);
-    panel.timer = setTimeout(closePanel, 7000);
+    // Choosing a multiview takes longer than switching a setting.
+    panel.timer = setTimeout(closePanel, panel.page === 'multiview' ? 30000 : 7000);
   }
 
   function closePanel() {
@@ -2138,8 +2242,10 @@
   function panelKey(key) {
     armPanel();
     var row = panel.grid.current();
+    if (key === K.BACK && panel.page === 'multiview') return openPanel('multiview');
     if (key === K.BACK || key === K.STOP) return closePanel();
     if ((key === K.LEFT || key === K.RIGHT) && row && row._cycle) return row._cycle(key === K.LEFT ? -1 : 1);
+    if ((key === K.LEFT || key === K.RIGHT) && panel.page === 'multiview') return panel.grid.handle(key);
     if (key === K.LEFT || key === K.RIGHT) { closePanel(); return playerKey(key); }
     panel.grid.handle(key);
   }
