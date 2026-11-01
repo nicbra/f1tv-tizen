@@ -212,8 +212,11 @@ var F1Api = (function () {
         return next();
       });
     }
-    // Only for Premium: Pro accounts, and accounts whose tier is unknown, keep exactly today's request.
-    var request = opts && opts.hdr && /^PREMIUM/i.test((state.location && state.location.entitlement) || '')
+    // Asked for every tier, not only Premium: what F1 offers is read from the answer, never from the
+    // entitlement, so an account that gets nothing simply falls through to the normal request -- as a
+    // Premium account already does on videos F1 has no HDR for. Asking costs one request per start and
+    // keeps the app right if F1 ever opens HDR beyond Premium, which nobody would otherwise notice.
+    var request = opts && opts.hdr
       ? playHdr(contentId, channelId).then(function (hdr) {
         if (!hdr) return next();
         if (!hdr.hdrEncrypted) return hdr;

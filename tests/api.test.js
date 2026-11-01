@@ -127,7 +127,7 @@ function premium(route) {
   return result;
 }
 
-for (const [tier, opts] of [['PRO', { hdr: true }], ['PREMIUM', undefined], ['PREMIUM', { hdr: false }]]) {
+for (const [tier, opts] of [['PRO', undefined], ['PREMIUM', undefined], ['PREMIUM', { hdr: false }]]) {
   test('play keeps the normal requests and result for ' + tier + ' with ' + JSON.stringify(opts), async () => {
     const route = (url) => url.includes('/BIG_SCREEN_DASH/')
       ? { status: 400, body: { message: 'Platform not allowed' } } : { body: { resultObj: SDR } };
@@ -194,12 +194,22 @@ for (const [name, answer, master] of [
   });
 }
 
-for (const location of [null, {}, { entitlement: '' }]) {
-  test('play keeps the normal requests when the account tier is unknown: ' + JSON.stringify(location), async () => {
-    const { F1Api, calls } = premium(() => ({ body: { resultObj: SDR } }));
-    F1Api.state.location = location;
-    await F1Api.play('42', null, { hdr: true });
-    assert.ok(calls.every((c) => c.init.headers['x-f1-device-info'].startsWith('device=web;')));
+// F1 offers HDR to Premium today, but that is read from the answer, not from the entitlement: every
+// tier asks, so the app would pick HDR up if F1 ever offered it more widely. An answer that is not
+// HDR changes nothing -- exactly as on a Premium account watching a video F1 has no HDR for.
+for (const location of [{ entitlement: 'PRO' }, null, {}, { entitlement: '' }]) {
+  test('every tier asks for HDR, and a non-HDR answer leaves the normal request and stream untouched: ' +
+      JSON.stringify(location), async () => {
+    const route = () => ({ body: { resultObj: SDR } });
+    const normal = premium(route);
+    const expected = await normal.F1Api.play('42', 'ch1');
+    const actual = premium(route);
+    actual.F1Api.state.location = location;
+    assert.deepEqual(plain(await actual.F1Api.play('42', 'ch1', { hdr: true })), plain(expected));
+    const asks = actual.calls.filter((c) => c.init.headers['x-f1-device-info'] === 'device=tvos;');
+    assert.equal(asks.length, 1, 'one extra HDR request');
+    const web = actual.calls.filter((c) => c.init.headers['x-f1-device-info'].startsWith('device=web;'));
+    assert.deepEqual(plain(web), plain(normal.calls));
   });
 }
 
