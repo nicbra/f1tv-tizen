@@ -24,10 +24,11 @@ function playback(load, capable = true, opts = {}) {
       play: async (id, channel, o) => {
         requests.push({ id, channel, hdr: o.hdr, cenc: o.cenc });
         if (opts.gate) await opts.gate(id);
-        if (o.cenc && !o.hdr) return { url: 'https://cdn/cast.mpd', cenc: true, channel };
-        return o.hdr ? { url: 'https://cdn/hdr.m3u8', hdr: true, channel, ...(opts.authorizedHdr ? {hdrEncrypted:true,licenseUrl:'https://lic/wv',widevineManifestUrl:'https://cdn/sdr.mpd'} : {}) } : { url: 'https://cdn/stream.m3u8', channel };
+        const drm = opts.drm ? { licenseUrl: 'https://lic/wv' } : {};
+        if (o.cenc && !o.hdr) return { url: 'https://cdn/cast.mpd', cenc: true, channel, ...drm };
+        return o.hdr ? { url: 'https://cdn/hdr.m3u8', hdr: true, channel, ...(opts.authorizedHdr ? {hdrEncrypted:true,licenseUrl:'https://lic/wv',widevineManifestUrl:'https://cdn/sdr.mpd'} : {}) } : { url: 'https://cdn/stream.m3u8', channel, ...drm };
       },
-      streamInfo: async (url) => (infos.push(url), { dynamic: false, windowStart: 0, windowEnd: 600,
+      streamInfo: async (url) => (infos.push(url), opts.info ? opts.info(url) : { dynamic: false, windowStart: 0, windowEnd: 600,
         encrypted: !!opts.encryptedHdr && url.includes('hdr') })
     },
     Timing: { load() {}, label: () => '', supported: () => false, isReady: () => false },
@@ -272,11 +273,51 @@ test('replays ask for the cenc stream when the browser can decrypt it; a failed 
   assert.equal(h.loads.at(-1).stream.cenc, undefined);
 });
 
-test('live sessions, and browsers without cenc, keep the usual request', async () => {
-  for (const [live, cencCapable] of [[true, true], [false, false]]) {
-    const h = playback(null, true, { cencCapable, settings: { hdr: false } });
+test('browsers without cenc keep the usual request', async () => {
+  for (const live of [true, false]) {
+    const h = playback(null, true, { cencCapable: false, settings: { hdr: false } });
     h.app.set(video({ live })); h.app.play(0, {});
     for (let i = 0; i < 3; i++) await settle();
     assert.deepEqual(h.requests.map((r) => r.cenc), [false]);
   }
+});
+
+const NOW = Date.now() / 1000;
+const liveInfo = () => ({ dynamic: true, windowStart: 1000, windowEnd: 4600, delay: 25, epochAtZero: NOW - 4600 });
+
+// AVPlay's Widevine crashes some TVs outright (github issue #1), live included, so live asks for
+// the cenc stream too -- but only when HDR gave nothing, since 4K HDR plays natively.
+test('live asks for the cenc stream too, and seeks in it instead of time-shifting the manifest', async () => {
+  for (const cencCapable of [true, false]) {
+    const h = playback(null, true, { cencCapable, drm: true, settings: { hdr: false }, info: liveInfo });
+    h.app.set(video({ live: true })); h.app.play(0, { startAt: 2000 });
+    for (let i = 0; i < 5; i++) await settle();
+    assert.deepEqual(h.requests.map((r) => r.cenc), [cencCapable]);
+    const l = h.loads.at(-1);
+    assert.equal(l.stream.cenc, cencCapable || undefined);
+    // Shaka opens the cenc stream at the moment itself; AVPlay gets the time-shifted manifest.
+    assert.equal(l.position, cencCapable ? 2000 : null);
+    assert.equal(l.stream.startDelay === undefined, cencCapable);
+  }
+});
+
+test('a live session playing in 4K HDR keeps the native stream: no cenc request is made', async () => {
+  const h = playback(null, true, { cencCapable: true, authorizedHdr: true, drm: true, info: liveInfo });
+  h.app.set(video({ live: true })); h.app.play(0, {});
+  for (let i = 0; i < 5; i++) await settle();
+  assert.deepEqual(h.requests.map((r) => [r.hdr, r.cenc]), [[true, true]]);   // asked for both
+  assert.equal(h.loads.at(-1).stream.hdrEncrypted, true);                     // HDR answered, so cenc was never used
+  assert.equal(h.loads.at(-1).stream.cenc, undefined);
+});
+
+test('a failed cenc live stream falls back to the usual time-shifted stream on AVPlay', async () => {
+  const h = playback(async (stream) => { if (stream.cenc) throw new Error('Shaka error 6007'); }, true,
+    { cencCapable: true, drm: true, settings: { hdr: false }, info: liveInfo });
+  const ctx = video({ live: true });
+  h.app.set(ctx); h.app.play(0, { startAt: 2000 });
+  for (let i = 0; i < 8; i++) await settle();
+  assert.deepEqual(h.requests.map((r) => r.cenc), [true, false]);
+  assert.equal(ctx.cencFailed, true);
+  assert.equal(h.loads.at(-1).stream.cenc, undefined);
+  assert.ok(h.loads.at(-1).stream.startDelay > 5);
 });

@@ -1254,9 +1254,14 @@
 
   var HDR_TRIES = 3;   // HDR failures before a video stays SDR
 
-  /** Replays' DRM streams in cenc on Shaka (see F1Api cencOffer); after a failure, AVPlay as before. */
+  /**
+   * DRM streams in cenc on Shaka (see F1Api cencOffer); after a failure, AVPlay as before. Live too:
+   * the request only goes out when HDR gave nothing, so a Premium TV playing 4K HDR keeps the native
+   * player, while everything else stays out of AVPlay's Widevine, which crashes some TVs outright
+   * (Tizen 9 on the S90C, github issue #1).
+   */
   function cencWanted() {
-    return !feedsCtx.live && !feedsCtx.cencFailed && !!(Player.cencCapable && Player.cencCapable());
+    return !feedsCtx.cencFailed && !!(Player.cencCapable && Player.cencCapable());
   }
 
   function hdrWanted() {
@@ -1324,9 +1329,10 @@
           var start = startPosition(stream.info, opts, from);
           // Live (dynamic) streams on AVPlay can't seek at start-up; instead the local service
           // time-shifts the manifest so the player's own live edge lies at the chosen moment
-          // (it starts `delay` before its edge, hence the extra info.delay).
+          // (it starts `delay` before its edge, hence the extra info.delay). Shaka seeks within the
+          // DVR window like any other stream, so the cenc live stream keeps its start time.
           var info = stream.info;
-          if (start != null && info && info.dynamic && info.epochAtZero > 1e9 && stream.licenseUrl) {
+          if (start != null && info && info.dynamic && info.epochAtZero > 1e9 && stream.licenseUrl && !stream.cenc) {
             var shift = Date.now() / 1000 - (info.epochAtZero + start) - info.delay;
             if (shift > 5) stream.startDelay = shift;
             start = null;
