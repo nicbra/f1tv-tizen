@@ -20,6 +20,10 @@ BV. I have shamelessly added the F1 logo in the app.
   switch 4K HDR off in the settings (your name in the top bar).
 - All of F1 TV's feeds: the main broadcast, F1 Live, an onboard camera for each driver, the
   tracker and the data channel. Switching feeds keeps you at the same moment of the session.
+- Multiview: up to four feeds at once, in sync, as one 4K HDR picture. Choose a layout (a 2×2
+  grid, side by side, one big feed with three small ones, or picture in picture) and which feed
+  goes where. The timing data fills the space the feeds leave free. Needs F1 TV Premium and a
+  4K HDR TV.
 - A timing tower in sync with the video: positions, gaps, lap times, tyres, pit stops and track
   status. The gap times are shown with 3 decimals, that F1TV for some reason removed from their
   feed.
@@ -36,6 +40,8 @@ BV. I have shamelessly added the F1 logo in the app.
 - Resume where you stopped, synced with F1 TV on your other devices.
 - Sign in with a code on your phone. No passwords are typed or stored on the TV, and the TV
   renews its session on its own.
+
+![Multiview: the main broadcast and three onboards, with the timing data below](docs/screenshots/multiview.jpg)
 
 <table>
   <tr>

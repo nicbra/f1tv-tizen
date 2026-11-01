@@ -103,7 +103,7 @@ var Timing = (function () {
     loadedKey = key;
     if (!worker) { worker = new Worker('js/timing-worker.js'); worker.onmessage = onMessage; }
     resolvePath(meta, token).then(function (path) {
-      if (loadedKey === key) worker.postMessage({ cmd: 'load', path: path, token: token, live: !!live });
+      if (loadedKey === key) worker.postMessage({ cmd: 'load', path: path, token: token, live: !!live, start: +meta.start || 0 });
     }).catch(function () {
       // The real-time feed needs no archive path: a live session still gets its tower.
       if (live && loadedKey === key) worker.postMessage({ cmd: 'load', path: '', token: token, live: true });

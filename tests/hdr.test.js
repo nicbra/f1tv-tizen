@@ -114,3 +114,25 @@ test('live HDR refuses timelines that do not line up, and a static source',async
  await assert.rejects(liveHarness(liveMpd(311353501))(),/timelines differ/);
  await assert.rejects(liveHarness(liveMpd().replace('type="dynamic"','type="static"'))(),/live layout/);
 });
+
+test('a clear HDR multiview gets the HLS master\'s WebVTT subtitles, on the video\'s timeline', async () => {
+  const ctx = vm.createContext({ URL, CmafDash, setTimeout, clearTimeout, AbortController });
+  vm.runInContext(fs.readFileSync('app/js/hdr.js', 'utf8'), ctx);
+  const subs = '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:5.760,\nindex_22_0_1.vtt\n#EXTINF:5.760,\nindex_22_0_2.vtt\n#EXT-X-ENDLIST\n';
+  const io = { get: async (url) => {
+    if (/fra/.test(url)) throw new Error('media request failed (403)');
+    return { body: subs, url };
+  } };
+  const feed = { masterUrl: 'https://cdn/x/master.m3u8', master: [
+    '#EXTM3U',
+    '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subtitles",NAME="fra_subtitle",DEFAULT=YES,LANGUAGE="fra",URI="fra/subs.m3u8"',
+    '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subtitles",NAME="eng_subtitle",DEFAULT=NO,LANGUAGE="eng",URI="eng/subs.m3u8"',
+    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",LANGUAGE="eng",URI="a.m3u8"'].join('\n') };
+  const round = (x) => Math.round(x * 1000) / 1000;
+  const tracks = plain(await ctx.HdrStream.subtitleTracks(io, feed, 0.02)).map((t) =>
+    Object.assign(t, { list: t.list.map((x) => Object.assign(x, { start: round(x.start), end: round(x.end) })) }));
+  // French failed: left out, the other languages stay.
+  assert.deepEqual(tracks, [{ lang: 'eng', vtt: true, offset: 0.02, timescale: 1, list: [
+    { url: 'https://cdn/x/eng/index_22_0_1.vtt', start: 0.02, end: 5.78 },
+    { url: 'https://cdn/x/eng/index_22_0_2.vtt', start: 5.78, end: 11.54 }] }]);
+});

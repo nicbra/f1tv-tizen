@@ -22,6 +22,10 @@ jobs:
           node-version: '24'
           package-manager-cache: false
 
+      # The multiview stitching tests decode their output with ffmpeg and skip those checks without it.
+      - name: Install ffmpeg (stitch pixel checks)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
       - name: Run tests
         run: |
           node --test tests/*.test.js

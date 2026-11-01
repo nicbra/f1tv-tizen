@@ -329,6 +329,15 @@ test('live HDR: the stored HLG set replaces the official video, on the official 
   assert.equal((await get(s, '/mpd?u=' + encodeURIComponent(live) + '&hdr=gone')).status, 502);
 });
 
+test('live HDR: a refresh that moves the window start renumbers the swapped-in video like the official one', async () => {
+  const live = 'https://ott-video-cf.formula1.com/v2/x/Main/index.mpd';
+  const moved = LIVE_HDR_MPD.replace('startNumber="311365738" presentationTimeOffset="89672909472000"', 'startNumber="311365800" presentationTimeOffset="89672927328000"');
+  const { s } = service({ [live]: { body: moved } });
+  await post(s, '/hdr/abc-9', HLG_SET);
+  const mpd = (await get(s, '/mpd?u=' + encodeURIComponent(live) + '&hdr=abc-9&notext=1')).body.toString();
+  assert.ok(mpd.includes('<Representation id="hlg0" bandwidth="18000000"><SegmentTemplate timescale="50000" presentationTimeOffset="89672927328000" startNumber="311365800"'));
+});
+
 test('live HDR: a time-shifted start trims the HLG timeline like the rest', async () => {
   const live = 'https://ott-video-cf.formula1.com/v2/x/Main/index.mpd';
   const { s } = service({ [live]: { body: LIVE_HDR_MPD } });

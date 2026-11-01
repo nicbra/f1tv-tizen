@@ -194,3 +194,17 @@ test('the app does not replace JavaScript built-ins such as Proxy', () => {
     for (const name of globals) assert.ok(!builtins.includes(name), f + ' defines a global ' + name);
   }
 });
+
+// ---------- stylesheet ----------
+
+test('every class index.html uses has a rule in the stylesheet (a truncated style.css loses them)', () => {
+  const html = readFileSync('app/index.html', 'utf8'), css = readFileSync('app/css/style.css', 'utf8');
+  const classes = new Set();
+  html.replace(/class="([^"]+)"/g, (all, list) => { list.split(/\s+/).forEach((c) => classes.add(c)); return all; });
+  // State classes the app toggles; they style other elements, not themselves.
+  ['hidden', 'small', 'muted'].forEach((c) => classes.delete(c));
+  const missing = [...classes].filter((c) => !new RegExp('\\.' + c.replace(/-/g, '\\-') + '(?![\\w-])').test(css));
+  assert.deepEqual(missing, []);
+  // And the end of the file is there.
+  assert.ok(/\.tower \{/.test(css) && /\.brand-logo \{/.test(css) && /\.subtitle \{/.test(css));
+});

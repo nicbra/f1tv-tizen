@@ -9,7 +9,7 @@ var F1Api = (function () {
   // Try the TV platform before the web fallback.
   var PLAY_PLATFORMS = ['BIG_SCREEN_DASH', 'WEB_DASH'];
   var PAGE_PLATFORM = 'WEB_DASH';
-  // How long the extra Premium HDR request may take before playback goes ahead without it.
+  // How long the extra HDR request may take before playback goes ahead without it.
   var HDR_WAIT = 8000;
   // Playback requires this header in web-player format; 'device=tv' is rejected.
   var DEVICE_INFO = 'device=web;screen=browser;os=tizen;browser=chrome;browserVersion=76;' +
@@ -148,8 +148,8 @@ var F1Api = (function () {
   }
 
   /**
-   * Premium's HLG offer. Clear HLS stays on Shaka; supported CBCS uses the normal Widevine offer.
-   * Null unless it is that (for Pro, or old replays, tvOS gets SDR), so the caller can fall back.
+   * The tvOS request's HLG offer. Clear HLS stays on Shaka; supported CBCS uses the normal Widevine offer.
+   * Null unless F1 answers with that (it gives SDR to Pro and for old replays), so the caller can fall back.
    */
   function playHdr(contentId, channelId) {
     var ask = playOn(PLAY_PLATFORMS[0], contentId, channelId, 'device=tvos;').then(function (r) {
@@ -189,7 +189,7 @@ var F1Api = (function () {
   /**
    * F1 encrypts its DRM streams for the web with cbcs, which only AVPlay can decrypt on Samsung TVs; asked
    * as a Chromecast, it gives the same stream with cenc, which the browser (Shaka) can. An extra request,
-   * like Premium's HDR one: its answer is used only when it is cenc Widevine DASH, otherwise `normal`.
+   * like the HDR one: its answer is used only when it is cenc Widevine DASH, otherwise `normal`.
    */
   function cencOffer(normal, contentId, channelId) {
     if (!/WV/i.test(normal.streamType || '') || /CENC/i.test(normal.streamType) || !/\.mpd(\?|$)/.test(normal.url || '')) return Promise.resolve(normal);
@@ -212,11 +212,15 @@ var F1Api = (function () {
         return next();
       });
     }
-    // Only for Premium: Pro accounts, and accounts whose tier is unknown, keep exactly today's request.
-    var request = opts && opts.hdr && /^PREMIUM/i.test((state.location && state.location.entitlement) || '')
+    // F1 decides what an account gets: the HDR request is asked for every account, and its answer is used
+    // only when it is HDR (playHdr). Otherwise (Pro gets SDR from it) the normal request, as before.
+    var request = opts && opts.hdr
       ? playHdr(contentId, channelId).then(function (hdr) {
         if (!hdr) return next();
         if (!hdr.hdrEncrypted) return hdr;
+        // Multiview's other feeds: the HDR stream alone, one PLAY session each. The first feed's Widevine
+        // offer has the licence and the clock; F1 limits how many streams an account plays at once.
+        if (opts.hdrOnly) return Object.assign({}, hdr, { laURL: '', laUrl: '' });
         return next().then(function (normal) {
           if (!/WV/i.test(normal.streamType || '') || !/\.mpd(\?|$)/.test(normal.url)) return normal;
           return Object.assign({}, normal, { url: hdr.url, streamType: hdr.streamType, hdr: true, hdrEncrypted: true,

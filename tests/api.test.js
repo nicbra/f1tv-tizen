@@ -121,20 +121,19 @@ const HDR = { url: 'https://cdn/hdr.m3u8?token=1', streamType: 'HDR_UHD_CMAF' };
 const MASTER = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE=HLG\n2160p.m3u8\n';
 const SDR = { url: 'https://cdn/sdr.m3u8', streamType: 'SDR_HD_CMAF' };
 
-function premium(route) {
+function signedIn(route) {
   const result = api(route);
   Object.assign(result.F1Api.state, { ascendon: 'ASC', entitlement: 'ENT', location: { entitlement: 'PREMIUM' } });
   return result;
 }
 
-for (const [tier, opts] of [['PRO', { hdr: true }], ['PREMIUM', undefined], ['PREMIUM', { hdr: false }]]) {
-  test('play keeps the normal requests and result for ' + tier + ' with ' + JSON.stringify(opts), async () => {
+for (const opts of [undefined, { hdr: false }]) {
+  test('play keeps the normal requests and result with ' + JSON.stringify(opts), async () => {
     const route = (url) => url.includes('/BIG_SCREEN_DASH/')
       ? { status: 400, body: { message: 'Platform not allowed' } } : { body: { resultObj: SDR } };
-    const normal = premium(route);
+    const normal = signedIn(route);
     const expected = await normal.F1Api.play('42', 'ch1');
-    const actual = premium(route);
-    actual.F1Api.state.location.entitlement = tier;
+    const actual = signedIn(route);
     assert.deepEqual(plain(await actual.F1Api.play('42', 'ch1', opts)), plain(expected));
     assert.deepEqual(plain(actual.calls), plain(normal.calls));
     assert.equal(actual.calls.length, 2);
@@ -144,7 +143,7 @@ for (const [tier, opts] of [['PRO', { hdr: true }], ['PREMIUM', undefined], ['PR
 
 for (const key of ['', '#EXT-X-KEY:METHOD=NONE\n']) {
   test('play accepts clear Premium HDR after checking the master' + (key ? ' with METHOD=NONE' : ''), async () => {
-    const { F1Api, calls } = premium((url) => ({ body: url === HDR.url ? MASTER + key : { resultObj: HDR } }));
+    const { F1Api, calls } = signedIn((url) => ({ body: url === HDR.url ? MASTER + key : { resultObj: HDR } }));
     const stream = await F1Api.play('42', 'ch1', { hdr: true });
     assert.equal(stream.hdr, true);
     assert.equal(stream.url, HDR.url);
@@ -181,9 +180,9 @@ for (const [name, answer, master] of [
   test('play falls back to the unchanged platform sequence after HDR ' + name, async () => {
     const route = (url) => url.includes('/BIG_SCREEN_DASH/')
       ? { status: 400, body: { message: 'Platform not allowed' } } : { body: { resultObj: SDR } };
-    const normal = premium(route);
+    const normal = signedIn(route);
     const expected = await normal.F1Api.play('42', 'ch1');
-    const { F1Api, calls } = premium((url, init) => {
+    const { F1Api, calls } = signedIn((url, init) => {
       const response = url === HDR.url ? master : init.headers['x-f1-device-info'] === 'device=tvos;' ? answer : route(url);
       if (response instanceof Error) throw response;
       return response;
@@ -194,12 +193,14 @@ for (const [name, answer, master] of [
   });
 }
 
-for (const location of [null, {}, { entitlement: '' }]) {
-  test('play keeps the normal requests when the account tier is unknown: ' + JSON.stringify(location), async () => {
-    const { F1Api, calls } = premium(() => ({ body: { resultObj: SDR } }));
+// The app doesn't decide what an account may play: F1's answer does, whatever tier the location names.
+for (const location of [{ entitlement: 'PRO' }, null, {}, { entitlement: '' }]) {
+  test('play asks for HDR and uses F1\'s answer whatever the account tier: ' + JSON.stringify(location), async () => {
+    const { F1Api, calls } = signedIn((url) => ({ body: url === HDR.url ? MASTER : { resultObj: HDR } }));
     F1Api.state.location = location;
-    await F1Api.play('42', null, { hdr: true });
-    assert.ok(calls.every((c) => c.init.headers['x-f1-device-info'].startsWith('device=web;')));
+    const stream = await F1Api.play('42', null, { hdr: true });
+    assert.equal(calls[0].init.headers['x-f1-device-info'], 'device=tvos;');
+    assert.equal(stream.hdr, true);
   });
 }
 
@@ -431,7 +432,7 @@ test('imageUrl sizes F1 image ids through the image resizer and keeps full URLs'
 
 test('Premium CBCS HDR uses the normal Widevine authorization and keeps its source manifest', async () => {
   const encrypted = { ...HDR, streamType: 'HDR_UHD_CMAFFP', entitlementToken: 'HDR_ENT', laURL:'https://lic/fairplay' };
-  const { F1Api, calls } = premium((url, init) => ({ body: url === HDR.url
+  const { F1Api, calls } = signedIn((url, init) => ({ body: url === HDR.url
     ? MASTER + '#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.apple.streamingkeydelivery",URI="skd://00112233-4455-6677-8899-aabbccddeeff"\n'
     : { resultObj: init.headers['x-f1-device-info'] === 'device=tvos;' ? encrypted
       : { url:'https://cdn/sdr.mpd', streamType:'SDR_HD_DASHWV_SINGLE', drmToken:'NORMAL_DRM' } } }));
@@ -444,6 +445,18 @@ test('Premium CBCS HDR uses the normal Widevine authorization and keeps its sour
   assert.equal(s.licenseHeaders.entitlementtoken, 'HDR_ENT');
   assert.equal(s.licenseHeaders.customdata, 'NORMAL_DRM');
   assert.equal(calls.filter(c=>c.url.includes('/CONTENT/PLAY')).length, 2);
+});
+
+test('a multiview feed asks for the Premium HDR stream alone: one PLAY session, no Apple licence URL', async () => {
+  const encrypted = { ...HDR, streamType: 'HDR_UHD_CMAFFP', laURL: 'https://lic/fairplay' };
+  const { F1Api, calls } = signedIn((url, init) => ({ body: url === HDR.url
+    ? MASTER + '#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.apple.streamingkeydelivery",URI="skd://00112233-4455-6677-8899-aabbccddeeff"\n'
+    : { resultObj: init.headers['x-f1-device-info'] === 'device=tvos;' ? encrypted : { url: 'https://cdn/sdr.mpd', streamType: 'SDR_HD_DASHWV_SINGLE' } } }));
+  const s = await F1Api.play('42', '1033', { hdr: true, hdrOnly: true });
+  assert.equal(s.hdrEncrypted, true);
+  assert.equal(s.url, HDR.url);
+  assert.ok(!/fairplay/.test(s.licenseUrl));
+  assert.equal(calls.filter((c) => c.url.includes('/CONTENT/PLAY')).length, 1);
 });
 
 // Chromecast's cenc stream: an extra request for replays whose usual stream is cbcs Widevine DASH.
@@ -499,14 +512,13 @@ test('play asks for HDR first; the Chromecast cenc request only comes when HDR h
     if (device === 'device=tvos;') return { body: { resultObj: hdrAnswer } };
     return castRoute(CAST)(url, init);
   };
-  const premium = (r) => { const a = api(r); a.F1Api.state.location = { entitlement: 'PREMIUM' }; return a; };
-  const withHdr = premium(route({ url: 'https://cdn/hdr.m3u8', streamType: 'HDR_UHD_CMAF' }));
+  const withHdr = signedIn(route({ url: 'https://cdn/hdr.m3u8', streamType: 'HDR_UHD_CMAF' }));
   const s = await withHdr.F1Api.play('42', null, { hdr: true, cenc: true });
   assert.equal(s.hdr, true);
   assert.equal(s.cenc, undefined);
   assert.ok(!withHdr.calls.some((c) => (c.init.headers || {})['x-f1-device-info'] === 'device=chromecast;'));
   // No HDR for this video (tvOS answers SDR): then the cenc stream.
-  const noHdr = premium(route({ url: 'https://cdn/sdr.m3u8', streamType: 'SDR_HD_CMAF' }));
+  const noHdr = signedIn(route({ url: 'https://cdn/sdr.m3u8', streamType: 'SDR_HD_CMAF' }));
   assert.equal((await noHdr.F1Api.play('42', null, { hdr: true, cenc: true })).cenc, true);
   assert.equal(noHdr.calls.filter((c) => /PLAY/.test(c.url))[0].init.headers['x-f1-device-info'], 'device=tvos;');
 });

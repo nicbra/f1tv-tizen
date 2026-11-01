@@ -18,6 +18,10 @@
   font-weight: 700; font-style: italic; }
 @font-face { font-family: 'Titillium Web'; src: url('../fonts/TitilliumWeb-Black.ttf') format('truetype');
   font-weight: 900; font-style: normal; }
+/* Noto Sans (SIL OFL 1.1): static 500/95 instance for Tizen without variable-font support.
+ * See fonts/NotoSans-NOTICE.txt and fonts/NotoSans-OFL.txt. */
+@font-face { font-family: 'Noto Sans Subtitle'; src: url('../fonts/NotoSans-Subtitle-Medium.woff2') format('woff2');
+  font-weight: 500; font-style: normal; font-stretch: 95%; }
 /* F1's own palette, as in F1 TV's apps: carbon black, its greys, red. */
 :root {
   --bg: #15151e;
@@ -200,7 +204,7 @@ body.avplay #video, body.avplay #video2 { display: none; }
   animation: spin 0.175s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.toast { position: absolute; left: 50%; bottom: 80px; transform: translateX(-50%); max-width: 1400px;
+.toast { position: absolute; z-index: 30; left: 50%; bottom: 80px; transform: translateX(-50%); max-width: 1400px;
   background: var(--overlay); padding: 22px 34px;
   font-size: 26px; line-height: 1.4; }
 /* A new version: an F1-red border that glows, pulsing a few times. */
@@ -268,6 +272,54 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .feed.focused .feed-name small { color: var(--text); }
 .panel-hint { position: absolute; bottom: 16px; left: 26px; right: 26px; font-size: 17px; }
 
+/* Multiview over the video: black everywhere but a rounded hole per feed (a canvas mask), and each feed's name.
+   Below the bar, tower and panel. */
+.mv-frames { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; z-index: 5; pointer-events: none; }
+.mv-mask { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; }
+.mv-label { position: absolute; display: flex; align-items: center; padding: 3px 10px; border-radius: 8px;
+  background: rgba(0, 0, 0, 0.6); font-size: 20px; font-weight: 700; white-space: nowrap; }
+.mv-label .feed-num { margin-right: 6px; }
+
+/* Multiview: timing data in the space a layout leaves free (a field under the big feed, or bands above and below). */
+.mv-data { position: absolute; z-index: 6; box-sizing: border-box; padding: 14px 24px; display: flex; flex-direction: column; overflow: hidden; }
+.mv-data-head { display: flex; align-items: center; height: 34px; font-size: 20px; flex: none; }
+.mv-data-head .tower-flag { margin: 0 0 0 14px; }
+.mv-data-name { color: var(--muted); text-transform: uppercase; font-size: 17px; margin-right: 14px; }
+.mv-data-value { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.mv-data-view { margin-left: auto; color: var(--muted); text-transform: uppercase; font-size: 14px; }
+.mv-data-rows { flex: 1; display: flex; flex-direction: column; flex-wrap: wrap; align-content: flex-start; min-height: 0; }
+.mv-data .tower-row { flex: none; box-sizing: border-box; padding: 0 16px 0 6px; border-radius: 4px; }
+.mv-data .tower-row.alt { background: #1c1c22; }
+.mv-data.band .mv-data-rows { flex-direction: row; }
+.mv-data.band .tower-row { padding: 0 10px 0 6px; }
+.mv-data.band .tw-tyre { display: none; }
+/* The value right after the name (the tower's own spreads to the right edge), then the sectors. */
+.mv-data .tw-val { flex: none; width: 104px; }
+.mv-data .tw-tyre { margin-left: 12px; }
+.tw-sec { flex: none; width: 76px; text-align: right; font-size: 18px; font-variant-numeric: tabular-nums; color: #f5d200; }
+.tw-sec.p { color: #3ccf6e; }
+.tw-sec.o { color: #b65cff; }
+
+/* Multiview page of watch options: layouts as diagrams of the TV screen (experiment) */
+.panel.wide { width: 680px; }
+.mv-thumbs { padding: 2px 20px 6px; }
+.mv-screen { position: relative; display: inline-block; vertical-align: top; background: #000; }
+.mv-picture { position: absolute; background: #161a21; }
+.mv-cell { position: absolute; box-sizing: border-box; background: #3a414e; border: 2px solid #000; overflow: hidden; }
+.mv-thumb { width: 136px; height: 77px; margin: 6px; outline: 3px solid transparent; outline-offset: 2px; }
+.mv-thumb.chosen { outline-color: rgba(255, 255, 255, 0.55); }
+.mv-thumb.focused { outline-color: var(--red); }
+.mv-thumb .mv-cell { border-width: 1px; }
+.mv-name { display: none; }
+.mv-badge { position: absolute; right: 4px; bottom: 3px; font-size: 12px; font-weight: 700; line-height: 16px; padding: 0 4px; background: var(--red); border-radius: 2px; }
+.mv-preview { display: block; width: 600px; height: 338px; margin: 6px 26px 14px; }
+.mv-preview .mv-cell { display: flex; align-items: center; justify-content: center; text-align: center; font-size: 18px; padding: 4px; }
+.mv-preview .mv-cell.focused { background: var(--red); }
+.mv-feed { display: flex; align-items: center; white-space: nowrap; overflow: hidden; }
+.mv-feed .feed-num { margin-right: 6px; }
+.mv-mini { width: 56px; height: 32px; vertical-align: middle; }
+.mv-mini .mv-cell { border-width: 1px; }
+
 /* Timing tower */
 /* Align with F1's 2026 broadcast tower: x 90, y 44-1034, width 246, rows starting at y 179. */
 .tower { position: absolute; left: 90px; top: 44px; width: 246px; height: 990px; display: flex; flex-direction: column;
@@ -295,8 +347,20 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .tyre-I { border-color: #43b02a; } .tyre-W { border-color: #0067ad; }
 
 /* Subtitles and seeker info */
+/* NRK TV's player styles, checked 2026-11-02:
+ * https://tv.nrk.no/assets/player-DqU6RAAI.css
+ * White on #000000a8, line-height 1.4, padding .1em .3em, radius .125em.
+ * Use rgba for older Tizen browsers that don't support eight-digit hex colours.
+ * Noto Sans Medium at 95% width provides an open alternative to NRK Sans.
+ * Keep the font separate from the F1 interface, including in multiview. */
 .subtitle { position: absolute; left: 50%; bottom: 90px; transition: bottom 0.2s ease-out; transform: translateX(-50%); max-width: 1400px;
-  background: rgba(0, 0, 0, 0.78); padding: 8px 22px; font-size: 38px; text-align: center; line-height: 1.3; }
+  font-family: 'Noto Sans Subtitle', Arial, sans-serif; font-size: 38px; font-weight: 500; font-style: normal; font-stretch: 95%;
+  text-align: center; line-height: 1.4; color: #fff; text-shadow: none; width: max-content; }
+.subtitle .sub-line { background: rgba(0, 0, 0, 0.6588235294); padding: .1em .3em; border-radius: .125em;
+  -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+/* Shaka's native WebVTT renderer uses video cues rather than the app's subtitle overlay. */
+video::cue { font-family: 'Noto Sans Subtitle', Arial, sans-serif; font-size: 38px; font-weight: 500; font-stretch: 95%; line-height: 1.4;
+  color: #fff; background-color: rgba(0, 0, 0, 0.6588235294); text-shadow: none; }
 .bubble-info { font-size: 20px; font-weight: 600; color: var(--muted); margin-top: 2px; }
 
 /* Brand: logo image and "TV" */
@@ -315,6 +379,9 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .osd-visible .subtitle { bottom: 270px; }
 /* Narrow subtitles to clear the tower (x 90-336). */
 .tower-on .subtitle { max-width: 1160px; }
+/* In a multiview: on the big feed, or across the picture (app.js placeSubtitles). */
+.subtitle.mv { left: var(--sub-x); bottom: var(--sub-bottom); max-width: var(--sub-width); font-size: var(--sub-size); }
+.osd-visible .subtitle.mv { bottom: var(--sub-bottom-osd); }
 
 /* Standings and driver pages */
 .list-row .row-colour { width: 6px; height: 40px; margin-right: 18px; background: var(--grey); flex: none; }

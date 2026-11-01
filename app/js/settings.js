@@ -8,6 +8,7 @@ var Settings = (function () {
     subtitles: '',       // subtitle language, '' = off
     spoilerFree: false,  // blur the artwork of replays and highlights
     hdr: true,           // 4K HDR where the subscription and TV allow it; off: always SDR
+    multiview: 'side2',  // the multiview layout offered first (HdrStream.layouts; experiment)
     updates: true        // look for a newer release on GitHub once a day
   };
   var values = {};

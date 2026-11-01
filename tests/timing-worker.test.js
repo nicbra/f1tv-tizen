@@ -9,11 +9,12 @@ const T0 = Date.parse('2024-05-05T12:00:00.000Z');
 const at = (sec) => T0 + sec * 1000;
 const iso = (sec) => new Date(at(sec)).toISOString();
 
-// One archive line: HH:MM:SS.mmm followed by the JSON patch.
+// One archive line: HH:MM:SS.mmm followed by the JSON patch; from a day on D.HH:MM:SS.mmm, as F1 writes it.
 function line(sec, data) {
   const ms = Math.round(sec * 1000);
   const p = (n, w) => String(n).padStart(w, '0');
-  const ts = p(Math.floor(ms / 3600000), 2) + ':' + p(Math.floor(ms / 60000) % 60, 2) + ':' +
+  const days = Math.floor(ms / 86400000);
+  const ts = (days ? days + '.' : '') + p(Math.floor(ms / 3600000) % 24, 2) + ':' + p(Math.floor(ms / 60000) % 60, 2) + ':' +
     p(Math.floor(ms / 1000) % 60, 2) + '.' + p(ms % 1000, 3);
   return ts + JSON.stringify(data);
 }
@@ -61,7 +62,7 @@ function harness(feeds, status, path = PATH, timers, now) {
   let nextId = 1;
   const api = {
     messages, urls, sockets,
-    load: (live) => self.onmessage({ data: { cmd: 'load', path, token: 'tok', live: !!live } }),
+    load: (live, start) => self.onmessage({ data: { cmd: 'load', path, token: 'tok', live: !!live, start } }),
     loaded: () => waitFor((m) => m.type === 'loaded' || m.type === 'error'),
     stop: () => self.onmessage({ data: { cmd: 'stop' } }),
     ask: (t) => {
@@ -230,6 +231,18 @@ test('a later TimingData patch reorders standings', async () => {
   });
   assert.deepEqual(w.ask(at(10)).standings.map((r) => r.tla), ['VER', 'HAM', 'LEC']);
   assert.deepEqual(w.ask(at(20)).standings.map((r) => r.tla), ['LEC', 'HAM', 'VER']);
+});
+
+test('sector times come with their colours: overall fastest, personal best, or neither', async () => {
+  const w = await loadedWorker({
+    ...base(),
+    TimingData: stream(
+      // The full array at first, then patches by index as each sector is done.
+      line(10, { Lines: { 1: { Position: '1', Sectors: [{ Value: '21.034', PersonalFastest: true }, { Value: '33.415' }, { Value: '' }] } } }),
+      line(20, { Lines: { 1: { Sectors: { 2: { Value: '25.900', OverallFastest: true, PersonalFastest: true } } } } }))
+  });
+  assert.deepEqual(Array.from(row(w.ask(at(10)), '1').sectors), ['p21.034', '33.415', '']);
+  assert.deepEqual(Array.from(row(w.ask(at(20)), '1').sectors), ['p21.034', '33.415', 'o25.900']);
 });
 
 test('drivers without a Position are left out of standings', async () => {
@@ -475,6 +488,60 @@ test('a race has not started until its first Started status, though LapCount alr
   assert.deepEqual([w.ask(at(500)).beforeStart, w.ask(at(500)).lap], [false, 57]);
 });
 
+test('an archive running past a day: the race after the pause, not the rehearsal before it (Mexico 2026)', async () => {
+  // F1 left a 20-minute Saturday rehearsal in the race's folder and appended the race a day later: its lines are
+  // "1.01:46:26.209", and its SessionData repeats the whole status history, the rehearsal's 'Started' included.
+  const DAY = 86400;
+  const w = await loadedWorker({
+    Heartbeat: stream(line(600, { Utc: iso(600) }), line(1200, { Utc: iso(1200) }),
+      ...[0, 1, 2, 3, 4].map((k) => line(DAY + 6000 + k * 600, { Utc: iso(DAY + 6000 + k * 600) }))),
+    SessionInfo: stream(line(0, { Type: 'Race', Name: 'Race' })),
+    DriverList: stream(line(600, { 1: { Tla: 'VER' }, 16: { Tla: 'LEC' } }), line(DAY + 6000, { 1: { Tla: 'VER' }, 16: { Tla: 'LEC' } })),
+    LapCount: stream(line(DAY + 6000, { CurrentLap: 1, TotalLaps: 71 }), line(DAY + 7000, { CurrentLap: 2 })),
+    SessionData: stream(
+      line(610, { StatusSeries: { 1: { Utc: iso(610), SessionStatus: 'Started' } } }),
+      line(DAY + 6000, { StatusSeries: [{ Utc: iso(610), SessionStatus: 'Started' }, { Utc: iso(DAY + 6000), SessionStatus: 'Inactive' }] }),
+      line(DAY + 6500, { StatusSeries: { 2: { Utc: iso(DAY + 6500), SessionStatus: 'Started' } } })),
+    TimingData: stream(line(620, { Lines: {} }),
+      line(DAY + 6100, { Lines: { 16: { Position: '2' }, 1: { Position: '1' } } }),
+      line(DAY + 7000, { Lines: { 16: { Position: '1' }, 1: { Position: '2' } } }))
+  });
+  const before = w.ask(at(DAY + 6200)), after = w.ask(at(DAY + 7100));
+  assert.equal(before.beforeStart, true, 'lights out is the race\'s Started, not the rehearsal\'s');
+  assert.deepEqual(before.standings.map((r) => r.tla), ['VER', 'LEC']);
+  assert.equal(w.ask(at(DAY + 6600)).beforeStart, false);
+  assert.deepEqual([after.lap, after.standings.map((r) => r.tla)], [2, ['LEC', 'VER']]);
+  assert.equal(w.ask(at(900)).standings, undefined, 'nothing from the rehearsal');
+});
+
+test('a long pause before a last metadata line keeps the session (only a new broadcast after a pause replaces it)', async () => {
+  const w = await loadedWorker({
+    ...base(),
+    TimingData: stream(line(10, { Lines: { 1: { Position: '1' }, 44: { Position: '2' } } })),
+    SessionInfo: stream(line(0, { Type: 'Race', Name: 'Test Grand Prix' }), line(5 * 3600, { ArchiveStatus: { Status: 'Complete' } }))
+  });
+  assert.deepEqual(w.ask(at(20)).standings.map((r) => r.tla), ['VER', 'HAM']);
+});
+
+test('without heartbeats the session clock gives the UTC base', async () => {
+  const w = await loadedWorker({
+    SessionInfo: stream(line(0, { Type: 'Race', Name: 'Test Grand Prix' })),
+    DriverList: base().DriverList,
+    ExtrapolatedClock: stream(line(5, { Utc: new Date(at(5) - 2000).toISOString(), Remaining: '01:00:00', Extrapolating: false })),
+    TimingData: stream(line(10, { Lines: { 1: { Position: '1' } } }))
+  });
+  assert.deepEqual(w.ask(at(10)).standings.map((r) => r.tla), ['VER']);
+  assert.equal(w.ask(at(9)).standings, undefined);
+});
+
+test('the last line of a finished archive counts even without a line break after it', async () => {
+  const w = await loadedWorker({
+    ...base(),
+    TimingData: line(10, { Lines: { 1: { Position: '1' }, 44: { Position: '2' } } })   // no '\n' at the end
+  });
+  assert.deepEqual(w.ask(at(10)).standings.map((r) => r.tla), ['VER', 'HAM']);
+});
+
 test('without status data a race counts as started', async () => {
   const w = await loadedWorker({
     ...base(),
@@ -668,6 +735,48 @@ test('live before the archive exists: joins the real-time feed and answers from 
   assert.equal(loaded.type, 'loaded');
   assert.equal(loaded.info.live, true);
   assert.equal(w.ask(at(590)).lap, 4);
+});
+
+test('live with a stale archive in the folder (a rehearsal the day before): the real-time feed alone', async () => {
+  // Mexico 2026 race: the folder held Saturday's test data, lap 3 of 56, while the race ran at lap 46.
+  const w = harness({ ...base(), LapCount: stream(line(20, { CurrentLap: 3, TotalLaps: 56 })) },
+    null, PATH, null, () => at(30 * 3600));
+  w.load(true);
+  for (let i = 0; i < 50 && !w.sockets.length; i++) await new Promise(setImmediate);
+  const ws = w.sockets[0];
+  assert.ok(ws, 'no real-time feed');
+  ws.onopen();
+  ws.onmessage({ data: '{}' + RS });
+  ws.onmessage({ data: frame({ type: 3, invocationId: '1', result: { SessionInfo: { Path: PATH, Type: 'Race', Name: 'Test GP' },
+    LapCount: { CurrentLap: 46, TotalLaps: 71 } } }) });
+  const loaded = await w.loaded();
+  assert.equal(loaded.type, 'loaded');
+  assert.equal(loaded.info.live, true);
+  assert.equal(w.messages.filter((m) => m.type === 'loaded').length, 1);
+  assert.deepEqual([w.ask(at(30 * 3600)).lap, w.ask(at(30 * 3600)).totalLaps], [46, 71]);
+  // The picture is ~30 s behind the feed: until it gets to the join, the first live state, not the rehearsal.
+  assert.equal(w.ask(at(30 * 3600) - 30000).lap, 46);
+  // Rewound further back than that: nothing rather than the wrong lap.
+  assert.equal(w.ask(at(30 * 3600) - 180000).lap, undefined);
+});
+
+test('live with the session start: a rehearsal archive that ends before it is dropped', async () => {
+  const w = harness({ ...base(), LapCount: stream(line(20, { CurrentLap: 3, TotalLaps: 56 })) },
+    null, PATH, null, () => at(30 * 3600));
+  w.load(true, at(29 * 3600));
+  for (let i = 0; i < 50 && !w.sockets.length; i++) await new Promise(setImmediate);
+  assert.ok(w.sockets.length, 'no real-time feed');
+  assert.equal(w.messages.filter((m) => m.type === 'loaded').length, 0, 'the rehearsal was loaded');
+});
+
+test('still listed as live after the session: its archive, written after the start, stays', async () => {
+  // Session from 0 s to 2 h; watched 3 h after the start, the archive ends an hour ago.
+  const w = harness({ ...base(), Heartbeat: stream(line(5, { Utc: iso(5) }), line(7200, { Utc: iso(7200) })),
+    LapCount: stream(line(20, { CurrentLap: 1, TotalLaps: 71 }), line(7000, { CurrentLap: 71 })) },
+  null, PATH, null, () => at(3 * 3600));
+  w.load(true, at(0));
+  assert.equal((await w.loaded()).info.live, undefined);
+  assert.equal(w.ask(at(7100)).lap, 71);
 });
 
 test('heartbeats off by weeks stay when the session clock is off as well', async () => {

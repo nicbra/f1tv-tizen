@@ -1,7 +1,8 @@
 /*
  * Subtitles for native HDR replays. Above 1080p, AVPlay's own TTML renderer loops over one segment's
  * lines (hundreds of changes a second) and never moves on (QE55Q77A), so the app reads F1's stpp
- * subtitle segments itself and shows their cues at the player's position.
+ * subtitle segments itself and shows their cues at the player's position. Clear HDR multiviews take
+ * theirs from the HLS master instead: WebVTT segments (tracks with `vtt` and a segment `list`).
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
@@ -46,16 +47,50 @@
     return out;
   }
 
+  function utf8(buffer) {
+    var bytes = new Uint8Array(buffer), text;
+    if (typeof TextDecoder === 'function') return new TextDecoder('utf-8').decode(bytes);
+    text = '';
+    for (var i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i]);
+    try { text = decodeURIComponent(escape(text)); } catch (e) { /* keep Latin-1 */ }
+    return text;
+  }
+
   /** The TTML documents in an stpp segment (the XML sits in mdat, between binary boxes). */
   function documents(buffer) {
-    var bytes = new Uint8Array(buffer), text;
-    if (typeof TextDecoder === 'function') text = new TextDecoder('utf-8').decode(bytes);
-    else {
-      text = '';
-      for (var i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i]);
-      try { text = decodeURIComponent(escape(text)); } catch (e) { /* keep Latin-1 */ }
+    return utf8(buffer).match(/<tt\b[\s\S]*?<\/tt>/g) || [];
+  }
+
+  /** A WebVTT time ("01:07:13.804" or "07:13.804") in seconds, or null. */
+  function vttTime(t) {
+    var m = /^(?:(\d+):)?(\d{2}):(\d{2}\.\d{3})$/.exec(t || '');
+    return m ? (+m[1] || 0) * 3600 + +m[2] * 60 + +m[3] : null;
+  }
+
+  /**
+   * The cues of a WebVTT segment, on the media timeline: [{ begin, end, text }]. X-TIMESTAMP-MAP maps the cue
+   * times onto it (F1's: LOCAL 0 at MPEGTS 0, so cue times are the stream's own seconds).
+   */
+  function vttCues(text) {
+    var blocks = String(text || '').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split(/\n{2,}/);
+    if (!/^WEBVTT/.test(blocks[0] || '')) return [];
+    var map = /X-TIMESTAMP-MAP=([^\n]*)/.exec(blocks[0]), shift = 0;
+    if (map) {
+      var local = /LOCAL:([\d:.]+)/.exec(map[1]), ts = /MPEGTS:(\d+)/.exec(map[1]);
+      shift = (ts ? +ts[1] / 90000 : 0) - (local ? vttTime(local[1]) || 0 : 0);
     }
-    return text.match(/<tt\b[\s\S]*?<\/tt>/g) || [];
+    var out = [];
+    blocks.slice(1).forEach(function (block) {
+      var lines = block.split('\n'), k = 0;
+      while (k < lines.length && lines[k].indexOf('-->') < 0) k++;
+      var times = /^\s*([\d:.]+)\s+-->\s+([\d:.]+)/.exec(lines[k] || '');
+      if (!times) return;
+      var begin = vttTime(times[1]), end = vttTime(times[2]);
+      var body = decode(lines.slice(k + 1).join('\n').replace(/<[^>]+>/g, ''))
+        .split('\n').map(function (l) { return l.replace(/\s+/g, ' ').trim(); }).filter(Boolean).join('\n');
+      if (begin != null && end > begin && body) out.push({ begin: begin + shift, end: end + shift, text: body });
+    });
+    return out;
   }
 
   /**
@@ -63,6 +98,16 @@
    * or { duration, offset }: { number, time (template ticks), start, end (seconds) }, or null.
    */
   function segmentAt(track, m) {
+    if (track.list) {
+      // A segment list ({ url, start, end } in seconds, in order): numbered from 0.
+      var lo = 0, hi = track.list.length - 1;
+      while (lo <= hi) {
+        var mid = (lo + hi) >> 1, x = track.list[mid];
+        if (m < x.start) hi = mid - 1; else if (m >= x.end) lo = mid + 1;
+        else return { number: mid, time: x.start, start: x.start, end: x.end, url: x.url };
+      }
+      return null;
+    }
     var ticks = m * track.timescale, n = track.startNumber;
     function seg(number, time, d) { return { number: number, time: time, start: time / track.timescale, end: (time + d) / track.timescale }; }
     if (track.runs && track.runs.length) {
@@ -86,6 +131,7 @@
 
   /** A segment's address from the track's SegmentTemplate media pattern. */
   function url(track, s) {
+    if (s.url) return s.url;
     var values = { RepresentationID: track.id, Number: s.number, Time: s.time, Bandwidth: track.bandwidth };
     var path = track.media.replace(/\$(RepresentationID|Number|Time|Bandwidth)(?:%0(\d+)d)?\$/g, function (all, key, width) {
       var v = String(values[key]);
@@ -117,7 +163,8 @@
         return r.arrayBuffer();
       }).then(function (buffer) {
         if (g !== gen || loaded[s.number] !== mine) return;
-        mine.cues = documents(buffer).reduce(function (all, xml) { return all.concat(cues(xml)); }, []).map(function (c) {
+        var found = track.vtt ? vttCues(utf8(buffer)) : documents(buffer).reduce(function (all, xml) { return all.concat(cues(xml)); }, []);
+        mine.cues = found.map(function (c) {
           // Some packagers time cues from the segment's start instead of on the track's timeline.
           return c.begin < s.start - 3600 ? { begin: c.begin + s.start, end: c.end + s.start, text: c.text } : c;
         });
@@ -137,7 +184,7 @@
       if (!track) return;
       var p = opts.position();
       if (p == null || !isFinite(p)) return;
-      var m = p + track.offset / track.timescale, s = segmentAt(track, m);
+      var m = p + (track.offset || 0) / (track.timescale || 1), s = segmentAt(track, m);
       if (!s) return show('', 0);
       load(s);
       var next = segmentAt(track, s.end + 0.001);
@@ -180,5 +227,5 @@
     return { select: select, stop: stop, langs: function () { return tracks.map(function (t) { return t.lang; }); } };
   }
 
-  return { seconds: seconds, cues: cues, documents: documents, segmentAt: segmentAt, url: url, reader: reader };
+  return { seconds: seconds, cues: cues, documents: documents, vttCues: vttCues, segmentAt: segmentAt, url: url, reader: reader };
 });

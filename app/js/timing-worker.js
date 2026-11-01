@@ -2,7 +2,7 @@
  * Replays timing data on a UTC timeline. Uses the archive when available; otherwise records
  * SignalR updates from connection time so delayed viewers see timing that matches the video.
  *
- * Messages in:  { cmd: 'load', path, token, live }  |  { cmd: 'query', id, t }  |  { cmd: 'stop' }
+ * Messages in:  { cmd: 'load', path, token, live, start }  |  { cmd: 'query', id, t }  |  { cmd: 'stop' }
  * Messages out: { type: 'loaded', info } | { type: 'error', message } | { type: 'state', id, state }
  */
 'use strict';
@@ -21,6 +21,7 @@ function emptyJob(path, token) {
     base: null,                            // UTC ms of offset 0
     info: {},                              // SessionInfo
     lap: [], clock: [], part: [], track: [], sessionPart: 0,   // sessionPart: the qualifying part (1-3) TimingData is on
+    from: null,                            // UTC ms the session's data starts, when the archive holds an earlier one too
     hasStatus: false, startedAt: null,     // startedAt: UTC ms of the first SessionStatus 'Started' (a race's lights out)
     clockStartedAt: null,                  // UTC ms the session clock first ran: lights out where there is no status (2018-2019)
     drivers: {}, timing: {}, stints: {},
@@ -28,9 +29,18 @@ function emptyJob(path, token) {
   };
 }
 
+/**
+ * A line's offset from the archive's start, in ms. F1 writes it as a .NET TimeSpan: "01:46:26.209", and from a day
+ * in "1.01:46:26.209" (Mexico 2026: a Saturday rehearsal in the race's folder, the race appended a day later).
+ */
 function offsetMs(ts) {
-  var m = /^(\d{2}):(\d{2}):(\d{2})\.(\d{3})/.exec(ts);
-  return m ? ((+m[1] * 60 + +m[2]) * 60 + +m[3]) * 1000 + +m[4] : null;
+  var m = /^(?:(\d+)\.)?(\d{2}):(\d{2}):(\d{2})\.(\d{3})/.exec(ts);
+  return m ? ((((+m[1] || 0) * 24 + +m[2]) * 60 + +m[3]) * 60 + +m[4]) * 1000 + +m[5] : null;
+}
+
+/** A line's JSON, after its offset (which is 12 characters, or more with days). */
+function lineData(line) {
+  return JSON.parse(line.slice(line.indexOf('{')));
 }
 
 /** Deep-merges a timing patch. F1 sends array updates as objects keyed by index. */
@@ -80,6 +90,7 @@ function apply(feed, t, d) {
         if (!s) return;
         j.hasStatus = true;
         var u = Date.parse(s.Utc) || t;
+        if (j.from != null && u < j.from) return;
         if (s.SessionStatus === 'Started' && (j.startedAt == null || u < j.startedAt)) j.startedAt = u;
       });
       break;
@@ -109,6 +120,19 @@ function latestPart(list, part, key) {
     if (v) return { value: v, part: p };
   }
   return null;
+}
+
+/**
+ * The three sector times as F1's timing shows them: 'o' (overall fastest, purple), 'p' (personal best, green)
+ * or '' before the time, e.g. ['p21.034', '33.415', '']. TimingData sends them as an array, then patches by index.
+ */
+function sectorsOf(sectors) {
+  var out = [];
+  for (var i = 0; i < 3; i++) {
+    var s = sectors && (sectors[i] || sectors[String(i)]), v = s && val(s);
+    out.push(v ? (s.OverallFastest ? 'o' : s.PersonalFastest ? 'p' : '') + v : '');
+  }
+  return out;
 }
 
 function snapshot(t) {
@@ -143,7 +167,7 @@ function snapshot(t) {
     }
     rows.push([num, +l.Position, gap || '', interval || '', best || '', val(l.LastLapTime) || '', l.NumberOfLaps || 0,
       !!(l.InPit || l.PitOut), !!(l.Retired || l.Stopped), !!l.KnockedOut, compound,
-      stops, age, fresh, +app.GridPos || null, old]);
+      stops, age, fresh, +app.GridPos || null, old, sectorsOf(l.Sectors)]);
   });
   rows.sort(function (a, b) { return a[1] - b[1]; });
   j.snaps.push([t, rows]);
@@ -166,14 +190,15 @@ function fetchFeed(feed) {
   }).then(function (text) {
     if (!text || job !== j) return;
     var lines = text.replace(/^\uFEFF/, '').split('\n');
-    lines.pop();   // empty, or a line still being written
+    // The last piece is empty, a line still being written (its JSON doesn't parse, so it is skipped), or a
+    // finished archive's last line without a line break.
     lines.forEach(function (l) { handleLine(feed, l.replace(/\r$/, '')); });
   });
 }
 
 /** UTC ms of offset 0 by a line's Utc field, or NaN. */
 function lineBase(l) {
-  try { return Date.parse(JSON.parse(l[2].slice(12)).Utc) - l[0]; } catch (e) { return NaN; }
+  try { return Date.parse(lineData(l[2]).Utc) - l[0]; } catch (e) { return NaN; }
 }
 
 function median(a) {
@@ -184,6 +209,38 @@ function median(a) {
 // The session clock's Utc gives a base this many ms before the heartbeats' (2.06-2.09 s from 2019;
 // in 2018 0.1 s, but the 2018 videos line up with clock + 2 s too).
 var CLOCK_LEAD = 2000;
+
+/**
+ * True if a live session's archive is not this session's: F1 left a rehearsal's data in the race's folder
+ * (Mexico 2026: Saturday morning, lap 3 of 56, status Ends) and wrote nothing more during the race. Such
+ * an archive ends before the session starts. Without a start time: it ends more than 15 min ago. An
+ * archive written after the session (watched while F1 still lists it as live) ends after the start.
+ */
+function staleForLive(j, start) {
+  return start ? j.end < start : Date.now() - j.end > 15 * 60000;
+}
+
+// Hours without a line from any feed after which the archive holds another broadcast (a session runs on without
+// such a pause: red flags still have heartbeats).
+var ARCHIVE_GAP_MS = 3 * 3600000;
+
+/**
+ * The lines (sorted by offset) after the archive's last long pause: Mexico 2026's race folder starts with a Saturday
+ * rehearsal (21 min, no positions), then the race a day later. Its first 'Started' would be lights out and its
+ * status the race's before the start. The session's name and the drivers are kept from before (F1 sends them
+ * again after the pause, but only SessionInfo's last line comes at the very end).
+ */
+function sinceLastGap(lines) {
+  var cut = -1, beats = false;
+  // The last pause that another broadcast (heartbeats) follows, not one before a late metadata line.
+  for (var i = lines.length - 1; i > 0 && cut < 0; i--) {
+    if (lines[i][1] === 'Heartbeat') beats = true;
+    if (beats && lines[i][0] - lines[i - 1][0] > ARCHIVE_GAP_MS) cut = i;
+  }
+  if (cut < 0) return { lines: lines, from: null };
+  return { lines: lines.filter(function (l, k) { return k >= cut || l[1] === 'SessionInfo' || l[1] === 'DriverList'; }),
+    from: lines[cut][0] };
+}
 
 /** True if a base lies within two days of the session's date in the archive path (".../2018-07-22_Race/"). */
 function plausible(path, base) {
@@ -202,20 +259,26 @@ function replayCollected() {
   var j = job, lines = j.collect, beats = [], clock = [];
   j.collect = null;
   lines.sort(function (a, b) { return a[0] - b[0]; });
+  var kept = sinceLastGap(lines);
+  lines = kept.lines;
   lines.forEach(function (l) {
     if (l[1] !== 'Heartbeat' && l[1] !== 'ExtrapolatedClock') return;
     var b = lineBase(l);
     if (!isNaN(b)) (l[1] === 'Heartbeat' ? beats : clock).push(b);
   });
-  if (!beats.length) throw new Error('No timing data for this session yet');
-  j.base = median(beats);
   var fromClock = clock.length ? median(clock) + CLOCK_LEAD : null;
+  // No heartbeats (missing feed): the session clock alone gives the base.
+  if (!beats.length && fromClock == null) throw new Error('No timing data for this session yet');
+  j.base = beats.length ? median(beats) : fromClock;
   if (!plausible(j.path, j.base) && fromClock != null && plausible(j.path, fromClock)) j.base = fromClock;
+  // SessionData after the pause repeats the whole status history, the earlier broadcast's 'Started' included.
+  if (kept.from != null) j.from = j.base + kept.from;
   lines.forEach(function (l) {
     var data;
-    try { data = JSON.parse(l[2].slice(12)); } catch (e) { return; }
+    try { data = lineData(l[2]); } catch (e) { return; }
     apply(l[1], j.base + l[0], data);
   });
+  j.end = j.base + lines[lines.length - 1][0];
 }
 
 function loadAll() {
@@ -240,9 +303,14 @@ function at(arr, t) {
   return ans;
 }
 
+// Live without an archive, data starts when the feed joins, while the picture is ~30 s behind: until the
+// picture gets there (and briefly after a rewind) show the first live state instead of nothing.
+var LIVE_GAP_MS = 120000;
+
 function query(t) {
   var j = job;
   if (!j || j.base == null) return null;
+  if (j.liveFrom != null && t < j.liveFrom && j.liveFrom - t <= LIVE_GAP_MS) t = j.liveFrom;
   var out = { type: j.info.Type || '', name: j.info.Name || '' };
   var li = at(j.lap, t);
   if (li >= 0) { out.lap = j.lap[li][1]; out.totalLaps = j.lap[li][2]; }
@@ -262,7 +330,7 @@ function query(t) {
       var d = j.drivers[r[0]] || {};
       return { num: r[0], pos: r[1], tla: d.Tla || r[0], colour: d.TeamColour ? '#' + d.TeamColour : '#77777d',
         gap: r[2], interval: r[3], best: r[4], last: r[5], laps: r[6], pit: r[7], out: r[8], knockedOut: r[9], tyre: r[10],
-        stops: r[11], tyreAge: r[12], tyreNew: r[13], grid: r[14], old: r[15] };
+        stops: r[11], tyreAge: r[12], tyreNew: r[13], grid: r[14], old: r[15], sectors: r[16] };
     });
   }
   out.started = j.snaps.length ? t >= j.snaps[0][0] : false;
@@ -279,6 +347,7 @@ function start(m) {
   var j = job;
   loadAll().then(function () {
     if (job !== j) return;
+    if (m.live && staleForLive(j, m.start)) return startLive(m);
     self.postMessage({ type: 'loaded', info: { type: j.info.Type, name: j.info.Name, drivers: Object.keys(j.drivers).length } });
     // Live, with the archive already written as it goes: what comes after it arrives on the real-time feed.
     if (m.live) { j.afterArchive = true; connect(j); }
@@ -354,6 +423,7 @@ function connect(j) {
             var t = Date.now();
             FEEDS.forEach(function (f) { if (msg.result[f]) apply(f, t, msg.result[f]); });
             snapshot(t);
+            if (!j.afterArchive && j.liveFrom == null) j.liveFrom = t;
             if (!announced) {
               announced = true;
               self.postMessage({ type: 'loaded', info: { type: j.info.Type, name: j.info.Name, live: true } });
