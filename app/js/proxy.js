@@ -77,5 +77,20 @@ var StreamProxy = (function () {
     });
   }
 
-  return { ensure: ensure, manifest: manifest, hdrManifest: hdrManifest, hdrLive: hdrLive };
+  /**
+   * Multiview (experiment): the feeds' Premium offers arranged in a layout by the helper (HdrStream.grid).
+   * `at`: the start position in seconds, so the helper reads that segment first. Resolves { url, subtitles }.
+   */
+  function gridManifest(streams, layout, langs, at) {
+    var id = 'mv' + Date.now().toString(36) + '-' + (++vodSequence);
+    return ensure().then(function () { return HdrStream.grid(streams, layout, { id: id, langs: langs, at: at }); }).then(function (built) {
+      var target = BASE + '/vod/' + id + '.mpd';
+      return fetch(target, { method: 'POST', body: built.mpd }).then(function (r) {
+        if (!r.ok) throw new Error('Could not prepare multiview');
+        return { url: target, subtitles: built.subtitles };
+      });
+    });
+  }
+
+  return { ensure: ensure, manifest: manifest, hdrManifest: hdrManifest, hdrLive: hdrLive, gridManifest: gridManifest };
 })();

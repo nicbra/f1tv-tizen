@@ -66,8 +66,8 @@ var HdrStream = (function () {
     var m = /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?$/.exec(d || '');
     return m ? +(m[1] || 0) * 86400 + +(m[2] || 0) * 3600 + +(m[3] || 0) * 60 + +(m[4] || 0) : 0;
   }
-  /** fetch() for one preparation, all of it aborted after 12 s. */
-  function fetcher() {
+  /** fetch() for one preparation, all of it aborted after 12 s (or `ms`). */
+  function fetcher(ms) {
     var controller = typeof AbortController === 'function' ? new AbortController() : null;
     function get(url, bytes, range) {
       return fetch(url, { signal: controller ? controller.signal : undefined, headers: range ? { Range: 'bytes=0-65535' } : {} }).then(function (r) {
@@ -78,7 +78,7 @@ var HdrStream = (function () {
     }
     function deadline(work) {
       return new Promise(function (resolve, reject) {
-        var timer = setTimeout(function () { if (controller) controller.abort(); reject(new Error('HDR preparation timed out')); }, 12000);
+        var timer = setTimeout(function () { if (controller) controller.abort(); reject(new Error('HDR preparation timed out')); }, ms || 12000);
         work.then(function (value) { clearTimeout(timer); resolve(value); }, function (e) { clearTimeout(timer); if (controller) controller.abort(); reject(e); });
       });
     }
@@ -245,5 +245,72 @@ var HdrStream = (function () {
       });
     }));
   }
-  return { build: build, live: live };
+  /** Multiview layouts (service/stitch-hevc.js LAYOUTS): the height of each feed, big ones first. */
+  var LAYOUT_FEEDS = { grid2x2: [540, 540, 540, 540], grid2x2hd: [1080, 1080, 1080, 1080], pip: [1080, 540],
+    side2: [1080, 540, 540], side5: [1080, 540, 540, 540, 540, 540], side3: [1620, 540, 540, 540], pip3: [1620, 540], pip4: [2160, 540] };
+
+  /**
+   * Multiview (experiment): the feeds' HEVC video arranged in a layout by the stream helper
+   * (service/stitch-hevc.js), with the first feed's commentary. streams: the feeds' Premium offers
+   * (hdrEncrypted), in the layout's feed order. Resolves { mpd, subtitles, width, height }.
+   */
+  function grid(streams, layout, opts) {
+    opts = opts || {};
+    var heights = LAYOUT_FEEDS[layout];
+    if (!heights || heights.length !== streams.length) return Promise.reject(new Error('HDR: layout ' + layout + ' needs ' + (heights ? heights.length : '?') + ' feeds'));
+    var io = fetcher(20000), get = io.get, range = opts.range || 'HLG', id = opts.id;
+    var first = streams[0];
+    return io.deadline(get(first.widevineManifestUrl).then(function (dash) {
+      var source = official(dash.body, dash.url, opts.langs || {});
+      return Promise.all(streams.map(function (stream, n) {
+        var height = heights[n];
+        return get(stream.url).then(function (master) {
+          var lines = master.body.split(/\r?\n/), uri = null, a = null;
+          lines.forEach(function (line, i) {
+            if (uri || !/^#EXT-X-STREAM-INF:/.test(line)) return;
+            var x = attrs(line.slice(18)), size = /^(\d+)x(\d+)$/.exec(x.RESOLUTION || '');
+            if (size && +size[2] === height && x['VIDEO-RANGE'] === range && /(hev1|hvc1)\./.test(x.CODECS || '')) { uri = (lines[i + 1] || '').trim(); a = x; }
+          });
+          if (!uri) return fail('no ' + height + 'p ' + range + ' HEVC variant');
+          return get(new URL(uri, master.url).toString()).then(function (response) {
+            var parsed = CmafDash.playlist(response.body);
+            var urls = parsed.segments.map(function (s) { return new URL(s.uri, response.url).toString(); });
+            return { init: new URL(parsed.init, response.url).toString(), urls: urls, durations: parsed.segments.map(function (s) { return s.duration; }),
+              keys: parsed.keys, bandwidth: +a.BANDWIDTH || 0, codec: (a.CODECS || '').split(',').filter(function (c) { return /^(hev1|hvc1)\./.test(c); })[0] };
+          });
+        });
+      })).then(function (feeds) {
+        var count = feeds[0].urls.length;
+        feeds.forEach(function (f) { if (f.urls.length !== count) fail('feeds differ in length'); });
+        return Promise.all([get(feeds[0].init, true), get(feeds[0].urls[0], true, true)]).then(function (data) {
+          var timing = CmafDash.timing(data[0], data[1]), protection = CmafDash.encryption(data[0]);
+          if (!protection || protection.scheme !== 'cbcs') return fail('unsupported media encryption');
+          feeds.forEach(function (f) { checkKeys(f.keys, protection.kid); });
+          if (Math.abs(timing.baseTime / timing.timescale - source.epoch) > 0.1) return fail('audio/video clocks differ');
+          var probe = 0, t = 0;
+          while (opts.at > 0 && probe < feeds[0].durations.length - 1 && t + feeds[0].durations[probe] <= opts.at) t += feeds[0].durations[probe++];
+          var body = { kind: 'hevc', layout: layout, probe: probe, ua: navigator.userAgent, feeds: feeds.map(function (f) {
+            var t = CmafDash.template(f.urls);
+            return t ? { init: f.init, media: t.media, startNumber: t.startNumber, count: f.urls.length } : { init: f.init, urls: f.urls };
+          }) };
+          return fetch(LOCAL + '/stitch/' + id, { method: 'POST', body: JSON.stringify(body) }).then(function (r) {
+            return r.text().then(function (text) {
+              if (!r.ok) return fail('grid helper: ' + text);
+              var info = JSON.parse(text);
+              var track = { type: 'video', id: 'grid', hdr: range === 'HLG', width: info.width, height: info.height, codecs: info.codecs,
+                bandwidth: feeds.reduce(function (n, f) { return n + f.bandwidth; }, 0), timing: timing,
+                init: LOCAL + '/stitch/' + id + '/init.mp4',
+                segments: feeds[0].durations.map(function (d, n) { return { url: LOCAL + '/stitch/' + id + '/' + n + '.m4s', duration: d }; }),
+                protection: { kid: protection.kid, pssh: psshFor(source, protection.kid) } };
+              var mpd = CmafDash.manifest([track]);
+              return { mpd: mpd.replace('<MPD ', '<MPD' + source.namespaces + ' ').replace('</Period>', source.others + '</Period>'),
+                subtitles: source.subtitles, width: info.width, height: info.height };
+            });
+          });
+        });
+      });
+    }));
+  }
+
+  return { build: build, live: live, grid: grid, layouts: LAYOUT_FEEDS };
 })();

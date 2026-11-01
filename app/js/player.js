@@ -412,6 +412,14 @@ var Player = (function () {
       av = webapis.avplay;
       startAt = startTime;
       if (captions) { captions.stop(); captions = null; }
+      if (s.grid) {
+        var gridPrefs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
+        return StreamProxy.gridManifest(s.grid.streams, s.grid.layout, gridPrefs, startTime).then(function (prepared) {
+          if (stream !== s) throw new Error('cancelled');
+          captions = subtitleReader(prepared.subtitles);
+          return open(s, prepared.url);
+        });
+      }
       if (s.hdrEncrypted) {
         var prefs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
         var prepare = s.info && s.info.dynamic ? StreamProxy.hdrLive(s, s.startDelay, prefs) : StreamProxy.hdrManifest(s, prefs);
