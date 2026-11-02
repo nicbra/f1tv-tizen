@@ -21,6 +21,7 @@ function emptyJob(path, token) {
     base: null,                            // UTC ms of offset 0
     info: {},                              // SessionInfo
     lap: [], clock: [], part: [], track: [], sessionPart: 0,   // sessionPart: the qualifying part (1-3) TimingData is on
+    from: null,                            // UTC ms the session's data starts, when the archive holds an earlier one too
     hasStatus: false, startedAt: null,     // startedAt: UTC ms of the first SessionStatus 'Started' (a race's lights out)
     clockStartedAt: null,                  // UTC ms the session clock first ran: lights out where there is no status (2018-2019)
     drivers: {}, timing: {}, stints: {},
@@ -28,9 +29,18 @@ function emptyJob(path, token) {
   };
 }
 
+/**
+ * A line's offset from the archive's start, in ms. F1 writes it as a .NET TimeSpan: "01:46:26.209", and from a day
+ * in "1.01:46:26.209" (Mexico 2026: a Saturday rehearsal in the race's folder, the race appended a day later).
+ */
 function offsetMs(ts) {
-  var m = /^(\d{2}):(\d{2}):(\d{2})\.(\d{3})/.exec(ts);
-  return m ? ((+m[1] * 60 + +m[2]) * 60 + +m[3]) * 1000 + +m[4] : null;
+  var m = /^(?:(\d+)\.)?(\d{2}):(\d{2}):(\d{2})\.(\d{3})/.exec(ts);
+  return m ? ((((+m[1] || 0) * 24 + +m[2]) * 60 + +m[3]) * 60 + +m[4]) * 1000 + +m[5] : null;
+}
+
+/** A line's JSON, after its offset (which is 12 characters, or more with days). */
+function lineData(line) {
+  return JSON.parse(line.slice(line.indexOf('{')));
 }
 
 /** Deep-merges a timing patch. F1 sends array updates as objects keyed by index. */
@@ -80,6 +90,7 @@ function apply(feed, t, d) {
         if (!s) return;
         j.hasStatus = true;
         var u = Date.parse(s.Utc) || t;
+        if (j.from != null && u < j.from) return;
         if (s.SessionStatus === 'Started' && (j.startedAt == null || u < j.startedAt)) j.startedAt = u;
       });
       break;
@@ -179,14 +190,15 @@ function fetchFeed(feed) {
   }).then(function (text) {
     if (!text || job !== j) return;
     var lines = text.replace(/^\uFEFF/, '').split('\n');
-    lines.pop();   // empty, or a line still being written
+    // The last piece is empty, a line still being written (its JSON doesn't parse, so it is skipped), or a
+    // finished archive's last line without a line break.
     lines.forEach(function (l) { handleLine(feed, l.replace(/\r$/, '')); });
   });
 }
 
 /** UTC ms of offset 0 by a line's Utc field, or NaN. */
 function lineBase(l) {
-  try { return Date.parse(JSON.parse(l[2].slice(12)).Utc) - l[0]; } catch (e) { return NaN; }
+  try { return Date.parse(lineData(l[2]).Utc) - l[0]; } catch (e) { return NaN; }
 }
 
 function median(a) {
@@ -208,6 +220,28 @@ function staleForLive(j, start) {
   return start ? j.end < start : Date.now() - j.end > 15 * 60000;
 }
 
+// Hours without a line from any feed after which the archive holds another broadcast (a session runs on without
+// such a pause: red flags still have heartbeats).
+var ARCHIVE_GAP_MS = 3 * 3600000;
+
+/**
+ * The lines (sorted by offset) after the archive's last long pause: Mexico 2026's race folder starts with a Saturday
+ * rehearsal (21 min, no positions), then the race a day later. Its first 'Started' would be lights out and its
+ * status the race's before the start. The session's name and the drivers are kept from before (F1 sends them
+ * again after the pause, but only SessionInfo's last line comes at the very end).
+ */
+function sinceLastGap(lines) {
+  var cut = -1, beats = false;
+  // The last pause that another broadcast (heartbeats) follows, not one before a late metadata line.
+  for (var i = lines.length - 1; i > 0 && cut < 0; i--) {
+    if (lines[i][1] === 'Heartbeat') beats = true;
+    if (beats && lines[i][0] - lines[i - 1][0] > ARCHIVE_GAP_MS) cut = i;
+  }
+  if (cut < 0) return { lines: lines, from: null };
+  return { lines: lines.filter(function (l, k) { return k >= cut || l[1] === 'SessionInfo' || l[1] === 'DriverList'; }),
+    from: lines[cut][0] };
+}
+
 /** True if a base lies within two days of the session's date in the archive path (".../2018-07-22_Race/"). */
 function plausible(path, base) {
   var m = /(\d{4}-\d{2}-\d{2})_[^/]*\/?$/.exec(path || '');
@@ -225,18 +259,23 @@ function replayCollected() {
   var j = job, lines = j.collect, beats = [], clock = [];
   j.collect = null;
   lines.sort(function (a, b) { return a[0] - b[0]; });
+  var kept = sinceLastGap(lines);
+  lines = kept.lines;
   lines.forEach(function (l) {
     if (l[1] !== 'Heartbeat' && l[1] !== 'ExtrapolatedClock') return;
     var b = lineBase(l);
     if (!isNaN(b)) (l[1] === 'Heartbeat' ? beats : clock).push(b);
   });
-  if (!beats.length) throw new Error('No timing data for this session yet');
-  j.base = median(beats);
   var fromClock = clock.length ? median(clock) + CLOCK_LEAD : null;
+  // No heartbeats (missing feed): the session clock alone gives the base.
+  if (!beats.length && fromClock == null) throw new Error('No timing data for this session yet');
+  j.base = beats.length ? median(beats) : fromClock;
   if (!plausible(j.path, j.base) && fromClock != null && plausible(j.path, fromClock)) j.base = fromClock;
+  // SessionData after the pause repeats the whole status history, the earlier broadcast's 'Started' included.
+  if (kept.from != null) j.from = j.base + kept.from;
   lines.forEach(function (l) {
     var data;
-    try { data = JSON.parse(l[2].slice(12)); } catch (e) { return; }
+    try { data = lineData(l[2]); } catch (e) { return; }
     apply(l[1], j.base + l[0], data);
   });
   j.end = j.base + lines[lines.length - 1][0];

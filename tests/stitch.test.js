@@ -276,8 +276,11 @@ test('HEVC: the tiled picture shows each feed, keyframes bit for bit', { skip: !
 
 // ---------- the helper's /stitch endpoints ----------
 
-/** service.js with a fake CDN that serves `routes` (url -> Buffer), recording each request's user agent. */
-function helper(routes) {
+/**
+ * service.js with a fake CDN that serves `routes` (url -> Buffer), recording each request's user agent.
+ * gate(url): a promise to hold that answer until it settles, or null.
+ */
+function helper(routes, gate) {
   const requested = [];
   const lib = {
     get(opts, cb) {
@@ -287,7 +290,7 @@ function helper(routes) {
       res.statusCode = body ? 200 : 404;
       res.headers = {};
       res.resume = () => {};
-      setImmediate(() => { cb(res); res.emit('data', body || Buffer.from('missing')); res.emit('end'); });
+      Promise.resolve(gate && gate(opts.href)).then(() => setImmediate(() => { cb(res); res.emit('data', body || Buffer.from('missing')); res.emit('end'); }));
       return { setTimeout() {}, on() {}, abort() {} };
     }
   };
@@ -344,4 +347,28 @@ test('the helper refuses grids it cannot build, and rearranging one it does not 
   assert.equal((await call(s, 'POST', '/stitch/g3', JSON.stringify({ kind: 'hevc', layout: 'grid2x2', feeds: offCdn }))).status, 400);
   assert.equal((await call(s, 'POST', '/stitch/none/layout', JSON.stringify({ kind: 'hevc', layout: 'grid2x2', feeds: feedsOf([0, 1, 2, 3]) }))).status, 404);
   assert.equal((await call(s, 'GET', '/stitch/none/0.m4s')).status, 404);
+});
+
+test('a segment still being built in the old arrangement does not answer requests made after a rearrangement', async () => {
+  const routes = cdnRoutes();
+  // A second segment per feed (the first one again, renumbered), whose answers wait for `open`.
+  [0, 1, 2, 3].forEach((i) => {
+    const seg = Buffer.from(clip('hevc' + i).seg), f = st.fragment(seg), tfdt = f.get('tfdt');
+    seg.writeUInt32BE(seg.readUInt32BE(tfdt.d + 4) + 16 * 1000, tfdt.d + 4);   // 16 frames later
+    routes[CDN + 'f' + i + '/seg_8.mp4'] = seg;
+  });
+  let open;
+  const held = new Promise((r) => { open = r; });
+  const { s } = helper(routes, (u) => (/seg_8/.test(u) ? held : null));
+  const feeds = (order) => feedsOf(order).map((f) => Object.assign(f, { count: 2 }));
+  assert.equal((await call(s, 'POST', '/stitch/g4', JSON.stringify({ kind: 'hevc', layout: 'grid2x2', feeds: feeds([0, 1, 2, 3]) }))).status, 201);
+  const before = call(s, 'GET', '/stitch/g4/1.m4s');   // built in the first arrangement, held
+  const moved = await call(s, 'POST', '/stitch/g4/layout', JSON.stringify({ kind: 'hevc', layout: 'grid2x2', feeds: feeds([3, 2, 1, 0]) }));
+  assert.equal(moved.status, 200, String(moved.body));
+  const after = call(s, 'GET', '/stitch/g4/1.m4s');
+  open();
+  const [a, b] = await Promise.all([before, after]);
+  assert.equal(a.status, 200);
+  assert.equal(b.status, 200);
+  assert.ok(!a.body.equals(b.body), 'the request after the change gets the new arrangement');
 });

@@ -359,7 +359,8 @@ function hevcRegridPost(res, id, body) {
     // The licence AVPlay has is for the running grid's key.
     if (grid.cfg.enc !== old.cfg.enc) return send(res, 422, toBuf('the new feeds are encrypted differently'));
     grid.init = old.init;
-    grid.pending = old.pending;   // segments already being built finish with the old arrangement
+    // Builds under way finish for whoever asked for them, in the old arrangement; a request from now on gets the
+    // new one (grid.pending starts empty), or the picture would switch back for a segment and the frames not match.
     stitches[id] = grid;
     // Where the new arrangement starts (the probe segment), for the player to go to.
     grid.info.from = grid.cache[0].number;

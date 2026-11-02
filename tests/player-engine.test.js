@@ -315,6 +315,72 @@ test('unloading waits for preparation, then stops and closes the native player',
   assert.ok(order.indexOf('close') > order.indexOf('stop'));
 });
 
+test('a preparation that never answers fails the load in time, and AVPlay is never stopped or closed under it', async () => {
+  const av = fakeAvPlay();
+  const answers = [];
+  // The first preparation hangs (keeps its callbacks); later ones answer at once.
+  av.prepareAsync = (ok, fail) => { av.calls.push(['prepareAsync']); if (answers.length) return setImmediate(ok); answers.push({ ok, fail }); };
+  const timers = [];
+  const P = await player(av, undefined, undefined, { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; }, clearTimeout: () => {} });
+  const first = P.load(Object.assign({}, LIVE), null);
+  for (let k = 0; k < 5; k++) await new Promise(setImmediate);
+  const limit = timers.find((t) => t.ms === 30000);
+  assert.ok(limit, 'a deadline: ' + timers.map((t) => t.ms).join());
+  limit.fn();
+  await assert.rejects(first, (e) => e.code === 'PREPARE_TIMEOUT');
+  // BACK, then the viewer tries again: nothing stops or closes AVPlay under the stuck preparation; it opens over it.
+  await P.unload();
+  await P.load(Object.assign({}, LIVE), null);
+  assert.deepEqual(names(av).filter((n) => n === 'stop' || n === 'close'), []);
+  assert.equal(names(av).filter((n) => n === 'open').length, 2);
+  assert.ok(names(av).includes('play'));
+  // The stuck preparation answers at last: the playing session is not started again, stopped or closed.
+  const plays = names(av).filter((n) => n === 'play').length;
+  answers[0].ok();
+  await new Promise(setImmediate);
+  assert.equal(names(av).filter((n) => n === 'play').length, plays);
+  assert.deepEqual(names(av).filter((n) => n === 'stop' || n === 'close'), []);
+  // With the player working again, leaving stops and closes it as usual.
+  await P.unload();
+  assert.deepEqual(names(av).filter((n) => n === 'stop' || n === 'close'), ['stop', 'close']);
+});
+
+test('a second unload while AVPlay still prepares waits for the first, and the player is closed once', async () => {
+  const av = fakeAvPlay();
+  let answer;
+  av.prepareAsync = (ok) => { av.calls.push(['prepareAsync']); answer = ok; };
+  const P = await player(av);
+  P.load(Object.assign({}, LIVE), null).catch(() => {});
+  for (let k = 0; k < 5; k++) await new Promise(setImmediate);
+  let done = 0;
+  P.unload().then(() => done++);
+  const second = P.unload().then(() => done++);
+  for (let k = 0; k < 5; k++) await new Promise(setImmediate);
+  assert.equal(done, 0, 'neither returns while AVPlay prepares');
+  answer();
+  await second;
+  await new Promise(setImmediate);
+  assert.equal(done, 2);
+  assert.deepEqual(names(av).filter((n) => n === 'stop' || n === 'close'), ['stop', 'close']);
+});
+
+test('a multiview gets 20 s to prepare, other streams 30 s', async () => {
+  for (const [grid, ms] of [[false, 30000], [true, 20000]]) {
+    const av = fakeAvPlay();
+    av.prepareAsync = () => {};
+    const timers = [];
+    const P = await player(av, undefined, undefined, { setTimeout: (fn, t) => { timers.push(t); return 0; }, clearTimeout: () => {} });
+    const s = Object.assign({}, REPLAY);
+    if (grid) {
+      s.grid = { streams: [], layout: 'grid2x2', slots: [0, 1, 2, 3] };
+      P.context.StreamProxy.gridManifest = async () => ({ id: 'g1', url: 'http://127.0.0.1:18765/vod/g1.mpd', subtitles: [] });
+    }
+    P.load(s, null).catch(() => {});
+    for (let k = 0; k < 5; k++) await new Promise(setImmediate);
+    assert.ok(timers.includes(ms), (grid ? 'grid ' : '') + timers.join());
+  }
+});
+
 test('an HDR video frozen on its first frame is loaded once more; one that plays is left alone', async () => {
   for (const [frames, hdr, reloads] of [[0, true, 1], [25, true, 0], [0, false, 0]]) {
     let loads = 0;

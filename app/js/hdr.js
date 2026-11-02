@@ -257,7 +257,8 @@ var HdrStream = (function () {
     var io = fetcher(20000), get = io.get, range = opts.range || 'HLG', id = opts.id;
     // Encrypted HDR takes its commentary and Widevine metadata from the normal offer; clear HDR (some replays)
     // has its own audio in the HLS master.
-    var first = streams[0], encrypted = !!first.hdrEncrypted;
+    // opts.audio: the place of the feed whose commentary and subtitles play.
+    var lead = opts.audio || 0, first = streams[lead], encrypted = !!first.hdrEncrypted;
     var official$ = encrypted ? get(first.widevineManifestUrl).then(function (dash) { return official(dash.body, dash.url, opts.langs || {}); }) : Promise.resolve(null);
     return io.deadline(official$.then(function (source) {
       return Promise.all(streams.map(function (stream, n) {
@@ -295,11 +296,13 @@ var HdrStream = (function () {
             var tpl = CmafDash.template(f.urls);
             return tpl ? { init: f.init, media: tpl.media, startNumber: tpl.startNumber, count: f.urls.length } : { init: f.init, urls: f.urls };
           }) };
-          return Promise.all([encrypted ? [] : audioTracks(io, feeds[0], opts.langs || {}),
+          var base = timing.baseTime / timing.timescale;
+          return Promise.all([encrypted ? [] : audioTracks(io, feeds[lead], opts.langs || {}),
+            encrypted ? source.subtitles : subtitleTracks(io, feeds[lead], base),
             fetch(LOCAL + '/stitch/' + id, { method: 'POST', body: JSON.stringify(body) }).then(function (r) {
               return r.text().then(function (text) { if (!r.ok) return fail('grid helper: ' + text); return JSON.parse(text); });
             })]).then(function (done) {
-            var audio = done[0], info = done[1];
+            var audio = done[0], subtitles = done[1], info = done[2];
             var track = { type: 'video', id: 'grid', hdr: range === 'HLG', width: info.width, height: info.height, codecs: info.codecs,
               bandwidth: feeds.reduce(function (n, f) { return n + f.bandwidth; }, 0), timing: timing,
               init: LOCAL + '/stitch/' + id + '/init.mp4',
@@ -307,7 +310,7 @@ var HdrStream = (function () {
               protection: encrypted ? { kid: protection.kid, pssh: psshFor(source, protection.kid) } : null };
             var mpd = CmafDash.manifest([track].concat(audio));
             if (encrypted) mpd = mpd.replace('<MPD ', '<MPD' + source.namespaces + ' ').replace('</Period>', source.others + '</Period>');
-            return { mpd: mpd, subtitles: encrypted ? source.subtitles : [], width: info.width, height: info.height };
+            return { mpd: mpd, subtitles: subtitles, width: info.width, height: info.height };
           });
         });
       });
@@ -318,6 +321,32 @@ var HdrStream = (function () {
    * Clear HDR: the commentary tracks of the first feed's HLS master (its variant's audio group), as DASH audio
    * tracks, the preferred language first (AVPlay starts on the first).
    */
+  /**
+   * A clear HDR stream's subtitles, from its HLS master: WebVTT segment lists for Ttml.reader, on the video's
+   * timeline (`base`: the first segment's media time, the grid manifest's presentationTimeOffset). F1's cues
+   * are timed from the stream's start (X-TIMESTAMP-MAP LOCAL 0 = MPEGTS 0). None, or a playlist that fails:
+   * no subtitles rather than no multiview.
+   */
+  function subtitleTracks(io, feed, base) {
+    var list = feed.master.split(/\r?\n/).filter(function (l) { return /^#EXT-X-MEDIA:/.test(l); })
+      .map(function (l) { return attrs(l.slice(13)); }).filter(function (a) { return a.TYPE === 'SUBTITLES' && a.URI; });
+    return Promise.all(list.map(function (a) {
+      return io.get(new URL(a.URI, feed.masterUrl).toString()).then(function (response) {
+        var t = base, segments = [], duration = null;
+        response.body.split(/\r?\n/).forEach(function (line) {
+          var inf = /^#EXTINF:([\d.]+)/.exec(line);
+          if (inf) duration = +inf[1];
+          else if (line && line.charAt(0) !== '#' && duration > 0) {
+            segments.push({ url: new URL(line.trim(), response.url).toString(), start: t, end: t + duration });
+            t += duration;
+            duration = null;
+          }
+        });
+        return segments.length ? { lang: a.LANGUAGE || 'und', vtt: true, list: segments, offset: base, timescale: 1 } : null;
+      }, function () { return null; });
+    })).then(function (tracks) { return tracks.filter(Boolean); });
+  }
+
   function audioTracks(io, feed, langs) {
     var lines = feed.master.split(/\r?\n/).filter(function (l) { return /^#EXT-X-MEDIA:/.test(l); }), list = [];
     lines.forEach(function (l) {
@@ -350,7 +379,7 @@ var HdrStream = (function () {
     opts = opts || {};
     var known = typeof MultiviewLayouts !== 'undefined' && MultiviewLayouts.layouts[layout], heights = known && known.feeds;
     if (!heights || heights.length !== streams.length) return Promise.reject(new Error('HDR: layout ' + layout + ' needs ' + (heights ? heights.length : '?') + ' feeds'));
-    var io = fetcher(20000), id = opts.id, first = streams[0];
+    var io = fetcher(20000), id = opts.id, first = streams[opts.audio || 0];
     return io.deadline(io.get(first.widevineManifestUrl).then(function (dash) {
       var mpd = dash.body;
       if (!/<MPD\b[^>]*\btype="dynamic"/.test(mpd) || (mpd.match(/<Period\b/g) || []).length !== 1 || /<BaseURL\b/.test(mpd)) return fail('unsupported Widevine live layout');
@@ -486,5 +515,5 @@ var HdrStream = (function () {
     }));
   }
 
-  return { build: build, live: live, grid: grid, liveGrid: liveGrid, regrid: regrid };
+  return { build: build, live: live, grid: grid, liveGrid: liveGrid, regrid: regrid, subtitleTracks: subtitleTracks };
 })();

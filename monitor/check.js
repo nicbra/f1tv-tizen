@@ -147,11 +147,12 @@ function hlgVariants(master) {
 
 /** UTC milliseconds at offset zero according to one heartbeat. */
 function heartbeatBase(line) {
-  const m = /^(\d{2}):(\d{2}):(\d{2})\.(\d{3})/.exec(line);
+  // "01:46:26.209", or "1.01:46:26.209" once the archive runs past a day (.NET TimeSpan).
+  const m = /^(?:(\d+)\.)?(\d{2}):(\d{2}):(\d{2})\.(\d{3})/.exec(line);
   if (!m) return null;
   try {
-    const utc = Date.parse(JSON.parse(line.slice(12)).Utc);
-    return Number.isFinite(utc) ? utc - ((+m[1] * 60 + +m[2]) * 60 + +m[3]) * 1000 - +m[4] : null;
+    const utc = Date.parse(JSON.parse(line.slice(line.indexOf('{'))).Utc);
+    return Number.isFinite(utc) ? utc - ((((+m[1] || 0) * 24 + +m[2]) * 60 + +m[3]) * 60 + +m[4]) * 1000 - +m[5] : null;
   } catch (e) { return null; }
 }
 

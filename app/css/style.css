@@ -18,6 +18,10 @@
   font-weight: 700; font-style: italic; }
 @font-face { font-family: 'Titillium Web'; src: url('../fonts/TitilliumWeb-Black.ttf') format('truetype');
   font-weight: 900; font-style: normal; }
+/* Noto Sans (SIL OFL 1.1): static 500/95 instance for Tizen without variable-font support.
+ * See fonts/NotoSans-NOTICE.txt and fonts/NotoSans-OFL.txt. */
+@font-face { font-family: 'Noto Sans Subtitle'; src: url('../fonts/NotoSans-Subtitle-Medium.woff2') format('woff2');
+  font-weight: 500; font-style: normal; font-stretch: 95%; }
 /* F1's own palette, as in F1 TV's apps: carbon black, its greys, red. */
 :root {
   --bg: #15151e;
@@ -343,8 +347,20 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .tyre-I { border-color: #43b02a; } .tyre-W { border-color: #0067ad; }
 
 /* Subtitles and seeker info */
+/* NRK TV's player styles, checked 2026-11-02:
+ * https://tv.nrk.no/assets/player-DqU6RAAI.css
+ * White on #000000a8, line-height 1.4, padding .1em .3em, radius .125em.
+ * Use rgba for older Tizen browsers that don't support eight-digit hex colours.
+ * Noto Sans Medium at 95% width provides an open alternative to NRK Sans.
+ * Keep the font separate from the F1 interface, including in multiview. */
 .subtitle { position: absolute; left: 50%; bottom: 90px; transition: bottom 0.2s ease-out; transform: translateX(-50%); max-width: 1400px;
-  background: rgba(0, 0, 0, 0.78); padding: 8px 22px; font-size: 38px; text-align: center; line-height: 1.3; }
+  font-family: 'Noto Sans Subtitle', Arial, sans-serif; font-size: 38px; font-weight: 500; font-style: normal; font-stretch: 95%;
+  text-align: center; line-height: 1.4; color: #fff; text-shadow: none; width: max-content; }
+.subtitle .sub-line { background: rgba(0, 0, 0, 0.6588235294); padding: .1em .3em; border-radius: .125em;
+  -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+/* Shaka's native WebVTT renderer uses video cues rather than the app's subtitle overlay. */
+video::cue { font-family: 'Noto Sans Subtitle', Arial, sans-serif; font-size: 38px; font-weight: 500; font-stretch: 95%; line-height: 1.4;
+  color: #fff; background-color: rgba(0, 0, 0, 0.6588235294); text-shadow: none; }
 .bubble-info { font-size: 20px; font-weight: 600; color: var(--muted); margin-top: 2px; }
 
 /* Brand: logo image and "TV" */
@@ -363,6 +379,9 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .osd-visible .subtitle { bottom: 270px; }
 /* Narrow subtitles to clear the tower (x 90-336). */
 .tower-on .subtitle { max-width: 1160px; }
+/* In a multiview: on the big feed, or across the picture (app.js placeSubtitles). */
+.subtitle.mv { left: var(--sub-x); bottom: var(--sub-bottom); max-width: var(--sub-width); font-size: var(--sub-size); }
+.osd-visible .subtitle.mv { bottom: var(--sub-bottom-osd); }
 
 /* Standings and driver pages */
 .list-row .row-colour { width: 6px; height: 40px; margin-right: 18px; background: var(--grey); flex: none; }

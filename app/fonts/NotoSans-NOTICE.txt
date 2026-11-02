@@ -1,0 +1,23 @@
+Noto Sans Subtitle
+
+Copyright 2022 The Noto Project Authors
+https://github.com/notofonts/latin-greek-cyrillic
+
+Licensed under the SIL Open Font License, Version 1.1.
+The complete license is included in NotoSans-OFL.txt.
+
+Source:
+https://github.com/google/fonts/blob/main/ofl/notosans/NotoSans%5Bwdth,wght%5D.ttf
+Retrieved: 2026-11-02
+Font version: 2.015
+Source SHA256: bfb7bb691513f12e734dc346c03a03f784912432d7e3fa8e56efcf906fe86b3d
+
+NotoSans-Subtitle-Medium.woff2 is a static instance of Noto Sans at
+wght=500, wdth=95, generated with fontTools.varLib.instancer and encoded
+as WOFF2. All original glyphs and copyright/license metadata are retained.
+The static instance supports Tizen versions without variable-font support
+and is bundled locally so playback does not require a font download.
+
+Selected as a visual approximation of NRK Sans after comparing Noto Sans,
+Open Sans and Source Sans 3. Background and spacing follow the NRK TV
+web-player styling referenced in css/style.css.

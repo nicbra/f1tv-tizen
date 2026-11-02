@@ -1186,7 +1186,7 @@
         var mv = auto.multiview, heights = mv && mvHeights(mv.layout), then = null;
         if (heights && mv.slots && mv.slots.length === heights.length && mv.slots.every(function (i) { return i >= 0 && i < feeds.length; })) {
           feed = mv.slots[0];
-          then = { layout: mv.layout, slots: mv.slots.slice() };
+          then = { layout: mv.layout, slots: mv.slots.slice(), audio: mv.audio };
         }
         playFeed(feed, auto.at ? { liveAt: auto.at } : auto.startAt != null ? { startAt: auto.startAt } : feedsCtx.live ? {} : { fromStart: true });
         if (then) mvAfterStart(feedsCtx, then);
@@ -1335,14 +1335,20 @@
    * streams an account plays at once (HTTP 402 from the CDN, Mexico 2026 race): the other feeds ask for the
    * HDR stream alone, and a reload of the same multiview (a seek, live) keeps the sessions it has.
    */
+  /** The feed a multiview's commentary and subtitles come from: its chosen one while shown, else the big feed. */
+  function mvSound(mv) {
+    return mv.audio != null && mv.slots.indexOf(mv.audio) >= 0 ? mv.audio : mv.slots[0];
+  }
+
   function mvStreams(mv) {
     var prev = Player.stream() && Player.stream().grid;
-    if (prev && prev.layout === mv.layout && prev.slots.join() === mv.slots.join()) return Promise.resolve(prev.streams);
-    var list = [];
+    if (prev && prev.layout === mv.layout && prev.slots.join() === mv.slots.join() && prev.audio === mvSound(mv)) return Promise.resolve(prev.streams);
+    var list = [], sound = mvSound(mv);
     return mv.slots.reduce(function (chain, idx, k) {
       return chain.then(function () {
         return (k ? new Promise(function (r) { setTimeout(r, 800); }) : Promise.resolve()).then(function () {
-          return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, { hdr: true, hdrOnly: k > 0 });
+          // The sound's feed gets the full offer (licence, commentary, the clock); the others their HDR video alone.
+          return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, { hdr: true, hdrOnly: idx !== sound });
         }).then(function (s) {
           // Clear and encrypted feeds don't stitch together (a frame decrypts with one key).
           if (!s.hdr || (list.length && !!s.hdrEncrypted !== !!list[0].hdrEncrypted)) throw new Error('no matching 4K HDR offer for ' + feedsCtx.feeds[idx].title);
@@ -1359,7 +1365,9 @@
    * then a seek to the same moment makes the player drop what it buffered in the old arrangement, so the
    * picture does not go black. Feeds that stay keep their sessions. Falls back to loading it anew.
    */
-  var mvAhead = null, MV_CHANGING = 'Changing the multiview…';   // { key, list, at }: a multiview prepared while the viewer chooses
+  // { key, content, list, at }: a multiview prepared while the viewer chooses (this video's, until the player is left)
+  var SETTLE_MS = 2000;   // a sound choice applies this long after the last ◀ ▶ press (or on OK)
+  var mvAhead = null, MV_CHANGING = 'Changing the multiview…';
 
   function mvCanRearrange() {
     var s = Player.stream();
@@ -1370,7 +1378,7 @@
   function mvOffers(g, mv) {
     var have = {}, list = [];
     g.slots.forEach(function (idx, k) { have[idx] = g.streams[k]; });
-    if (mvAhead && mvAhead.list && Date.now() - mvAhead.at < 60000) mvAhead.slots.forEach(function (idx, k) { if (!have[idx]) have[idx] = mvAhead.list[k]; });
+    if (mvAhead && mvAhead.list && mvAhead.content === feedsCtx.contentId && Date.now() - mvAhead.at < 60000) mvAhead.slots.forEach(function (idx, k) { if (!have[idx]) have[idx] = mvAhead.list[k]; });
     return mv.slots.reduce(function (chain, idx) {
       return chain.then(function () {
         if (have[idx]) { list.push(have[idx]); return null; }
@@ -1392,8 +1400,11 @@
   function mvPrepare(mv) {
     if (!mvCanRearrange() || !mv || mv.layout === 'off') return;
     var s = Player.stream(), g = s.grid, key = mv.layout + '|' + mv.slots.join();
-    if (key === g.layout + '|' + g.slots.join() || (mvAhead && mvAhead.key === key && Date.now() - mvAhead.at < 30000)) return;
-    var ahead = mvAhead = { key: key, slots: mv.slots.slice(), list: null, at: Date.now() };
+    if (key === g.layout + '|' + g.slots.join() || (mvAhead && mvAhead.key === key && mvAhead.content === feedsCtx.contentId &&
+      Date.now() - mvAhead.at < 30000)) return;
+    // Without the feed the sound comes from, the change loads the multiview anew (mvRearrange): nothing to prepare.
+    if (mv.slots.indexOf(g.audio) < 0) return;
+    var ahead = mvAhead = { key: key, content: feedsCtx.contentId, slots: mv.slots.slice(), list: null, at: Date.now() };
     // Settles with the offers once the helper has what it needs (or failed: then the change starts afresh).
     ahead.ready = mvOffers(g, mv).then(function (list) {
       ahead.list = list;
@@ -1404,13 +1415,23 @@
   }
 
   function mvRearrange(mv) {
-    var s = Player.stream(), g = s && s.grid;
-    function reload() { feedsCtx.multiview = mv; playFeed(mv.slots[0], { switching: true }); }
-    if (!mvCanRearrange()) return reload();
+    var s = Player.stream(), g = s && s.grid, ctx = feedsCtx, exits = playerExits;
+    // The sound stays with its feed while that feed is shown (mvSound: else the new big feed's).
+    mv = { layout: mv.layout, slots: mv.slots.slice(), audio: mv.audio != null ? mv.audio : g && g.audio };
+    function reload() {
+      // Not after the viewer has left the player or gone to another video meanwhile.
+      if (feedsCtx !== ctx || exits !== playerExits || screen !== 'player') return;
+      feedsCtx.multiview = mv;
+      playFeed(mv.slots[0], { switching: true });
+    }
+    // The commentary and subtitles come from one feed's manifest (Sound from in watch options). Without that
+    // feed, the multiview loads anew with the big feed's sound (also so the old feed's stream ends: F1 allows
+    // four at once).
+    if (!mvCanRearrange() || mv.slots.indexOf(g.audio) < 0) return reload();
     toast(MV_CHANGING, 120000);   // until the new arrangement shows
     // Prepared while the viewer chose (focus on Show): wait for that rather than start over.
     var key = mv.layout + '|' + mv.slots.join(), ahead = mvAhead;
-    var offers = ahead && ahead.key === key && ahead.ready && Date.now() - ahead.at < 60000
+    var offers = ahead && ahead.key === key && ahead.content === feedsCtx.contentId && ahead.ready && Date.now() - ahead.at < 60000
       ? ahead.ready.catch(function () { return mvOffers(g, mv); }) : mvOffers(g, mv);
     offers.then(function (list) {
       if (Player.stream() !== s) throw new Error('cancelled');
@@ -1425,7 +1446,7 @@
       g.layout = mv.layout;
       g.slots = mv.slots.slice();
       g.streams = list;
-      feedsCtx.multiview = { layout: mv.layout, slots: mv.slots.slice() };
+      feedsCtx.multiview = { layout: mv.layout, slots: mv.slots.slice(), audio: g.audio };
       feedsCtx.index = mv.slots[0];
       $('osd-feed').textContent = feedLabel(s);
       // To where the new arrangement is ready (at most a few seconds ahead), or here if playback got past it.
@@ -1443,6 +1464,7 @@
       });
     }).catch(function (e) {
       if (e && e.message === 'cancelled') return;
+      if (Player.stream() !== s || feedsCtx !== ctx || exits !== playerExits || screen !== 'player') return;
       toast('Reloading the multiview (' + ((e && e.message) || e) + ')', 4000);
       reload();
     });
@@ -1487,11 +1509,12 @@
       var a = shown && mvLayouts().area(shown.layout, 1920, 1080, align);
       Player.setGridRect(a && align === 'top' ? [0, 0, 1920, Math.round(a.height)] : null);
     }
-    if (!key) return;
+    if (!key) return placeSubtitles(null);
     var M = 6, R = 16;   // margin from the feed's edge, corner radius (screen pixels)
     var rects = mvLayouts().onScreen(shown.layout, 1920, 1080, align).map(function (r) {
       return { left: r.left + M, top: r.top + M, width: r.width - 2 * M, height: r.height - 2 * M };
     });
+    placeSubtitles(rects);
     var canvas = el('canvas', 'mv-mask'), ctx = canvas.getContext && canvas.getContext('2d');
     canvas.width = 1920;
     canvas.height = 1080;
@@ -1521,6 +1544,36 @@
       label.appendChild(el('span', '', fd.full || fd.title));
       box.appendChild(label);
     });
+  }
+
+  /**
+   * Where subtitles go in a multiview (`rects`: the feeds on screen; null: one feed, the usual place): at the
+   * bottom of the big feed when the layout has one, else across the whole picture. Clear of an inset over the
+   * big feed, and above the player bar when it shows.
+   */
+  function placeSubtitles(rects) {
+    var box = $('subtitle');
+    box.classList.toggle('mv', !!rects);
+    if (!rects) return;
+    var areas = rects.map(function (r) { return r.width * r.height; }), most = Math.max.apply(Math, areas);
+    var big = areas.filter(function (a) { return a === most; }).length === 1 ? rects[areas.indexOf(most)] : null;
+    var t = big || rects.reduce(function (u, r) {
+      var left = Math.min(u.left, r.left), top = Math.min(u.top, r.top);
+      return { left: left, top: top, width: Math.max(u.left + u.width, r.left + r.width) - left,
+        height: Math.max(u.top + u.height, r.top + r.height) - top };
+    });
+    var cx = t.left + t.width / 2, bottomY = t.top + t.height, half = t.width / 2 - 24;
+    // An inset in the big feed's lower part: the lines stay beside it.
+    rects.forEach(function (r) {
+      if (r === t || r.top > bottomY || r.top + r.height < bottomY - 220 || r.left > t.left + t.width || r.left + r.width < t.left) return;
+      half = Math.min(half, r.left >= cx ? r.left - cx - 24 : cx - (r.left + r.width) - 24);
+    });
+    var bottom = 1080 - bottomY + 28;
+    box.style.setProperty('--sub-x', Math.round(cx) + 'px');
+    box.style.setProperty('--sub-width', Math.max(400, Math.round(half * 2)) + 'px');
+    box.style.setProperty('--sub-bottom', Math.round(bottom) + 'px');
+    box.style.setProperty('--sub-bottom-osd', Math.round(Math.max(bottom, 270)) + 'px');
+    box.style.setProperty('--sub-size', Math.round(Math.min(38, Math.max(28, t.width / 36))) + 'px');
   }
 
   function feedLabel(stream) {
@@ -1555,8 +1608,9 @@
       $('osd-title').textContent = feedsCtx.title;
       $('osd-event').textContent = feedsCtx.event;
       $('osd-feed').textContent = feedLabel();
-      if (from) toast(mv ? 'Starting multiview…' : 'Switching to ' + (f.full || f.title) + '…', 2500);
-      else {
+      if (from) {
+        if (!opts.retrying) toast(mv ? 'Starting multiview…' : 'Switching to ' + (f.full || f.title) + '…', 2500);
+      } else {
         $('spinner').classList.remove('hidden');
         towerHold = true;
         timingState = null;
@@ -1569,8 +1623,9 @@
           if (!mv) return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(), cenc: cencWanted() });
           // Multiview: the first feed's offer gives the clock, licence and commentary; the player builds the grid.
           return mvStreams(mv).then(function (list) {
-            var s = Object.assign({}, list[0]);
-            s.grid = { streams: list, layout: mv.layout, slots: mv.slots.slice() };
+            // audio: the feed whose commentary and subtitles play (mvSound), audioPos: its place in the layout.
+            var lead = mv.slots.indexOf(mvSound(mv)), s = Object.assign({}, list[lead]);
+            s.grid = { streams: list, layout: mv.layout, slots: mv.slots.slice(), audio: mv.slots[lead], audioPos: lead };
             return s;
           });
         })
@@ -1616,6 +1671,7 @@
         .then(function () {
           $('spinner').classList.add('hidden');
           towerHold = false;
+          if (Player.stream() === stream) feedsCtx.prepareRetried = false;
           Timing.load(feedsCtx.timingMeta, F1Api.state.ascendon, feedsCtx.live);
           if (stream && Player.stream() === stream && !opts.retry) watchStart(stream, opts);
         })
@@ -1631,17 +1687,26 @@
             feedsCtx.index = feedsCtx.playing != null ? feedsCtx.playing : from.index;
             $('osd-feed').textContent = feedLabel(from.stream);
           }
+          // AVPlay's preparation hung (player.js PREPARE_MS): one more try opens over it, as BACK and trying again
+          // did (Mexico 2026 multiview). Another hang, or a player that won't open again, needs the app restarted;
+          // what played last is saved (saveWatching), so it comes back at that moment.
+          if (e && (e.code === 'PREPARE_TIMEOUT' || e.code === 'PLAYER_STUCK')) {
+            if (e.code === 'PLAYER_STUCK' || feedsCtx.prepareRetried) {
+              return toast('The TV\'s video player is stuck. Restart the app to continue where you were.', 20000);
+            }
+            feedsCtx.prepareRetried = true;
+            toast((mv ? 'Multiview' : 'The video') + ' didn\'t start, trying again…', 4000);
+            var again = sameMoment(from, opts);
+            again.retrying = true;   // keeps the message above
+            if (!queuedFeed && screen === 'player') playFeed(i, again);
+            return;
+          }
           // Multiview failed: the big feed alone (a failed switch leaves the previous video playing).
           if (mv && feedsCtx.multiview === mv) {
             feedsCtx.multiview = null;
             toast('Multiview didn\'t work (' + ((e && e.message) || e) + ').', 8000);
             if (from && Player.stream() === from.stream) return;
-            var single = {};
-            if (from) {
-              var gone = from.paused ? 0 : (Date.now() - from.at) / 1000;
-              if (from.wall) single.liveAt = from.wall + gone; else single.startAt = from.pos + gone;
-            } else if (opts.startAt != null) single.startAt = opts.startAt;
-            if (!queuedFeed && screen === 'player') playFeed(i, single);
+            if (!queuedFeed && screen === 'player') playFeed(i, sameMoment(from, opts));
             return;
           }
           var hdrFailure = stream && stream.hdr && !feedsCtx.hdrFailed;
@@ -1679,6 +1744,23 @@
       // The session could not be checked (no network): say so instead of doing nothing.
       if (feedsCtx === ctx && exits === playerExits && seq === navSeq) toast('Could not reach F1 TV: ' + (e.message || e), 8000);
     });
+  }
+
+  /**
+   * Options for loading a feed again after a failed load: at the moment the viewer was at when a switch failed
+   * (`from`, paused as they were), or at the one the failed load asked for (`opts`).
+   */
+  function sameMoment(from, opts) {
+    var o = {};
+    if (from) {
+      var late = from.paused ? 0 : (Date.now() - from.at) / 1000;
+      if (from.wall) o.liveAt = from.wall + late; else o.startAt = from.pos + late;
+      o.switching = true;
+      o.switchPaused = from.paused;
+    } else {
+      ['startAt', 'liveAt', 'fromStart'].forEach(function (k) { if (opts[k] != null) o[k] = opts[k]; });
+    }
+    return o;
   }
 
   /**
@@ -1918,7 +2000,7 @@
     var pos = Player.position(), wall = pos > 0 ? Player.wallClock(pos) : null;
     if (!(pos > 0)) return;
     var state = { contentId: feedsCtx.contentId, title: feedsCtx.title, image: feedsCtx.image, feed: feedsCtx.index,
-      multiview: feedsCtx.multiview || null, wall: wall || null, pos: wall ? null : pos, at: Date.now() };
+      multiview: feedsCtx.multiview || feedsCtx.resumeMv || null, wall: wall || null, pos: wall ? null : pos, at: Date.now() };
     try { localStorage.setItem(WATCHING, JSON.stringify(state)); } catch (e) { /* storage unavailable */ }
   }
 
@@ -1928,12 +2010,16 @@
 
   /** Once `ctx`'s first feed plays (its position moves), its multiview takes over at the same moment. */
   function mvAfterStart(ctx, mv) {
-    var since = Date.now(), first = null;
+    var since = Date.now(), first = null, exits = playerExits;
+    ctx.resumeMv = mv;   // saved meanwhile (saveWatching): a restart before it takes over still comes back to it
     (function wait() {
-      if (feedsCtx !== ctx || Date.now() - since > 60000 || ctx.multiview) return;
+      // Not once the viewer has left the player or chosen another feed (or multiview) meanwhile.
+      if (feedsCtx !== ctx || exits !== playerExits || Date.now() - since > 60000 || ctx.multiview ||
+        (first != null && ctx.index !== mv.slots[0])) { ctx.resumeMv = null; return; }
       var p = screen === 'player' && Player.engineName() && !loadingFeed ? Player.position() : null;
       if (p != null && first == null) first = p;
       if (p != null && p > first + 1) {
+        ctx.resumeMv = null;
         ctx.multiview = mv;
         return playFeed(mv.slots[0], { switching: true });
       }
@@ -1945,8 +2031,14 @@
   function resumeWatching() {
     var state = null;
     try { state = JSON.parse(localStorage.getItem(WATCHING) || 'null'); } catch (e) { state = null; }
-    clearWatching();
-    if (!state || !state.contentId || !(Date.now() - state.at < RESUME_WITHIN)) return false;
+    // Kept until the video plays again (saveWatching then saves anew), so a restart before that still comes back
+    // here; twice at most, should resuming be what fails.
+    if (!state || !state.contentId || !(Date.now() - state.at < RESUME_WITHIN) || (state.tries || 0) >= 2) {
+      clearWatching();
+      return false;
+    }
+    state.tries = (state.tries || 0) + 1;
+    try { localStorage.setItem(WATCHING, JSON.stringify(state)); } catch (e) { /* storage unavailable */ }
     toast('Continuing where you were…', 4000);
     openFeeds(state.contentId, { title: state.title || '', image: state.image }, null,
       { at: state.wall, startAt: state.pos, feed: state.feed, multiview: state.multiview });
@@ -1956,6 +2048,7 @@
   /** Stops playback and clears the player's overlays, staying on the player screen. */
   function leavePlayer() {
     playerExits++;
+    mvAhead = null;   // prepared for this video only
     clearWatching();
     queuedFeed = null;   // a feed switch asked for while loading must not restart playback
     liveFocus = false;
@@ -2247,6 +2340,32 @@
       rows.push([e]);
     }
 
+    /*
+     * A choice that changes what you hear: ◀ ▶ only show the next value, so browsing doesn't switch the sound at
+     * every press. It applies on OK, after SETTLE_MS without another press, or when the panel closes.
+     */
+    var commits = [];
+    function deferredSetting(label, values, current, name, apply, key) {
+      var pending = null, timer = null;
+      function commit() {
+        clearTimeout(timer);
+        timer = null;
+        if (pending == null) return;
+        var v = pending;
+        pending = null;
+        if (v !== current()) apply(v);
+        e._refresh();
+      }
+      setting(label, function () { return name(pending != null ? pending : current()); }, function (dir) {
+        pending = cycleValue(values, pending != null ? pending : current(), dir);
+        clearTimeout(timer);
+        timer = setTimeout(commit, SETTLE_MS);
+      }, key);
+      var e = rows[rows.length - 1][0];
+      e._commit = function () { var had = pending != null; commit(); return had; };
+      commits.push(commit);
+    }
+
     function action(label, run) {
       var e = el('div', 'panel-row setting go-live');
       e.appendChild(el('span', 'panel-label', label));
@@ -2275,16 +2394,28 @@
         });
     }
 
+    // In a multiview: which feed the commentary and subtitles come from (it loads the multiview anew).
+    var mvNow = feedsCtx.multiview, grid0 = Player.stream() && Player.stream().grid;
+    if (mvNow && grid0 && mvNow.slots.length > 1) {
+      deferredSetting('Sound from', mvNow.slots, function () { return grid0.audio; }, function (idx) {
+        var f = feedsCtx.feeds[idx];
+        return f ? (f.full || f.title) : '';
+      }, function (idx) {
+        closePanel();
+        feedsCtx.multiview = { layout: mvNow.layout, slots: mvNow.slots.slice(), audio: idx };
+        toast('Sound from ' + (feedsCtx.feeds[idx].full || feedsCtx.feeds[idx].title) + '…', 3000);
+        playFeed(mvNow.slots[0], { switching: true });
+      }, 'sound');
+    }
+
     var audio = opts.audio;
     if (audio.length > 1) {
-      setting('Commentary', function () {
-        var cur = audio.indexOf(Settings.get('audio')) >= 0 ? Settings.get('audio') : audio[0];
-        return LANG_NAMES[cur] || cur;
-      }, function (dir) {
-        var next = cycleValue(audio, Settings.get('audio'), dir);
+      deferredSetting('Commentary', audio, function () {
+        return audio.indexOf(Settings.get('audio')) >= 0 ? Settings.get('audio') : audio[0];
+      }, function (cur) { return LANG_NAMES[cur] || cur; }, function (next) {
         Settings.set('audio', next);
         Player.setAudio(next);
-      });
+      }, 'audio');
     }
 
     var text = [''].concat(opts.text);
@@ -2333,6 +2464,7 @@
     var g = new Focus.Grid(rows, {
       onSelect: function (e) {
         if (e._action) return e._action();
+        if (e._commit && e._commit()) return;   // OK takes the value shown
         if (e._cycle) return e._cycle(1);
         closePanel();
         // A feed from the list: that feed alone (also leaving multiview).
@@ -2349,7 +2481,7 @@
     });
     g.r = focusRow >= 0 ? focusRow : current;
     if (panel) clearTimeout(panel.timer);   // rebuilt while open
-    panel = { grid: g, timer: null, page: 'main' };
+    panel = { grid: g, timer: null, page: 'main', commits: commits };
     $('panel').classList.remove('hidden');
     $('osd').classList.add('hidden');
     $('screen-player').classList.remove('osd-visible');
@@ -2567,7 +2699,9 @@
   function closePanel() {
     if (!panel) return;
     clearTimeout(panel.timer);
+    var commits = panel.commits || [];
     panel = null;
+    commits.forEach(function (c) { c(); });   // a choice still shown applies
     mvDraft = null;
     $('panel').classList.add('hidden');
   }
@@ -2812,7 +2946,15 @@
     clearTimeout(subtitleTimer);
     if (!s || !Settings.get('subtitles')) return hide();
     if (!s.text) { subtitleTimer = setTimeout(hide, 300); return; }
-    if (box.textContent !== s.text) box.textContent = s.text;
+    // A box behind each line, NRK style.
+    if (box._text !== s.text) {
+      box._text = s.text;
+      box.innerHTML = '';
+      s.text.split('\n').forEach(function (line, k) {
+        if (k) box.appendChild(document.createElement('br'));
+        box.appendChild(el('span', 'sub-line', line));
+      });
+    }
     box.classList.remove('hidden');
     subtitleTimer = setTimeout(hide, Math.max(1500, s.ms) + 300);
   }

@@ -23,7 +23,7 @@ function makeDom() {
   class El {
     constructor(tag) {
       this.tagName = String(tag).toUpperCase();
-      this.children = []; this.parentNode = null; this.style = {}; this.className = ''; this.ownText = '';
+      this.children = []; this.parentNode = null; this.style = { setProperty(k, v) { this[k] = String(v); } }; this.className = ''; this.ownText = '';
       this.attrs = {}; this.html = ''; this.listeners = {};
       this.offsetTop = 0; this.offsetHeight = 0; this.offsetWidth = 0; this.clientHeight = 1000;
     }
@@ -382,7 +382,7 @@ async function boot(options = {}) {
     page: (id) => net.page(id === api.ARCHIVE_PAGE_ID ? '/archive' : '/home'),
     pageByUri: (uri) => net.page(uri),
     video: (id) => net.video(id),
-    play: (id, channel) => net.play(id, channel),
+    play: (id, channel, opts) => net.play(id, channel, opts),
     streamInfo: (url) => net.info(url),
     resumePosition: (id) => net.resume(id),
     savePosition: async (...a) => { saved.push(a); }
@@ -707,6 +707,46 @@ test('a failed feed switch leaves the previous feed current', async () => {
   assert.equal(app.player.loads.at(-1).url, 'https://cdn/101/1033.m3u8');
 });
 
+test('a start that hangs in AVPlay is tried once more at the same moment, then the viewer is told to restart', async () => {
+  const hung = () => Object.assign(new Error('The video player did not start'), { code: 'PREPARE_TIMEOUT' });
+  const app = await boot();
+  app.net.resume = () => Promise.resolve(1800);
+  await app.pick(/^Race/);
+  await app.advance(100);
+  app.player.hold = deferred();
+  await app.pick(/^INTERNATIONAL/);
+  await app.press('ENTER');   // continue from 30:00
+  await app.advance(200);
+  const first = app.player.hold;
+  app.player.hold = deferred();
+  first.reject(hung());
+  await app.advance(200);
+  assert.match(app.toast(), /didn't start, trying again/);
+  assert.deepEqual(app.player.loads.map((l) => l.start), [1800, 1800]);
+  app.player.hold.reject(hung());
+  app.player.hold = null;
+  await app.advance(200);
+  assert.match(app.toast(), /video player is stuck\. Restart the app/);
+  assert.equal(app.player.loads.length, 2, 'no third open over a stuck player');
+});
+
+test('after a hung start that recovered, a later hang gets its retry again', async () => {
+  const hung = () => Object.assign(new Error('The video player did not start'), { code: 'PREPARE_TIMEOUT' });
+  const app = await boot();
+  await play(app, 'Race');
+  app.player.pos = 3000;
+  for (const round of [1, 2]) {
+    app.player.hold = deferred();
+    await app.press('CH_DOWN');
+    await app.advance(100);
+    const h = app.player.hold;
+    app.player.hold = null;
+    h.reject(hung());
+    await app.advance(500);
+    assert.match(app.toast(), /didn't start, trying again/, 'round ' + round);
+  }
+});
+
 test('OK on the feed list before the saved position arrives still offers to continue', async () => {
   const app = await boot();
   const resume = deferred();
@@ -839,6 +879,27 @@ test('a single-feed video plays at once, and BACK returns to the tile it was ope
   assert.match(app.focused(), /^ McLaren/);
 });
 
+test('browsing commentary languages applies only the one chosen: on OK, or once the presses stop', async () => {
+  const app = await boot();
+  await play(app, 'Race');
+  app.player.trackList = { audio: [{ lang: 'eng' }, { lang: 'deu' }, { lang: 'fra' }, { lang: 'fx' }], text: [] };
+  await app.press('UP');
+  await app.moveTo(/^Commentary/, ['UP']);
+  await app.press('RIGHT');
+  await app.advance(1000);
+  await app.press('RIGHT');   // past Deutsch to Français, within 2 s
+  await app.advance(1500);
+  assert.deepEqual(app.player.chosen, [], 'nothing while browsing');
+  await app.press('ENTER');   // OK takes it at once
+  assert.deepEqual(app.player.chosen, [['audio', 'fra']]);
+  await app.advance(3000);
+  assert.deepEqual(app.player.chosen, [['audio', 'fra']], 'once');
+  // A choice still shown when the panel closes applies.
+  await app.press('RIGHT');
+  await app.press('BACK');
+  assert.deepEqual(app.player.chosen, [['audio', 'fra'], ['audio', 'fx']]);
+});
+
 test('watch options change commentary and subtitles, and pick a feed', async () => {
   const app = await boot();
   await play(app, 'Race');
@@ -852,6 +913,10 @@ test('watch options change commentary and subtitles, and pick a feed', async () 
   await app.moveTo(/^Commentary/, ['UP']);
   await app.press('RIGHT');
   assert.match(app.focused(), /Deutsch/);
+  // Browsing the commentary doesn't switch the sound at every press: it does once the choice settles.
+  assert.deepEqual(app.player.chosen, []);
+  await app.advance(2100);
+  assert.deepEqual(app.player.chosen, [['audio', 'deu']]);
   await app.press('DOWN', 'LEFT');
   assert.match(app.focused(), /Français/);
   assert.deepEqual(app.player.chosen, [['audio', 'deu'], ['subtitles', 'fra']]);
@@ -1082,6 +1147,151 @@ test('after a restart the app continues the same video at the same moment, also 
   // Leaving the player forgets it.
   await again.press('BACK', 'BACK');
   assert.equal(again.store['f1tv.watching'], '');
+});
+
+/** A Big + 2 multiview playing on AVPlay, with its grid id set as the player sets it. */
+async function playingBig2(app) {
+  app.player.kind = 'avplay';
+  await play(app, 'Race');
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(3000);
+  app.player.current.grid.id = 'g1';
+  return app.player.current.grid;
+}
+
+test('a failed rearrangement does not bring the viewer back to the player after they left', async () => {
+  const app = await premiumHdr({ play: premiumOffer });
+  await playingBig2(app);
+  let fail;
+  app.context.StreamProxy = { regrid: (s, list, layout, at, prepareOnly) => (prepareOnly ? Promise.resolve(null) : new Promise((r, f) => { fail = f; })) };
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Picture in picture ½$/, ['RIGHT']);
+  await app.pick(/^Show this multiview/, ['DOWN']);
+  await app.advance(500);
+  const loads = app.player.loads.length;
+  await app.press('BACK', 'BACK');   // the toast says it changes; the viewer leaves meanwhile
+  await app.advance(200);
+  assert.notEqual(app.screen(), 'player');
+  fail(new Error('HTTP 502'));
+  await app.advance(3000);
+  assert.notEqual(app.screen(), 'player');
+  assert.equal(app.player.loads.length, loads, 'nothing loaded again');
+});
+
+test('a multiview without the feed the sound comes from loads anew, so the sound follows the new big feed', async () => {
+  const app = await premiumHdr({ play: premiumOffer });
+  const grid = await playingBig2(app);
+  const asked = [];
+  app.context.StreamProxy = { regrid: async (s, list, layout, at, prepareOnly) => { asked.push(!!prepareOnly); return prepareOnly ? null : {}; } };
+  const soundFrom = app.$('panel-list') && grid.audio;
+  const loads = app.player.loads.length;
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Picture in picture ½$/, ['RIGHT']);
+  // The big place (the feed the sound comes from) gets the feed that Picture in picture leaves out.
+  const places = () => app.$('panel-list').children.find((e) => /mv-preview/.test(e.className)).children[0].children.map((c) => c.textContent);
+  const shown = places();
+  await app.press('ENTER');
+  const other = app.$('panel-list').children.map((e) => e.textContent).find((t) => !/in multiview/.test(t) && !shown.includes(t.replace(/^\d+/, '')) && /^(INTERNATIONAL|F1 LIVE|1VER)/.test(t));
+  await app.pick(new RegExp('^' + other.slice(0, 5).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), ['DOWN', 'UP']);
+  await app.pick(/^Show this multiview/, ['DOWN']);
+  await app.advance(3000);
+  assert.deepEqual(asked.filter((x) => !x), [], 'not rearranged in place');
+  assert.equal(app.player.loads.length, loads + 1, 'loaded anew');
+  const g = app.player.current.grid;
+  assert.ok(!g.slots.includes(soundFrom));
+  assert.equal(g.audio, g.slots[0], 'the sound from the new big feed');
+});
+
+test('a restart before the resumed video plays still comes back to it, twice at most', async () => {
+  const state = { contentId: 101, title: 'Race', feed: 0, multiview: null, wall: null, pos: 1500 };
+  const boot1 = await premiumHdr();
+  const saved = (tries) => Object.assign({}, boot1.store, { 'f1tv.watching': JSON.stringify(Object.assign({}, state, { at: boot1.clock.now(), tries })) });
+  // While it opens, the moment stays saved (a restart now comes back to it), counted as one try.
+  const first = await premiumHdr({ store: saved(undefined) });
+  assert.equal(JSON.parse(first.store['f1tv.watching']).tries, 1);
+  await first.advance(4000);
+  assert.equal(first.player.loads.at(-1).start, 1500);
+  // Tried twice already (resuming may be what fails): not again.
+  const third = await premiumHdr({ store: saved(2) });
+  await third.advance(4000);
+  assert.notEqual(third.screen(), 'player');
+  assert.equal(third.store['f1tv.watching'], '');
+});
+
+test('a feed chosen while a resumed multiview waits for its big feed is not overridden', async () => {
+  const app = await premiumHdr();
+  app.net.info = async () => ({ epochAtZero: 1.7e9, windowStart: 0, windowEnd: 7200 });
+  await play(app, 'Race');
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  app.net.play = premiumOffer;
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(3000);
+  app.player.pos = 2345;
+  await app.advance(3100);
+  const again = await premiumHdr({ store: app.store, info: app.net.info, play: premiumOffer });
+  await again.advance(4000);
+  assert.ok(!again.player.current.grid);
+  await again.press('CH_DOWN');   // another feed, before the multiview takes over
+  await again.advance(1000);
+  again.player.progress = true;
+  await again.advance(5000);
+  assert.ok(!again.player.current.grid, 'the viewer\'s feed stays');
+});
+
+test('in a multiview, Sound from picks the feed the commentary comes from, once the choice settles', async () => {
+  const app = await premiumHdr({ play: premiumOffer });
+  const grid = await playingBig2(app);
+  assert.equal(grid.audio, grid.slots[0], 'at first the big feed\'s sound');
+  const offers = [];
+  app.net.play = (id, channel, opts) => { offers.push([channel, !!(opts && opts.hdrOnly)]); return premiumOffer(id, channel); };
+  const loads = app.player.loads.length;
+  await app.press('UP');
+  await app.moveTo(/^Sound from/, ['UP', 'DOWN']);
+  assert.match(app.focused(), /^Sound from‹ INTERNATIONAL/);
+  await app.press('RIGHT');
+  const shown = app.focused();
+  await app.advance(1500);
+  assert.equal(app.player.loads.length, loads, 'not while browsing');
+  await app.advance(5000);
+  assert.equal(app.player.loads.length, loads + 1, 'the multiview loads anew with that sound');
+  const g = app.player.current.grid;
+  assert.deepEqual(Array.from(g.slots), Array.from(grid.slots), 'the same feeds, in the same places');
+  assert.equal(g.audio, grid.slots[1]);
+  assert.equal(g.audioPos, 1);
+  assert.doesNotMatch(shown, /INTERNATIONAL/, 'the next feed shown while browsing');
+  // The sound's feed gets the full offer (licence, commentary); the others their HDR video alone.
+  assert.deepEqual(offers.filter((o) => !o[1]).length, 1);
+  // The choice is saved for a restart.
+  await app.advance(3100);
+  assert.equal(JSON.parse(app.store['f1tv.watching']).multiview.audio, grid.slots[1]);
+});
+
+test('subtitles: a box behind each line, and in a multiview at the bottom of the big feed', async () => {
+  const app = await premiumHdr({ play: premiumOffer, settings: { subtitles: 'eng' } });
+  await playingBig2(app);
+  await app.advance(600);
+  app.player.listeners.subtitle({ text: 'Box, box\nfor softs', ms: 3000 });
+  const box = app.$('subtitle');
+  assert.ok(!box.classList.contains('hidden'));
+  assert.deepEqual(box.children.filter((c) => /sub-line/.test(c.className)).map((c) => c.textContent), ['Box, box', 'for softs']);
+  assert.ok(box.classList.contains('mv'));
+  // Big + 2: the big feed is the left two thirds; the lines sit centred on it, as wide as it allows.
+  const big = app.context.MultiviewLayouts.onScreen('side2', 1920, 1080, 'center')[0];
+  assert.equal(+box.style['--sub-x'].replace('px', ''), Math.round(big.left + big.width / 2));
+  assert.ok(+box.style['--sub-width'].replace('px', '') < big.width);
+  assert.equal(+box.style['--sub-bottom'].replace('px', ''), Math.round(1080 - (big.top + big.height - 6) + 28));
+  // One feed again: the usual place.
+  await app.press('UP');
+  await app.pick(/^1VER/, ['DOWN']);
+  await app.advance(600);
+  assert.ok(!box.classList.contains('mv'));
 });
 
 test('no multiview without Premium', async () => {

@@ -146,7 +146,8 @@ var Stats = (function () {
       var list = {};
       text.replace(/^﻿/, '').split('\n').forEach(function (line) {
         try {
-          var d = JSON.parse(line.slice(12));
+          // After the offset: "01:46:26.209", or "1.01:46:26.209" in an archive running past a day.
+          var d = JSON.parse(line.slice(line.indexOf('{')));
           Object.keys(d).forEach(function (n) { list[n] = Object.assign(list[n] || {}, d[n]); });
         } catch (e) { /* skip partial lines */ }
       });

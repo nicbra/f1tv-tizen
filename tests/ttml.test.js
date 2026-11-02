@@ -151,3 +151,36 @@ test('cues timed from the segment start are moved onto the media timeline', asyn
   assert.equal(h.shown.at(-1).text, 'Relative');
   h.reader.stop();
 });
+
+// As F1's WebVTT (Elemental, Mexico 2026 race): cue times from the stream's start, cues numbered.
+const vtt = (cues, map = 'LOCAL:00:00:00.000,MPEGTS:0') => 'WEBVTT\t#Elemental Media Engine(TM) 2.1.3.0\nX-TIMESTAMP-MAP=' + map + '\n\n' +
+  cues.map(([n, b, e, t]) => n + '\n' + b + ' --> ' + e + '\n' + t + '\n').join('\n');
+
+test('WebVTT cues: times with or without hours, markup and entities, and X-TIMESTAMP-MAP', () => {
+  assert.deepEqual(Ttml.vttCues(vtt([[14242458, '01:07:13.804', '01:07:14.883', "l'Air de dire"],
+    [14242463, '07:15.364', '07:17.564', '<i>que les gommes</i> &amp;\nmediums']])), [
+    { begin: 4033.804, end: 4034.883, text: "l'Air de dire" },
+    { begin: 435.364, end: 437.564, text: 'que les gommes &\nmediums' }]);
+  // A timestamp map moves the cues: MPEGTS 900000 (10 s) at LOCAL 2 s is 8 s later.
+  assert.deepEqual(Ttml.vttCues(vtt([[1, '00:00:01.000', '00:00:02.000', 'x']], 'MPEGTS:900000,LOCAL:00:00:02.000')).map((c) => c.begin), [9]);
+  assert.deepEqual(Ttml.vttCues('not a vtt'), []);
+});
+
+test('the reader shows WebVTT cues from a segment list at the player\'s position, once each', async () => {
+  const files = {
+    'https://cdn/s/1.vtt': vtt([[1, '00:00:01.000', '00:00:03.000', 'First'], [2, '00:00:05.000', '00:00:07.000', 'Across']]),
+    'https://cdn/s/2.vtt': vtt([[2, '00:00:05.000', '00:00:07.000', 'Across'], [3, '00:00:08.000', '00:00:09.000', 'Third']])
+  };
+  const shown = [], state = { position: 0 };
+  const track = { lang: 'eng', vtt: true, offset: 0, timescale: 1,
+    list: [{ url: 'https://cdn/s/1.vtt', start: 0, end: 5.76 }, { url: 'https://cdn/s/2.vtt', start: 5.76, end: 11.52 }] };
+  const reader = Ttml.reader([track], { position: () => state.position, show: (s) => shown.push(s),
+    fetch: async (url) => ({ ok: true, arrayBuffer: async () => Uint8Array.from(Buffer.from(files[url], 'utf8')).buffer }) });
+  reader.select('eng');
+  for (const [pos, expect] of [[1.5, 'First'], [3.5, null], [6, 'Across'], [8.5, 'Third']]) {
+    state.position = pos;
+    await wait(230);
+    assert.equal(shown.at(-1).text || null, expect, 'at ' + pos);
+  }
+  reader.stop();
+});

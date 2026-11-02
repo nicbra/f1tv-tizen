@@ -344,6 +344,16 @@ var Player = (function () {
     var posMs = 0;
     var startAt = null;
 
+    /*
+     * AVPlay's preparation can hang: no callback for minutes (Mexico 2026 multiview, twice as the first video
+     * after the app started, once after another video). It can't be cancelled, and stopping or closing AVPlay
+     * while it prepares has crashed or frozen the player, so a preparation that takes longer than this is left
+     * alone (`stuck`): its open fails with code PREPARE_TIMEOUT, and the next open goes over it, as BACK and trying
+     * again did. Each open has its own generation, so a late answer from an earlier one changes nothing.
+     */
+    var PREPARE_MS = { grid: 20000, other: 30000 };
+    var openGen = 0, stuck = null;
+
     function b64ToBytes(b64) {
       var bin = atob(b64), out = new Uint8Array(bin.length);
       for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
@@ -359,6 +369,7 @@ var Player = (function () {
     function onDrm(type, data) {
       if (!data) return;
       if (data.name === 'Challenge') {
+        var g = openGen;
         fetch(stream.licenseUrl, {
           method: 'POST',
           headers: stream.licenseHeaders || {},
@@ -367,6 +378,7 @@ var Player = (function () {
           if (!res.ok) throw new Error('License server answered ' + res.status);
           return res.arrayBuffer();
         }).then(function (lic) {
+          if (g !== openGen) return;   // a newer open has the player now
           var param = data.session_id + 'PARAM_START_POSITION' + bytesToB64(lic) + 'PARAM_START_POSITION';
           av.setDrm('WIDEVINE_CDM', 'widevine_license_data', param);
         }).catch(function (e) { emit('error', 'License: ' + e.message); });
@@ -425,7 +437,7 @@ var Player = (function () {
       if (s.grid) {
         var gridPrefs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
         var gridReady = s.info && s.info.dynamic ? StreamProxy.gridLive(s, s.startDelay, gridPrefs) :
-          StreamProxy.gridManifest(s.grid.streams, s.grid.layout, gridPrefs, startTime);
+          StreamProxy.gridManifest(s.grid.streams, s.grid.layout, gridPrefs, startTime, s.grid.audioPos || 0);
         return gridReady.then(function (prepared) {
           if (stream !== s) throw new Error('cancelled');
           s.grid.id = prepared.id;   // for rearranging it later without reloading
@@ -467,8 +479,15 @@ var Player = (function () {
       started = false;
       els.av.classList.remove('hidden');
       document.body.classList.add('avplay');
+      var g = ++openGen;
       return new Promise(function (resolve, reject) {
-        av.open(url);
+        try { av.open(url); } catch (e) {
+          // Over a stuck preparation, AVPlay may refuse to open again: only restarting the app helps then.
+          if (!stuck) throw e;
+          var refused = new Error('The TV\'s video player is stuck');
+          refused.code = 'PLAYER_STUCK';
+          throw refused;
+        }
         openedAt = Date.now();
         quietUntil = openedAt + 6000;
         av.setListener({
@@ -498,14 +517,39 @@ var Player = (function () {
         var rect = s.grid && gridRect ? gridRect : [0, 0, 1920, 1080];
         av.setDisplayRect(rect[0], rect[1], rect[2], rect[3]);
         av.setDisplayMethod('PLAYER_DISPLAY_MODE_LETTER_BOX');
-        var settle;
-        preparing = new Promise(function (r) { settle = r; });
+        var settle, finished = false;
+        var mine = preparing = new Promise(function (r) { settle = r; });
+        // AVPlay has answered (the seek before preparing, or the preparation): it may be stopped and closed again.
+        function answered() {
+          settle();
+          if (stuck && stuck.gen === g) stuck = null;
+        }
+        // This open's outcome, once: false if it has already failed (timed out).
+        function finish() {
+          if (finished) return false;
+          finished = true;
+          clearTimeout(timer);
+          return true;
+        }
+        var timer = setTimeout(function () {
+          if (!finish()) return;
+          stuck = { gen: g };
+          // Whoever waits for this preparation goes on (unload() then leaves AVPlay alone: see `stuck`).
+          settle();
+          if (preparing === mine) preparing = null;
+          var e = new Error('The video player did not start');
+          e.code = 'PREPARE_TIMEOUT';
+          reject(e);
+        }, s.grid ? PREPARE_MS.grid : PREPARE_MS.other);
         function prepare() {
-          if (stream !== s) { settle(); return reject(new Error('cancelled')); }
+          if (finished) return answered();   // the seek answered after this open gave up: don't prepare now
+          if (stream !== s) { answered(); finish(); return reject(new Error('cancelled')); }
           av.prepareAsync(function () {
-            settle();
+            answered();
+            if (!finish()) return;   // too late: this open has failed, and a retry may have the player
             // Unloaded or replaced while preparing: don't start (unload() closes the player).
             if (stream !== s) return reject(new Error('cancelled'));
+            stuck = null;   // AVPlay prepares again: an earlier stuck preparation no longer holds it
             started = true;
             var d = av.getDuration();
             live = s.info ? s.info.dynamic : (!!s.live || !d || d <= 0);
@@ -517,7 +561,10 @@ var Player = (function () {
             applyTextWhenPlaying(s);
             if (startAt != null && !live && !seekFirst) seek(startAt * 1000, null, 16);
             resolve();
-          }, function (e) { settle(); reject(new Error(stream !== s ? 'cancelled' : 'Could not open stream: ' + e)); });
+          }, function (e) {
+            answered();
+            if (finish()) reject(new Error(stream !== s ? 'cancelled' : 'Could not open stream: ' + e));
+          });
         }
         // Seek before preparation to avoid briefly showing the beginning of a resumed replay.
         var seekFirst = startAt != null && !(s.info ? s.info.dynamic : s.live);
@@ -713,13 +760,15 @@ var Player = (function () {
 
     // Closing AVPlay during prepareAsync can crash the native player; wait for it to finish.
     function unload() {
-      var wait = preparing || Promise.resolve();
+      var wait = preparing || Promise.resolve(), g = openGen;
       stream = null;
       clearTimeout(stallTimer);
       if (captions) { captions.stop(); captions = null; }
       els.av.classList.add('hidden');
       document.body.classList.remove('avplay');
       return wait.then(function () {
+        // A newer open has the player by now (this waited for a slow preparation), or one is stuck: leave it.
+        if (g !== openGen || stuck) return;
         try { if (av) av.stop(); } catch (e) { /* not started */ }
         try { if (av) av.close(); } catch (e) { /* already closed */ }
         preparing = null;
@@ -833,10 +882,16 @@ var Player = (function () {
     });
   }
 
+  // The engine's unload still under way: a second unload (or the next load) waits for it too, so a player still
+  // finishing a preparation is not opened again under it.
+  var teardown = null;
+
   function unload() {
     var e = engine;
     engine = null;
-    return e ? e.unload() : Promise.resolve();
+    if (!e) return teardown || Promise.resolve();
+    var t = teardown = e.unload().then(function () { if (teardown === t) teardown = null; });
+    return t;
   }
 
   /** Seeks to an absolute position (player seconds), clamped to the seekable range. */

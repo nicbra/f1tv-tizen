@@ -79,11 +79,12 @@ var StreamProxy = (function () {
 
   /**
    * Multiview (experiment): the feeds' Premium offers arranged in a layout by the helper (HdrStream.grid).
-   * `at`: the start position in seconds, so the helper reads that segment first. Resolves { url, subtitles }.
+   * `at`: the start position in seconds, so the helper reads that segment first. `audio`: the place of the feed
+   * whose commentary and subtitles play. Resolves { url, subtitles }.
    */
-  function gridManifest(streams, layout, langs, at) {
+  function gridManifest(streams, layout, langs, at, audio) {
     var id = 'mv' + Date.now().toString(36) + '-' + (++vodSequence);
-    return ensure().then(function () { return HdrStream.grid(streams, layout, { id: id, langs: langs, at: at }); }).then(function (built) {
+    return ensure().then(function () { return HdrStream.grid(streams, layout, { id: id, langs: langs, at: at, audio: audio || 0 }); }).then(function (built) {
       var target = BASE + '/vod/' + id + '.mpd';
       return fetch(target, { method: 'POST', body: built.mpd }).then(function (r) {
         if (!r.ok) throw new Error('Could not prepare multiview');
@@ -98,11 +99,12 @@ var StreamProxy = (function () {
    */
   function gridLive(stream, shift, langs) {
     var id = 'mv' + Date.now().toString(36) + '-' + (++vodSequence);
-    return ensure().then(function () { return HdrStream.liveGrid(stream.grid.streams, stream.grid.layout, { id: id, langs: langs }); }).then(function (built) {
+    var lead = stream.grid.audioPos || 0;
+    return ensure().then(function () { return HdrStream.liveGrid(stream.grid.streams, stream.grid.layout, { id: id, langs: langs, audio: lead }); }).then(function (built) {
       return fetch(BASE + '/hdr/' + id, { method: 'POST', body: built.adaptation }).then(function (r) {
         if (!r.ok) throw new Error('Could not prepare multiview');
-        // The first feed's official live manifest: the grid follows its clock and numbering.
-        var url = manifest(stream.grid.streams[0].widevineManifestUrl, shift, { audio: langs && langs.audio }) + '&hdr=' + id + '&notext=1';
+        // The sound feed's official live manifest: the grid follows its clock and numbering (all feeds share them).
+        var url = manifest(stream.grid.streams[lead].widevineManifestUrl, shift, { audio: langs && langs.audio }) + '&hdr=' + id + '&notext=1';
         return fetch(url, { cache: 'no-store' }).then(function (check) {
           if (!check.ok) throw new Error('Multiview live manifest answered ' + check.status);
           return { url: url, subtitles: built.subtitles, id: id };
