@@ -79,7 +79,7 @@ test('load finds the session folder in the season index and starts the worker wi
   assert.equal(fetches[0].url, 'https://livetiming.formula1.com/static/2026/Index.json');
   assert.equal(fetches[0].init.headers.Authorization, 'Bearer TOKEN');
   assert.equal(workers[0].src, 'js/timing-worker.js');
-  assert.deepEqual(workers[0].sent.at(-1), { cmd: 'load', path: '2026/2026-10-11_Singapore_Grand_Prix/2026-10-11_Race/', token: 'TOKEN', live: false });
+  assert.deepEqual(workers[0].sent.at(-1), { cmd: 'load', path: '2026/2026-10-11_Singapore_Grand_Prix/2026-10-11_Race/', token: 'TOKEN', live: false, start: meta.start });
 });
 
 test('load builds the folder from local dates when the session is not indexed yet', async () => {

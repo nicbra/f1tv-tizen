@@ -95,15 +95,33 @@ function unescape(b, s, e) {
  * Adds emulation prevention bytes; `next` is the escaped byte that follows (or -1). After two zeros an
  * escaped 3 is already an emulation prevention byte, so only 0-2 need one here.
  */
-function escape(rbsp, next) {
+function escape(rbsp, next, nextIsData) {
   var out = [], zeros = 0;
   for (var i = 0; i < rbsp.length; i++) {
     if (zeros >= 2 && rbsp[i] <= 3) { out.push(3); zeros = 0; }
     out.push(rbsp[i]);
     zeros = rbsp[i] === 0 ? zeros + 1 : 0;
   }
-  if (zeros >= 2 && next >= 0 && next <= 2) out.push(3);
+  // nextIsData: `next` is the following payload byte itself (then a 3 needs one too).
+  if (zeros >= 2 && next >= 0 && next <= (nextIsData ? 3 : 2)) out.push(3);
   return out;
+}
+
+/** How far into a slice NAL unit its header is read: headers are short, the data is copied as it is. */
+var HEADER_WINDOW = 512;
+
+/**
+ * A slice with a rewritten header, without escaping all of its data again: the new header and the first two
+ * data bytes are escaped anew, and the rest is copied unchanged from `restAt` (from there on, escaping
+ * depends only on data bytes, which are the same). win: the unescaped window from the NAL body ({ rbsp, map });
+ * whole: whether it reaches the end of the clear bytes. Returns { head (escaped bytes), restAt (index in seg) }.
+ */
+function spliceHeader(seg, win, header, dataStart, winEnd, whole) {
+  var k = dataStart + 2;
+  if (k < win.rbsp.length) return { head: escape(header.concat(win.rbsp.slice(dataStart, k)), win.rbsp[k], true), restAt: win.map[k] };
+  if (!whole) throw new Error('slice header too long');
+  // The clear bytes end right after the header: all of them anew, before the encrypted ones.
+  return { head: escape(header.concat(win.rbsp.slice(dataStart)), winEnd < seg.length ? seg[winEnd] : -1), restAt: winEnd };
 }
 
 // --- parameter sets ---
@@ -371,10 +389,10 @@ function feedSlice(f, s, cfg) {
     if (s.subs[0][0] + protectedLen !== s.size) throw new Error('subsample does not cover the sample');
   }
   var protStart = sl.end - protectedLen, bodyStart = sl.at + cfg.nalLength + 1;
-  var clear = unescape(f.seg, bodyStart, protStart);
+  var winEnd = Math.min(protStart, bodyStart + HEADER_WINDOW), clear = unescape(f.seg, bodyStart, winEnd);
   var h = parseSlice(clear.rbsp, sl.type, sl.refIdc, cfg.sps, cfg.pps);
   if (h.dataStart > clear.rbsp.length) throw new Error('slice header reaches the encrypted bytes');
-  return { nals: nals, slice: sl, h: h, rbsp: clear.rbsp, protStart: protStart, prefix: f.seg.slice(s.at, sl.at) };
+  return { nals: nals, slice: sl, h: h, rbsp: clear.rbsp, win: clear, winEnd: winEnd, protStart: protStart, prefix: f.seg.slice(s.at, sl.at) };
 }
 
 /**
@@ -384,7 +402,13 @@ function feedSlice(f, s, cfg) {
 function stackSegment(segs, cfg, gapRows) {
   var frags = segs.map(fragment), A = frags[0], n = frags.length, g = gapRows || 0;
   var encrypted = !!A.get('senc'), count = A.samples.length, w = cfg.sps.widthMbs, hMb = cfg.sps.heightMapUnits, i, k;
-  frags.forEach(function (f) { if (f.samples.length !== count) throw new Error('feeds differ in frame count'); });
+  // The same moment in every feed, frame for frame (the output takes feed 0's timing).
+  var t0 = decodeTime(A);
+  frags.forEach(function (f, n) {
+    if (f.samples.length !== count) throw new Error('feeds differ in frame count');
+    if (decodeTime(f) !== t0) throw new Error('feed ' + n + ' is at another time than feed 0');
+    f.samples.forEach(function (smp, j) { if (smp.dur !== A.samples[j].dur || smp.cto !== A.samples[j].cto) throw new Error('feed ' + n + ' timing differs at frame ' + j); });
+  });
   var data = [], sizes = [], subs = [];
   for (i = 0; i < count; i++) {
     var parts = frags.map(function (f) { return feedSlice(f, f.samples[i], cfg); });
@@ -406,22 +430,28 @@ function stackSegment(segs, cfg, gapRows) {
         gap = gl.concat(gn);
       }
       var header = rewriteHeader(p.rbsp, h, k * (hMb + g) * w, a.idr);
-      var clearRbsp = header.concat(p.rbsp.slice(h.dataStart));
-      var nextByte = p.protStart < p.slice.end ? segs[k][p.protStart] : -1;
-      var nalBody = [segs[k][p.slice.at + cfg.nalLength]].concat(escape(clearRbsp, nextByte));
-      var protectedBytes = segs[k].slice(p.protStart, p.slice.end);
-      var len = nalBody.length + protectedBytes.length, lenBytes = [];
+      var sp = spliceHeader(segs[k], p.win, header, h.dataStart, p.winEnd, p.winEnd === p.protStart);
+      var nalHead = [segs[k][p.slice.at + cfg.nalLength]].concat(sp.head);
+      var rest = segs[k].slice(sp.restAt, p.slice.end), protectedLen = p.slice.end - p.protStart;   // clear data, then encrypted
+      var len = nalHead.length + rest.length, lenBytes = [];
       for (var b = cfg.nalLength - 1; b >= 0; b--) lenBytes.push(Math.floor(len / Math.pow(256, b)) & 255);
-      var clearPart = bytes(gap.concat(lenBytes, nalBody));
-      chunks.push(clearPart, protectedBytes);
-      var clearLen = clearPart.length + (k === 0 ? parts[0].prefix.length : 0);
+      var clearPart = bytes(gap.concat(lenBytes, nalHead));
+      chunks.push(clearPart, rest);
+      var clearLen = clearPart.length + rest.length - protectedLen + (k === 0 ? parts[0].prefix.length : 0);
       if (encrypted && clearLen > 65535) throw new Error('clear part too long');
-      sampleSubs.push([clearLen, protectedBytes.length]);
+      sampleSubs.push([clearLen, protectedLen]);
     }
     var sample = concat(chunks);
     data.push(sample); sizes.push(sample.length); subs.push(sampleSubs);
   }
   return buildSegment(A, sizes, subs, concat(data));
+}
+
+/** A fragment's tfdt (baseMediaDecodeTime). */
+function decodeTime(f) {
+  var b = f.get('tfdt'), seg = f.seg;
+  if (!b) throw new Error('no tfdt');
+  return seg[b.d] === 1 ? u32(seg, b.d + 4) * 4294967296 + u32(seg, b.d + 8) : u32(seg, b.d + 4);
 }
 
 function fullBox(type, version, flags, payload) {
@@ -478,5 +508,5 @@ function buildSegment(A, sizes, subs, mdatData) {
 module.exports = { stackInit: stackInit, stackSegment: stackSegment, avcConfig: avcConfig, fragment: fragment,
   // shared with stitch-hevc.js
   u16: u16, u32: u32, w16: w16, w32: w32, alloc: alloc, concat: concat, bytes: bytes, boxes: boxes, child: child, box: box,
-  Reader: Reader, Writer: Writer, buildSegment: buildSegment,
+  Reader: Reader, Writer: Writer, buildSegment: buildSegment, spliceHeader: spliceHeader, HEADER_WINDOW: HEADER_WINDOW,
   parseSps: parseSps, stackSps: stackSps, parseSlice: parseSlice, rewriteHeader: rewriteHeader, escape: escape, unescape: unescape, levelFor: levelFor };

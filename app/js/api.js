@@ -217,6 +217,9 @@ var F1Api = (function () {
       ? playHdr(contentId, channelId).then(function (hdr) {
         if (!hdr) return next();
         if (!hdr.hdrEncrypted) return hdr;
+        // Multiview's other feeds: the HDR stream alone, one PLAY session each. The first feed's Widevine
+        // offer has the licence and the clock; F1 limits how many streams an account plays at once.
+        if (opts.hdrOnly) return Object.assign({}, hdr, { laURL: '', laUrl: '' });
         return next().then(function (normal) {
           if (!/WV/i.test(normal.streamType || '') || !/\.mpd(\?|$)/.test(normal.url)) return normal;
           return Object.assign({}, normal, { url: hdr.url, streamType: hdr.streamType, hdr: true, hdrEncrypted: true,

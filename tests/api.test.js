@@ -446,6 +446,18 @@ test('Premium CBCS HDR uses the normal Widevine authorization and keeps its sour
   assert.equal(calls.filter(c=>c.url.includes('/CONTENT/PLAY')).length, 2);
 });
 
+test('a multiview feed asks for the Premium HDR stream alone: one PLAY session, no Apple licence URL', async () => {
+  const encrypted = { ...HDR, streamType: 'HDR_UHD_CMAFFP', laURL: 'https://lic/fairplay' };
+  const { F1Api, calls } = premium((url, init) => ({ body: url === HDR.url
+    ? MASTER + '#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.apple.streamingkeydelivery",URI="skd://00112233-4455-6677-8899-aabbccddeeff"\n'
+    : { resultObj: init.headers['x-f1-device-info'] === 'device=tvos;' ? encrypted : { url: 'https://cdn/sdr.mpd', streamType: 'SDR_HD_DASHWV_SINGLE' } } }));
+  const s = await F1Api.play('42', '1033', { hdr: true, hdrOnly: true });
+  assert.equal(s.hdrEncrypted, true);
+  assert.equal(s.url, HDR.url);
+  assert.ok(!/fairplay/.test(s.licenseUrl));
+  assert.equal(calls.filter((c) => c.url.includes('/CONTENT/PLAY')).length, 1);
+});
+
 // Chromecast's cenc stream: an extra request for replays whose usual stream is cbcs Widevine DASH.
 const castRoute = (cast) => (url, init) => {
   if (!/\/CONTENT\/PLAY\?/.test(url)) return null;

@@ -87,10 +87,34 @@ var StreamProxy = (function () {
       var target = BASE + '/vod/' + id + '.mpd';
       return fetch(target, { method: 'POST', body: built.mpd }).then(function (r) {
         if (!r.ok) throw new Error('Could not prepare multiview');
-        return { url: target, subtitles: built.subtitles };
+        return { url: target, subtitles: built.subtitles, id: id };
       });
     });
   }
 
-  return { ensure: ensure, manifest: manifest, hdrManifest: hdrManifest, hdrLive: hdrLive, gridManifest: gridManifest };
+  /**
+   * Live multiview (experiment): the official live manifest through the helper, as for live HDR, with the
+   * helper's grid as its video (HdrStream.liveGrid). Resolves { url, subtitles }.
+   */
+  function gridLive(stream, shift, langs) {
+    var id = 'mv' + Date.now().toString(36) + '-' + (++vodSequence);
+    return ensure().then(function () { return HdrStream.liveGrid(stream.grid.streams, stream.grid.layout, { id: id, langs: langs }); }).then(function (built) {
+      return fetch(BASE + '/hdr/' + id, { method: 'POST', body: built.adaptation }).then(function (r) {
+        if (!r.ok) throw new Error('Could not prepare multiview');
+        // The first feed's official live manifest: the grid follows its clock and numbering.
+        var url = manifest(stream.grid.streams[0].widevineManifestUrl, shift, { audio: langs && langs.audio }) + '&hdr=' + id + '&notext=1';
+        return fetch(url, { cache: 'no-store' }).then(function (check) {
+          if (!check.ok) throw new Error('Multiview live manifest answered ' + check.status);
+          return { url: url, subtitles: built.subtitles, id: id };
+        });
+      });
+    });
+  }
+
+  /** Multiview: the playing grid rearranged in the helper (HdrStream.regrid); the player keeps its manifest. */
+  function regrid(stream, streams, layout, at, prepareOnly) {
+    return HdrStream.regrid(streams, layout, { id: stream.grid.id, at: at, prepareOnly: prepareOnly });
+  }
+
+  return { ensure: ensure, manifest: manifest, hdrManifest: hdrManifest, hdrLive: hdrLive, gridManifest: gridManifest, gridLive: gridLive, regrid: regrid };
 })();

@@ -329,6 +329,16 @@ var Player = (function () {
   var AvEngine = (function () {
     var av = null;
     var stream = null;
+    var gridRect = null;   // where a multiview's picture goes on screen (set by the app), else the whole screen
+
+    /** A multiview's picture area on screen ([x, y, w, h]), or null for the whole screen. */
+    function setGridRect(rect) {
+      var key = rect ? rect.join() : '';
+      if (key === (gridRect ? gridRect.join() : '')) return;
+      gridRect = rect;
+      var r = rect || [0, 0, 1920, 1080];
+      if (av && stream && stream.grid) try { av.setDisplayRect(r[0], r[1], r[2], r[3]); } catch (e) { /* not open */ }
+    }
     var live = false;
     var isPaused = false;
     var posMs = 0;
@@ -414,8 +424,11 @@ var Player = (function () {
       if (captions) { captions.stop(); captions = null; }
       if (s.grid) {
         var gridPrefs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
-        return StreamProxy.gridManifest(s.grid.streams, s.grid.layout, gridPrefs, startTime).then(function (prepared) {
+        var gridReady = s.info && s.info.dynamic ? StreamProxy.gridLive(s, s.startDelay, gridPrefs) :
+          StreamProxy.gridManifest(s.grid.streams, s.grid.layout, gridPrefs, startTime);
+        return gridReady.then(function (prepared) {
           if (stream !== s) throw new Error('cancelled');
+          s.grid.id = prepared.id;   // for rearranging it later without reloading
           captions = subtitleReader(prepared.subtitles);
           return open(s, prepared.url);
         });
@@ -482,7 +495,8 @@ var Player = (function () {
           av.setDrm('WIDEVINE_CDM', 'SetProperties', JSON.stringify(properties));
         }
         tune(s);
-        av.setDisplayRect(0, 0, 1920, 1080);
+        var rect = s.grid && gridRect ? gridRect : [0, 0, 1920, 1080];
+        av.setDisplayRect(rect[0], rect[1], rect[2], rect[3]);
         av.setDisplayMethod('PLAYER_DISPLAY_MODE_LETTER_BOX');
         var settle;
         preparing = new Promise(function (r) { settle = r; });
@@ -516,7 +530,7 @@ var Player = (function () {
     }
 
     // Samsung requires at least 4 s of buffering after a seek.
-    var tuning = { resumeBuffer: 4 };
+    var tuning = { resumeBuffer: 4, gridResumeBuffer: 2 };
 
     /*
      * AVPlay's own choice on F1's SDR DASH replays drops from 1080p to 720p, 540p and even 270p every
@@ -547,9 +561,14 @@ var Player = (function () {
       var adaptive = 'STARTBITRATE=' + START_LEVELS[startLevel()];
       if (pinned) adaptive = 'BITRATES=' + pinned + '~' + pinned * 2 + '|' + adaptive;
       try { av.setStreamingProperty('ADAPTIVE_INFO', adaptive); } catch (e) { /* keep default */ }
+      // A multiview changes by a seek to the same moment: it plays on sooner with less buffer (its segments are
+      // built ahead by the stream helper).
+      var resume = s.grid ? tuning.gridResumeBuffer : tuning.resumeBuffer;
       try {
-        if (tuning.resumeBuffer) av.setBufferingParam('PLAYER_BUFFER_FOR_RESUME', 'PLAYER_BUFFER_SIZE_IN_SECOND', tuning.resumeBuffer);
-      } catch (e) { /* older firmware: keep defaults */ }
+        if (resume) av.setBufferingParam('PLAYER_BUFFER_FOR_RESUME', 'PLAYER_BUFFER_SIZE_IN_SECOND', resume);
+      } catch (e) {
+        try { if (tuning.resumeBuffer) av.setBufferingParam('PLAYER_BUFFER_FOR_RESUME', 'PLAYER_BUFFER_SIZE_IN_SECOND', tuning.resumeBuffer); } catch (e2) { /* keep defaults */ }
+      }
     }
 
     /*
@@ -734,6 +753,7 @@ var Player = (function () {
       play: function () { try { av.play(); } catch (e) { /* not ready: ensurePlaying retries */ } isPaused = false; },
       pause: function () { try { av.pause(); } catch (e) { /* not ready yet */ } isPaused = true; },
       tracks: trackList,
+      setGridRect: setGridRect,
       setAudio: selectAudio,
       setSubtitles: selectText,
       grid: function () {
@@ -791,6 +811,8 @@ var Player = (function () {
    */
   function choose(stream) {
     if (Player.forceEngine) return engines[Player.forceEngine];
+    // Multiview: the stream helper's stitched HEVC, native only (clear or encrypted).
+    if (stream.grid) return AvEngine;
     if (stream.hdrEncrypted && stream.licenseUrl && hasAvPlay()) return AvEngine;
     // F1's cenc stream (asked as a Chromecast): the browser decrypts it, so Shaka plays it.
     if (stream.cenc) return ShakaEngine;
@@ -906,6 +928,8 @@ var Player = (function () {
     setAudio: function (l) { if (engine) engine.setAudio(l); },
     setSubtitles: function (l) { if (engine) engine.setSubtitles(l); },
     forceEngine: null,
+    /** Multiview: where AVPlay draws the grid's picture ([x, y, w, h] on the 1920x1080 screen, null: all of it). */
+    setGridRect: function (rect) { AvEngine.setGridRect(rect); },
     on: function (name, fn) { listeners[name] = fn; }
   };
 })();

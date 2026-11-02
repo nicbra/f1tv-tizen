@@ -221,7 +221,8 @@
 
   // navigation tabs
 
-  function enterBrowse() {
+  /** then: run once Home has opened (resuming a video must come after it, or Home takes the screen back). */
+  function enterBrowse(then) {
     if (loginJob && loginJob.cancel) loginJob.cancel();
     loginJob = null;
     show('browse');
@@ -254,6 +255,7 @@
         nav.appendChild(e);
       });
       openTab(0);
+      if (then) then();
     });
   }
 
@@ -1176,7 +1178,20 @@
         onMove: function (r) { list.style.transform = 'translateY(' + (-Math.max(0, r - 5) * 72) + 'px)'; }
       });
       grid.apply();
-      if (auto) return playFeed(0, auto.at ? { liveAt: auto.at } : feedsCtx.live ? {} : { fromStart: true });
+      if (auto) {
+        var feed = auto.feed > 0 && auto.feed < feeds.length ? auto.feed : 0;
+        // Resuming a multiview: only with feeds this video still has. The big feed plays first, alone, then the
+        // multiview takes over at the same moment: a multiview as the first video after the app starts has
+        // stalled in AVPlay's preparation (twice, Mexico 2026), as Samsung's first native HDR start can.
+        var mv = auto.multiview, heights = mv && mvHeights(mv.layout), then = null;
+        if (heights && mv.slots && mv.slots.length === heights.length && mv.slots.every(function (i) { return i >= 0 && i < feeds.length; })) {
+          feed = mv.slots[0];
+          then = { layout: mv.layout, slots: mv.slots.slice() };
+        }
+        playFeed(feed, auto.at ? { liveAt: auto.at } : auto.startAt != null ? { startAt: auto.startAt } : feedsCtx.live ? {} : { fromStart: true });
+        if (then) mvAfterStart(feedsCtx, then);
+        return;
+      }
       if (feedsCtx.single) {
         var ctx = feedsCtx;
         resumeReady.then(function () { if (feedsCtx === ctx && screen === 'feeds') chooseStart(0); });
@@ -1271,14 +1286,14 @@
    */
   // Names for the player bar and screen readers; the multiview page shows the layouts as diagrams.
   var MV_NAMES = { off: 'One feed', grid2x2: '2×2', grid2x2hd: '2×2 HD', pip: 'Picture in picture ½', pip3: 'Picture in picture ⅓',
-    pip4: 'Picture in picture ¼', side2: 'Big + 2', side5: 'Big + 5' };
+    pip4: 'Picture in picture ¼', side2: 'Big + 2', big3: 'Big + 3', side5: 'Big + 5' };
 
   function mvLayouts() { return typeof MultiviewLayouts !== 'undefined' ? MultiviewLayouts : null; }
 
   function mvHeights(layout) { var L = mvLayouts(), l = L && L.layouts[layout]; return l ? l.feeds : null; }
 
   function multiviewAvailable() {
-    return !!feedsCtx && !feedsCtx.live && feedsCtx.feeds.length > 1 && Settings.get('hdr') && Player.hdrCapable() &&
+    return !!feedsCtx && feedsCtx.feeds.length > 1 && Settings.get('hdr') && Player.hdrCapable() &&
       /^PREMIUM/i.test((F1Api.state.location && F1Api.state.location.entitlement) || '') && !!mvLayouts();
   }
 
@@ -1315,19 +1330,197 @@
     return out;
   }
 
-  /** The slots' Premium offers, one PLAY request at a time (F1 rate-limits them). */
+  /**
+   * The slots' Premium offers, one PLAY request at a time (F1 rate-limits them). F1 also limits how many
+   * streams an account plays at once (HTTP 402 from the CDN, Mexico 2026 race): the other feeds ask for the
+   * HDR stream alone, and a reload of the same multiview (a seek, live) keeps the sessions it has.
+   */
   function mvStreams(mv) {
+    var prev = Player.stream() && Player.stream().grid;
+    if (prev && prev.layout === mv.layout && prev.slots.join() === mv.slots.join()) return Promise.resolve(prev.streams);
     var list = [];
     return mv.slots.reduce(function (chain, idx, k) {
       return chain.then(function () {
         return (k ? new Promise(function (r) { setTimeout(r, 800); }) : Promise.resolve()).then(function () {
-          return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, { hdr: true });
+          return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, { hdr: true, hdrOnly: k > 0 });
         }).then(function (s) {
-          if (!s.hdrEncrypted) throw new Error('no 4K HDR offer for ' + feedsCtx.feeds[idx].title);
+          // Clear and encrypted feeds don't stitch together (a frame decrypts with one key).
+          if (!s.hdr || (list.length && !!s.hdrEncrypted !== !!list[0].hdrEncrypted)) throw new Error('no matching 4K HDR offer for ' + feedsCtx.feeds[idx].title);
           list.push(s);
         });
       });
     }, Promise.resolve()).then(function () { return list; });
+  }
+
+  var mvStall = null, mvDrawn = '';
+
+  /**
+   * A playing multiview changed (another layout, other feeds): the stream helper rearranges it while it plays,
+   * then a seek to the same moment makes the player drop what it buffered in the old arrangement, so the
+   * picture does not go black. Feeds that stay keep their sessions. Falls back to loading it anew.
+   */
+  var mvAhead = null, MV_CHANGING = 'Changing the multiview…';   // { key, list, at }: a multiview prepared while the viewer chooses
+
+  function mvCanRearrange() {
+    var s = Player.stream();
+    return !!(s && s.grid && s.grid.id && Player.engineName() === 'avplay' && !loadingFeed && typeof StreamProxy !== 'undefined' && StreamProxy.regrid);
+  }
+
+  /** The offers for a multiview's feeds: those playing (or prepared) keep their sessions, the rest are asked for. */
+  function mvOffers(g, mv) {
+    var have = {}, list = [];
+    g.slots.forEach(function (idx, k) { have[idx] = g.streams[k]; });
+    if (mvAhead && mvAhead.list && Date.now() - mvAhead.at < 60000) mvAhead.slots.forEach(function (idx, k) { if (!have[idx]) have[idx] = mvAhead.list[k]; });
+    return mv.slots.reduce(function (chain, idx) {
+      return chain.then(function () {
+        if (have[idx]) { list.push(have[idx]); return null; }
+        return new Promise(function (r) { setTimeout(r, 800); }).then(function () {
+          return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, { hdr: true, hdrOnly: true });
+        }).then(function (x) {
+          if (!x.hdr || !!x.hdrEncrypted !== !!g.streams[0].hdrEncrypted) throw new Error('no matching 4K HDR offer for ' + feedsCtx.feeds[idx].title);
+          have[idx] = x;
+          list.push(x);
+        });
+      });
+    }, Promise.resolve()).then(function () { return list; });
+  }
+
+  /**
+   * The viewer is about to show another multiview (focus on Show): get its offers and have the helper fetch
+   * what it needs, so the change starts at once. Once per arrangement.
+   */
+  function mvPrepare(mv) {
+    if (!mvCanRearrange() || !mv || mv.layout === 'off') return;
+    var s = Player.stream(), g = s.grid, key = mv.layout + '|' + mv.slots.join();
+    if (key === g.layout + '|' + g.slots.join() || (mvAhead && mvAhead.key === key && Date.now() - mvAhead.at < 30000)) return;
+    var ahead = mvAhead = { key: key, slots: mv.slots.slice(), list: null, at: Date.now() };
+    // Settles with the offers once the helper has what it needs (or failed: then the change starts afresh).
+    ahead.ready = mvOffers(g, mv).then(function (list) {
+      ahead.list = list;
+      if (Player.stream() !== s) return list;
+      return StreamProxy.regrid(s, list, mv.layout, Player.position() + 4, true).then(function () { return list; });
+    });
+    ahead.ready.catch(function () { if (mvAhead === ahead) mvAhead = null; });
+  }
+
+  function mvRearrange(mv) {
+    var s = Player.stream(), g = s && s.grid;
+    function reload() { feedsCtx.multiview = mv; playFeed(mv.slots[0], { switching: true }); }
+    if (!mvCanRearrange()) return reload();
+    toast(MV_CHANGING, 120000);   // until the new arrangement shows
+    // Prepared while the viewer chose (focus on Show): wait for that rather than start over.
+    var key = mv.layout + '|' + mv.slots.join(), ahead = mvAhead;
+    var offers = ahead && ahead.key === key && ahead.ready && Date.now() - ahead.at < 60000
+      ? ahead.ready.catch(function () { return mvOffers(g, mv); }) : mvOffers(g, mv);
+    offers.then(function (list) {
+      if (Player.stream() !== s) throw new Error('cancelled');
+      // A few seconds ahead: the helper prepares from there, and the player goes there once it is ready.
+      return StreamProxy.regrid(s, list, mv.layout, Player.position() + 4).then(function (info) { info = info || {}; info.list = list; return info; });
+    }).then(function (info) {
+      var list = info.list;
+      if (Player.stream() !== s) return;
+      // The frames over the video stay as they are until the new arrangement shows: after the seek, once
+      // the position moves on.
+      g.shown = { layout: g.layout, slots: g.slots.slice() };
+      g.layout = mv.layout;
+      g.slots = mv.slots.slice();
+      g.streams = list;
+      feedsCtx.multiview = { layout: mv.layout, slots: mv.slots.slice() };
+      feedsCtx.index = mv.slots[0];
+      $('osd-feed').textContent = feedLabel(s);
+      // To where the new arrangement is ready (at most a few seconds ahead), or here if playback got past it.
+      var target = Math.max(Player.position(), info && info.start != null ? info.start + 0.1 : 0), since = Date.now();
+      Player.seekTo(target, function () {
+        (function shows() {
+          if (Player.stream() !== s || g.shown == null) return;
+          if (Player.position() > target + 0.3 || Date.now() - since > 30000) {
+            delete g.shown;
+            if ($('toast').textContent === MV_CHANGING) $('toast').classList.add('hidden');
+            return mvFrames();
+          }
+          setTimeout(shows, 200);
+        })();
+      });
+    }).catch(function (e) {
+      if (e && e.message === 'cancelled') return;
+      toast('Reloading the multiview (' + ((e && e.message) || e) + ')', 4000);
+      reload();
+    });
+  }
+
+  /** A rounded rectangle path (no ctx.roundRect in this browser). */
+  function roundedRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  /**
+   * Over a playing multiview: everything black but a rounded hole per feed (margins between them, and the
+   * encoder's padding lines and the seams covered), and each feed's name unless switched off. The frames
+   * follow the picture: during a change, the arrangement still shown (grid.shown).
+   */
+  /**
+   * Where a multiview's picture goes: in the middle, or at the top when it is wider than the screen and timing
+   * data shows, so the data gets the space below in one piece instead of two bands.
+   */
+  function mvAlign(layout) {
+    var a = mvLayouts().area(layout, 1920, 1080, 'top');
+    var timing = Settings.get('timing') && timingState && timingState.standings && timingState.standings.length;
+    return timing && 1080 - a.height >= 200 ? 'top' : 'center';
+  }
+
+  function mvFrames() {
+    var s = screen === 'player' && Player.stream(), grid = s && s.grid, box = $('mv-frames');
+    var shown = grid && mvLayouts() && (grid.shown || grid), labels = Settings.get('mvLabels') !== false;
+    var align = shown ? mvAlign(shown.layout) : '';
+    var key = shown ? shown.layout + '|' + shown.slots.join() + '|' + labels + '|' + align : '';
+    if (key === mvDrawn) return;
+    mvDrawn = key;
+    box.innerHTML = '';
+    box.classList.toggle('hidden', !key);
+    if (Player.setGridRect) {
+      var a = shown && mvLayouts().area(shown.layout, 1920, 1080, align);
+      Player.setGridRect(a && align === 'top' ? [0, 0, 1920, Math.round(a.height)] : null);
+    }
+    if (!key) return;
+    var M = 6, R = 16;   // margin from the feed's edge, corner radius (screen pixels)
+    var rects = mvLayouts().onScreen(shown.layout, 1920, 1080, align).map(function (r) {
+      return { left: r.left + M, top: r.top + M, width: r.width - 2 * M, height: r.height - 2 * M };
+    });
+    var canvas = el('canvas', 'mv-mask'), ctx = canvas.getContext && canvas.getContext('2d');
+    canvas.width = 1920;
+    canvas.height = 1080;
+    box.appendChild(canvas);
+    if (ctx) {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, 1920, 1080);
+      rects.forEach(function (r) {
+        // An inset over an earlier feed gets its black margin back, then its own hole.
+        ctx.globalCompositeOperation = 'source-over';
+        roundedRect(ctx, r.left - 2 * M, r.top - 2 * M, r.width + 4 * M, r.height + 4 * M, R + 2 * M);
+        ctx.fill();
+        ctx.globalCompositeOperation = 'destination-out';
+        roundedRect(ctx, r.left, r.top, r.width, r.height, R);
+        ctx.fill();
+      });
+      ctx.globalCompositeOperation = 'source-over';
+    }
+    if (!labels) return;
+    rects.forEach(function (r, k) {
+      var fd = feedsCtx && feedsCtx.feeds[shown.slots[k]];
+      if (!fd) return;
+      var label = el('div', 'mv-label');
+      label.style.left = (r.left + 10) + 'px';
+      label.style.top = (r.top + 10) + 'px';
+      if (fd.num) label.appendChild(feedNumber(fd));
+      label.appendChild(el('span', '', fd.full || fd.title));
+      box.appendChild(label);
+    });
   }
 
   function feedLabel(stream) {
@@ -1377,7 +1570,7 @@
           // Multiview: the first feed's offer gives the clock, licence and commentary; the player builds the grid.
           return mvStreams(mv).then(function (list) {
             var s = Object.assign({}, list[0]);
-            s.grid = { streams: list, layout: mv.layout };
+            s.grid = { streams: list, layout: mv.layout, slots: mv.slots.slice() };
             return s;
           });
         })
@@ -1573,6 +1766,7 @@
   }
 
   function updateOsd() {
+    mvFrames();
     if (screen !== 'player') return;
     var pos = Player.position();
     var r = Player.range();
@@ -1712,9 +1906,57 @@
     }
   }
 
+  /*
+   * What plays now, saved every few seconds: after the app is restarted (a new version installed, the TV's
+   * app switcher) it opens the same video at the same moment, with its multiview, without jumping ahead.
+   * Leaving the player clears it.
+   */
+  var WATCHING = 'f1tv.watching', RESUME_WITHIN = 10 * 60000;
+
+  function saveWatching() {
+    if (screen !== 'player' || !feedsCtx || !Player.engineName() || loadingFeed || queuedFeed) return;
+    var pos = Player.position(), wall = pos > 0 ? Player.wallClock(pos) : null;
+    if (!(pos > 0)) return;
+    var state = { contentId: feedsCtx.contentId, title: feedsCtx.title, image: feedsCtx.image, feed: feedsCtx.index,
+      multiview: feedsCtx.multiview || null, wall: wall || null, pos: wall ? null : pos, at: Date.now() };
+    try { localStorage.setItem(WATCHING, JSON.stringify(state)); } catch (e) { /* storage unavailable */ }
+  }
+
+  function clearWatching() {
+    try { localStorage.setItem(WATCHING, ''); } catch (e) { /* storage unavailable */ }
+  }
+
+  /** Once `ctx`'s first feed plays (its position moves), its multiview takes over at the same moment. */
+  function mvAfterStart(ctx, mv) {
+    var since = Date.now(), first = null;
+    (function wait() {
+      if (feedsCtx !== ctx || Date.now() - since > 60000 || ctx.multiview) return;
+      var p = screen === 'player' && Player.engineName() && !loadingFeed ? Player.position() : null;
+      if (p != null && first == null) first = p;
+      if (p != null && p > first + 1) {
+        ctx.multiview = mv;
+        return playFeed(mv.slots[0], { switching: true });
+      }
+      setTimeout(wait, 500);
+    })();
+  }
+
+  /** At start-up: back to what played before the app was restarted, if that was a moment ago. */
+  function resumeWatching() {
+    var state = null;
+    try { state = JSON.parse(localStorage.getItem(WATCHING) || 'null'); } catch (e) { state = null; }
+    clearWatching();
+    if (!state || !state.contentId || !(Date.now() - state.at < RESUME_WITHIN)) return false;
+    toast('Continuing where you were…', 4000);
+    openFeeds(state.contentId, { title: state.title || '', image: state.image }, null,
+      { at: state.wall, startAt: state.pos, feed: state.feed, multiview: state.multiview });
+    return true;
+  }
+
   /** Stops playback and clears the player's overlays, staying on the player screen. */
   function leavePlayer() {
     playerExits++;
+    clearWatching();
     queuedFeed = null;   // a feed switch asked for while loading must not restart playback
     liveFocus = false;
     saveProgress();
@@ -2115,10 +2357,24 @@
     armPanel();
   }
 
+  /** Remembered multiview feeds per layout, by feed title (feed indexes differ between videos). */
+  function mvRemember(layout, slots) {
+    var all = Settings.get('mvFeeds') || {};
+    all[layout] = slots.map(function (i) { return feedsCtx.feeds[i].title; });
+    Settings.set('mvFeeds', all);
+  }
+
+  function mvRemembered(layout) {
+    var titles = (Settings.get('mvFeeds') || {})[layout];
+    if (!titles) return null;
+    var idx = titles.map(function (t) { var i = -1; feedsCtx.feeds.forEach(function (f, j) { if (i < 0 && f.title === t) i = j; }); return i; });
+    return idx.every(function (i) { return i >= 0; }) ? idx : null;
+  }
+
   /**
-   * The multiview page of watch options: the layouts as diagrams (OK chooses one), then the chosen
-   * layout larger with a feed in each place (▲ ▼ move between them, ◀ ▶ change the feed), and Show.
-   * focus: 'layout:<name>' or 'slot<k>'.
+   * The multiview page of watch options: the layouts as diagrams (OK chooses one), the chosen layout larger
+   * with each feed in its place (the arrows move between places, OK opens the feed list for that place),
+   * feed names on the video, and Show. focus: 'layout:<name>', 'slot<k>' or a row key.
    */
   function openMultiview(focus) {
     var box = $('panel-list');
@@ -2126,7 +2382,7 @@
     box.style.transform = '';
     $('panel').classList.add('wide');
     $('panel-title').textContent = 'Multiview';
-    $('panel-hint').textContent = 'OK choose · ◀ ▶ change a feed · BACK watch options';
+    $('panel-hint').textContent = 'Arrows move · OK choose · BACK watch options';
     var active = feedsCtx.multiview, count = feedsCtx.feeds.length, rows = [], focusRow = -1, focusCol = 0;
     if (!mvDraft) mvDraft = { layout: active ? active.layout : 'off', slots: active ? active.slots.slice() : null };
     var draft = mvDraft;
@@ -2147,48 +2403,53 @@
       row.push(t);
     });
 
-    function action(label, run) {
+    function action(label, run, key) {
       var e = el('div', 'panel-row setting go-live');
       e.appendChild(el('span', 'panel-label', label));
       e._action = run;
+      if (key && key === focus) focusRow = rows.length;
       box.appendChild(e);
       rows.push([e]);
+      return e;
     }
 
     if (draft.layout !== 'off') {
-      draft.slots = mvSlots(draft.layout, draft.slots);
+      draft.slots = mvSlots(draft.layout, draft.slots || mvRemembered(draft.layout));
       box.appendChild(el('div', 'panel-head', 'Feeds'));
-      var d = mvDiagram(draft.layout, 'mv-preview');
+      var d = mvDiagram(draft.layout, 'mv-preview'), places = mvLayouts().shape(draft.layout).rects;
       box.appendChild(d.box);
       d.cells.forEach(function (c, k) {
+        var fd = feedsCtx.feeds[draft.slots[k]], label = el('span', 'mv-feed');
+        if (fd.num) label.appendChild(feedNumber(fd));
+        label.appendChild(el('span', '', fd.title));
+        c.appendChild(label);
         c._anchor = d.box;
-        c._refresh = function () {
-          var fd = feedsCtx.feeds[draft.slots[k]];
-          c.innerHTML = '';
-          var label = el('span', 'mv-feed');
-          if (fd.num) label.appendChild(feedNumber(fd));
-          label.appendChild(el('span', '', fd.title));
-          c.appendChild(label);
-        };
-        c._cycle = function (dir) {
-          // The next feed not shown elsewhere in the layout.
-          var next = draft.slots[k];
-          for (var n = 0; n < count; n++) {
-            next = (next + dir + count) % count;
-            if (draft.slots.indexOf(next) < 0) break;
-          }
-          draft.slots[k] = next;
-          c._refresh();
-        };
-        c._refresh();
+        c._place = places[k];
+        c._slot = k;
         if (focus === 'slot' + k) focusRow = rows.length;
         rows.push([c]);
       });
-      action(active ? 'Show this multiview' : 'Show multiview', function () {
+      var labels = el('div', 'panel-row setting');
+      var lv = el('span', 'panel-value');
+      labels.appendChild(el('span', 'panel-label', 'Feed names on the video'));
+      labels.appendChild(lv);
+      labels._refresh = function () { lv.textContent = '‹ ' + (Settings.get('mvLabels') !== false ? 'On' : 'Off') + ' ›'; };
+      labels._cycle = function () { Settings.set('mvLabels', Settings.get('mvLabels') === false); labels._refresh(); };
+      labels._refresh();
+      if (focus === 'labels') focusRow = rows.length;
+      box.appendChild(labels);
+      rows.push([labels]);
+      var show = action(active ? 'Show this multiview' : 'Show multiview', function () {
         closePanel();
-        feedsCtx.multiview = { layout: draft.layout, slots: draft.slots.slice() };
-        playFeed(draft.slots[0], { switching: true });
-      });
+        mvRemember(draft.layout, draft.slots);
+        var mv = { layout: draft.layout, slots: draft.slots.slice() };
+        // A multiview already playing changes in place; otherwise it loads.
+        if (active && Player.stream() && Player.stream().grid) return mvRearrange(mv);
+        feedsCtx.multiview = mv;
+        playFeed(mv.slots[0], { switching: true });
+      }, 'show');
+      // Focus on Show: prepare it already.
+      show._prepare = function () { mvPrepare({ layout: draft.layout, slots: draft.slots.slice() }); };
     } else if (active) {
       action('Back to one feed', function () {
         closePanel();
@@ -2202,16 +2463,19 @@
         if (e._layout) {
           if (e._layout !== draft.layout) {
             draft.layout = e._layout;
+            draft.slots = null;   // that layout's remembered feeds, or the current one and the next
             if (e._layout !== 'off') Settings.set('multiview', e._layout);
           }
           return openMultiview(e._layout === 'off' ? 'layout:off' : 'slot0');
         }
+        if (e._slot != null) return openMvFeeds(e._slot);
         if (e._action) return e._action();
         if (e._cycle) return e._cycle(1);
       },
       onMove: function (r, c, e) {
         var top = (e._anchor || e).offsetTop, view = $('panel-list').parentNode.clientHeight;
         box.style.transform = 'translateY(' + (-Math.max(0, top - view / 3)) + 'px)';
+        if (e._prepare) e._prepare();
       }
     });
     g.r = focusRow >= 0 ? focusRow : 0;
@@ -2225,10 +2489,79 @@
     armPanel();
   }
 
+  /**
+   * The arrows between the places of the layout drawing: to the nearest place in that direction, from the
+   * top ones up to the layouts, from the bottom ones down to the rows below. Returns false if not on a place.
+   */
+  function mvMove(key) {
+    if (key !== K.LEFT && key !== K.RIGHT && key !== K.UP && key !== K.DOWN) return false;
+    var g = panel.grid, cur = g.current(), p = cur && cur._place;
+    if (!p) return false;
+    var dx = key === K.LEFT ? -1 : key === K.RIGHT ? 1 : 0, dy = key === K.UP ? -1 : key === K.DOWN ? 1 : 0;
+    var cx = p.x + p.w / 2, cy = p.y + p.h / 2, best = null, bestCost = Infinity;
+    g.rows.forEach(function (row, r) {
+      var q = row[0]._place;
+      if (!q || row[0] === cur) return;
+      var qx = q.x + q.w / 2, qy = q.y + q.h / 2, along = (qx - cx) * dx + (qy - cy) * dy;
+      if (along <= 0) return;
+      var cost = along + 2 * Math.abs(dx ? qy - cy : qx - cx);
+      if (cost < bestCost) { bestCost = cost; best = r; }
+    });
+    if (best == null) {
+      if (dx) return true;   // nothing that way: stay
+      var first = -1, last = -1;
+      g.rows.forEach(function (row, r) { if (row[0]._place) { if (first < 0) first = r; last = r; } });
+      best = dy < 0 ? first - 1 : last + 1;
+      if (best < 0 || best >= g.rows.length) return true;
+    }
+    g.r = best;
+    g.apply();
+    return true;
+  }
+
+  /** The feed list for one place of the multiview being set up; a feed shown elsewhere swaps places. */
+  function openMvFeeds(k) {
+    var box = $('panel-list'), draft = mvDraft, rows = [], current = 0;
+    box.innerHTML = '';
+    box.style.transform = '';
+    $('panel-title').textContent = 'Feed for this place';
+    $('panel-hint').textContent = '▲ ▼ choose · OK select · BACK multiview';
+    feedsCtx.feeds.forEach(function (f, i) {
+      var e = el('div', 'panel-row feed-row' + (i === draft.slots[k] ? ' current' : ''));
+      e.appendChild(feedNumber(f));
+      var name = el('span', 'panel-label', f.title);
+      if (f.full) name.appendChild(el('small', '', f.full));
+      e.appendChild(name);
+      var elsewhere = draft.slots.indexOf(i);
+      if (elsewhere >= 0 && elsewhere !== k) e.appendChild(el('span', 'panel-value', 'in multiview'));
+      e._feed = i;
+      if (i === draft.slots[k]) current = rows.length;
+      box.appendChild(e);
+      rows.push([e]);
+    });
+    var g = new Focus.Grid(rows, {
+      onSelect: function (e) {
+        var other = draft.slots.indexOf(e._feed);
+        if (other >= 0) draft.slots[other] = draft.slots[k];
+        draft.slots[k] = e._feed;
+        openMultiview('slot' + k);
+      },
+      onMove: function (r, c, e) {
+        var view = $('panel-list').parentNode.clientHeight;
+        box.style.transform = 'translateY(' + (-Math.max(0, e.offsetTop - view / 2)) + 'px)';
+      }
+    });
+    g.r = current;
+    if (panel) clearTimeout(panel.timer);
+    panel = { grid: g, timer: null, page: 'mvfeeds', slot: k };
+    g.apply();
+    armPanel();
+  }
+
   function armPanel() {
     clearTimeout(panel.timer);
     // Choosing a multiview takes longer than switching a setting.
-    panel.timer = setTimeout(closePanel, panel.page === 'multiview' ? 30000 : 7000);
+    panel.timer = setTimeout(closePanel, panel.page === 'main' ? 7000 : 30000);
   }
 
   function closePanel() {
@@ -2243,9 +2576,11 @@
     armPanel();
     var row = panel.grid.current();
     if (key === K.BACK && panel.page === 'multiview') return openPanel('multiview');
+    if (key === K.BACK && panel.page === 'mvfeeds') return openMultiview('slot' + panel.slot);
     if (key === K.BACK || key === K.STOP) return closePanel();
     if ((key === K.LEFT || key === K.RIGHT) && row && row._cycle) return row._cycle(key === K.LEFT ? -1 : 1);
-    if ((key === K.LEFT || key === K.RIGHT) && panel.page === 'multiview') return panel.grid.handle(key);
+    if (panel.page === 'multiview' && mvMove(key)) return;
+    if ((key === K.LEFT || key === K.RIGHT) && panel.page !== 'main') return panel.grid.handle(key);
     if (key === K.LEFT || key === K.RIGHT) { closePanel(); return playerKey(key); }
     panel.grid.handle(key);
   }
@@ -2353,8 +2688,88 @@
     return clock;
   }
 
+  /**
+   * Multiview: the screen space the playing layout leaves free, if there is room for timing data there:
+   * { rect, mode: 'field' (rows in two columns) or 'band' (a strip) }, else null.
+   */
+  function mvDataSpace() {
+    var s = screen === 'player' && Player.stream(), grid = s && s.grid, L = mvLayouts();
+    if (!grid || !L || !L.freeSpace) return null;
+    var layout = (grid.shown || grid).layout;
+    var free = L.freeSpace(layout, 1920, 1080, mvAlign(layout)).filter(function (r) { return r.height >= 120 && r.width >= 600; });
+    if (!free.length) return null;
+    // Of two alike (the bands above and below), the lower one.
+    var best = free.filter(function (r) { return r.width * r.height >= free[0].width * free[0].height - 1; })
+      .sort(function (a, b) { return b.top - a.top; })[0];
+    return { rect: best, mode: best.height >= 280 ? 'field' : 'band' };
+  }
+
+  var mvDataSig = '';
+
+  /** The timing data in a multiview's free space (instead of the tower over the video). */
+  function renderMvData(st, space) {
+    var box = $('mv-data');
+    box.classList.toggle('hidden', !st || !space);
+    if (!st || !space) { mvDataSig = ''; return; }
+    var r = space.rect, view = towerView(), race = st.type === 'Race';
+    box.className = 'mv-data ' + space.mode;
+    box.style.left = Math.round(r.left) + 'px';
+    box.style.top = Math.round(r.top) + 'px';
+    box.style.width = Math.round(r.width) + 'px';
+    box.style.height = Math.round(r.height) + 'px';
+    var t = st.track, flag = { '2': 'YELLOW', '4': 'SC', '5': 'RED', '6': 'VSC', '7': 'VSC' }[t] || '';
+    var head = st.name + '|' + towerValue(st) + '|' + flag + '|' + view;
+    var sig = head + JSON.stringify(st.standings) + '|' + space.mode + JSON.stringify(r);
+    if (sig === mvDataSig) return;
+    mvDataSig = sig;
+    box.innerHTML = '';
+    var top = el('div', 'mv-data-head');
+    top.appendChild(el('span', 'mv-data-name', st.name));
+    top.appendChild(el('span', 'mv-data-value', towerValue(st)));
+    if (flag) top.appendChild(el('span', 'tower-flag ' + ({ '2': 'yellow', '4': 'sc', '5': 'red', '6': 'vsc', '7': 'vsc' }[t]), flag));
+    top.appendChild(el('span', 'mv-data-view', viewLabel(view)));
+    box.appendChild(top);
+    // As few columns as the rows fit in (at least 26 px each), so each column has room for the sector times
+    // too; where it hasn't, they are left out.
+    var n = st.standings.length, availH = r.height - 28 - 34, availW = r.width - 48, field = space.mode === 'field';
+    var cols = 1;
+    while (Math.ceil(n / cols) * 26 > availH && cols < n) cols++;
+    var sectors = field && cols * 470 <= availW, minW = sectors ? 470 : field ? 290 : 170;
+    while (cols * minW > availW && cols > 1) cols--;
+    var rowH = Math.max(20, Math.min(30, Math.floor(availH / Math.ceil(n / cols))));
+    box.classList.toggle('sectors', sectors);
+    var rows = el('div', 'mv-data-rows'), perCol = Math.ceil(n / cols);
+    st.standings.forEach(function (d, i) {
+      // Every other row a shade lighter, counted within its column (the columns fill top to bottom; a band's
+      // lines fill left to right).
+      var alt = (field ? i % perCol : Math.floor(i / cols)) % 2 === 1;
+      var row = el('div', 'tower-row' + (d.out || d.knockedOut ? ' out' : '') + (alt ? ' alt' : ''));
+      row.style.height = rowH + 'px';
+      row.style.width = (100 / cols) + '%';
+      row.appendChild(el('span', 'tw-pos', d.pos));
+      var bar = el('span', 'tw-bar');
+      bar.style.background = d.colour;
+      row.appendChild(bar);
+      row.appendChild(el('span', 'tw-tla', d.tla));
+      var cell = towerCell(d, view, race);
+      row.appendChild(el('span', 'tw-val' + (cell[1] ? ' ' + cell[1] : ''), cell[0] || ''));
+      // Sector times, coloured as on F1's timing screens: purple overall fastest, green personal best.
+      if (sectors) (d.sectors || ['', '', '']).forEach(function (t) {
+        var mark = /^[op]/.test(t) ? t.charAt(0) : '';
+        row.appendChild(el('span', 'tw-sec' + (mark ? ' ' + mark : ''), mark ? t.slice(1) : t));
+      });
+      if (d.tyre) row.appendChild(el('span', 'tw-tyre tyre-' + d.tyre, d.tyre));
+      rows.appendChild(row);
+    });
+    box.appendChild(rows);
+  }
+
   function renderTower() {
     var visible = screen === 'player' && Settings.get('timing') && timingState && timingState.standings && timingState.standings.length;
+    // In a multiview with room to spare, the timing data goes there instead of over the video.
+    var mvSpace = visible ? mvDataSpace() : null;
+    renderMvData(mvSpace ? timingState : null, mvSpace);
+    if (mvSpace) visible = false;
     $('tower').classList.toggle('hidden', !visible);
     $('screen-player').classList.toggle('tower-on', !!visible);   // moves the player title clear of it
     if (!visible) return;
@@ -2448,7 +2863,10 @@
 
     Player.on('error', function (msg) { toast(msg, 8000); $('spinner').classList.add('hidden'); });
     // During a jump the pending-seek logic owns the spinner (it waits a moment before showing it).
-    Player.on('buffering', function (b) { if (!pending) $('spinner').classList.toggle('hidden', !b); });
+    Player.on('buffering', function (b) {
+      if (!pending) $('spinner').classList.toggle('hidden', !b);
+      mvBuffering(b);
+    });
     setInterval(checkPending, 100);
     Player.on('ended', function () {
       if (screen !== 'player' || upNext) return;   // the "Next" / "Broadcast ended" card is counting down already
@@ -2457,6 +2875,7 @@
     Player.on('subtitle', showSubtitle);
     setInterval(timingTick, 250);   // often, so the session clock ticks with the on-screen one
     setInterval(saveProgress, 30000);
+    setInterval(saveWatching, 3000);
     setInterval(checkNextPart, 2000);
     setInterval(function () {
       if (screen === 'browse' && currentPage && currentPage.kind === 'home' && grid && !dialog) refreshPage(currentPage);
@@ -2467,7 +2886,7 @@
       .then(function () { return ensureSession(); })
       .then(function (ok) {
         if (!ok) return F1Api.refreshLocation().then(function () { showLogin(); });
-        enterBrowse();
+        enterBrowse(resumeWatching);
       })
       .catch(function (e) {
         showLogin('Startup problem: ' + e.message);

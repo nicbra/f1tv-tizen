@@ -171,13 +171,14 @@ function parseSlice(rbsp, type, sps, pps) {
   s.saoLuma = 0; s.saoChroma = 0;
   if (sps.sao) { s.saoLuma = r.u(1); if (sps.chroma) s.saoChroma = r.u(1); }
   var P = s.sliceType === 1, B = s.sliceType === 0;
+  s.cabacInit = 0; s.mvdL1Zero = 0; s.mergeCand = 0;
   if (P || B) {
     if (r.u(1)) { r.ue(); if (B) r.ue(); }
-    if (B) r.u(1);
-    if (pps.cabacInitPresent) r.u(1);
-    r.ue();
+    if (B) s.mvdL1Zero = r.u(1);
+    if (pps.cabacInitPresent) s.cabacInit = r.u(1);
+    s.mergeCand = r.ue();
   }
-  r.se();
+  s.qp = pps.initQp + r.se();
   if (pps.chromaQpOffsets) { r.se(); r.se(); }
   s.deblockAt = r.p;
   s.deblockDisabled = pps.deblockDisabled; s.beta = pps.beta; s.tc = pps.tc;
@@ -213,6 +214,56 @@ function cellHeader(rbsp, s, address, grid, filterEdges) {
   w.ue(0);                                       // one tile per slice: no entry points
   w.copy(rbsp, s.extAt, s.end);
   return finish(w);
+}
+
+// --- filler: an empty cell ---
+
+/*
+ * A flat gray cell (x265, the settings that decide how F1's slices are read: 32-pixel CTBs, 8-pixel minimum
+ * CUs, 4-32 pixel transforms, intra depth 0, no AMP, no SAO data), by cell size in CTBs: an I slice and all-skip
+ * P and B slices, without emulation prevention. Gray is prediction alone (no residual), so it reads alike
+ * whatever else the stream's parameter sets enable. The app's overlay covers it with black.
+ */
+var FILLER = {
+  '30x17': { I: { qp: 27, cabacInit: 0, mergeCand: 0, mvdL1Zero: 0, data: '053a895b9c61b2ef43c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001050' },
+    P: { qp: 30, cabacInit: 0, mergeCand: 2, mvdL1Zero: 0, data: '9a000000000000000b58' },
+    B: { qp: 32, cabacInit: 0, mergeCand: 2, mvdL1Zero: 0, data: '960000000000000020e0' } },
+  '4x2': { I: { qp: 27, cabacInit: 0, mergeCand: 0, mvdL1Zero: 0, data: '053a895b9c61b3c780' },
+    P: { qp: 30, cabacInit: 0, mergeCand: 2, mvdL1Zero: 0, data: '9ac980' },
+    B: { qp: 32, cabacInit: 0, mergeCand: 2, mvdL1Zero: 0, data: '96cf80' } }
+};
+
+function hexBytes(hex) { var out = []; for (var i = 0; i < hex.length; i += 2) out.push(parseInt(hex.substr(i, 2), 16)); return out; }
+
+/** An empty cell's slice for the picture whose first slice is `ref` (its type, order and references). */
+function fillerNal(ref, refRbsp, g, address) {
+  var set = FILLER[g.cellW + 'x' + g.cellH], t = set['BPI'.charAt(ref.sliceType)], w = new Writer();
+  var sps = g.sps, pps = g.pps, B = ref.sliceType === 0, P = ref.sliceType === 1, i;
+  w.u(8, ref.type << 1); w.u(8, refRbsp[1]);
+  w.u(1, 0);                                         // never the first slice
+  if (ref.type >= 16 && ref.type <= 23) w.copy(refRbsp, ref.irapAt, ref.irapAt + 1);
+  w.ue(pps.id);
+  if (pps.dependentSlices) w.u(1, 0);
+  w.u(g.addressBits, address);
+  for (i = 0; i < pps.extraBits; i++) w.u(1, 0);
+  w.ue(ref.sliceType);
+  if (pps.outputFlag) w.u(1, 1);
+  if (ref.type !== 19 && ref.type !== 20) { w.u(sps.log2Poc, ref.poc); w.copy(refRbsp, ref.rpsAt, ref.rpsEnd); }
+  if (sps.sao) { w.u(1, 0); if (sps.chroma) w.u(1, 0); }
+  if (P || B) {
+    w.u(1, 0);                                       // no num_ref_idx override
+    if (B) w.u(1, t.mvdL1Zero);
+    if (pps.cabacInitPresent) w.u(1, t.cabacInit);
+    w.ue(t.mergeCand);
+  }
+  w.se(t.qp - pps.initQp);
+  if (pps.chromaQpOffsets) { w.se(0); w.se(0); }
+  var disabled = pps.deblockDisabled;
+  if (pps.deblockOverride) { w.u(1, 1); w.u(1, 1); disabled = 1; }
+  if (pps.loopAcrossSlices && !disabled) w.u(1, 0);
+  w.ue(0);                                           // one tile: no entry points
+  if (pps.headerExtension) w.ue(0);
+  return escape(finish(w).concat(hexBytes(t.data)), -1);
 }
 
 // --- layouts ---
@@ -315,6 +366,24 @@ function units(seg, s, nalLength) {
   return out;
 }
 
+/** A fragment's tfdt (baseMediaDecodeTime). */
+function decodeTime(f) {
+  var b = f.get('tfdt'), seg = f.seg;
+  if (!b) fail('no tfdt');
+  return seg[b.d] === 1 ? u32(seg, b.d + 4) * 4294967296 + u32(seg, b.d + 8) : u32(seg, b.d + 4);
+}
+
+/** The track encryption (tenc payload: pattern, key id, constant IV) as hex, or '' for clear media. */
+function trackEncryption(init, e) {
+  var sinf = boxes(init, e.entry.d + 78, e.entry.e).filter(function (x) { return x.type === 'sinf'; })[0];
+  if (!sinf) return '';
+  var schi = boxes(init, sinf.d, sinf.e).filter(function (x) { return x.type === 'schi'; })[0];
+  var tenc = schi && boxes(init, schi.d, schi.e).filter(function (x) { return x.type === 'tenc'; })[0];
+  if (!tenc) fail('protected entry without tenc');
+  var out = ''; for (var i = tenc.d; i < tenc.e; i++) out += (init[i] < 16 ? '0' : '') + init[i].toString(16);
+  return out;
+}
+
 function lengthPrefix(n, nalLength) { var out = []; for (var b = nalLength - 1; b >= 0; b--) out.push(Math.floor(n / Math.pow(256, b)) & 255); return out; }
 
 /**
@@ -327,14 +396,15 @@ function feedFrame(seg, sample, nalLength, sets) {
   if (params.length) paramSets(params, sets);
   var slices = list.filter(function (u) { return u.type < 32; }).map(function (u) {
     var protStart = u.protStart >= 0 ? u.protStart : u.end;
-    var clear = unescape(seg, u.body, protStart).rbsp;
+    // Only the start of the slice is read (its header); the data is copied as it is.
+    var winEnd = Math.min(protStart, u.body + h.HEADER_WINDOW), win = unescape(seg, u.body, winEnd), clear = win.rbsp;
     var pps = sets.pps[ppsIdOf(clear, u.type)];
     if (!pps) fail('unknown PPS');
     var sps = sets.sps[pps.sps], hd = parseSlice(clear, u.type, sps, pps);
     if (hd.dataStart > clear.length) fail('slice header reaches the encrypted bytes');
     var tileW = sps.wCtb / pps.tileCols, tileH = Math.ceil(sps.hCtb / pps.tileRows);
     var tile = Math.floor(Math.floor(hd.address / sps.wCtb) / tileH) * pps.tileCols + Math.floor((hd.address % sps.wCtb) / tileW);
-    return { unit: u, rbsp: clear, h: hd, tile: tile, protStart: protStart };
+    return { unit: u, rbsp: clear, win: win, winEnd: winEnd, h: hd, tile: tile, protStart: protStart };
   });
   return { units: list, slices: slices };
 }
@@ -346,7 +416,13 @@ function feedFrame(seg, sample, nalLength, sets) {
 function gridSegment(segs, cfg) {
   var g = cfg.g, l = cfg.layout, nl = cfg.nalLength;
   var frags = segs.map(h.fragment), A = frags[0], count = A.samples.length, encrypted = !!A.get('senc'), i, k;
-  frags.forEach(function (f) { if (f.samples.length !== count) fail('feeds differ in frame count'); });
+  // The same moment in every feed, frame for frame (the output takes feed 0's timing).
+  var t0 = decodeTime(A);
+  frags.forEach(function (f, n) {
+    if (f.samples.length !== count) fail('feeds differ in frame count');
+    if (decodeTime(f) !== t0) fail('feed ' + n + ' is at another time than feed 0');
+    f.samples.forEach(function (smp, j) { if (smp.dur !== A.samples[j].dur || smp.cto !== A.samples[j].cto) fail('feed ' + n + ' timing differs at frame ' + j); });
+  });
   var data = [], sizes = [], subs = [];
   for (i = 0; i < count; i++) {
     var frames = frags.map(function (f, n) { return feedFrame(f.seg, f.samples[i], nl, cfg.sets[n]); });
@@ -361,7 +437,16 @@ function gridSegment(segs, cfg) {
       var part = bytes(lengthPrefix(out.length, nl)); chunks.push(part, out); pendingClear += part.length + out.length;
     });
     for (k = 0; k < l.cells.length; k++) {
-      var c = l.cells[k], f = frags[c[0]];
+      var c = l.cells[k];
+      if (!c) {
+        // An empty cell: gray filler, clear bytes (counted with the next feed's).
+        var fn = fillerNal(ref.h, ref.rbsp, g, Math.floor(k / l.cols) * g.cellH * g.wCtb + (k % l.cols) * g.cellW);
+        var fill = bytes(lengthPrefix(fn.length, nl).concat(fn));
+        chunks.push(fill);
+        pendingClear += fill.length;
+        continue;
+      }
+      var f = frags[c[0]];
       var sl = frames[c[0]].slices.filter(function (x) { return x.tile === c[1]; })[0];
       if (!sl) fail('feed ' + c[0] + ' has no tile ' + c[1] + ' at frame ' + i);
       var hd = sl.h;
@@ -371,16 +456,16 @@ function gridSegment(segs, cfg) {
       var col = k % l.cols, row = Math.floor(k / l.cols);
       var address = row * g.cellH * g.wCtb + col * g.cellW;
       var header = cellHeader(sl.rbsp, hd, address, g, edgesOwn(l, k, cfg.tileCols));
-      var next = sl.protStart < sl.unit.end ? f.seg[sl.protStart] : -1;
-      var body = escape(header.concat(sl.rbsp.slice(hd.dataStart)), next);
-      var protectedBytes = f.seg.slice(sl.protStart, sl.unit.end);
-      var head = bytes(lengthPrefix(body.length + protectedBytes.length, nl).concat(body));
-      chunks.push(head, protectedBytes);
-      pendingClear += head.length;
+      var sp = h.spliceHeader(f.seg, sl.win, header, hd.dataStart, sl.winEnd, sl.winEnd === sl.protStart);
+      var rest = f.seg.slice(sp.restAt, sl.unit.end), protectedLen = sl.unit.end - sl.protStart;   // clear data, then encrypted
+      var head = bytes(lengthPrefix(sp.head.length + rest.length, nl).concat(sp.head));
+      chunks.push(head, rest);
+      pendingClear += head.length + rest.length - protectedLen;
       if (encrypted && pendingClear > 65535) fail('clear part too long');
-      sampleSubs.push([pendingClear, protectedBytes.length]);
+      sampleSubs.push([pendingClear, protectedLen]);
       pendingClear = 0;
     }
+    if (pendingClear) sampleSubs.push([pendingClear, 0]);   // the frame ends with clear bytes (filler)
     var sample = concat(chunks);
     data.push(sample); sizes.push(sample.length); subs.push(sampleSubs);
   }
@@ -394,6 +479,9 @@ function gridSegment(segs, cfg) {
 function prepare(inits, firstSegments, layout, fps) {
   var l = validLayout(typeof layout === 'string' ? LAYOUTS[layout] : layout);
   var entries = inits.map(sampleEntry), nl = entries[0].nalLength;
+  // One key, IV and pattern for every feed: a sample decrypts with one of each.
+  var enc = trackEncryption(inits[0], entries[0]);
+  inits.forEach(function (init, n) { if (trackEncryption(init, entries[n]) !== enc) fail('feed ' + n + ' is encrypted differently'); });
   var sets = inits.map(function (init, n) {
     var s = paramSets(hvcCParamSets(init, entries[n]));
     var f = h.fragment(firstSegments[n]);
@@ -418,10 +506,13 @@ function prepare(inits, firstSegments, layout, fps) {
   g.level = levelFor(g.width, g.height, fps || 50);
   g.addressBits = log2ceil(cell.w * l.cols * cell.h * l.rows);
   g.pps = { id: leadPps.id, dependentSlices: leadPps.dependentSlices, deblockOverride: leadPps.deblockOverride, deblockDisabled: leadPps.deblockDisabled,
-    beta: leadPps.beta, tc: leadPps.tc, loopAcrossSlices: leadPps.loopAcrossSlices };
+    beta: leadPps.beta, tc: leadPps.tc, loopAcrossSlices: leadPps.loopAcrossSlices, extraBits: leadPps.extraBits, outputFlag: leadPps.outputFlag,
+    cabacInitPresent: leadPps.cabacInitPresent, chromaQpOffsets: leadPps.chromaQpOffsets, headerExtension: leadPps.headerExtension, initQp: leadPps.initQp };
+  g.sps = { log2Poc: leadSps.log2Poc, sao: leadSps.sao, chroma: leadSps.chroma };
+  if (l.cells.some(function (c) { return !c; }) && !FILLER[cell.w + 'x' + cell.h]) fail('no filler for ' + cell.w + 'x' + cell.h + ' CTB cells');
   var e = entries[l.cells[0][0]], init = inits[l.cells[0][0]];
   var profile = init[e.hvcC.d + 1] & 31, tier = (init[e.hvcC.d + 1] >> 5) & 1;
-  return { init: gridInit(init, g), cfg: { g: g, layout: l, nalLength: nl, sets: sets, tileCols: tileCols },
+  return { init: gridInit(init, g), cfg: { g: g, layout: l, nalLength: nl, sets: sets, tileCols: tileCols, enc: enc },
     width: g.width, height: g.display, codecs: 'hev1.' + profile + '.' + ({ 1: '6', 2: '4' }[profile] || '4') + '.' + (tier ? 'H' : 'L') + g.level + '.B0' };
 }
 

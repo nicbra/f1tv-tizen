@@ -53,8 +53,11 @@ function logged(req, res, u) {
   res.writeHead = function (status) {
     var host = '';
     try { host = u.pathname === '/mpd' ? urlLib.parse(String(u.query.u)).host : /^\/s\/([^/]+)\//.test(u.pathname) ? urlLib.parse(b64urlDecode(RegExp.$1)).host : ''; } catch (e) { /* no host */ }
-    recent.push({ at: new Date(t0).toISOString(), kind: kind, method: req.method || 'GET', host: host, status: status, ms: Date.now() - t0 });
-    if (recent.length > 60) recent.shift();
+    var entry = { at: new Date(t0).toISOString(), kind: kind, method: req.method || 'GET', host: host, status: status, ms: Date.now() - t0 };
+    // Multiview: which segment, where the time went, and why it failed (no URLs or tokens).
+    if (res.f1) Object.keys(res.f1).forEach(function (k) { entry[k] = res.f1[k]; });
+    recent.push(entry);
+    if (recent.length > 200) recent.shift();   // a few minutes of live multiview
     return head.apply(res, arguments);
   };
   return res;
@@ -65,9 +68,11 @@ function logged(req, res, u) {
  * ua: the user agent to send; the TV browser's for multiview, as Akamai only serves a stream's media to
  * the user agent that opened it (403 "Access Denied" otherwise, Mexico 2026).
  */
+var browserUa = null;   // the TV browser's user agent, once the app has sent it (multiview)
+
 function fetchBuffer(target, redirects, cb, ua) {
   var opts = urlLib.parse(target);
-  opts.headers = { 'User-Agent': ua || UA };
+  opts.headers = { 'User-Agent': ua || browserUa || UA };
   var lib = opts.protocol === 'http:' ? http : https;
   var req = lib.get(opts, function (res) {
     if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
@@ -184,6 +189,13 @@ function useHdrVideo(mpd, adaptation) {
   var timeline = video && /<SegmentTimeline>[\s\S]*?<\/SegmentTimeline>/.exec(video.text);
   if (!timeline) return null;
   var hdr = adaptation.split('<!--timeline-->').join(timeline[0]);
+  // This refresh's addressing too, not only its timeline: should F1 move the window's start (startNumber,
+  // offset), the swapped-in video must number its segments as the official one does.
+  var official = /<SegmentTemplate\b([^>]*)>/.exec(video.text);
+  if (official) ['startNumber', 'timescale', 'presentationTimeOffset'].forEach(function (name) {
+    var v = attr(official[1], name);
+    if (v != null) hdr = hdr.replace(new RegExp('(<SegmentTemplate\\b[^>]*\\s' + name + '=")[^"]*"', 'g'), function (all, head) { return head + v + '"'; });
+  });
   return mpd.slice(0, video.at) + hdr + mpd.slice(video.at + video.text.length);
 }
 
@@ -310,10 +322,11 @@ var stitch = null, stitchHevc = null;
 try { stitch = require('./stitch'); stitchHevc = require('./stitch-hevc'); } catch (e) { console.log('stitch unavailable: ' + e); }
 
 /** HEVC grid: a feed's media segment n (0-based) from its template or list. */
+/** n: the index in the playlist, or for live (`absolute`) the segment number itself (as in the DASH timeline). */
 function hevcSegmentUrl(feed, n) {
   if (feed.urls) return feed.urls[n];
   return feed.media.replace(/\$Number(?:%0(\d+)d)?\$/g, function (m, w) {
-    var s = String(feed.startNumber + n); while (s.length < (+w || 0)) s = '0' + s; return s;
+    var s = String(feed.absolute ? n : feed.startNumber + n); while (s.length < (+w || 0)) s = '0' + s; return s;
   });
 }
 
@@ -322,43 +335,117 @@ function hevcSegmentUrl(feed, n) {
  * (see stitch-hevc.js LAYOUTS).
  */
 function hevcGridPost(res, id, body) {
+  buildGrid(body, function (status, err, grid) {
+    if (err) return send(res, status, toBuf(err));
+    stitches[id] = grid;
+    var ids = Object.keys(stitches);
+    if (ids.length > 2) delete stitches[ids[0]];
+    send(res, 201, toBuf(JSON.stringify(grid.info)), 'application/json');
+    warmNext(grid, grid.cache[0].number);
+  });
+}
+
+/**
+ * POST /stitch/<id>/layout, with a body as for a new grid: the running grid rearranged (other feeds, another
+ * layout). AVPlay keeps the init segment it has; the new segments carry their own parameter sets (hev1).
+ * Takes effect for every segment built from now on.
+ */
+function hevcRegridPost(res, id, body) {
+  var old = stitches[id];
+  if (!old || old.kind !== 'hevc') return send(res, 404, toBuf('no such grid'));
+  if (!!body.live !== old.live) return send(res, 400, toBuf('live and replay grids differ'));
+  buildGrid(body, function (status, err, grid) {
+    if (err) return send(res, status, toBuf(err));
+    // The licence AVPlay has is for the running grid's key.
+    if (grid.cfg.enc !== old.cfg.enc) return send(res, 422, toBuf('the new feeds are encrypted differently'));
+    grid.init = old.init;
+    grid.pending = old.pending;   // segments already being built finish with the old arrangement
+    stitches[id] = grid;
+    // Where the new arrangement starts (the probe segment), for the player to go to.
+    grid.info.from = grid.cache[0].number;
+    send(res, 200, toBuf(JSON.stringify(grid.info)), 'application/json');
+    warmNext(grid, grid.cache[0].number);
+  });
+}
+
+/** Fetches the feeds' init and probe segments, prepares the grid and stitches the probe; cb(status, error, grid). */
+function buildGrid(body, cb) {
   var feeds = body.feeds || [];
-  if (feeds.length < 1 || feeds.length > 9) return send(res, 400, toBuf('need 1-9 feeds'));
-  var count0 = feeds[0].urls ? feeds[0].urls.length : feeds[0].count;
-  var probe = Math.max(0, Math.min(count0 - 1, +body.probe || 0)), all = [];
+  if (feeds.length < 1 || feeds.length > 9) return cb(400, 'need 1-9 feeds');
+  var live = !!body.live, count0 = feeds[0].urls ? feeds[0].urls.length : feeds[0].count;
+  var probe = live ? +body.probe : Math.max(0, Math.min(count0 - 1, +body.probe || 0)), all = [];
+  if (live && !(probe > 0 && feeds.every(function (f) { return f.absolute && f.media; }))) return cb(400, 'live grids need absolute numbers');
   feeds.forEach(function (f) { all.push(f.init, hevcSegmentUrl(f, probe)); });
-  if (!all.every(function (u) { return f1Cdn(String(u)); })) return send(res, 400, toBuf('need F1 media'));
-  var count = feeds[0].urls ? feeds[0].urls.length : feeds[0].count, ua = body.ua ? String(body.ua).slice(0, 300) : null;
-  fetchAll(all, function (err, got) {
-    if (err) return send(res, 502, toBuf(String(err)));
+  if (!all.every(function (u) { return f1Cdn(String(u)); })) return cb(400, 'need F1 media');
+  var count = live ? Infinity : feeds[0].urls ? feeds[0].urls.length : feeds[0].count, ua = body.ua ? String(body.ua).slice(0, 300) : null;
+  // Akamai serves a stream only to the user agent that opened it: the manifest and commentary too.
+  if (ua) browserUa = ua;
+  if (body.prepareOnly) {
+    // Only fetch the inputs now (the viewer is choosing); the grid is built when chosen, a moment later:
+    // the segment after too.
+    var later = feeds.map(function (f) { return hevcSegmentUrl(f, probe + 1); }).filter(function (u) { return u && f1Cdn(String(u)); });
+    return fetchInputs(all.concat(live || probe + 1 < count0 ? later : []), function (err) { cb(err ? 502 : 204, err ? String(err) : null, null); }, 2, ua, live);
+  }
+  fetchInputs(all, function (err, got) {
+    if (err) return cb(502, String(err));
     try {
       var inits = [], firsts = [];
       got.forEach(function (b, i) { (i % 2 ? firsts : inits).push(b); });
       var g = stitchHevc.prepare(inits, firsts, body.layout || 'grid2x2', 50);
-      stitches[id] = { kind: 'hevc', feeds: feeds, count: count, init: g.init, cfg: g.cfg, cache: [], at: Date.now(), ua: ua };
-      var ids = Object.keys(stitches);
-      if (ids.length > 2) delete stitches[ids[0]];
-      send(res, 201, toBuf(JSON.stringify({ width: g.width, height: g.height, codecs: g.codecs })), 'application/json');
-    } catch (e) { send(res, 422, toBuf(String(e && e.message || e))); }
-  }, 2, ua);
+      // Stitch the probe now: it proves the feeds fit together, and is likely the first segment asked for.
+      var warm = stitchHevc.gridSegment(firsts, g.cfg);
+      cb(200, null, { kind: 'hevc', live: live, feeds: feeds, count: count, init: g.init, cfg: g.cfg, cache: [{ number: probe, body: warm }],
+        pending: {}, at: Date.now(), ua: ua, info: { width: g.width, height: g.height, codecs: g.codecs } });
+    } catch (e) { cb(422, String(e && e.message || e)); }
+  }, 2, ua, live);
 }
 
 var stitches = {};   // id -> { kind, feeds, count, init, cfg, cache, at } (and mpd for the H.264 stack)
 
 /**
  * Fetches all urls in parallel. F1's CDN sometimes refuses one of a burst (HTTP 403, Mexico 2026 grids)
- * although the file exists: such answers, server errors and network errors are retried twice.
+ * although the file exists: such answers, server errors and network errors are retried three times,
+ * within ~2 s (AVPlay gives up on a segment after ~5 s).
+ * `missing`: also retry 404 (live: a feed's newest segment may reach the CDN a moment after another's).
  */
-function fetchAll(urls, cb, parallel, ua) {
+/*
+ * A minute's worth of fetched grid inputs (inits and first segments), so a multiview prepared while the viewer
+ * chooses (POST /stitch/<id>/prepare) starts at once when chosen. A few entries: 1080p segments are ~4 MB.
+ */
+var inputs = [];
+function cachedInput(u) {
+  inputs = inputs.filter(function (c) { return Date.now() - c.at < 60000; });
+  var hit = inputs.filter(function (c) { return c.url === u; })[0];
+  return hit ? hit.body : null;
+}
+function keepInput(u, body) {
+  inputs = inputs.filter(function (c) { return c.url !== u; });
+  inputs.push({ url: u, body: body, at: Date.now() });
+  if (inputs.length > 12) inputs.shift();
+}
+
+/** fetchAll with the grid input cache: answers from it, and keeps what it fetched. */
+function fetchInputs(urls, cb, parallel, ua, missing) {
+  var have = urls.map(cachedInput), want = [], at = [];
+  urls.forEach(function (u, i) { if (!have[i]) { want.push(u); at.push(i); } });
+  if (!want.length) return cb(null, have);
+  fetchAll(want, function (err, got) {
+    if (err) return cb(err);
+    got.forEach(function (b, k) { have[at[k]] = b; keepInput(want[k], b); });
+    cb(null, have);
+  }, parallel, ua, missing);
+}
+
+function fetchAll(urls, cb, parallel, ua, missing) {
   var out = [], left = urls.length, failed = false, next = 0, limit = parallel || urls.length;
   function start(i) {
     (function attempt(tries) {
       fetchBuffer(urls[i], 3, function (err, status, body) {
         if (failed) return;
-        if ((err || status === 403 || status === 429 || status >= 500) && tries < 3) return setTimeout(function () { attempt(tries + 1); }, 400 * (tries + 1) * (tries + 1));
+        if ((err || status === 403 || status === 429 || status >= 500 || (missing && status === 404)) && tries < 3) return setTimeout(function () { attempt(tries + 1); }, 300 * (tries + 1));
         if (err || status !== 200) {
           failed = true;
-          var why = err ? String(err) : 'HTTP ' + status + ' ' + String(body ? body.slice(0, 160) : '').replace(/\s+/g, ' ');
+          var why = err ? String(err).replace(/https?:\/\/\S*/g, '') : 'HTTP ' + status;
           return cb(new Error(why + ' (request ' + i + ', ' + (urlLib.parse(urls[i]).host || '') + ')'));
         }
         out[i] = body;
@@ -412,15 +499,21 @@ function stitchManifest(mpd, manifestUrl, id, first, stacked, feeds) {
 
 function stitchRequest(req, res, u) {
   if (!stitch) return send(res, 501, toBuf('stitching unavailable'));
-  var m = /^\/stitch\/([a-z0-9-]{1,64})(?:\.mpd|\/(init\.mp4|\d+\.m4s))?$/.exec(u.pathname);
+  var m = /^\/stitch\/([a-z0-9-]{1,64})(?:\.mpd|\/(init\.mp4|\d+\.m4s|layout|prepare))?$/.exec(u.pathname);
   if (!m) return send(res, 404, toBuf('not found'));
   var id = m[1], what = m[2] || (/\.mpd$/.test(u.pathname) ? 'mpd' : null);
-  if (req.method === 'POST' && !what) {
+  if (req.method === 'POST' && (!what || what === 'layout' || what === 'prepare')) {
     var chunks = [];
     req.on('data', function (b) { chunks.push(b); });
     req.on('end', function () {
       var body;
       try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (e) { return send(res, 400, toBuf('bad json')); }
+      if (what === 'prepare') {
+        if (!stitches[id]) return send(res, 404, toBuf('no such grid'));
+        body.prepareOnly = true;
+        return buildGrid(body, function (status, err) { send(res, status, toBuf(err || '')); });
+      }
+      if (what === 'layout') return hevcRegridPost(res, id, body);
       if (body.kind === 'hevc') return hevcGridPost(res, id, body);
       var urls = (body.urls || []).map(String);
       if (urls.length < 2 || urls.length > 4 || !urls.every(f1Cdn)) return send(res, 400, toBuf('need 2-4 F1 manifests'));
@@ -456,20 +549,55 @@ function stitchRequest(req, res, u) {
   if (what === 'mpd') return send(res, 200, s.mpd, 'application/dash+xml');
   if (what === 'init.mp4') return send(res, 200, s.init, 'video/mp4');
   var number = parseInt(what, 10);
+  if (s.kind === 'hevc' && !(number >= 0 && number < s.count)) return send(res, 404, toBuf('no such segment'));
+  segmentFor(s, number, function (status, body, timing) {
+    res.f1 = timing;
+    send(res, status, body, status === 200 ? 'video/mp4' : 'text/plain');
+  });
+}
+
+/**
+ * Segment `number` of a grid: from the cache, from a build already under way, or built now (the feeds'
+ * segments fetched and stitched). cb(status, body, timing). The cache keeps a few: a 4K grid's is ~20 MB.
+ */
+function segmentFor(s, number, cb) {
   var hit = s.cache.filter(function (c) { return c.number === number; })[0];
-  if (hit) return send(res, 200, hit.body, 'video/mp4');
-  var first = s.feeds[0], hevc = s.kind === 'hevc';
-  if (hevc && !(number >= 0 && number < s.count)) return send(res, 404, toBuf('no such segment'));
+  if (hit) return cb(200, hit.body, { segment: number, cached: true });
+  // A live grid keeps getting used for hours: keep it from expiring.
+  s.at = Date.now();
+  s.pending = s.pending || {};
+  if (s.pending[number]) return s.pending[number].push(cb);
+  var waiting = s.pending[number] = [cb], first = s.feeds[0], hevc = s.kind === 'hevc';
+  var t0 = Date.now(), timing = { segment: number };
+  function answer(status, body) {
+    delete s.pending[number];
+    if (status !== 200) timing.why = String(body).slice(0, 200);
+    waiting.forEach(function (w) { w(status, body, timing); });
+  }
   var segUrls = s.feeds.map(function (f) { return hevc ? hevcSegmentUrl(f, number) : segmentUrl(f, number - first.start + f.start); });
   fetchAll(segUrls, function (err, segs) {
-    if (err) return send(res, 502, toBuf(String(err)));
-    var out;
+    timing.fetchMs = Date.now() - t0;
+    if (err) return answer(502, toBuf(String(err)));
+    var out, t1 = Date.now();
     try { out = hevc ? stitchHevc.gridSegment(segs, s.cfg) : stitch.stackSegment(segs, s.cfg); }
-    catch (e) { return send(res, 422, toBuf(String(e && e.message || e))); }
+    catch (e) { return answer(422, toBuf(String(e && e.message || e))); }
+    timing.stitchMs = Date.now() - t1;
+    timing.mb = Math.round(out.length / 1e5) / 10;
     s.cache.push({ number: number, body: out });
-    if (s.cache.length > 3) s.cache.shift();
-    send(res, 200, out, 'video/mp4');
-  }, 0, s.ua);
+    if (s.cache.length > 4) s.cache.shift();
+    answer(200, out);
+  }, 0, s.ua, s.live);
+}
+
+/**
+ * The two segments after the one just built, made ready in the background, one after the other: a grid
+ * starts or changes there, and after a seek AVPlay wants ~4 s of buffer before it plays on.
+ */
+function warmNext(s, number) {
+  if (s.kind !== 'hevc') return;
+  if (number + 1 < s.count) segmentFor(s, number + 1, function () {
+    if (stitches[Object.keys(stitches).filter(function (k) { return stitches[k] === s; })[0]] && number + 2 < s.count) segmentFor(s, number + 2, function () {});
+  });
 }
 
 function start() {

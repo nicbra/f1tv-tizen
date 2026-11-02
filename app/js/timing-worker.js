@@ -2,7 +2,7 @@
  * Replays timing data on a UTC timeline. Uses the archive when available; otherwise records
  * SignalR updates from connection time so delayed viewers see timing that matches the video.
  *
- * Messages in:  { cmd: 'load', path, token, live }  |  { cmd: 'query', id, t }  |  { cmd: 'stop' }
+ * Messages in:  { cmd: 'load', path, token, live, start }  |  { cmd: 'query', id, t }  |  { cmd: 'stop' }
  * Messages out: { type: 'loaded', info } | { type: 'error', message } | { type: 'state', id, state }
  */
 'use strict';
@@ -111,6 +111,19 @@ function latestPart(list, part, key) {
   return null;
 }
 
+/**
+ * The three sector times as F1's timing shows them: 'o' (overall fastest, purple), 'p' (personal best, green)
+ * or '' before the time, e.g. ['p21.034', '33.415', '']. TimingData sends them as an array, then patches by index.
+ */
+function sectorsOf(sectors) {
+  var out = [];
+  for (var i = 0; i < 3; i++) {
+    var s = sectors && (sectors[i] || sectors[String(i)]), v = s && val(s);
+    out.push(v ? (s.OverallFastest ? 'o' : s.PersonalFastest ? 'p' : '') + v : '');
+  }
+  return out;
+}
+
 function snapshot(t) {
   var j = job, rows = [];
   Object.keys(j.timing).forEach(function (num) {
@@ -143,7 +156,7 @@ function snapshot(t) {
     }
     rows.push([num, +l.Position, gap || '', interval || '', best || '', val(l.LastLapTime) || '', l.NumberOfLaps || 0,
       !!(l.InPit || l.PitOut), !!(l.Retired || l.Stopped), !!l.KnockedOut, compound,
-      stops, age, fresh, +app.GridPos || null, old]);
+      stops, age, fresh, +app.GridPos || null, old, sectorsOf(l.Sectors)]);
   });
   rows.sort(function (a, b) { return a[1] - b[1]; });
   j.snaps.push([t, rows]);
@@ -185,6 +198,16 @@ function median(a) {
 // in 2018 0.1 s, but the 2018 videos line up with clock + 2 s too).
 var CLOCK_LEAD = 2000;
 
+/**
+ * True if a live session's archive is not this session's: F1 left a rehearsal's data in the race's folder
+ * (Mexico 2026: Saturday morning, lap 3 of 56, status Ends) and wrote nothing more during the race. Such
+ * an archive ends before the session starts. Without a start time: it ends more than 15 min ago. An
+ * archive written after the session (watched while F1 still lists it as live) ends after the start.
+ */
+function staleForLive(j, start) {
+  return start ? j.end < start : Date.now() - j.end > 15 * 60000;
+}
+
 /** True if a base lies within two days of the session's date in the archive path (".../2018-07-22_Race/"). */
 function plausible(path, base) {
   var m = /(\d{4}-\d{2}-\d{2})_[^/]*\/?$/.exec(path || '');
@@ -216,6 +239,7 @@ function replayCollected() {
     try { data = JSON.parse(l[2].slice(12)); } catch (e) { return; }
     apply(l[1], j.base + l[0], data);
   });
+  j.end = j.base + lines[lines.length - 1][0];
 }
 
 function loadAll() {
@@ -240,9 +264,14 @@ function at(arr, t) {
   return ans;
 }
 
+// Live without an archive, data starts when the feed joins, while the picture is ~30 s behind: until the
+// picture gets there (and briefly after a rewind) show the first live state instead of nothing.
+var LIVE_GAP_MS = 120000;
+
 function query(t) {
   var j = job;
   if (!j || j.base == null) return null;
+  if (j.liveFrom != null && t < j.liveFrom && j.liveFrom - t <= LIVE_GAP_MS) t = j.liveFrom;
   var out = { type: j.info.Type || '', name: j.info.Name || '' };
   var li = at(j.lap, t);
   if (li >= 0) { out.lap = j.lap[li][1]; out.totalLaps = j.lap[li][2]; }
@@ -262,7 +291,7 @@ function query(t) {
       var d = j.drivers[r[0]] || {};
       return { num: r[0], pos: r[1], tla: d.Tla || r[0], colour: d.TeamColour ? '#' + d.TeamColour : '#77777d',
         gap: r[2], interval: r[3], best: r[4], last: r[5], laps: r[6], pit: r[7], out: r[8], knockedOut: r[9], tyre: r[10],
-        stops: r[11], tyreAge: r[12], tyreNew: r[13], grid: r[14], old: r[15] };
+        stops: r[11], tyreAge: r[12], tyreNew: r[13], grid: r[14], old: r[15], sectors: r[16] };
     });
   }
   out.started = j.snaps.length ? t >= j.snaps[0][0] : false;
@@ -279,6 +308,7 @@ function start(m) {
   var j = job;
   loadAll().then(function () {
     if (job !== j) return;
+    if (m.live && staleForLive(j, m.start)) return startLive(m);
     self.postMessage({ type: 'loaded', info: { type: j.info.Type, name: j.info.Name, drivers: Object.keys(j.drivers).length } });
     // Live, with the archive already written as it goes: what comes after it arrives on the real-time feed.
     if (m.live) { j.afterArchive = true; connect(j); }
@@ -354,6 +384,7 @@ function connect(j) {
             var t = Date.now();
             FEEDS.forEach(function (f) { if (msg.result[f]) apply(f, t, msg.result[f]); });
             snapshot(t);
+            if (!j.afterArchive && j.liveFrom == null) j.liveFrom = t;
             if (!announced) {
               announced = true;
               self.postMessage({ type: 'loaded', info: { type: j.info.Type, name: j.info.Name, live: true } });

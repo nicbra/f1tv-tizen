@@ -225,7 +225,8 @@ async function boot(options = {}) {
   const clock = makeClock(options.now || NOW);
   const pages = Object.assign({}, PAGES, options.pages);
   const { document } = makeDom();
-  const store = { 'f1tv.settings': JSON.stringify(options.settings || {}) };
+  // options.store: what an earlier run left in localStorage (a restart).
+  const store = Object.assign({ 'f1tv.settings': JSON.stringify(options.settings || {}) }, options.store);
   const windowListeners = {};
   const exits = [];
   const auth = { token: null, pairing: null, cancelled: 0 };
@@ -233,13 +234,13 @@ async function boot(options = {}) {
     // Each returns a promise; tests replace them to hold or fail requests.
     page: (uri) => Promise.resolve(pages[uri] || []),
     video: (id) => Promise.resolve({ metadata: JSON.parse(JSON.stringify(VIDEOS[id])) }),
-    play: (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' }),
-    info: (url) => {
+    play: options.play || ((id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' })),
+    info: options.info || ((url) => {
       const id = /cdn\/(\d+)\//.exec(url)[1];
       // Live: a DVR window of the last hour, on the wall clock.
       if (id === '106') return Promise.resolve({ dynamic: true, windowStart: 1000, windowEnd: 4600, delay: 25, marks: [], epochAtZero: NOW / 1000 - 4600 });
       return Promise.resolve({ dynamic: false, windowStart: 0, windowEnd: 7200, delay: 25, marks: [], epochAtZero: CLOCKS[id] });
-    },
+    }),
     resume: () => Promise.resolve(0),
     login: () => Promise.resolve(),
     standings: () => Promise.resolve({ round: 19, drivers: [
@@ -276,7 +277,7 @@ async function boot(options = {}) {
   const player = {
     current: null, engine: null, pos: 0, paused: false, loads: [], listeners: {}, hold: null,
     init: async () => {},
-    hdrCapable: () => false,
+    hdrCapable: () => !!options.hdrCapable,
     kind: 'shaka',   // or 'avplay': which engine the stub plays as
     load(s, start) {
       player.current = s;
@@ -298,6 +299,7 @@ async function boot(options = {}) {
         (e) => { player.current = prev; throw e; });
     },
     unload: async () => { player.engine = null; },
+    setGridRect(r) { player.gridRect = r; },
     stream: () => player.current,
     engineName: () => player.engine,
     position: () => (player.engine ? player.pos : 0),
@@ -370,7 +372,9 @@ async function boot(options = {}) {
     vm.runInContext(readFileSync('app/js/' + f, 'utf8'), context, { filename: f });
   }
   const api = context.F1Api;
-  if (!options.signedOut) Object.assign(api.state, { ascendon: 'TOKEN', entitlement: 'ENT', location: { entitlement: 'PRO', groupId: 2 } });
+  if (!options.signedOut) Object.assign(api.state, { ascendon: 'TOKEN', entitlement: 'ENT', location: { entitlement: options.tier || 'PRO', groupId: 2 } });
+  // Multiview's layouts, loaded before app.js as in index.html.
+  if (options.multiview) vm.runInContext(readFileSync('app/js/layouts.js', 'utf8'), context, { filename: 'layouts.js' });
   Object.assign(api, {
     refreshConfig: async () => ({}), refreshLocation: async () => null,
     login: () => net.login().then(() => { Object.assign(api.state, { ascendon: 'TOKEN', entitlement: 'ENT' }); }),
@@ -392,7 +396,7 @@ async function boot(options = {}) {
   const $ = (id) => document.getElementById(id);
   const KEYS = context.Keys.codes;
   const app = {
-    context, clock, net, player, timing, requests, exits, saved, $, deferred, api, auth, stats,
+    context, clock, net, player, timing, requests, exits, saved, $, deferred, api, auth, stats, store,
     advance: (ms) => clock.advance(ms),
     async press(...names) {
       for (const name of names) {
@@ -859,11 +863,9 @@ test('watch options change commentary and subtitles, and pick a feed', async () 
 
 // ---------- multiview (experiment) ----------
 
-async function premiumHdr() {
-  const app = await boot();
-  app.api.state.location = { entitlement: 'PREMIUM', groupId: 2 };
+async function premiumHdr(options) {
+  const app = await boot(Object.assign({ tier: 'PREMIUM', multiview: true, hdrCapable: true }, options));
   app.player.hdrCapable = () => true;
-  vm.runInContext(readFileSync('app/js/layouts.js', 'utf8'), app.context, { filename: 'layouts.js' });
   return app;
 }
 
@@ -885,11 +887,18 @@ test('watch options open a multiview page: layouts as pictures, then a feed for 
   await app.press('ENTER');
   // The chosen layout, larger, with the current feed in the big place.
   assert.match(app.focused(), /INTERNATIONAL/);
-  await app.press('DOWN');
-  const before = app.focused();
-  await app.press('RIGHT');
-  assert.notEqual(app.focused(), before);
-  assert.ok(!/INTERNATIONAL/.test(app.focused()), 'a feed is never in two places');
+  const places = () => app.$('panel-list').children.find((e) => /mv-preview/.test(e.className)).children[0].children.map((c) => c.textContent);
+  await app.press('RIGHT');   // the arrows go by position: the small place beside the big one
+  const small = app.focused();
+  assert.equal(small, places()[1]);
+  // OK opens the feeds for that place; one already shown elsewhere swaps places.
+  await app.press('ENTER');
+  assert.equal(app.$('panel-title').textContent, 'Feed for this place');
+  assert.match(app.$('panel-list').textContent, /in multiview/);
+  await app.pick(/^INTERNATIONAL/, ['UP']);
+  assert.equal(app.$('panel-title').textContent, 'Multiview');
+  assert.deepEqual(places().slice(0, 2), [small, 'INTERNATIONAL']);
+  assert.equal(new Set(places()).size, 3);
   // BACK returns to watch options, OK there comes back with the choices kept.
   await app.press('BACK');
   assert.equal(app.$('panel-title').textContent, 'Watch options');
@@ -902,12 +911,133 @@ test('watch options open a multiview page: layouts as pictures, then a feed for 
   assert.equal(s.grid.layout, 'side2');
   assert.equal(s.grid.streams.length, 3);
   assert.equal(app.context.Settings.get('multiview'), 'side2');
+  assert.equal(app.context.Settings.get('mvFeeds').side2[1], 'INTERNATIONAL', 'the feeds are remembered by name');
   assert.match(app.$('osd-feed').textContent, /^Multiview · 3 feeds · HDR/);
+  // Over the video: a frame per feed (margins, rounded corners), with its name.
+  await app.advance(600);
+  const frames = app.$('mv-frames');
+  assert.ok(!frames.classList.contains('hidden'));
+  const labels = frames.children.filter((c) => /mv-label/.test(c.className));
+  assert.equal(labels.length, 3);
+  assert.match(labels[1].textContent, /INTERNATIONAL/);
   // A feed from the list plays alone again.
   await app.press('UP');
   await app.pick(/^1VER/, ['DOWN']);
-  await app.advance(300);
+  await app.advance(600);
   assert.ok(!app.player.current.grid);
+  assert.ok(app.$('mv-frames').classList.contains('hidden'));
+});
+
+test('changing a playing multiview rearranges it in place: no new load, feeds that stay keep their sessions', async () => {
+  const app = await premiumHdr({ play: premiumOffer });
+  app.player.kind = 'avplay';
+  await play(app, 'Race');
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(3000);
+  const grid = app.player.current.grid;
+  grid.id = 'g1';                                     // as the player sets it once the helper has the grid
+  const asked = [], plays = [];
+  app.context.StreamProxy = { regrid: async (s, list, layout, at, prepareOnly) => { asked.push({ list, layout, at, prepareOnly }); return prepareOnly ? null : {}; } };
+  app.net.play = (id, channel) => { plays.push(channel); return premiumOffer(id, channel); };
+  const loads = app.player.loads.length;
+  app.player.pos = 1234;
+  // The big feed and the second place swap (the race has three feeds, all shown).
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.moveTo(/INTERNATIONAL/, ['DOWN']);
+  await app.press('RIGHT', 'ENTER');
+  const before = grid.slots.slice(), sessions = grid.streams.slice();
+  await app.pick(/^INTERNATIONAL/, ['UP']);
+  await app.pick(/^Show this multiview/, ['DOWN']);
+  await app.advance(3000);
+  assert.equal(app.player.loads.length, loads, 'not loaded again');
+  // Focus on Show had the helper prepare it; OK then changed it.
+  assert.deepEqual(asked.map((a) => !!a.prepareOnly), [true, false]);
+  assert.equal(asked[1].list[0], asked[0].list[0], 'the prepared offers are used');
+  asked.shift();
+  assert.equal(asked[0].layout, 'side2');
+  assert.equal(asked[0].at, 1238, 'prepared from a few seconds ahead');
+  assert.equal(plays.length, 0, 'no new streams from F1 for feeds that stay');
+  assert.deepEqual(Array.from(grid.slots), [before[1], before[0], before[2]]);
+  assert.ok(asked[0].list[0] === sessions[1] && asked[0].list[1] === sessions[0] && asked[0].list[2] === sessions[2], 'each feed keeps its session');
+  assert.equal(app.player.pos, 1234, 'the same moment, fetched anew');
+});
+
+test('OK on Show while that multiview is still being prepared waits for it', async () => {
+  const app = await premiumHdr({ play: premiumOffer });
+  app.player.kind = 'avplay';
+  await play(app, 'Race');
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(3000);
+  app.player.current.grid.id = 'g1';
+  let release;
+  const held = new Promise((r) => { release = r; });
+  const asked = [], plays = [];
+  app.context.StreamProxy = { regrid: (s, list, layout, at, prepareOnly) => { asked.push(!!prepareOnly); return prepareOnly ? held : Promise.resolve({}); } };
+  app.net.play = (id, channel) => { plays.push(channel); return premiumOffer(id, channel); };
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Picture in picture ½$/, ['RIGHT']);
+  await app.moveTo(/^Show this multiview/, ['DOWN']);   // starts preparing, which hangs on
+  await app.advance(200);
+  await app.press('ENTER');
+  await app.advance(500);
+  assert.deepEqual(asked, [true], 'the change waits for the preparation');
+  release(null);
+  await app.advance(1000);
+  assert.deepEqual(asked, [true, false]);
+  assert.equal(plays.length, 0, 'no second set of offers');
+  assert.equal(app.player.current.grid.layout, 'pip');
+});
+
+test('in a multiview, the timing data moves from the tower into the space the layout leaves free', async () => {
+  const app = await premiumHdr({ play: premiumOffer });
+  app.timing.state = (path) => {
+    const st = busyRace(path);
+    if (st) st.standings[0].sectors = ['p21.034', 'o33.415', '25.900'];
+    return st;
+  };
+  await play(app, 'Race');
+  app.timing.loaded();
+  app.player.pos = 1800;
+  await app.advance(1000);
+  assert.ok(!app.$('tower').classList.contains('hidden'), 'one feed: the tower');
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(3000);
+  const data = app.$('mv-data');
+  assert.ok(app.$('tower').classList.contains('hidden'), 'not over the video');
+  assert.ok(!data.classList.contains('hidden'));
+  // Big + 2 is wider than the screen: with timing data, the picture goes to the top and the data below it.
+  assert.deepEqual(Array.from(app.player.gridRect), [0, 0, 1920, 723]);
+  assert.match(data.className, /field/);
+  assert.equal(data.style.top, '723px');
+  const frames = app.$('mv-frames').children.filter((c) => /mv-label/.test(c.className));
+  assert.ok(frames.every((l) => parseInt(l.style.top, 10) < 723), 'the frames follow the picture up');
+  assert.match(data.textContent, /Lap 10 \/ 58/);
+  // With room to spare, the sector times: green personal best, purple overall fastest.
+  const secs = data.children[1].children[0].children.filter((c) => /tw-sec/.test(c.className));
+  assert.deepEqual(secs.map((c) => c.textContent + ':' + c.className), ['21.034:tw-sec p', '33.415:tw-sec o', '25.900:tw-sec']);
+  assert.ok(!/21\.034/.test(app.$('tower').textContent), 'the tower stays as it was');
+  // Every other row a shade lighter.
+  assert.deepEqual(data.children[1].children.map((r) => /\balt\b/.test(r.className)), [false, true, false, true]);
+  assert.match(data.textContent, /VER/);
+  assert.match(data.textContent, /SC/);
+  // Back to one feed: the tower again, and the picture on the whole screen.
+  await app.press('UP');
+  await app.pick(/^1VER/, ['DOWN']);
+  await app.advance(1000);
+  assert.ok(data.classList.contains('hidden'));
+  assert.ok(!app.$('tower').classList.contains('hidden'));
+  assert.equal(app.player.gridRect, null);
 });
 
 test('a multiview without 4K HDR offers falls back to the big feed alone', async () => {
@@ -920,7 +1050,38 @@ test('a multiview without 4K HDR offers falls back to the big feed alone', async
   await app.advance(3000);
   assert.ok(!app.player.current.grid);
   assert.match(app.player.current.url, /main\.m3u8$/);
-  assert.match(app.$('toast').textContent, /Multiview didn't work \(no 4K HDR offer for/);
+  assert.match(app.$('toast').textContent, /Multiview didn't work \(no matching 4K HDR offer for/);
+});
+
+test('after a restart the app continues the same video at the same moment, also a multiview', async () => {
+  const app = await premiumHdr();
+  app.net.info = async () => ({ epochAtZero: 1.7e9, windowStart: 0, windowEnd: 7200 });
+  await play(app, 'Race');
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  app.net.play = premiumOffer;
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(3000);
+  app.player.pos = 2345;
+  await app.advance(3100);
+  const saved = JSON.parse(app.store['f1tv.watching']);
+  assert.equal(saved.wall, 1.7e9 + 2345);
+  assert.equal(saved.multiview.layout, 'side2');
+  // The TV restarts the app (a new version): it opens that video again at that moment, as a multiview.
+  const again = await premiumHdr({ store: app.store, info: app.net.info, play: premiumOffer });
+  await again.advance(4000);
+  assert.equal(again.screen(), 'player');
+  // The big feed first, alone (a multiview as the first video has stalled in AVPlay), at that moment.
+  assert.ok(!again.player.current.grid);
+  assert.equal(again.player.loads.at(-1).start, 2345, 'not a second further: no spoilers');
+  // Once it plays, the multiview takes over.
+  again.player.progress = true;
+  await again.advance(5000);
+  assert.equal(again.player.current.grid.layout, 'side2');
+  // Leaving the player forgets it.
+  await again.press('BACK', 'BACK');
+  assert.equal(again.store['f1tv.watching'], '');
 });
 
 test('no multiview without Premium', async () => {
