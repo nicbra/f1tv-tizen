@@ -706,6 +706,19 @@ test('Chromecast\'s cenc stream plays on Shaka, with its licence; the usual cbcs
   assert.equal(P.engineName(), 'avplay');
 });
 
+test('live cenc plays on AVPlay through the helper; Tizen 5 reports no cbcs, Tizen 6 and unknown TVs do', async () => {
+  const av = fakeAvPlay();
+  const P = await player(av, undefined, () => Promise.resolve());
+  await P.load(Object.assign({}, LIVE, { cenc: true }), null);
+  assert.equal(P.engineName(), 'avplay');
+  assert.match(av.calls.find((c) => c[0] === 'open')[1], /^http:\/\/127\.0\.0\.1:18765\/mpd\?u=/);
+  assert.equal(P.cbcsCapable(), true);
+  for (const [version, cbcs] of [['5.0', false], ['5.5', false], ['6.0', true], ['6.5', true]]) {
+    const tv = await player(fakeAvPlay(), undefined, undefined, { tizen: { systeminfo: { getCapability: () => version } } });
+    assert.equal(tv.cbcsCapable(), cbcs, version);
+  }
+});
+
 test('the first cenc video, stalled before any data (readyState 1), is loaded once more; a clear one still buffering is not', async () => {
   for (const [cenc, readyState, reloads] of [[true, 1, 1], [false, 1, 0], [true, 4, 1]]) {
     let loads = 0;

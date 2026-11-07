@@ -1254,9 +1254,14 @@
 
   var HDR_TRIES = 3;   // HDR failures before a video stays SDR
 
-  /** Replays' DRM streams in cenc on Shaka (see F1Api cencOffer); after a failure, AVPlay as before. */
+  /**
+   * Replays' DRM streams in cenc on Shaka (see F1Api cencOffer); after a failure, AVPlay as before. Every DRM
+   * stream in cenc where AVPlay can't decrypt the usual cbcs (Tizen 5): live plays it on AVPlay.
+   */
   function cencWanted() {
-    return !feedsCtx.live && !feedsCtx.cencFailed && !!(Player.cencCapable && Player.cencCapable());
+    if (feedsCtx.cencFailed) return false;
+    if (Player.cbcsCapable && !Player.cbcsCapable()) return true;
+    return !feedsCtx.live && !!(Player.cencCapable && Player.cencCapable());
   }
 
   function hdrWanted() {
@@ -1304,7 +1309,10 @@
       showOsd();
       var stream;
       return (from || playing ? Promise.resolve() : Player.unload())
-        .then(function () { return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(), cenc: cencWanted() }); })
+        .then(function () {
+          return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(), cenc: cencWanted(),
+            cbcs: !(Player.cbcsCapable && !Player.cbcsCapable()) });
+        })
         .then(function (s) {
           stream = s;
           stream.live = feedsCtx.live;

@@ -23,6 +23,7 @@ function playback(load, capable = true, opts = {}) {
       state: {}, isNotStarted: () => false, savePosition: async () => {},
       play: async (id, channel, o) => {
         requests.push({ id, channel, hdr: o.hdr, cenc: o.cenc });
+        if (opts.cbcsCapable === false) requests.at(-1).cbcs = o.cbcs;
         if (opts.gate) await opts.gate(id);
         if (o.cenc && !o.hdr) return { url: 'https://cdn/cast.mpd', cenc: true, channel };
         return o.hdr ? { url: 'https://cdn/hdr.m3u8', hdr: true, channel, ...(opts.authorizedHdr ? {hdrEncrypted:true,licenseUrl:'https://lic/wv',widevineManifestUrl:'https://cdn/sdr.mpd'} : {}) } : { url: 'https://cdn/stream.m3u8', channel };
@@ -34,6 +35,7 @@ function playback(load, capable = true, opts = {}) {
     Settings: { get: (k) => (opts.settings && k in opts.settings ? opts.settings[k] : k === 'hdr') },
     Player: {
       hdrCapable: () => capable, cencCapable: () => !!opts.cencCapable, engineName: () => current ? 'shaka' : null,
+      ...(opts.cbcsCapable === false ? { cbcsCapable: () => false } : {}),
       unload: async () => {}, stream: () => current,
       load: (s, p) => start(s, p, false), switchTo: (s, p) => start(s, p, true),
       position: () => opts.position ? opts.position(current) : 120, wallClock: () => null, isLive: () => false, isPaused: () => paused, togglePause: () => { paused = !paused; },
@@ -278,5 +280,14 @@ test('live sessions, and browsers without cenc, keep the usual request', async (
     h.app.set(video({ live })); h.app.play(0, {});
     for (let i = 0; i < 3; i++) await settle();
     assert.deepEqual(h.requests.map((r) => r.cenc), [false]);
+  }
+});
+
+test('where AVPlay cannot decrypt cbcs (Tizen 5), live and replays ask for cenc and no encrypted HDR', async () => {
+  for (const [live, cencCapable] of [[true, true], [true, false], [false, false]]) {
+    const h = playback(null, true, { cencCapable, cbcsCapable: false, settings: { hdr: false } });
+    h.app.set(video({ live })); h.app.play(0, {});
+    for (let i = 0; i < 3; i++) await settle();
+    assert.deepEqual(h.requests.map((r) => [r.cenc, r.cbcs]), [[true, false]]);
   }
 });

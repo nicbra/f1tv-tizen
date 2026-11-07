@@ -215,7 +215,8 @@ var F1Api = (function () {
     // Only for Premium: Pro accounts, and accounts whose tier is unknown, keep exactly today's request.
     var request = opts && opts.hdr && /^PREMIUM/i.test((state.location && state.location.entitlement) || '')
       ? playHdr(contentId, channelId).then(function (hdr) {
-        if (!hdr) return next();
+        // Encrypted HDR is cbcs Widevine on AVPlay: not for TVs whose AVPlay can't decrypt cbcs.
+        if (!hdr || (hdr.hdrEncrypted && opts.cbcs === false)) return next();
         if (!hdr.hdrEncrypted) return hdr;
         return next().then(function (normal) {
           if (!/WV/i.test(normal.streamType || '') || !/\.mpd(\?|$)/.test(normal.url)) return normal;

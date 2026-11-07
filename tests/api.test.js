@@ -444,6 +444,10 @@ test('Premium CBCS HDR uses the normal Widevine authorization and keeps its sour
   assert.equal(s.licenseHeaders.entitlementtoken, 'HDR_ENT');
   assert.equal(s.licenseHeaders.customdata, 'NORMAL_DRM');
   assert.equal(calls.filter(c=>c.url.includes('/CONTENT/PLAY')).length, 2);
+  // A TV whose AVPlay cannot decrypt cbcs gets the normal stream (the cenc one, when asked).
+  const sdr = await F1Api.play('42', '1033', { hdr:true, cbcs:false });
+  assert.equal(sdr.hdr, undefined);
+  assert.equal(sdr.url, 'https://cdn/sdr.mpd');
 });
 
 // Chromecast's cenc stream: an extra request for replays whose usual stream is cbcs Widevine DASH.

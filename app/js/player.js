@@ -766,6 +766,20 @@ var Player = (function () {
     } catch (e) { /* no EME */ }
   }
 
+  /*
+   * Whether AVPlay decrypts F1's usual cbcs Widevine. Tizen 5.0's (2019 TVs) does not: live fails right after
+   * the licence ("Unknown error"), a replay never finishes preparing. It plays the cenc stream. Tizen 6 does.
+   */
+  var cbcsSupport = null;
+
+  function cbcsCapable() {
+    if (cbcsSupport !== null) return cbcsSupport;
+    var version = NaN;
+    try { version = parseFloat(tizen.systeminfo.getCapability('http://tizen.org/feature/platform.version')); } catch (e) { /* unknown */ }
+    cbcsSupport = !(version < 6);
+    return cbcsSupport;
+  }
+
   var hdrSupport = null;
 
   function hdrCapable() {
@@ -784,8 +798,9 @@ var Player = (function () {
   function choose(stream) {
     if (Player.forceEngine) return engines[Player.forceEngine];
     if (stream.hdrEncrypted && stream.licenseUrl && hasAvPlay()) return AvEngine;
-    // F1's cenc stream (asked as a Chromecast): the browser decrypts it, so Shaka plays it.
-    if (stream.cenc) return ShakaEngine;
+    // F1's cenc stream (asked as a Chromecast): the browser decrypts it, so Shaka plays replays. Live stays
+    // on AVPlay (time-shifted by the helper), as on TVs that are asked for it only because they lack cbcs.
+    if (stream.cenc) return stream.live && hasAvPlay() ? AvEngine : ShakaEngine;
     // AVPlay picks SDR variants from HDR playlists; Shaka can be told to prefer HLG.
     if (stream.hdr) return ShakaEngine;
     if (!hasAvPlay()) return ShakaEngine;
@@ -873,6 +888,7 @@ var Player = (function () {
     init: init,
     hdrCapable: hdrCapable,
     cencCapable: function () { return cencSupport; },
+    cbcsCapable: cbcsCapable,
     load: load,
     unload: unload,
     seekBy: seekBy,
