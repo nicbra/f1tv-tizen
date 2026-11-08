@@ -138,6 +138,7 @@ var Updates = (function () {
         return result;
       })
       .catch(function () {
+        if (typeof DiagUpload !== 'undefined') DiagUpload.apiFailed('update_check', null, 0);
         c = load();
         c.at = Date.now();   // failed (the network not up yet, say): try again in an hour
         save(c);

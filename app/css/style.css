@@ -243,11 +243,22 @@ body.avplay #video, body.avplay #video2 { display: none; }
   display: flex; align-items: center; justify-content: center; }
 .dialog-box { background: var(--surface); padding: 50px 70px; min-width: 820px; max-width: 1480px; text-align: center; }
 .dialog-box h2 { font-size: 42px; }
-.dialog-box p { margin-top: 14px; max-height: 560px; overflow-y: auto; white-space: pre-wrap; overflow-wrap: break-word; }
+#dialog-text { margin-top: 14px; max-height: 560px; overflow-y: auto; white-space: pre-wrap; overflow-wrap: break-word; }
 /* Release notes: read line by line. */
-.dialog-box p.notes { text-align: left; line-height: 1.35; }
-.dialog-box p.focused { outline: 2px solid var(--focus); outline-offset: 8px; }
-.dialog-actions { margin-top: 36px; display: flex; justify-content: center; }
+#dialog-text.notes { text-align: left; line-height: 1.35; }
+#dialog-text.focused { outline: 2px solid var(--focus); outline-offset: 8px; }
+/* A Markdown document (app/PRIVACY.md under Read more). */
+#dialog-text.doc { max-height: 720px; max-width: 1340px; text-align: left; line-height: 1.35; white-space: normal; padding-right: 16px; }
+#dialog-text.doc > div > :first-child { margin-top: 0; }
+#dialog-text.doc h3 { font-size: 32px; color: var(--text); margin: 30px 0 10px; }
+#dialog-text.doc h4 { font-size: 28px; color: var(--text); margin: 22px 0 8px; }
+#dialog-text.doc p { margin: 0 0 14px; }
+#dialog-text.doc ul, #dialog-text.doc ol { margin: 0 0 14px; padding-left: 40px; }
+#dialog-text.doc li { margin-bottom: 6px; }
+#dialog-text.doc strong { color: var(--text); }
+.dialog-actions { margin-top: 36px; }
+.dialog-row { display: flex; justify-content: center; }
+.dialog-row + .dialog-row { margin-top: 20px; }
 .dialog-actions .btn { margin: 0 12px; }
 
 /* Watch options panel */

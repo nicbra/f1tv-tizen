@@ -8,7 +8,54 @@ var Player = (function () {
   var listeners = {};
   var els = { video: null, av: null };
 
-  function emit(name, arg) { if (listeners[name]) listeners[name](arg); }
+  /** Diagnostics log (js/diag.js), when it is loaded. */
+  function diag(kind, data, level) { if (typeof Diag !== 'undefined') Diag.note(kind, data, level); }
+  function diagTrail(kind, data) { if (typeof Diag !== 'undefined') Diag.trail(kind, data); }
+  function kbps(bps) { return bps > 0 ? Math.round(bps / 1000) : null; }
+
+  function emit(name, arg, extra) { if (listeners[name]) listeners[name](arg, extra); }
+
+  // AVPlay's error types the diagnostics contract keeps as they are (others: AVPLAY_ERROR without a platform code).
+  var AV_ERRORS = { PLAYER_ERROR_CONNECTION_FAILED: 'NETWORK_ERROR', PLAYER_ERROR_NOT_SUPPORTED_FORMAT: 'UNSUPPORTED',
+    PLAYER_ERROR_NOT_SUPPORTED_FILE: 'UNSUPPORTED', PLAYER_ERROR_INVALID_STATE: 'AVPLAY_ERROR', PLAYER_ERROR_INVALID_OPERATION: 'AVPLAY_ERROR',
+    PLAYER_ERROR_INVALID_PARAMETER: 'AVPLAY_ERROR', PLAYER_ERROR_NO_SUCH_FILE: 'AVPLAY_ERROR', PLAYER_ERROR_SEEK_FAILED: 'AVPLAY_ERROR',
+    PLAYER_ERROR_NONE: 'AVPLAY_ERROR' };
+
+  function avError(type) {
+    var t = String(type == null ? '' : type).trim();
+    return AV_ERRORS[t] ? { code: AV_ERRORS[t], platform: t } : { code: 'AVPLAY_ERROR', platform: null };
+  }
+
+  // Shaka's error categories (shaka.util.Error.Category): NETWORK 1, DRM 6; the rest is SHAKA_ERROR.
+  var SHAKA_CODES = { 1: 'NETWORK_ERROR', 6: 'DRM_ERROR' };
+
+  /**
+   * A stable error code and the engine's own identifier for a playback failure, taken from the error itself, never
+   * from display text: { code: 'SHAKA_ERROR' | 'AVPLAY_ERROR' | 'DRM_ERROR' | ..., platform: '6007' | 'PLAYER_ERROR_...' | null }.
+   * Errors this app throws carry their own (`e.diag`); the HDR/helper ones are recognised by their fixed messages.
+   */
+  function errorInfo(e) {
+    if (!e) return { code: 'UNKNOWN', platform: null };
+    if (e.diag && e.diag.code) return e.diag;
+    if (e.code === 'PREPARE_TIMEOUT' || e.code === 'PLAYER_STUCK') return { code: e.code, platform: null };
+    if (typeof e.code === 'number' && typeof e.category === 'number') {
+      // 4032: CONTENT_UNSUPPORTED_BY_BROWSER (no playable variant); 3016 with media error 3: MEDIA_ERR_DECODE.
+      var shaka = e.code === 4032 ? 'UNSUPPORTED' : e.code === 3016 && e.data && e.data[0] === 3 ? 'DECODE_ERROR'
+        : SHAKA_CODES[e.category] || 'SHAKA_ERROR';
+      return { code: shaka, platform: e.code >= 0 && e.code % 1 === 0 ? String(e.code) : null };
+    }
+    if (typeof e === 'string' && /^PLAYER_ERROR_[A-Z_]+$/.test(e.trim())) return avError(e);
+    if (e.name && /^PLAYER_ERROR_[A-Z_]+$/.test(e.name)) return avError(e.name);
+    // An HTTP answer (F1's API): a server failure is a network problem; a refusal (4xx) is something else.
+    if (typeof e.status === 'number') return { code: e.status >= 500 ? 'NETWORK_ERROR' : 'OTHER', platform: null };
+    // This app's own fixed messages (never text from a server).
+    var m = String(e.message || '');
+    if (/^encrypted HDR stream$|^HDR: (?!media request failed)/.test(m)) return { code: 'UNSUPPORTED', platform: null };
+    if (/^HDR: media request failed|^HDR preparation timed out/.test(m)) return { code: 'NETWORK_ERROR', platform: null };
+    if (/^helper did not answer$|^Stream helper service did not start$|^Could not prepare (HDR manifest|multiview)$/.test(m)) return { code: 'HELPER_ERROR', platform: null };
+    if (e instanceof TypeError && /fetch|network/i.test(m)) return { code: 'NETWORK_ERROR', platform: null };
+    return { code: 'OTHER', platform: null };
+  }
 
   // Shaka reports two-letter languages, AVPlay three-letter ones; settings may hold either. Team radio
   // is "tea" in the replays' HLS and "teamradio" on AVPlay.
@@ -75,7 +122,7 @@ var Player = (function () {
           var text = shaka.util.StringUtils.fromUTF8(response.data);
           response.data = shaka.util.StringUtils.toUTF8(hlgMaster(text));
         });
-        player.addEventListener('error', function (ev) { if (slots[cur] === slot) emit('error', describe(ev.detail)); });
+        player.addEventListener('error', function (ev) { if (slots[cur] === slot) emit('error', describe(ev.detail), errorInfo(ev.detail)); });
         player.addEventListener('buffering', function (ev) { if (slots[cur] === slot) emit('buffering', ev.buffering); });
         video.addEventListener('ended', function () { if (slots[cur] === slot && !swapping) emit('ended'); });
         return slot;
@@ -186,6 +233,7 @@ var Player = (function () {
         if (gen !== generation || userPaused || !q || q.totalVideoFrames > 0 || (slot.v.readyState < 3 && !stream.cenc)) return;
         // From where it is now, which includes a seek made meanwhile.
         var at = slot.v.currentTime > 0 ? slot.v.currentTime : startTime;
+        diag('player.frozen-reload', { hdr: !!stream.hdr, cenc: !!stream.cenc, readyState: slot.v.readyState, at: at });
         slot.p.load(stream.url, at == null ? null : at).then(function () {
           if (gen !== generation) return;
           // A new load starts on the stream's default tracks (French subtitles on F1's replays).
@@ -350,8 +398,33 @@ var Player = (function () {
       // The viewer's pause counts even while showFrame plays a switched-to feed until it has a picture.
       paused: function () { return userPaused || V().paused; },
       play: function () { userPaused = false; V().play(); },
-      pause: function () { userPaused = true; V().pause(); }
+      pause: function () { userPaused = true; V().pause(); },
+      snapshot: snapshot
     };
+
+    /** The playing slot's state for the diagnostics log. */
+    function snapshot() {
+      var p = P(), v = V(), o = { slots: slots.length, readyState: v.readyState, networkState: v.networkState,
+        videoPaused: v.paused, userPaused: userPaused, hdrSlot: !!slots[cur].hdr };
+      if (v.error) o.mediaError = { code: v.error.code, message: v.error.message };
+      try {
+        var q = v.getVideoPlaybackQuality();
+        o.frames = { total: q.totalVideoFrames, dropped: q.droppedVideoFrames };
+      } catch (e) { /* not available */ }
+      try {
+        var st = p.getStats();
+        o.stats = { width: st.width, height: st.height, streamKbps: kbps(st.streamBandwidth), estimatedKbps: kbps(st.estimatedBandwidth),
+          bufferingTime: st.bufferingTime, playTime: st.playTime, loadLatency: st.loadLatency };
+      } catch (e) { /* not loaded */ }
+      try {
+        var tracks = p.getVariantTracks(), t = tracks.filter(function (x) { return x.active; })[0];
+        o.variants = tracks.length;
+        if (t) o.variant = { height: t.height, kbps: kbps(t.bandwidth), video: t.videoCodec, audio: t.audioCodec, hdr: t.hdr,
+          fps: t.frameRate, lang: t.language };
+      } catch (e) { /* not loaded */ }
+      try { o.text = p.isTextTrackVisible() ? (p.getTextTracks().filter(function (x) { return x.active; })[0] || {}).language : null; } catch (e) { /* none */ }
+      return o;
+    }
   })();
 
   // Samsung AVPlay
@@ -405,15 +478,23 @@ var Player = (function () {
           headers: stream.licenseHeaders || {},
           body: b64ToBytes(data.challenge)
         }).then(function (res) {
-          if (!res.ok) throw new Error('License server answered ' + res.status);
+          if (!res.ok) {
+            var refused = new Error('License server answered ' + res.status);
+            refused.diag = { code: 'DRM_ERROR', platform: null };
+            refused.status = res.status;
+            throw refused;
+          }
           return res.arrayBuffer();
         }).then(function (lic) {
           if (g !== openGen) return;   // a newer open has the player now
           var param = data.session_id + 'PARAM_START_POSITION' + bytesToB64(lic) + 'PARAM_START_POSITION';
           av.setDrm('WIDEVINE_CDM', 'widevine_license_data', param);
-        }).catch(function (e) { emit('error', 'License: ' + e.message); });
+        }).catch(function (e) {
+          if (typeof DiagUpload !== 'undefined') DiagUpload.apiFailed('playback_license', e.status || null, 0);
+          emit('error', 'License: ' + e.message, { code: 'DRM_ERROR', platform: null });
+        });
       } else if (data.name === 'DrmError') {
-        emit('error', 'DRM error ' + (data.code || '') + ' ' + (data.message || ''));
+        emit('error', 'DRM error ' + (data.code || '') + ' ' + (data.message || ''), { code: 'DRM_ERROR', platform: null });
       }
     }
 
@@ -527,7 +608,9 @@ var Player = (function () {
           onbufferingcomplete: function () { emit('buffering', false); clearTimeout(stallTimer); },
           oncurrentplaytime: function (ms) { posMs = ms; noteSmooth(s); },
           onstreamcompleted: function () { emit('ended'); },
-          onerror: function (e) { emit('error', 'Player error: ' + e); },
+          onerror: function (e) { emit('error', 'Player error: ' + e, avError(e)); },
+          // The type only: its data is often binary (Tizen 6) and could carry anything.
+          onevent: function (type) { diagTrail('avplay.event', { type: type }); },
           onsubtitlechange: function (duration, text) {
             text = String(text || '').replace(/\u0000/g, '').trim();
             // At each segment boundary AVPlay sends the new segment's earlier lines again (F1 repeats
@@ -595,7 +678,10 @@ var Player = (function () {
             resolve();
           }, function (e) {
             answered();
-            if (finish()) reject(new Error(stream !== s ? 'cancelled' : 'Could not open stream: ' + e));
+            if (!finish()) return;
+            var failure = new Error(stream !== s ? 'cancelled' : 'Could not open stream: ' + e);
+            failure.diag = avError(e && typeof e === 'object' && e.name ? e.name : e);
+            reject(failure);
           });
         }
         // Seek before preparation to avoid briefly showing the beginning of a resumed replay.
@@ -626,13 +712,14 @@ var Player = (function () {
 
     function release(s) {
       if (stream !== s || !pinned || !started) return;
+      diag('player.unpin', { bitrate: pinned, position: posMs / 1000 }, 'info');
       pinned = 0;
       s.unpinned = true;
       setStartLevel(Math.max(1, startLevel()));
       startAt = posMs / 1000;
       try { av.stop(); } catch (e) { /* not playing */ }
       try { av.close(); } catch (e) { /* already closed */ }
-      open(s, openedUrl).catch(function (e) { if (stream === s) emit('error', 'Could not reopen: ' + e.message); });
+      open(s, openedUrl).catch(function (e) { if (stream === s) emit('error', 'Could not reopen: ' + e.message, errorInfo(e)); });
     }
 
     function tune(s) {
@@ -843,8 +930,30 @@ var Player = (function () {
         var i = stream && stream.info;
         return !live && i && i.segDur >= 10 ? { size: i.segDur, origin: i.windowStart || 0 } : null;
       },
-      tuning: tuning
+      tuning: tuning,
+      snapshot: snapshot
     };
+
+    /** AVPlay's state for the diagnostics log. */
+    function snapshot() {
+      var o = { started: started, paused: isPaused, live: live, positionS: posMs / 1000, pinnedKbps: kbps(pinned),
+        startLevel: START_LEVELS[startLevel()], sinceOpenS: openedAt ? Math.round((Date.now() - openedAt) / 100) / 10 : null };
+      if (!av) return o;
+      try { o.state = av.getState(); } catch (e) { /* not open */ }
+      try { o.durationS = av.getDuration() / 1000; } catch (e) { /* not prepared */ }
+      try { o.bandwidthKbps = kbps(+av.getStreamingProperty('CURRENT_BANDWIDTH')); } catch (e) { /* not available */ }
+      try {
+        av.getCurrentStreamInfo().forEach(function (t) {
+          var x = {};
+          try { x = JSON.parse(t.extra_info || '{}'); } catch (e) { /* unknown */ }
+          o[String(t.type).toLowerCase()] = t.type === 'VIDEO'
+            ? { width: x.Width, height: x.Height, kbps: kbps(+x.Bit_rate), fourCC: x.fourCC }
+            : { lang: x.language || x.track_lang, fourCC: x.fourCC };
+        });
+      } catch (e) { /* not prepared */ }
+      if (live) o.liveWindow = liveWindow();
+      return o;
+    }
   })();
 
   // public interface
@@ -990,21 +1099,50 @@ var Player = (function () {
     return function () { return engine ? engine[fn]() : fallback; };
   }
 
+  /** Calls `fn`, first leaving a step in the diagnostics trail (`what` gives its details from the arguments). */
+  function traced(kind, fn, what) {
+    return function () {
+      try {
+        if (typeof Diag !== 'undefined' && Diag.recording()) Diag.trail(kind, what ? what.apply(null, arguments) : undefined);
+      } catch (e) { /* never in the way */ }
+      return fn.apply(null, arguments);
+    };
+  }
+
+  /** The player's state for the diagnostics log. */
+  function snapshot() {
+    var o = { engine: engineName, hdrCapable: hdrSupport };
+    if (!engine) return o;
+    try {
+      o.position = engine.position();
+      o.paused = engine.paused();
+      o.live = engine.isLive();
+      var r = engine.range();
+      o.range = { start: r.start, end: r.end };
+      // AVPlay doesn't tell how much it has buffered (its bufferedEnd is the position).
+      if (engine === ShakaEngine) o.bufferedAheadS = Math.max(0, engine.bufferedEnd() - o.position);
+    } catch (e) { /* not loaded */ }
+    try { if (engine.snapshot) o[engineName] = engine.snapshot(); } catch (e) { o[engineName] = { failed: String(e && e.message) }; }
+    return o;
+  }
+
   return {
     init: init,
     hdrCapable: hdrCapable,
     hevcDecodes: hevcDecodes,
     cencCapable: function () { return typeof Caps !== 'undefined' && Caps.browser('cenc') !== false; },
-    load: load,
-    unload: unload,
-    seekBy: seekBy,
-    seekTo: seekTo,
-    switchTo: switchTo,
+    load: traced('player.load', load, function (s, t) { return { start: t, cenc: !!(s && s.cenc), hdr: !!(s && s.hdr) }; }),
+    unload: traced('player.unload', unload),
+    seekBy: traced('player.seekBy', seekBy, function (d) { return { by: d }; }),
+    seekTo: traced('player.seekTo', seekTo, function (t) { return { to: t }; }),
+    switchTo: traced('player.switchTo', switchTo, function (s, t) { return { start: t, cenc: !!(s && s.cenc), hdr: !!(s && s.hdr) }; }),
+    snapshot: snapshot,
+    errorInfo: errorInfo,
     avTuning: AvEngine.tuning,
     wallClock: wallClock,
     positionAt: positionAt,
     stream: function () { return current; },
-    togglePause: togglePause,
+    togglePause: traced('player.togglePause', togglePause, function () { return { wasPaused: !!(engine && engine.paused()) }; }),
     isLive: proxy('isLive', false),
     isPaused: proxy('paused', false),
     range: proxy('range', { start: 0, end: 0 }),
@@ -1019,11 +1157,13 @@ var Player = (function () {
      */
     seekGrid: function () { return engine === AvEngine ? AvEngine.grid() : null; },
     tracks: function () { return engine ? engine.tracks() : { audio: [], text: [] }; },
-    setAudio: function (l) { if (engine) engine.setAudio(l); },
-    setSubtitles: function (l) { if (engine) engine.setSubtitles(l); },
+    setAudio: traced('player.setAudio', function (l) { if (engine) engine.setAudio(l); }, function (l) { return { lang: l }; }),
+    setSubtitles: traced('player.setSubtitles', function (l) { if (engine) engine.setSubtitles(l); }, function (l) { return { lang: l }; }),
     forceEngine: null,
     /** Multiview: where AVPlay draws the grid's picture ([x, y, w, h] on the 1920x1080 screen, null: all of it). */
     setGridRect: function (rect) { AvEngine.setGridRect(rect); },
     on: function (name, fn) { listeners[name] = fn; }
   };
 })();
+
+if (typeof Diag !== 'undefined') Diag.provide('player', function () { return Player.snapshot(); });

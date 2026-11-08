@@ -29,12 +29,29 @@ var F1Api = (function () {
 
   function loginStatus() { return state.ascendon ? 'R' : 'A'; }
 
+  /** Diagnostics log (js/diag.js), when it is loaded. */
+  function diag(kind, data, level) { if (typeof Diag !== 'undefined') Diag.note(kind, data, level); }
+
+  /** An operation that failed (the upload's api.request_failed: a fixed label and the status, no URL). */
+  function failed(op, status, retries) {
+    if (op && typeof DiagUpload !== 'undefined') DiagUpload.apiFailed(op, status || null, retries || 0);
+  }
+
+  /** Either diagnostics log is on: worth summing up what a manifest offers. */
+  function observed() {
+    return (typeof Diag !== 'undefined' && Diag.recording()) || (typeof DiagUpload !== 'undefined' && DiagUpload.enabled());
+  }
+
   function http(url, opts) {
     opts = opts || {};
     return fetch(url, {
       method: opts.method || 'GET',
       headers: opts.headers || {},
       body: opts.body
+    }).catch(function (e) {
+      diag('api.network', { url: url, error: e });
+      failed(opts.op, null, 0);
+      throw e;
     }).then(function (res) {
       return res.text().then(function (text) {
         var data = null;
@@ -44,6 +61,9 @@ var F1Api = (function () {
           var err = new Error(msg);
           err.status = res.status;
           err.data = data;
+          // An HTML 403 is CloudFront's per-IP block ("Request blocked"), not an F1 TV answer.
+          diag('api.http', { url: url, status: res.status, message: msg, blocked: !data && /Request blocked/i.test(text) });
+          failed(opts.op, res.status, 0);
           throw err;
         }
         return data;
@@ -67,7 +87,7 @@ var F1Api = (function () {
   }
 
   function refreshConfig() {
-    return http(BASE + '/config').then(function (cfg) {
+    return http(BASE + '/config', { op: 'config' }).then(function (cfg) {
       state.config = cfg;
       var api = (cfg && cfg.apiConfig) || {};
       if (/^\d+\.\d+$/.test(api.playAPIVersion || '')) state.playApi = api.playAPIVersion;
@@ -78,17 +98,19 @@ var F1Api = (function () {
 
   function refreshLocation() {
     var url = [BASE, '1.0', loginStatus(), LANG, PAGE_PLATFORM, 'ALL/USER/LOCATION'].join('/');
-    var headers = state.entitlement ? { entitlementtoken: state.entitlement } : {};
-    return http(url, { headers: headers }).then(function (data) {
+    var headers = state.entitlement ? { entitlementtoken: state.entitlement } : {}, forToken = state.ascendon;
+    return http(url, { headers: headers, op: 'location' }).then(function (data) {
       var list = data && data.resultObj && data.resultObj.userLocation;
       state.location = (list && list[0]) || null;
+      // Whose location this is: the diagnostics tier is unknown while it belongs to another sign-in.
+      state.locationFor = forToken;
       return state.location;
     });
   }
 
   function fetchEntitlement() {
     var url = [BASE, '2.0', 'R', LANG, PAGE_PLATFORM, 'ALL/USER/ENTITLEMENT'].join('/');
-    return http(url, { headers: { ascendontoken: state.ascendon } }).then(function (data) {
+    return http(url, { headers: { ascendontoken: state.ascendon }, op: 'entitlement' }).then(function (data) {
       // HTTP 200 can still carry a fault or an empty resultObj; say so rather than fail on undefined.
       var token = data && data.resultObj && data.resultObj.entitlementToken;
       if (!token) throw new Error((data && data.resultObj && data.resultObj.message) || 'no entitlement token');
@@ -97,21 +119,27 @@ var F1Api = (function () {
     });
   }
 
+  /** The diagnostics upload's account.status follows sign-in and the tier (it sends only changes). */
+  function accountChanged(v) {
+    if (typeof DiagUpload !== 'undefined') DiagUpload.account();
+    return v;
+  }
+
   function login(ascendon) {
     state.ascendon = ascendon;
-    return fetchEntitlement().then(refreshLocation);
+    return fetchEntitlement().then(refreshLocation).then(accountChanged);
   }
 
   function logout() {
     state.ascendon = null;
     state.entitlement = null;
-    return refreshLocation();
+    return refreshLocation().then(accountChanged, function (e) { accountChanged(); throw e; });
   }
 
   function page(pageId) {
     var l = loc();
     var url = [BASE, '2.0', loginStatus(), LANG, PAGE_PLATFORM, 'ALL/PAGE', pageId, l.entitlement, l.groupId].join('/');
-    return http(url, { headers: authHeaders() }).then(function (data) {
+    return http(url, { headers: authHeaders(), op: 'content_list' }).then(function (data) {
       return (data && data.resultObj && data.resultObj.containers) || [];
     });
   }
@@ -119,7 +147,7 @@ var F1Api = (function () {
   /** Follows an action uri from a page item (they are already full API paths). */
   function pageByUri(uri) {
     var url = uri.indexOf('http') === 0 ? uri : BASE + uri;
-    return http(url, { headers: authHeaders() }).then(function (data) {
+    return http(url, { headers: authHeaders(), op: 'content_list' }).then(function (data) {
       return (data && data.resultObj && data.resultObj.containers) || [];
     });
   }
@@ -127,7 +155,7 @@ var F1Api = (function () {
   function video(contentId) {
     var l = loc();
     var url = [BASE, state.videoApi, loginStatus(), LANG, PAGE_PLATFORM, 'ALL/CONTENT/VIDEO', contentId, l.entitlement, l.groupId].join('/');
-    return http(url, { headers: authHeaders() }).then(function (data) {
+    return http(url, { headers: authHeaders(), op: 'content_detail' }).then(function (data) {
       var c = data && data.resultObj && data.resultObj.containers;
       if (!c || !c.length) throw new Error('Video not found');
       return c[0];
@@ -151,11 +179,34 @@ var F1Api = (function () {
   }
 
   /**
+   * What kind of answer a PLAY request gave, as the diagnostics upload names it (families, never F1's own strings or
+   * URLs): hls, dash, wv_dash, wv_cenc_dash, hdr_hls, hdr_cmaffp_hls or other.
+   */
+  function offerFamily(r) {
+    if (!r || typeof r.url !== 'string') return 'other';
+    var t = String(r.streamType || '').toUpperCase(), hls = /\.m3u8(\?|$)/.test(r.url), mpd = /\.mpd(\?|$)/.test(r.url);
+    if (hls) return /^HDR_/.test(t) ? (/CMAFFP/.test(t) ? 'hdr_cmaffp_hls' : 'hdr_hls') : 'hls';
+    if (mpd) return /WV/.test(t) ? (/CENC/.test(t) ? 'wv_cenc_dash' : 'wv_dash') : 'dash';
+    return 'other';
+  }
+
+  /** One request's answer into `offers[key]`: no_answer from asking until an answer (later ones are ignored). */
+  function probe(offers, key, ask) {
+    if (!offers) return ask;
+    offers[key] = 'no_answer';
+    var open = true;
+    ask.then(function (r) { if (open && offers[key] === 'no_answer') offers[key] = offerFamily(r); }, function () {});
+    offers.close = offers.close || [];
+    offers.close.push(function () { open = false; });
+    return ask;
+  }
+
+  /**
    * The tvOS request's HLG offer. Clear HLS stays on Shaka; supported CBCS uses the normal Widevine offer.
    * Null unless F1 answers with that (it gives SDR to Pro and for old replays), so the caller can fall back.
    */
-  function playHdr(contentId, channelId) {
-    var ask = playOn(PLAY_PLATFORMS[0], contentId, channelId, 'device=tvos;').then(function (r) {
+  function playHdr(contentId, channelId, offers) {
+    var ask = probe(offers, 'hdr', playOn(PLAY_PLATFORMS[0], contentId, channelId, 'device=tvos;')).then(function (r) {
       if (!/^HDR_/.test(r.streamType || '') || typeof r.url !== 'string' ||
           !/\.m3u8(\?|$)/.test(r.url) || ((r.laURL || r.laUrl) && !/CMAFFP/.test(r.streamType))) return null;
       // tvOS may receive FairPlay streams, which this player cannot decrypt.
@@ -194,9 +245,9 @@ var F1Api = (function () {
    * including live (measured in PR #3 on Tizen 5); browser Widevine can play that on Shaka. An extra request,
    * like the HDR one: its answer is used only when it is cenc Widevine DASH, otherwise `normal`.
    */
-  function cencOffer(normal, contentId, channelId) {
+  function cencOffer(normal, contentId, channelId, offers) {
     if (!/WV/i.test(normal.streamType || '') || /CENC/i.test(normal.streamType) || !/\.mpd(\?|$)/.test(normal.url || '')) return Promise.resolve(normal);
-    return playOn(normal.platform, contentId, channelId, 'device=chromecast;').then(function (r) {
+    return probe(offers, 'cenc', playOn(normal.platform, contentId, channelId, 'device=chromecast;')).then(function (r) {
       if (!/WV/i.test(r.streamType || '') || !/_CENC$/i.test(r.streamType) || !/\.mpd(\?|$)/.test(r.url)) return normal;
       r.cenc = true;
       return r;
@@ -206,19 +257,28 @@ var F1Api = (function () {
   /** Resolves the manifest URL, license URL and required license headers. */
   function play(contentId, channelId, opts) {
     var i = 0;
-    var firstErr = null;
+    var firstErr = null, lastErr = null;
+    // Which requests were asked and what came back (for the diagnostics upload; nothing extra is requested for it).
+    var offers = observed() ? { web: 'not_asked', hdr: 'not_asked', cenc: 'not_asked' } : null;
     function next() {
-      if (i >= PLAY_PLATFORMS.length) return Promise.reject(firstErr || new Error('Playback unavailable'));
+      if (i >= PLAY_PLATFORMS.length) {
+        // Every platform failed: one failed operation (a session that hasn't started yet isn't one).
+        if (!isNotStarted(firstErr)) failed('playback_offer', lastErr && lastErr.status, i - 1);
+        return Promise.reject(firstErr || new Error('Playback unavailable'));
+      }
       var platform = PLAY_PLATFORMS[i++];
-      return playOn(platform, contentId, channelId).catch(function (e) {
+      var ask = playOn(platform, contentId, channelId);
+      if (offers) probe(offers, 'web', ask);   // a later platform only after the first failed
+      return ask.catch(function (e) {
         if (!firstErr) firstErr = e;
+        lastErr = e;
         return next();
       });
     }
     // F1 decides what an account gets: the HDR request is asked for every account, and its answer is used
     // only when it is HDR (playHdr). Otherwise (Pro gets SDR from it) the normal request, as before.
     var request = opts && opts.hdr
-      ? playHdr(contentId, channelId).then(function (hdr) {
+      ? playHdr(contentId, channelId, offers).then(function (hdr) {
         // Apple TV is the only 4K HDR offer: clear HLS on some replays, cbcs on others and live.
         // There is no cenc HDR. Keep clear HDR when the TV has learned to avoid native cbcs.
         if (!hdr || (hdr.hdrEncrypted && opts.cbcs === false)) return next();
@@ -232,7 +292,7 @@ var F1Api = (function () {
             widevineManifestUrl: normal.url, entitlementToken: hdr.entitlementToken || normal.entitlementToken });
         });
       }) : next();
-    if (opts && opts.cenc) request = request.then(function (r) { return r.hdr ? r : cencOffer(r, contentId, channelId); });
+    if (opts && opts.cenc) request = request.then(function (r) { return r.hdr ? r : cencOffer(r, contentId, channelId, offers); });
     return request.then(function (r) {
       var la = r.laURL || r.laUrl || '';
       if (!la && (/WV/i.test(r.streamType || '') || r.hdrEncrypted)) {
@@ -257,6 +317,10 @@ var F1Api = (function () {
       if (r.hdr) stream.hdr = true;
       if (r.cenc) stream.cenc = true;
       if (r.hdrEncrypted) { stream.hdrEncrypted = true; stream.widevineManifestUrl = r.widevineManifestUrl; }
+      if (offers) {
+        (offers.close || []).forEach(function (close) { close(); });
+        stream.offers = { web: offers.web, hdr: offers.hdr, cenc: offers.cenc, chosen: r.hdr ? 'hdr' : r.cenc ? 'cenc' : 'web' };
+      }
       return stream;
     });
   }
@@ -265,7 +329,7 @@ var F1Api = (function () {
   function menu() {
     var l = loc();
     var url = [BASE, '2.0', loginStatus(), LANG, PAGE_PLATFORM, 'ALL/MENU', l.entitlement, l.groupId].join('/');
-    return http(url, { headers: authHeaders() }).then(function (data) {
+    return http(url, { headers: authHeaders(), op: 'menu' }).then(function (data) {
       var out = [];
       (function walk(o) {
         if (!o || typeof o !== 'object') return;
@@ -386,12 +450,75 @@ var F1Api = (function () {
   /** A manifest's text; an error page (a CDN 503, say) is a failure, not a manifest. */
   function manifest(url, re) {
     return fetch(url).then(function (r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
+      if (!r.ok) { failed('manifest', r.status, 0); throw new Error('HTTP ' + r.status); }
       return r.text();
-    }).then(function (text) {
+    }, function (e) { failed('manifest', null, 0); throw e; }).then(function (text) {
       if (!re.test(text)) throw new Error('Not a manifest');
       return text;
     });
+  }
+
+  /** What an HLS master offers, for the diagnostics log: variants (size, rate, codecs, range), languages, key formats. */
+  function hlsOffer(master) {
+    var attrs = function (line) {
+      var o = {}, re = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/g, m;
+      while ((m = re.exec(line))) o[m[1]] = m[2].replace(/^"|"$/g, '');
+      return o;
+    };
+    var variants = [], audio = [], text = [], keys = [];
+    master.split('\n').forEach(function (l) {
+      if (l.indexOf('#EXT-X-STREAM-INF:') === 0) {
+        var a = attrs(l.slice(18));
+        variants.push({ kbps: Math.round(+a.BANDWIDTH / 1000) || null, res: a.RESOLUTION || null, codecs: a.CODECS || null,
+          range: a['VIDEO-RANGE'] || null, fps: +a['FRAME-RATE'] || null });
+      } else if (l.indexOf('#EXT-X-MEDIA:') === 0) {
+        var x = attrs(l.slice(13));
+        (x.TYPE === 'AUDIO' ? audio : x.TYPE === 'SUBTITLES' ? text : []).push(x.LANGUAGE || x.NAME || '?');
+      } else if (/^#EXT-X-(SESSION-)?KEY:/.test(l)) {
+        var k = attrs(l.replace(/^#EXT-X-(SESSION-)?KEY:/, ''));
+        keys.push((k.METHOD || '?') + (k.KEYFORMAT ? ' ' + k.KEYFORMAT : ''));
+      }
+    });
+    return { kind: 'hls', variants: variants, audio: unique(audio), subtitles: unique(text), keyFormats: unique(keys) };
+  }
+
+  /** The same for a DASH manifest: representations per type, DRM schemes and systems. */
+  function dashOffer(mpd) {
+    var video = [], audio = [], text = [], schemes = [], systems = [];
+    (mpd.match(/<AdaptationSet\b[\s\S]*?<\/AdaptationSet>/g) || []).forEach(function (set) {
+      var head = /<AdaptationSet\b[^>]*>/.exec(set)[0];
+      var get = function (s, n) { var m = new RegExp('\\s' + n + '="([^"]*)"').exec(s); return m ? m[1] : null; };
+      // Type and codecs can be on the AdaptationSet or only on its Representations.
+      var rep = (/<Representation\b[^>]*>/.exec(set) || [''])[0];
+      var mime = get(head, 'mimeType') || get(rep, 'mimeType') || '';
+      var codecs = get(head, 'codecs') || get(rep, 'codecs');
+      var type = get(head, 'contentType') || mime.split('/')[0];
+      if (type !== 'video' && type !== 'audio' && (/^(text|application)\//.test(mime) || /^(stpp|wvtt)/.test(codecs || ''))) type = 'text';
+      if (type === 'video') {
+        (set.match(/<Representation\b[^>]*>/g) || []).forEach(function (r) {
+          video.push({ kbps: Math.round(+get(r, 'bandwidth') / 1000) || null, res: (get(r, 'width') || get(head, 'width')) + 'x' +
+            (get(r, 'height') || get(head, 'height')), codecs: get(r, 'codecs') || codecs, fps: get(r, 'frameRate') || get(head, 'frameRate') });
+        });
+      } else if (type === 'audio') audio.push((get(head, 'lang') || '?') + (codecs ? ' ' + codecs : ''));
+      else if (type === 'text') text.push(get(head, 'lang') || get(rep, 'lang') || '?');
+      (set.match(/<ContentProtection\b[^>]*>/g) || []).forEach(function (cp) {
+        var v = get(cp, 'value'), id = (get(cp, 'schemeIdUri') || '').toLowerCase();
+        if (/^(cenc|cbcs|cens|cbc1)$/.test(v || '')) schemes.push(v);
+        systems.push(/edef8ba9/.test(id) ? 'widevine' : /9a04f079/.test(id) ? 'playready' : /94ce86fb/.test(id) ? 'fairplay' :
+          /mp4protection/.test(id) ? null : id.slice(0, 40));
+      });
+    });
+    return { kind: 'dash', video: video, audio: unique(audio), subtitles: unique(text), schemes: unique(schemes),
+      systems: unique(systems.filter(Boolean)) };
+  }
+
+  function unique(list) { return list.filter(function (x, i) { return list.indexOf(x) === i; }); }
+
+  /** For the diagnostics log, only while it records: what the manifest offers. Never fails the stream. */
+  function withOffer(info, read, text) {
+    if (!observed()) return info;
+    try { info.offer = read(text); } catch (e) { /* unknown layout */ }
+    return info;
   }
 
   function dashInfo(url) {
@@ -412,7 +539,7 @@ var F1Api = (function () {
       var segDur = (+attr(/<SegmentTemplate\b[^>]*\sduration="(\d+)"/) || +attr(/<S\b[^>]*\sd="(\d+)"/) || 0) / ts;
       // Session replays say contentType="video"; highlights only mimeType="video/mp4".
       var video = (/<AdaptationSet\b[^>]*(?:contentType="video"|mimeType="video\/)[\s\S]*?<\/AdaptationSet>/.exec(mpd) || [''])[0];
-      return {
+      return withOffer({
         // The video qualities' declared bitrates, lowest first.
         videoBitrates: (video.match(/<Representation\b[^>]*>/g) || []).map(function (r) {
           return +((/\sbandwidth="(\d+)"/.exec(r) || [])[1] || 0);
@@ -423,7 +550,7 @@ var F1Api = (function () {
         windowEnd: windowStart + span / ts,
         epochAtZero: dynamic ? ast : (pto / ts) - periodStart,
         delay: isoSeconds(attr(/suggestedPresentationDelay="([^"]+)"/)) || 25
-      };
+      }, dashOffer, mpd);
     });
   }
 
@@ -432,7 +559,9 @@ var F1Api = (function () {
    * which give the real clock time of segments; marks maps player positions to Unix seconds.
    */
   function hlsInfo(url) {
+    var offer = null;
     return manifest(url, /^\s*#EXTM3U/).then(function (master) {
+      offer = withOffer({}, hlsOffer, master).offer || null;
       var lines = master.split('\n');
       for (var i = 0; i < lines.length - 1; i++) {
         if (lines[i].indexOf('#EXT-X-STREAM-INF') === 0) {
@@ -451,8 +580,10 @@ var F1Api = (function () {
         }
       });
       var live = !/#EXT-X-ENDLIST/.test(playlist) && !/PLAYLIST-TYPE:VOD/.test(playlist);
-      return { dynamic: live, windowStart: 0, windowEnd: pos, delay: 25, marks: marks,
+      var info = { dynamic: live, windowStart: 0, windowEnd: pos, delay: 25, marks: marks,
         epochAtZero: marks.length ? marks[0].wall - marks[0].pos : 0, encrypted: hasKeys(playlist) };
+      if (offer) info.offer = offer;
+      return info;
     });
   }
 
@@ -471,7 +602,8 @@ var F1Api = (function () {
     return http(url, {
       method: 'POST',
       headers: { entitlementtoken: state.entitlement, 'content-type': 'text/plain;charset=UTF-8', 'x-f1-device-info': DEVICE_INFO },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      op: 'resume_position'
     }).then(function (data) {
       var r = data && data.resultObj && data.resultObj[contentId];
       return (r && r.user && r.user.resume && r.user.resume.playHeadPosition) || 0;
@@ -485,7 +617,8 @@ var F1Api = (function () {
     return http(url, {
       method: 'POST',
       headers: { ascendontoken: state.ascendon, entitlementtoken: state.entitlement, 'content-type': 'application/json', 'x-f1-device-info': DEVICE_INFO },
-      body: JSON.stringify({ contentId: +contentId, playHeadPosition: Math.round(seconds), contentSubType: contentSubtype || 'REPLAY' })
+      body: JSON.stringify({ contentId: +contentId, playHeadPosition: Math.round(seconds), contentSubType: contentSubtype || 'REPLAY' }),
+      op: 'save_position'
     }).catch(function () { /* best effort */ });
   }
 
@@ -524,3 +657,12 @@ var F1Api = (function () {
     imageUrl: imageUrl
   };
 })();
+
+// The subscription tier (the location entitlement, e.g. PRO or PREMIUM) for the diagnostics log: only to read
+// problems by what F1 offers each tier, never to decide anything in the app.
+if (typeof Diag !== 'undefined') {
+  Diag.provide('account', function () {
+    var l = F1Api.state.location;
+    return { signedIn: !!F1Api.state.ascendon, tier: (l && l.entitlement) || null };
+  });
+}

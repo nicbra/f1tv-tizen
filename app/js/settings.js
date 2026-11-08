@@ -9,7 +9,9 @@ var Settings = (function () {
     spoilerFree: false,  // blur the artwork of replays and highlights
     hdr: true,           // 4K HDR where the subscription and TV allow it; off: always SDR
     multiview: 'side2',  // the multiview layout offered first (HdrStream.layouts; experiment)
-    updates: 'automatic' // automatic | off (legacy booleans are read below)
+    updates: 'automatic', // automatic | off (legacy booleans are read below)
+    diagnostics: 'off',  // opt-in upload of diagnostics events: 'off' | 'basic' (js/diag-upload.js)
+    diagnosticsAsked: false   // the one-time question about diagnostics was answered
   };
   var values = {};
 

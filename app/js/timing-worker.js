@@ -185,7 +185,7 @@ function fetchFeed(feed) {
   return fetch(BASE + j.path + feed + '.jsonStream', { headers: { Authorization: 'Bearer ' + j.token }, cache: 'no-store' }).then(function (r) {
     // Missing feeds (e.g. LapCount in practice) come back as 403 from the archive's storage.
     if (r.status === 404 || r.status === 403) return '';
-    if (!r.ok) throw new Error(feed + ': HTTP ' + r.status);
+    if (!r.ok) { var e = new Error(feed + ': HTTP ' + r.status); e.status = r.status; throw e; }
     return r.text();
   }).then(function (text) {
     if (!text || job !== j) return;
@@ -355,7 +355,8 @@ function start(m) {
     if (job !== j) return;
     // No archive yet: a live session. Follow F1's real-time feed instead.
     if (m.live && !j.stopped) return startLive(m);
-    self.postMessage({ type: 'error', message: err.message });
+    var category = err && err.status ? 'http' : err instanceof SyntaxError ? 'parse' : err instanceof TypeError ? 'network' : 'archive_unavailable';
+    self.postMessage({ type: 'error', message: err.message, category: category });
   });
 }
 
@@ -379,12 +380,43 @@ function startLive(m) {
   connect(j);
 }
 
+/**
+ * A live-feed incident for the diagnostics upload: the first cause is kept until the feed is back (reported as
+ * reconnected) or given up (failed, when the job is replaced while still down).
+ */
+function trouble(j, category) {
+  if (!j.incident) j.incident = { category: category, since: Date.now() };
+}
+
+function recovered(j) {
+  if (!j.incident) return;
+  self.postMessage({ type: 'diag', category: j.incident.category, reconnect: 'reconnected', since: j.incident.since });
+  j.incident = null;
+}
+
+/**
+ * The job ended (the viewer left, another video) while the feed was down: a failed incident if it had been down a
+ * minute already; a short gap at a normal stop is no failure.
+ */
+function gaveUp(j) {
+  if (!j.incident) return;
+  if (Date.now() - j.incident.since >= 60000) {
+    self.postMessage({ type: 'diag', category: j.incident.category, reconnect: 'failed', since: j.incident.since });
+  }
+  j.incident = null;
+}
+
 function connect(j) {
   if (job !== j || j.stopped) return;
   fetch(LIVE + '/negotiate?negotiateVersion=1', { method: 'POST', credentials: 'include' })
-    .then(function (r) { return r.text(); })
+    .then(function (r) {
+      // A refused negotiation is the server's answer, not the network's.
+      if (!r.ok) { var e = new Error('negotiate: HTTP ' + r.status); e.category = 'http'; throw e; }
+      return r.text();
+    })
     .then(function (text) {
-      var n = JSON.parse(text.replace(/^\uFEFF/, ''));
+      var n;
+      try { n = JSON.parse(text.replace(/^\uFEFF/, '')); } catch (e) { e.category = 'parse'; throw e; }
       var ws = new WebSocket('wss://livetiming.formula1.com/signalrcore?id=' + encodeURIComponent(n.connectionToken || n.connectionId));
       var handshaken = false, announced = false;
       j.ws = ws;
@@ -392,6 +424,7 @@ function connect(j) {
       // SignalR clients drop a connection that has been silent for 30 s (the server pings every 15 s), and
       // one that never answers the handshake. A half-open socket never closes by itself.
       function reconnect() {
+        trouble(j, 'timeout');
         ws.onclose = null;
         clearInterval(j.keepAlive);
         try { ws.close(); } catch (x) { /* closed */ }
@@ -423,6 +456,7 @@ function connect(j) {
             var t = Date.now();
             FEEDS.forEach(function (f) { if (msg.result[f]) apply(f, t, msg.result[f]); });
             snapshot(t);
+            recovered(j);
             if (!j.afterArchive && j.liveFrom == null) j.liveFrom = t;
             if (!announced) {
               announced = true;
@@ -438,21 +472,21 @@ function connect(j) {
       };
       ws.onclose = function () {
         clearInterval(j.keepAlive);
-        if (job === j && !j.stopped) setTimeout(function () { connect(j); }, 5000);
+        if (job === j && !j.stopped) { trouble(j, 'disconnected'); setTimeout(function () { connect(j); }, 5000); }
       };
     })
-    .catch(function () { setTimeout(function () { connect(j); }, 10000); });
+    .catch(function (e) { trouble(j, (e && e.category) || 'network'); setTimeout(function () { connect(j); }, 10000); });
 }
 
 self.onmessage = function (e) {
   var m = e.data;
   if (m.cmd === 'load') {
-    if (job) job.stopped = true;
+    if (job) { gaveUp(job); job.stopped = true; }
     start(m);
   } else if (m.cmd === 'query') {
     self.postMessage({ type: 'state', id: m.id, state: query(m.t) });
   } else if (m.cmd === 'stop') {
-    if (job) job.stopped = true;
+    if (job) { gaveUp(job); job.stopped = true; }
     if (job && job.ws) try { job.ws.close(); } catch (x) { /* closed */ }
     if (job) clearTimeout(job.flushTimer);
     job = null;

@@ -155,6 +155,9 @@
     }
     save();
     window.Launcher.version = b.manifest.version; window.Launcher.base = base;
+    // Which signed release build this is (the diagnostics upload names it; the server checks it against GitHub).
+    var archive = b.manifest.archive && b.manifest.archive.sha512;
+    window.Launcher.archiveSha512 = /^[a-f0-9]{128}$/.test(archive || '') ? archive : null;
     timer = setTimeout(function () { mark('start timeout'); }, 30000);
     function read(relative, done) {
       if (b.builtin) request(base + relative, 'GET', false, done);

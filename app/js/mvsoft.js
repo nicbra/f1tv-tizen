@@ -21,6 +21,13 @@ var MvSoftware = (function () {
     try { if (typeof Diag !== 'undefined' && Diag.note) Diag.note(kind, data, 'warn'); } catch (e) { /* no log */ }
   }
 
+  /** An error with its cause for the diagnostics upload (others count as decoding failures). */
+  function failure(message, code) {
+    var e = new Error(message);
+    e.diag = { code: code, platform: null };
+    return e;
+  }
+
   /** Whether this TV can play it: Samsung's EMSS with side-thread pictures, and worker canvases for the frames. */
   function supported() {
     var w = typeof window !== 'undefined' ? window : {};
@@ -42,7 +49,7 @@ var MvSoftware = (function () {
   /** A small feed's H.264 variant playlist of `height` lines (else the nearest below) from its offer's master playlist. */
   function variant(url, height) {
     return fetch(url).then(function (r) {
-      if (!r.ok) throw new Error('feed playlist: HTTP ' + r.status);
+      if (!r.ok) throw failure('feed playlist: HTTP ' + r.status, 'NETWORK_ERROR');
       return r.text().then(function (text) {
         var lines = text.split(/\r?\n/), best = null;
         lines.forEach(function (line, i) {
@@ -51,7 +58,7 @@ var MvSoftware = (function () {
           if (!/avc1/.test(a.CODECS || '') || !h || h > height || (best && best.h >= h)) return;
           best = { h: h, url: new URL((lines[i + 1] || '').trim(), r.url).toString() };
         });
-        if (!best) throw new Error('no H.264 variant');
+        if (!best) throw failure('no H.264 variant', 'UNSUPPORTED');
         return best.url;
       });
     });
@@ -61,7 +68,7 @@ var MvSoftware = (function () {
   function starts(url) {
     return fetch(url).then(function (r) {
       // An error body has no segment times: reject, or the start clock becomes NaN and never settles.
-      if (!r.ok) throw new Error('segment playlist ' + r.status);
+      if (!r.ok) throw failure('segment playlist ' + r.status, 'NETWORK_ERROR');
       return r.text();
     }).then(function (text) {
       var out = [], t = 0;
@@ -76,13 +83,13 @@ var MvSoftware = (function () {
 
   function post(body) {
     return fetch(LOCAL + '/stitch/' + ID, { method: 'POST', body: JSON.stringify(body) }).then(function (r) {
-      return r.text().then(function (text) { if (r.status !== 201) throw new Error('helper: ' + text.slice(0, 160)); return JSON.parse(text); });
+      return r.text().then(function (text) { if (r.status !== 201) throw failure('helper: ' + text.slice(0, 160), 'HELPER_ERROR'); return JSON.parse(text); });
     });
   }
 
   function bytes(url) {
     return fetch(url).then(function (r) {
-      if (!r.ok) return r.text().then(function (t) { throw new Error('helper: HTTP ' + r.status + ' ' + t.slice(0, 120)); });
+      if (!r.ok) return r.text().then(function (t) { throw failure('helper: HTTP ' + r.status + ' ' + t.slice(0, 120), 'HELPER_ERROR'); });
       return r.arrayBuffer();
     }).then(function (b) { return new Uint8Array(b); });
   }

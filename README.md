@@ -129,9 +129,16 @@ device profile. Removing it signs the TV out.
 
 The app never sees your F1 password: you sign in on F1's own website, on your phone. Your F1 TV
 login is only sent to formula1.com. Apart from F1, the app contacts `api.jolpi.ca` for the
-standings and GitHub to look for updates, which you can turn off. There is no
-tracking or analytics. All the source code is in this repository, GitHub Actions builds the
-release packages from it, and the installer checks them against their SHA-256 sums.
+standings and GitHub to look for updates, which you can turn off. All the source code is in this
+repository, GitHub Actions builds the release packages from it, and the installer checks them
+against their SHA-256 sums.
+
+### Does it send anything about me?
+
+Only crash reports, unless you say yes to more. The app asks you once whether to send
+diagnostics to help improve the app, and you can turn that off later.
+The diagnostics data is anonymous and only sent to a server in EU/EEA.
+Read more about [what the app sends](app/PRIVACY.md) for more details.
 
 ### Does it get around F1 TV's DRM?
 

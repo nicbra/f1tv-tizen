@@ -271,8 +271,16 @@ async function boot(options = {}) {
       }
     }
   }
-  const fetch = async (url) => {
+  const uploads = [];
+  const fetch = async (url, init) => {
     requests.push(url);
+    // The diagnostics server: down unless the test answers (it isn't deployed yet either).
+    if (/^https:\/\/diag\.example\//.test(url)) {
+      uploads.push({ url, method: init.method, headers: init.headers, body: init.body && JSON.parse(init.body) });
+      if (!options.uploadAnswer) throw new TypeError('Failed to fetch');
+      const r = options.uploadAnswer(url, init);
+      return { status: r.status, headers: { get: () => null }, text: async () => JSON.stringify(r.body || {}) };
+    }
     if (/127\.0\.0\.1:18765\/launcher\/check/.test(url) && options.launcherResult) return { ok: true, json: async () => options.launcherResult };
     if (/127\.0\.0\.1:18765\/launcher\/info/.test(url) && options.launcherInfo) return { ok: true, json: async () => options.launcherInfo };
     if (/127\.0\.0\.1:18765\/launcher\/ack/.test(url)) return { ok: true, json: async () => ({ ok: true }) };
@@ -345,20 +353,27 @@ async function boot(options = {}) {
     driverInfo: async () => ({}), seasonProgress: async () => ({ rounds: [], drivers: {}, teams: {} }),
     driverSeason: () => net.season(), summary: () => ({ wins: 0, podiums: 0, poles: 0, fastestLaps: 0, best: null, avg: null, dnfs: 0 })
   };
+  const localStorage = { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); },
+    removeItem: (k) => { delete store[k]; } };
   const context = vm.createContext({
     document,
     ...(options.launcher ? { Launcher: options.launcher, StreamProxy: { ensure: options.ensure || (async () => true) } } : {}),
     ...(options.diag ? { Diag: options.diag } : {}),
-    window: { addEventListener: (t, fn) => { windowListeners[t] = fn; } },
-    localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } },
+    window: { addEventListener: (t, fn) => { windowListeners[t] = fn; }, localStorage },
+    localStorage,
     setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, setInterval: clock.setInterval, clearInterval: clock.clearInterval,
     Date: clock.Date, Math, JSON, Promise, encodeURIComponent, decodeURIComponent, URL, Worker, fetch,
     Image: class { set src(v) { this._src = v; } },
     qrcode: () => ({ addData() {}, make() {}, createImgTag: () => '<img>' }),
     tizen: { application: { getCurrentApplication: () => ({ appInfo: { version: '1.0.0' }, exit: () => exits.push(clock.now()) }) } },
     XMLHttpRequest: class {
-      open() {}
-      send() { this.status = 200; this.responseText = options.installMarker || ''; this.onload(); }
+      open(method, url) { this.url = url; }
+      // app/PRIVACY.md (Read more in the diagnostics question), else the install marker.
+      send() {
+        this.status = 200;
+        this.responseText = this.url === 'PRIVACY.md' ? readFileSync('app/PRIVACY.md', 'utf8') : options.installMarker || '';
+        this.onload();
+      }
     },
     Auth: options.signedOut ? {
       // Not paired: pairing shows a code and waits; tests resolve auth.pairing to sign in.
@@ -382,6 +397,20 @@ async function boot(options = {}) {
     MvSoftware: mvSoft
   });
   vm.runInContext(readFileSync('app/js/caps.js', 'utf8'), context, { filename: 'caps.js' });
+  // options.realDiag: the real diagnostics log, recording as on personal TV builds, loaded before the other
+  // scripts as in index.html (they register their state with it as they load).
+  if (options.realDiag) {
+    vm.runInContext('var DIAG_BUILD = { record: true, label: "test", server: "https://diag.example/diag/v1" };', context);
+    vm.runInContext(readFileSync('app/js/diag.js', 'utf8'), context, { filename: 'diag.js' });
+  }
+  // options.uploads: the real diagnostics upload and attempt tracker (the viewer's answer is in options.settings).
+  if (options.uploads) {
+    // A build with a diagnostics server (options.noServer: one without, like a fork's).
+    if (!options.realDiag) vm.runInContext(options.noServer ? 'var DIAG_BUILD = { record: false };' : 'var DIAG_BUILD = { record: false, server: "https://diag.example/diag/v1" };', context);
+    context.window.crypto = { getRandomValues: (a) => require('node:crypto').randomFillSync(a) };
+    // In index.html's order: settings.js first (loaded again below; harmless).
+    for (const f of ['settings.js', 'diag-upload.js', 'diag-play.js']) vm.runInContext(readFileSync('app/js/' + f, 'utf8'), context, { filename: f });
+  }
   if (options.av) {
     class SimpleTextDisplayer { append() {} }
     class ShakaPlayer {
@@ -395,11 +424,11 @@ async function boot(options = {}) {
         util: { Error: { Category: {} } } } });
     for (const f of ['proxy.js', 'player.js']) vm.runInContext(readFileSync('app/js/' + f, 'utf8'), context, { filename: f });
   }
-  for (const f of ['settings.js', 'keys.js', 'focus.js', 'upnext.js', 'api.js', 'timing.js']) {
+  for (const f of ['settings.js', 'keys.js', 'focus.js', 'upnext.js', 'markdown.js', 'api.js', 'timing.js']) {
     vm.runInContext(readFileSync('app/js/' + f, 'utf8'), context, { filename: f });
   }
   const api = context.F1Api;
-  if (!options.signedOut) Object.assign(api.state, { ascendon: 'TOKEN', entitlement: 'ENT', location: { entitlement: options.tier || 'PRO', groupId: 2 } });
+  if (!options.signedOut) Object.assign(api.state, { ascendon: 'TOKEN', locationFor: 'TOKEN', entitlement: 'ENT', location: { entitlement: options.tier || 'PRO', groupId: 2 } });
   // Multiview's layouts, loaded before app.js as in index.html.
   if (options.multiview) vm.runInContext(readFileSync('app/js/layouts.js', 'utf8'), context, { filename: 'layouts.js' });
   Object.assign(api, {
@@ -425,7 +454,7 @@ async function boot(options = {}) {
   const KEYS = context.Keys.codes;
   const app = {
     mvSoft,
-    context, clock, net, player, timing, requests, exits, saved, $, deferred, api, auth, stats, store, windowListeners,
+    context, clock, net, player, timing, requests, exits, saved, $, deferred, api, auth, stats, store, windowListeners, uploads,
     advance: (ms) => clock.advance(ms),
     async press(...names) {
       for (const name of names) {
@@ -2685,9 +2714,9 @@ test('long release notes scroll with UP and DOWN and return to the Close button'
   await app.press('BACK');
   assert.equal(app.focused(), 'v1.3.0New');
   const css = readFileSync('app/css/style.css', 'utf8');
-  assert.match(css, /\.dialog-box p\s*\{[^}]*max-height:\s*560px/);
-  assert.match(css, /\.dialog-box p\s*\{[^}]*overflow-y:\s*auto/);
-  assert.match(css, /\.dialog-box p\s*\{[^}]*white-space:\s*pre-wrap/);
+  assert.match(css, /#dialog-text\s*\{[^}]*max-height:\s*560px/);
+  assert.match(css, /#dialog-text\s*\{[^}]*overflow-y:\s*auto/);
+  assert.match(css, /#dialog-text\s*\{[^}]*white-space:\s*pre-wrap/);
 });
 
 test('BACK to a weekend list shows the badges as they are now', async () => {
@@ -3299,7 +3328,8 @@ test('a version confirms itself only once its own helper answers', async () => {
 
 test('failed starts the shell kept go into the diagnostics log once, then are acknowledged', async () => {
   const notes = [];
-  const diag = { note: (kind, data, level) => notes.push([kind, data.version, data.reason, level]) };
+  const diag = { note: (kind, data, level) => notes.push([kind, data.version, data.reason, level]), provide() {}, provideAsync() {},
+    trail() {}, playing() {}, stream: () => null, recording: () => true };
   const launcherInfo = { state: { events: [{ id: 4, at: 1, version: '1.2.0', reason: 'page: start timeout' }, { id: 5, at: 2, version: '1.2.0', reason: 'page: script error' }] } };
   const app = await boot({ launcher: updateLauncher(() => {}), diag, launcherInfo });
   await app.advance(100);
@@ -3334,4 +3364,140 @@ test('whether the full restart works is learned per TV: a late return means it d
   const store = { 'f1tv.relaunch': JSON.stringify({ pending: NOW - 10000 }) };
   const quick = await boot({ launcher: launcher(), store });
   assert.deepEqual(JSON.parse(quick.store['f1tv.relaunch']), { ok: true });
+});
+
+test('the diagnostics log keeps a failed feed switch with its details, but no URL query or DRM data', async () => {
+  const app = await boot({ realDiag: true });
+  await play(app, 'Race');
+  app.player.pos = 3000;
+  app.net.play = (id, ch) => Promise.resolve({ url: 'https://cdn/' + id + '/' + ch + '/master.m3u8?token=URLSECRET',
+    streamType: 'SDR_HD_DASHWV', licenseUrl: 'https://lic.example/la?auth=LASECRET',
+    licenseHeaders: { ascendontoken: 'HDRSECRET', customdata: 'DRMSECRET' } });
+  app.player.hold = deferred();
+  await app.press('CH_DOWN');
+  app.player.hold.reject(new Error('Load failed for https://cdn/101/1033/master.m3u8?token=URLSECRET'));
+  app.player.hold = null;
+  await app.advance(1500);
+  const stored = app.context.localStorage.getItem('f1tv.diag');
+  const log = JSON.parse(stored);
+  const failed = log.find((e) => e.k === 'play.failed');
+  assert.ok(failed, log.map((e) => e.k).join(' '));
+  assert.match(failed.d.error.message, /^Load failed for https:\/\/cdn\/…\/master\.m3u8$/);
+  assert.equal(failed.d.switching, true);
+  assert.equal(failed.d.stream.streamType, 'SDR_HD_DASHWV');
+  assert.equal(failed.d.stream.drm, 'cbcs');
+  assert.equal(String(failed.d.stream.channelId), '1033');
+  assert.ok(failed.trail.some((t) => t.k === 'play.request'));
+  assert.ok(failed.trail.some((t) => t.k === 'play.offer' && t.d.streamType === 'SDR_HD_DASHWV'));
+  assert.equal(failed.s.app.screen, 'player');
+  assert.equal(failed.s.account.tier, 'PRO');
+  assert.doesNotMatch(stored, /URLSECRET|LASECRET|HDRSECRET|DRMSECRET|TOKEN|ENT\b/);
+});
+
+test('the one-time diagnostics question: Yes has the focus, No and BACK say no, Read more shows app/PRIVACY.md; asked once', async () => {
+  const buttons = (app) => app.$('dialog-actions').children.map((row) => row.children.map((b) => b.textContent + (b.classList.contains('focused') ? '*' : '')));
+  for (const keys of [['RIGHT', 'ENTER'], ['BACK']]) {
+    const no = await boot({ uploads: true });
+    await no.advance(4500);
+    await no.press(...keys);
+    assert.equal(no.context.Settings.get('diagnostics'), 'off', keys.join(' '));
+    assert.ok(no.$('dialog').classList.contains('hidden'));
+  }
+  const app = await boot({ uploads: true });
+  await app.advance(4500);
+  assert.equal(app.$('dialog-title').textContent, 'Help improve this app?');
+  assert.match(app.$('dialog-text').textContent, /developer\.\nThe data will only be stored and handled in the EU\/EEA\.$/);
+  assert.deepEqual(buttons(app), [['Yes*', 'No'], ['Read more']]);
+  // Read more: the Markdown file as text (no Markdown syntax or comments left), then back to the question.
+  await app.press('DOWN', 'ENTER');
+  const md = readFileSync('app/PRIVACY.md', 'utf8');
+  assert.equal(app.$('dialog-title').textContent, md.match(/^# (.+)$/m)[1]);
+  const doc = app.$('dialog-text');
+  assert.ok(doc.classList.contains('doc'));
+  for (const h of md.match(/^#{2,6} .+$/gm)) assert.ok(doc.textContent.includes(h.replace(/^#+ /, '')), h);
+  assert.doesNotMatch(doc.textContent, /\*\*|\]\(|<!--|^#/m);
+  assert.deepEqual(buttons(app), [['Back*']]);
+  await app.press('BACK');
+  assert.equal(app.$('dialog-title').textContent, 'Help improve this app?');
+  assert.deepEqual(buttons(app), [['Yes*', 'No'], ['Read more']]);
+  assert.equal(app.context.Settings.get('diagnostics'), 'off', 'reading is no answer');
+  await app.press('ENTER');
+  assert.equal(app.context.Settings.get('diagnostics'), 'basic');
+  assert.equal(app.context.DiagUpload.enabled(), true);
+  const again = await boot({ uploads: true, store: app.store });
+  await again.advance(10000);
+  assert.ok(again.$('dialog').classList.contains('hidden'));
+});
+
+test('a build without a diagnostics server never asks, has no Diagnostics rows and sends nothing, even after a yes', async () => {
+  const app = await boot({ uploads: true, noServer: true, settings: { diagnostics: 'basic', diagnosticsAsked: true } });
+  await app.advance(10000);
+  assert.ok(app.$('dialog').classList.contains('hidden'));
+  assert.equal(app.context.DiagUpload.enabled(), false);
+  app.context.DiagUpload.jsError('uncaught_error', null, null);
+  await app.advance(120000);
+  assert.deepEqual(app.uploads, []);
+  await app.press('UP');
+  await app.moveTo(/^Nicholas$/, ['RIGHT']);
+  await app.press('ENTER');
+  const rows = app.$('list-inner').querySelectorAll('.list-row').map((r) => r.textContent);
+  assert.ok(rows.some((r) => /^Playback on this TV/.test(r)), rows.join(' | '));
+  assert.ok(!rows.some((r) => /diagnostics/i.test(r)), rows.join(' | '));
+  const fresh = await boot({ uploads: true, noServer: true });
+  await fresh.advance(10000);
+  assert.ok(fresh.$('dialog').classList.contains('hidden'), 'no question');
+  assert.equal(fresh.context.Settings.get('diagnosticsAsked'), false);
+});
+
+test('diagnostics uploads: a played video is one attempt with its outcome and summary, without titles, ids or URLs', async () => {
+  const batches = [];
+  const app = await boot({ uploads: true, settings: { diagnostics: 'basic', diagnosticsAsked: true },
+    uploadAnswer: (url, init) => {
+      const body = JSON.parse(init.body);
+      batches.push(body);
+      return { status: 200, body: { stored: body.events.length, duplicates: 0, dropped: 0 } };
+    } });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(3000);
+  await app.press('CH_DOWN');
+  await app.advance(3000);
+  await app.stop();
+  await app.advance(120000);
+  const events = batches.flatMap((b) => b.events);
+  const names = events.map((e) => e.name);
+  assert.ok(names.includes('app.started'), names.join(' '));
+  assert.ok(names.includes('account.status'));
+  const outcome = events.find((e) => e.name === 'playback.attempt_outcome');
+  assert.equal(outcome.fields.outcome, 'playing');
+  assert.equal(outcome.fields.requested_layout, 'off');
+  assert.equal(outcome.fields.tier, 'pro');
+  const summary = events.find((e) => e.name === 'playback.summary');
+  assert.equal(summary.fields.stream_switch_count, 1);
+  assert.equal(summary.playback_attempt_id, outcome.playback_attempt_id);
+  assert.equal(names.filter((n) => n === 'playback.attempt_outcome').length, 1, 'the feed switch is no new attempt');
+  const text = JSON.stringify(batches);
+  assert.doesNotMatch(text, /cdn\/|Race|INTERNATIONAL|TOKEN|"contentId"/);
+  // The content id (101) in no value; random ids (UUIDs) may contain the digits.
+  const strings = [];
+  (function walk(v) { if (v && typeof v === 'object') Object.values(v).forEach(walk); else if (typeof v === 'string') strings.push(v); })(batches);
+  assert.ok(!strings.some((v) => !/^[0-9a-f-]{36}$/.test(v) && /101/.test(v)), 'no content id');
+});
+
+test('the sign-in screen has no Diagnostics button, with diagnostics on or off', async () => {
+  for (const diagnostics of ['basic', 'off']) {
+    const app = await boot({ signedOut: true, uploads: true, settings: { diagnostics, diagnosticsAsked: true } });
+    assert.equal(app.screen(), 'login');
+    assert.doesNotMatch(app.$('login-actions').textContent, /Diagnostics/);
+  }
+});
+
+test('an unreachable diagnostics server changes nothing for the viewer', async () => {
+  const app = await boot({ uploads: true, settings: { diagnostics: 'basic', diagnosticsAsked: true } });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(600000);
+  assert.equal(app.screen(), 'player');
+  assert.ok(app.uploads.length >= 1);
+  assert.doesNotMatch(app.toast() || '', /diagnostic|server/i);
 });

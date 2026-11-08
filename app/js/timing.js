@@ -8,10 +8,24 @@ var Timing = (function () {
   var seq = 0;
   var waiting = {};
 
+  var incidents = {};   // timing incidents sent this session, per category (at most five each)
+
+  /** A timing failure or a recovered live feed, for the diagnostics upload (since: when it began, if it began earlier). */
+  function diagnose(category, reconnect, since) {
+    if (typeof DiagUpload === 'undefined' || !DiagUpload.enabled()) return;
+    if (since && !DiagUpload.covers(since)) return;   // it began before the viewer said yes
+    var cats = ['network', 'timeout', 'http', 'parse', 'worker', 'archive_unavailable', 'disconnected', 'other', 'unknown'];
+    if (cats.indexOf(category) < 0) category = 'other';
+    incidents[category] = (incidents[category] || 0) + 1;
+    if (incidents[category] > 5) return;
+    DiagUpload.event('timing.feed_error', { error_category: category, reconnect_outcome: reconnect }, 'warn');
+  }
+
   function onMessage(e) {
     var m = e.data;
     if (m.type === 'loaded') ready = true;
-    else if (m.type === 'error') failed(loadedKey);
+    else if (m.type === 'diag') diagnose(m.category, m.reconnect === 'reconnected' ? 'reconnected' : 'failed', m.since);
+    else if (m.type === 'error') { diagnose(m.category || 'unknown', 'not_attempted'); failed(loadedKey); }
     else if (m.type === 'state' && waiting[m.id]) { waiting[m.id](m.state); delete waiting[m.id]; }
   }
 
@@ -101,7 +115,11 @@ var Timing = (function () {
     if (key === loadedKey || (key === failure.key && Date.now() - failure.at < 60000)) return;
     stop();
     loadedKey = key;
-    if (!worker) { worker = (typeof Launcher !== 'undefined' ? Launcher.worker('js/timing-worker.js') : new Worker('js/timing-worker.js')); worker.onmessage = onMessage; }
+    if (!worker) {
+      worker = (typeof Launcher !== 'undefined' ? Launcher.worker('js/timing-worker.js') : new Worker('js/timing-worker.js'));
+      worker.onmessage = onMessage;
+      worker.onerror = function () { diagnose('worker', 'not_attempted'); };
+    }
     resolvePath(meta, token).then(function (path) {
       if (loadedKey === key) worker.postMessage({ cmd: 'load', path: path, token: token, live: !!live, start: +meta.start || 0 });
     }).catch(function () {

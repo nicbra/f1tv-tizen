@@ -18,12 +18,17 @@ var Stats = (function () {
     return entry.promise;
   }
 
+  /** A failed request for the diagnostics upload: a driver's seasons, or the standings (the season's results too). */
+  function failed(path, status) {
+    if (typeof DiagUpload !== 'undefined') DiagUpload.apiFailed(/^\/drivers\//.test(path) ? 'driver_season' : 'standings', status || null, 0);
+  }
+
   function get(path) {
     return cached(path, function () {
       return fetch(API + path + '?limit=100').then(function (r) {
-        if (!r.ok) throw new Error('Stats unavailable (HTTP ' + r.status + ')');
+        if (!r.ok) { failed(path, r.status); throw new Error('Stats unavailable (HTTP ' + r.status + ')'); }
         return r.json();
-      }).then(function (j) { return j.MRData; });
+      }, function (e) { failed(path, null); throw e; }).then(function (j) { return j.MRData; });
     });
   }
 
@@ -174,7 +179,7 @@ var Stats = (function () {
     return cached('pages:' + path, function () {
       return (function next(offset, acc) {
         return fetch(API + path + '?limit=100&offset=' + offset).then(function (r) {
-          if (!r.ok) throw new Error('Stats unavailable (HTTP ' + r.status + ')');
+          if (!r.ok) { failed(path, r.status); throw new Error('Stats unavailable (HTTP ' + r.status + ')'); }
           return r.json();
         }).then(function (j) {
           var d = j.MRData, size = +d.limit || 100;

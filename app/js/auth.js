@@ -177,9 +177,19 @@ var Auth = (function () {
   function renew() {
     if (!isPaired()) return Promise.resolve(null);
     return byDevice().catch(function (e) {
+      renewFailed(e);
       if (e && (e.fault || (e.status >= 400 && e.status < 500) || /No token/.test(e.message))) return null;
       throw e;
     });
+  }
+
+  /** Why a renewal failed, as a category for the diagnostics upload (never F1's fault text). */
+  function renewFailed(e) {
+    if (typeof DiagUpload === 'undefined') return;
+    var c = !e ? 'unknown' : e.fault || (e.status >= 400 && e.status < 500) ? 'rejected' : e.status >= 500 ? 'server'
+      : /No token/.test(e.message || '') ? 'missing_token' : /timeout/i.test(e.message || '') ? 'timeout'
+      : e instanceof SyntaxError ? 'invalid_response' : e.status == null ? 'network' : 'other';
+    DiagUpload.event('auth.refresh_failed', { error_category: c }, 'warn');
   }
 
   return {

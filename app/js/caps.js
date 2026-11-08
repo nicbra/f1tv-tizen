@@ -13,19 +13,29 @@ var Caps = (function () {
     try { localStorage.setItem(KEY, JSON.stringify(record)); } catch (e) { /* full or disabled */ }
   }
 
+  // Told when the evidence changes ('paths' or 'browser'), not on heartbeats: the diagnostics logs follow it.
+  var listeners = [];
+  function changed(kind) {
+    listeners.forEach(function (fn) { try { fn(kind); } catch (e) { /* a listener never breaks playback */ } });
+  }
+
   function count(path, outcome) {
     var p = record.paths[path] || (record.paths[path] = { ok: 0, failed: 0, crashed: 0, last: 0 });
     p[outcome]++;
     p.last = Date.now();
     save();
+    changed('paths');
   }
 
   // A heartbeat left from the last run means it ended while protected video played on AVPlay: a crash (the app
   // vanishes, issue #1), a kill or a power cut. Counted only when the app is started again within 10 minutes (after a
   // power cut the TV is usually off for longer); one alone never rules out a path (see avoided).
-  var marker = record.playing;
+  var marker = record.playing, previous = null;
   delete record.playing;
-  if (marker && marker.path && Date.now() >= marker.at && Date.now() - marker.at < 10 * 60000) count(marker.path, 'crashed');
+  if (marker && marker.path && Date.now() >= marker.at && Date.now() - marker.at < 10 * 60000) {
+    count(marker.path, 'crashed');
+    previous = { path: marker.path, minutes: Math.floor((Date.now() - marker.at) / 60000) };
+  }
   save();
 
   function avoided(path) {
@@ -70,7 +80,7 @@ var Caps = (function () {
   function probe(scheme) {
     // Measured on QE55Q77A/Tizen 6: cenc is granted, cbcs refused. Including audio grants just audio;
     // an early/lenient probe also lied. Ask video-only after 10 s and inspect the granted scheme.
-    function result(supported) { record.browser[scheme] = supported; save(); }
+    function result(supported) { record.browser[scheme] = supported; save(); changed('browser'); }
     try {
       navigator.requestMediaKeySystemAccess('com.widevine.alpha', [{ initDataTypes: ['cenc'],
         videoCapabilities: [{ contentType: 'video/mp4; codecs="avc1.4d402a"', encryptionScheme: scheme }] }])
@@ -102,6 +112,7 @@ var Caps = (function () {
     var browser = record.browser;
     record = { version: 1, firmware: firmware, browser: browser, paths: {} };
     save();
+    changed('paths');
   }
 
   return {
@@ -110,6 +121,18 @@ var Caps = (function () {
     failed: function (path) { count(path, 'failed'); },
     crashStart: crashStart, crashEnd: crashEnd, usable: usable,
     browser: function (scheme) { return record.browser[scheme]; },
-    report: function () { return JSON.parse(JSON.stringify(record)); }
+    report: function () { return JSON.parse(JSON.stringify(record)); },
+    /** The heartbeat this start found (the app ended while protected video played): { path, minutes } or null. */
+    previousRun: function () { return previous; },
+    onChange: function (fn) { listeners.push(fn); }
   };
 })();
+
+// The diagnostics upload sends what this TV can play when it changes (projected; no counts or times).
+if (typeof DiagUpload !== 'undefined') Caps.onChange(function () { DiagUpload.caps(); });
+
+// The local diagnostics log (developer builds) shows the evidence with every warning and notes probe results.
+if (typeof Diag !== 'undefined') {
+  Diag.provide('caps', function () { var r = Caps.report(); delete r.playing; return r; });
+  Caps.onChange(function (kind) { if (kind === 'browser') Diag.note('caps.browser', { widevine: Caps.report().browser }, 'info'); });
+}

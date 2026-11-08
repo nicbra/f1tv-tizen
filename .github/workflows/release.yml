@@ -116,6 +116,8 @@ jobs:
         env:
           TIZEN_AUTHOR_CERT_BASE64: ${{ secrets.TIZEN_AUTHOR_CERT_BASE64 }}
           TIZEN_AUTHOR_PASSWORD: ${{ secrets.TIZEN_AUTHOR_PASSWORD }}
+          # The diagnostics server's base URL (https://…/diag/v1), a repository Actions variable.
+          DIAG_SERVER: ${{ vars.DIAG_SERVER }}
         run: |
           [[ -n "$TIZEN_AUTHOR_CERT_BASE64" && -n "$TIZEN_AUTHOR_PASSWORD" ]] || {
             echo 'Set TIZEN_AUTHOR_CERT_BASE64 and TIZEN_AUTHOR_PASSWORD in repository Actions secrets.' >&2

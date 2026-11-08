@@ -61,6 +61,17 @@
     toast.timer = setTimeout(function () { t.classList.add('hidden'); }, ms || 5000);
   }
 
+  /** Diagnostics log (js/diag.js), when it is loaded. */
+  function diag(kind, data, level) { if (typeof Diag !== 'undefined') Diag.note(kind, data, level); }
+  function diagStream(s) { return typeof Diag !== 'undefined' && Diag.recording() ? Diag.stream(s) : null; }
+  function diagTrail(kind, data) { if (typeof Diag !== 'undefined') Diag.trail(kind, data); }
+  /** Playback attempts for the diagnostics upload (js/diag-play.js), when it is loaded: DiagPlay[method](...). */
+  function dplay(method) {
+    if (typeof DiagPlay === 'undefined') return null;
+    try { return DiagPlay[method].apply(null, Array.prototype.slice.call(arguments, 1)); } catch (e) { return null; }
+  }
+  function uploading() { return typeof DiagUpload !== 'undefined' && DiagUpload.enabled(); }
+
   function el(tag, cls, text) {
     var e = document.createElement(tag);
     if (cls) e.className = cls;
@@ -134,30 +145,38 @@
   // dialog
 
   /**
-   * Shows a choice dialog; resolves with the chosen option's value, or null on BACK. textClass: e.g. 'notes' for long
-   * text read line by line (left-aligned).
+   * Shows a choice dialog; resolves with the chosen option's value, or null on BACK. text: a string, or elements (a
+   * Markdown document). options: one row of buttons, or rows of them ([[Yes, No], [Read more]]); the first button has
+   * the focus. textClass: e.g. 'notes' for long text read line by line (left-aligned), 'doc' for a document.
+   * focusText: a text that scrolls starts with the focus (UP/DOWN scroll it at once).
    */
-  function ask(title, text, options, textClass) {
+  function ask(title, text, options, textClass, focusText) {
     $('dialog-title').textContent = title;
     var content = $('dialog-text');
     content.className = 'muted' + (textClass ? ' ' + textClass : '');   // index.html's class, plus the kind
-    content.textContent = text || '';
+    content.textContent = '';
+    if (text && typeof text === 'object') content.appendChild(text);
+    else content.textContent = text || '';
     var box = $('dialog-actions');
     box.innerHTML = '';
-    var row = options.map(function (o) {
-      var b = el('div', 'btn', o.label);
-      b._value = o.value;
-      box.appendChild(b);
-      return b;
+    var rows = (Array.isArray(options[0]) ? options : [options]).map(function (list) {
+      var line = box.appendChild(el('div', 'dialog-row'));
+      return list.map(function (o) {
+        var b = el('div', 'btn', o.label);
+        b._value = o.value;
+        line.appendChild(b);
+        return b;
+      });
     });
     $('dialog').classList.remove('hidden');
     content.scrollTop = 0;
     return new Promise(function (resolve) {
-      var scrollable = content.scrollHeight > content.clientHeight;
-      var g = new Focus.Grid(scrollable ? [[content], row] : [row], {
+      // A few pixels over are line-height rounding (35.1 px lines: 175 vs 177 on the TV), nothing to scroll to.
+      var scrollable = content.scrollHeight > content.clientHeight + 4;
+      var g = new Focus.Grid(scrollable ? [[content]].concat(rows) : rows, {
         onSelect: function (b) { if (b !== content) close(b._value); }
       });
-      g.r = scrollable ? 1 : 0;
+      g.r = scrollable && !focusText ? 1 : 0;
       function close(v) { $('dialog').classList.add('hidden'); dialog = null; setTimeout(applyDownloadedUpdate, 0); if (grid) grid.apply(); resolve(v); }
       dialog = { grid: g, close: close };
       g.apply();
@@ -215,7 +234,7 @@
     $('login-status').textContent = 'Signing in…';
     return F1Api.login(token).then(function () {
       toast('Signed in as ' + (Auth.profile().firstName || 'you'));
-      enterBrowse();
+      enterBrowse(function () { askDiagnosticsOnce(); });
     }).catch(function (e) {
       Auth.clear();
       showLogin('Sign-in failed: ' + e.message);
@@ -545,7 +564,9 @@
    * Renders a vertical list. rows: [{ day } | { when, what, sub, badge, badgeCls, past, info, run }].
    * focusIndex is the index into the focusable rows.
    */
+  var listSerial = 0;   // which list shows (a late answer must not redraw another one)
   function renderList(spec, focusIndex) {
+    listSerial++;
     show('list');
     $('list-title').textContent = spec.title;
     $('list-sub').textContent = spec.sub || '';
@@ -1094,16 +1115,26 @@
   }
 
   /*
-   * Versions that failed a start (the shell keeps them, docs/LAUNCHER.md): into the diagnostics log, once each, then
-   * acknowledged. Without a diagnostics log in this build they stay with the shell (the latest twenty).
+   * Versions that failed a start (the shell keeps them, docs/LAUNCHER.md): into the diagnostics log and the upload (an
+   * event, or an anonymous crash report), once each, then acknowledged. Without either they stay with the shell (the
+   * latest twenty).
    */
   function reportFailedStarts() {
-    if (typeof Launcher === 'undefined' || typeof Diag === 'undefined' || !Diag.note) return;
+    var local = typeof Diag !== 'undefined' && Diag.recording(), upload = typeof DiagUpload !== 'undefined';
+    // Nothing keeps them in this build: the shell holds on to them (the latest twenty).
+    if (typeof Launcher === 'undefined' || (!local && !upload)) return;
     fetch('http://127.0.0.1:18765/launcher/info').then(function (r) { return r.json(); }).then(function (info) {
-      var events = (info && info.state && info.state.events) || [];
+      var events = ((info && info.state && info.state.events) || []).filter(function (e) { return e && typeof e.id === 'number'; });
+      // Each one once: the last id taken is kept before acknowledging, so a lost acknowledgement repeats nothing.
+      var seen = +localStorage.getItem('f1tv.launcher.seen') || 0, fresh = events.filter(function (e) { return e.id > seen; });
       if (!events.length) return;
-      events.forEach(function (e) { Diag.note('launcher.failed-start', { version: e.version, reason: e.reason, at: e.at }, 'warn'); });
-      return fetch('http://127.0.0.1:18765/launcher/ack?through=' + events[events.length - 1].id, { method: 'POST' });
+      fresh.forEach(function (e) {
+        if (local) Diag.note('launcher.failed-start', { version: e.version, reason: e.reason, at: e.at }, 'warn');
+        if (upload) DiagUpload.launcherFailed(e);
+      });
+      var last = events[events.length - 1].id;
+      try { localStorage.setItem('f1tv.launcher.seen', String(Math.max(seen, last))); } catch (e) { return; }
+      return fetch('http://127.0.0.1:18765/launcher/ack?through=' + last, { method: 'POST' });
     }).catch(function () { /* next start */ });
   }
 
@@ -1258,10 +1289,135 @@
           } }
       ]).concat(typeof Caps !== 'undefined' ? [
         { what: 'Playback on this TV', sub: capsSummary(), run: function (idx) { showCaps(idx); } }
-      ] : []).concat([
+      ] : []).concat(diagRows(openAccount)).concat([
         { info: true, what: 'Unofficial F1 TV app', sub: 'Not affiliated with Formula 1.' }
       ])
     }, focus || 0);
+  }
+
+  // diagnostics (js/diag-upload.js): opt-in, explained before it starts
+
+  var REPORT_NAMES = { playback_fails: 'Videos don\'t play', buffering: 'Buffering or low quality', picture_or_sound: 'Picture or sound',
+    multiview: 'Multiview', sign_in: 'Signing in', timing: 'Live timing', app_crash: 'The app closes or freezes', other: 'Something else' };
+
+  /**
+   * The Diagnostics rows in Account. reopen(idx): shows the list these rows are in again, at that row.
+   */
+  function diagRows(reopen) {
+    if (typeof DiagUpload === 'undefined' || !DiagUpload.available()) return [];
+    var on = DiagUpload.enabled(), stopped = DiagUpload.stopped(), id = DiagUpload.id(), last = DiagUpload.lastReference();
+    var rows = [{ day: 'Diagnostics' },
+      { what: 'Send diagnostics', sub: stopped ? 'Stopped: the server didn\'t accept this TV. Turn on to start again with a new ID.'
+        : on ? 'Playback and error data under a random ID. Diagnostics ID ' + id : 'Help fix problems on more TVs. See what is sent.',
+        badge: on ? 'On' : stopped ? 'Stopped' : 'Off', badgeCls: on ? 'live' : '',
+        run: function (idx) {
+          askDiagnostics(on ? 'Diagnostics are on' : 'Send diagnostics?',
+            on ? [{ label: 'Keep on', value: null }, { label: 'Turn off', value: false }] : [{ label: 'Not now', value: null }, { label: 'Turn on', value: true }])
+            .then(function (v) { if (v != null) DiagUpload.setEnabled(v); reopen(idx); });
+        } }];
+    if (on) {
+      rows.push({ what: 'Send a problem report', sub: last ? 'Last reference: ' + last : 'With a reference to mention when you tell about it.',
+        run: function (idx) { openReport(function () { reopen(idx); }); } });
+    }
+    if (on || DiagUpload.hasData()) {
+      rows.push({ what: 'Delete my diagnostics data', sub: DiagUpload.deletionPending() ? 'Deletion pending: tries again until the server confirms.' : 'Everything this TV sent; turns diagnostics off.',
+        run: function (idx) {
+          ask('Delete diagnostics data?', 'Deletes everything this TV has sent and turns diagnostics off.', [
+            { label: 'Cancel', value: false }, { label: 'Delete', value: true }
+          ]).then(function (yes) {
+            if (!yes) return;
+            var here = listSerial;
+            DiagUpload.deleteMyData().then(function (r) {
+              toast(r === 'deleted' ? 'Deleted.' : 'The server can\'t be reached. The app tries again until it is deleted.', 6000);
+              // Only while this list still shows (the answer can take seconds).
+              if (screen === 'list' && listSerial === here && !dialog) reopen(idx);
+            });
+          });
+        } });
+    }
+    return rows;
+  }
+
+  function openReport(back) {
+    backStack.push(back);
+    renderList({ title: 'Send a problem report', sub: 'What is the problem?',
+      rows: DiagUpload.categories.map(function (c) {
+        return { what: REPORT_NAMES[c], run: function () {
+          ask('Send a problem report?', 'Sends the kind of problem (' + REPORT_NAMES[c] + '), a few settings (HDR, multiview, timing, '
+            + 'commentary language), what this TV can play, and this session\'s diagnostics. No account details or titles.', [
+            { label: 'Send', value: true }, { label: 'Cancel', value: false }
+          ]).then(function (yes) {
+            if (!yes) return;
+            toast('Sending…', 10000);
+            var here = listSerial;
+            DiagUpload.report(c).then(function (ref) {
+              var text = 'Reference: ' + ref + '\n\nMention it when you tell about the problem (GitHub issues).';
+              // The answer can come after the viewer moved on: then a toast (Diagnostics keeps the reference).
+              if (screen === 'list' && listSerial === here && !dialog) ask('Report sent', text, [{ label: 'Close', value: true }]);
+              else toast('Report sent. Reference: ' + ref, 15000);
+            }, function (e) { toast('The report could not be sent: ' + e.message, 6000); });
+          });
+        } };
+      }) }, 0);
+  }
+
+  /** The one-time question, a moment after Home first shows (never over playback, a dialog or an update). */
+  function askDiagnosticsOnce() {
+    if (typeof DiagUpload === 'undefined' || !DiagUpload.available() || Settings.get('diagnosticsAsked') || DiagUpload.enabled()) return;
+    setTimeout(function () {
+      if (screen !== 'browse' || dialog || applyingUpdate || loadingFeed || Settings.get('diagnosticsAsked')) return;
+      Settings.set('diagnosticsAsked', true);
+      // Yes has the focus; No and BACK say no.
+      askDiagnostics('Help improve this app?', [{ label: 'Yes', value: true }, { label: 'No', value: false }])
+        .then(function (yes) { DiagUpload.setEnabled(!!yes); });
+    }, 4000);
+  }
+
+  var READ_MORE = {};
+
+  /**
+   * The diagnostics question: the short explanation, the answers, and Read more below them, which shows app/PRIVACY.md
+   * (the README links to the same file) and then asks again. Resolves with the chosen answer's value (null on BACK).
+   */
+  function askDiagnostics(title, answers) {
+    var doc = privacyDoc();   // loading while the question shows, so Read more opens at once
+    return ask(title, DiagUpload.explanation, [answers, [{ label: 'Read more', value: READ_MORE }]], 'notes')
+      .then(function (v) {
+        if (v !== READ_MORE) return v;
+        return doc.then(function (d) { return ask(d.title, d.body, [{ label: 'Back', value: null }], 'doc', true); })
+          .then(function () { return askDiagnostics(title, answers); });
+      });
+  }
+
+  var privacyText = null;
+
+  /** app/PRIVACY.md as { title, body } (Markdown.render), or a note that it couldn't be read. */
+  function privacyDoc() {
+    if (!privacyText) privacyText = appFile('PRIVACY.md');
+    return privacyText.then(function (text) {
+      var d = Markdown.render(text);
+      return { title: d.title || 'What the app sends', body: d.body };
+    }).catch(function () {
+      privacyText = null;   // tried again next time
+      return { title: 'What the app sends', body: 'The text could not be loaded. It is also on GitHub: github.com/nicbra/f1tv-tizen (app/PRIVACY.md).' };
+    });
+  }
+
+  /** A text file of the running app: through the launcher (checked against its signed manifest) or next to index.html. */
+  function appFile(relative) {
+    return new Promise(function (resolve, reject) {
+      if (typeof Launcher !== 'undefined' && Launcher.file) {
+        return Launcher.file(relative, function (err, bytes) {
+          if (err) return reject(err);
+          try { resolve(new TextDecoder('utf-8').decode(bytes)); } catch (e) { reject(e); }
+        });
+      }
+      var x = new XMLHttpRequest();
+      x.open('GET', relative);
+      x.onload = function () { if (x.status === 200 || (x.status === 0 && x.responseText)) resolve(x.responseText); else reject(new Error('HTTP ' + x.status)); };
+      x.onerror = function () { reject(new Error('Not readable')); };
+      x.send();
+    });
   }
 
   // feeds
@@ -1538,12 +1694,14 @@
    * smaller feeds don't make it lighter). 'h264': the offer has no HEVC at all (2018-2024 replays): the big feed plays
    * on AVPlay and up to three small 540p ones come from one stream decoded in software (MvSoftware, js/mvsoft.js).
    */
-  function mvEngine(layout) {
-    var L = mvLayouts(), l = L.layouts[layout], sh = L.shape(layout), src = mvSource;
+  function mvEngine(layout) { return mvEngineFor(layout, mvSource, Player.stream()); }
+
+  /** mvEngine for a given source ({ hdr, heights }, heights null while unread) and stream. */
+  function mvEngineFor(layout, src, s) {
+    var L = mvLayouts(), l = L.layouts[layout], sh = L.shape(layout);
     if (!l || l.feeds.length > feedsCtx.feeds.length) return null;
     var missing = src && src.heights && l.feeds.some(function (h) { return src.heights.indexOf(h) < 0; });
     if (!missing) return Player.hevcDecodes(sh.width, sh.height, src ? src.hdr : hdrWanted()) ? 'hevc' : null;
-    var s = Player.stream();
     return src.heights.length === 0 && mvSoftLayout(l) && !feedsCtx.live && s && mvKind(s) === 'sdr' &&
       typeof MvSoftware !== 'undefined' && MvSoftware.supported() ? 'h264' : null;
   }
@@ -1700,17 +1858,21 @@
     var s = Player.stream(), g = s && s.grid, ctx = feedsCtx, exits = playerExits;
     // The sound stays with its feed while that feed is shown (mvSound: else the new big feed's).
     mv = { layout: mv.layout, slots: mv.slots.slice(), audio: mv.audio != null ? mv.audio : g && g.audio };
-    function reload() {
+    function reload(recover) {
       // Not after the viewer has left the player or gone to another video meanwhile.
       if (feedsCtx !== ctx || exits !== playerExits || screen !== 'player') return;
       feedsCtx.multiview = mv;
-      playFeed(mv.slots[0], { switching: true });
+      playFeed(mv.slots[0], recover ? recovering({ switching: true }) : { switching: true });
     }
     // The commentary and subtitles come from one feed's manifest (Sound from in watch options). Without that
     // feed, the multiview loads anew with the big feed's sound (also so the old feed's stream ends: F1 allows
     // four at once).
     if (!mvCanRearrange() || mv.slots.indexOf(g.audio) < 0) return reload();
     toast(MV_CHANGING, 120000);   // until the new arrangement shows
+    // For the diagnostics upload: a new layout is a new attempt, other feeds in the same layout a switch.
+    var trial = uploading() ? dplay('request', { layout: mv.layout, switching: true, feeds: feedsCtx.feeds.length,
+      content: diagContent(), tier: DiagUpload.currentTier() }) : null;
+    dplay('loading', trial, s);
     // Prepared while the viewer chose (focus on Show): wait for that rather than start over.
     var key = mv.layout + '|' + mv.slots.join(), ahead = mvAhead;
     var offers = ahead && ahead.key === key && ahead.content === feedsCtx.contentId && ahead.ready && Date.now() - ahead.at < 60000
@@ -1733,6 +1895,7 @@
       $('osd-feed').textContent = feedLabel(s);
       // To where the new arrangement is ready (at most a few seconds ahead), or here if playback got past it.
       var target = Math.max(Player.position(), info && info.start != null ? info.start + 0.1 : 0), since = Date.now();
+      dplay('loaded', trial, s, target);   // it plays once the position moves on from the target
       Player.seekTo(target, function () {
         (function shows() {
           if (Player.stream() !== s || g.shown == null) return;
@@ -1747,8 +1910,9 @@
     }).catch(function (e) {
       if (e && e.message === 'cancelled') return;
       if (Player.stream() !== s || feedsCtx !== ctx || exits !== playerExits || screen !== 'player') return;
+      dplay('failed', trial, e);
       toast('Reloading the multiview (' + ((e && e.message) || e) + ')', 4000);
-      reload();
+      reload(true);
     });
   }
 
@@ -1803,11 +1967,18 @@
     var g = stream.grid;
     mvSoftShown = false;
     mvFrames();
+    dplay('supplementaryStart');
     MvSoftware.start({ streams: g.streams.slice(1), rects: mvPlaces(g.layout).slice(1), canvas: $('mv-soft'),
-      onShown: function () { if (Player.stream() !== stream) return; mvSoftShown = true; mvFrames(); },
+      onShown: function () {
+        if (Player.stream() !== stream) return;
+        if (!mvSoftShown) dplay('supplementary', 'playing');
+        mvSoftShown = true;
+        mvFrames();
+      },
       clock: { position: function () { return Player.exactPosition(); }, playing: function () { return Player.stream() === stream && !Player.isPaused(); } },
       onError: function (e) {
         if (Player.stream() !== stream || screen !== 'player') return;
+        dplay('supplementary', 'failed', e, { final: !!retried });
         if (!retried) {
           toast('The small feeds stopped, starting them again…', 3000);
           return setTimeout(function () { if (Player.stream() === stream && screen === 'player') mvSoftStart(stream, true); }, 2000);
@@ -1815,7 +1986,7 @@
         toast('Multiview didn\'t work (' + ((e && e.message) || e) + ').', 8000);
         if (feedsCtx.multiview) {
           feedsCtx.multiview = null;
-          playFeed(feedsCtx.index, { switching: true, retrying: true });   // retrying: the message above stays
+          playFeed(feedsCtx.index, { switching: true, retrying: true, recover: true });   // retrying: the message above stays
         }
       } });
   }
@@ -1934,11 +2105,19 @@
     var from = opts.switching && playing ? { wall: Player.wallClock(Player.position()), at: Date.now(),
       pos: Player.position(), paused: Player.isPaused(), index: feedsCtx.index, stream: Player.stream() } : null;
     switchPause = from ? (opts.switchPaused != null ? opts.switchPaused : from.paused) : null;
+    var askedAt = Date.now();
+    diagTrail('play.request', { feed: f && f.title, switching: !!from, retry: !!opts.retry, hdrRetry: !!opts.hdrRetry,
+      startAt: opts.startAt, liveAt: opts.liveAt, fromStart: !!opts.fromStart });
+    var trial = uploading() ? dplay('request', { layout: mv ? mv.layout : null, switching: !!from, jump: !!opts.jump,
+      recover: !!(opts.recover || opts.retry || opts.retrying || opts.hdrRetry), feeds: feedsCtx.feeds.length,
+      content: diagContent(), tier: DiagUpload.currentTier() }) : null;
+    if (trial) DiagUpload.quiet();
     return ensureSession().then(function (ok) {
       // Gone back meanwhile (renewing the session can take a while).
       if (feedsCtx !== ctx || exits !== playerExits || seq !== navSeq || applyingUpdate) return;
       if (!ok) {
         // Signed out (the device key was refused): stop what plays, and let BACK return to browsing.
+        dplay('gaveUp', null, { cancelled: true }, trial);
         if (screen === 'player') stopPlayer();
         return showLogin('Sign in to watch.', snapshot());
       }
@@ -1975,6 +2154,11 @@
         })
         .then(function (s) {
           stream = s;
+          // For the diagnostics log: which video and feed this stream is.
+          stream.contentId = feedsCtx.contentId;
+          stream.channelId = f.channelId;
+          stream.feed = f.title;
+          diagTrail('play.offer', { streamType: s.streamType, hdr: !!s.hdr, cenc: !!s.cenc, ms: Date.now() - askedAt });
           stream.live = feedsCtx.live;
           stream.multiFeed = feedsCtx.feeds.length > 1;
           stream.capsRoute = route;
@@ -1983,7 +2167,10 @@
             (stream.cenc ? (stream.cencAvplay || stream.grid ? 'avplay:cenc' : 'shaka:cenc') : 'avplay:cbcs');
           // Live HDR plays on the official live DASH timeline (the helper swaps in the HLG video).
           var timeline = stream.hdrEncrypted && stream.live ? stream.widevineManifestUrl : stream.url;
-          return F1Api.streamInfo(timeline).then(function (info) { stream.info = info; }, function () {});
+          return F1Api.streamInfo(timeline).then(function (info) { stream.info = info; }, function () {}).then(function () {
+            // What F1 offered for the main broadcast (the first feed), once per attempt.
+            if (trial && !mv && i === 0 && dplay('wantsOffer', trial)) dplay('offered', trial, { offer: diagOffer(stream) });
+          });
         })
         .then(function () {
           // Superseded by a newer request, or the viewer left the player while it loaded.
@@ -2006,6 +2193,7 @@
           }
           // H.264 multiview: AVPlay shows the big feed in its place from the start.
           if (stream.grid && stream.grid.engine === 'h264') Player.setGridRect(mvBigRect(stream.grid.layout));
+          dplay('loading', trial, stream);
           if (!from) return Player.load(stream, start).then(function () { feedsCtx.playing = i; });
           var t0 = Date.now();
           return Player.switchTo(stream, start).then(function () {
@@ -2025,9 +2213,11 @@
           if (Player.stream() === stream) {
             feedsCtx.prepareRetried = false;
             stream.capsPosition = Player.position();
+            dplay('loaded', trial, stream, Player.position());
           }
           if (stream && stream.grid && stream.grid.engine === 'h264' && Player.stream() === stream) mvSoftStart(stream);
           Timing.load(feedsCtx.timingMeta, F1Api.state.ascendon, feedsCtx.live);
+          if (stream && Player.stream() === stream && typeof Diag !== 'undefined') Diag.playing(stream);
           if (stream && Player.stream() === stream) watchStart(stream, opts);
         })
         .catch(function (e) {
@@ -2036,6 +2226,10 @@
           // Stopped by the viewer while it loaded (Shaka rejects the interrupted load): no error, and no
           // reason to give up on HDR for this video.
           if (feedsCtx !== ctx || exits !== playerExits || (e && e.message === 'cancelled')) return;
+          diag('play.failed', { error: e, stream: diagStream(stream), switching: !!from, retry: !!opts.retry,
+            hdrRetry: !!opts.hdrRetry, afterMs: Date.now() - askedAt }, 'error');
+          // That trial failed (an engine row only if an engine was asked to load); whether the attempt does follows below.
+          dplay('failed', trial, e);
           // A failed switch leaves the previous feed playing: it is still the current one (not
           // feedsCtx.index, which a superseded switch may have moved on).
           if (from && Player.stream() === from.stream) {
@@ -2047,7 +2241,7 @@
           // native cenc still goes through the helper, as in PR #3.
           if (!mv && stream && !stream.hdr && stream.capsPath && sdrPath() !== stream.capsRoute &&
               !(e && e.code === 'PLAYER_STUCK')) {
-            if (!queuedFeed && screen === 'player') playFeed(i, sameMoment(from, opts));
+            if (!queuedFeed && screen === 'player') playFeed(i, recovering(sameMoment(from, opts)));
             return;
           }
           // AVPlay's preparation hung (player.js PREPARE_MS): one more try opens over it, as BACK and trying again
@@ -2055,11 +2249,12 @@
           // what played last is saved (saveWatching), so it comes back at that moment.
           if (e && (e.code === 'PREPARE_TIMEOUT' || e.code === 'PLAYER_STUCK')) {
             if (e.code === 'PLAYER_STUCK' || feedsCtx.prepareRetried) {
+              dplay('gaveUp', e, null, trial);
               return toast('The TV\'s video player is stuck. Restart the app to continue where you were.', 20000);
             }
             feedsCtx.prepareRetried = true;
             toast((mv ? 'Multiview' : 'The video') + ' didn\'t start, trying again…', 4000);
-            var again = sameMoment(from, opts);
+            var again = recovering(sameMoment(from, opts));
             again.retrying = true;   // keeps the message above
             if (!queuedFeed && screen === 'player') playFeed(i, again);
             return;
@@ -2068,8 +2263,8 @@
           if (mv && feedsCtx.multiview === mv) {
             feedsCtx.multiview = null;
             toast('Multiview didn\'t work (' + ((e && e.message) || e) + ').', 8000);
-            if (from && Player.stream() === from.stream) return;
-            if (!queuedFeed && screen === 'player') playFeed(i, sameMoment(from, opts));
+            if (from && Player.stream() === from.stream) { dplay('gaveUp', e, null, trial); return; }
+            if (!queuedFeed && screen === 'player') playFeed(i, recovering(sameMoment(from, opts)));
             return;
           }
           var hdrFailure = stream && stream.hdr && !feedsCtx.hdrFailed;
@@ -2084,8 +2279,10 @@
             } else {
               feedsCtx.cencFailed = true;   // this video plays the usual cbcs stream on AVPlay from now on
             }
+            diag('play.fallback', { to: hdrFailure ? (feedsCtx.hdrFailed ? 'sdr' : 'hdr-again') : 'cbcs',
+              hdrFailures: feedsCtx.hdrFailures || 0 });
             // Queue the retry behind this load; a newer feed request still wins.
-            var recovery = Object.assign({}, opts, hdrFailure ? { hdrRetry: true } : {});
+            var recovery = Object.assign({}, opts, hdrFailure ? { hdrRetry: true } : {}, { recover: true });
             if (from) recovery.switchPaused = switchPause != null ? switchPause : from.paused;
             // Native preparation replaces the outgoing player. Its failed stream reports zero,
             // so retain the outgoing moment rather than deriving a new target from that zero.
@@ -2098,14 +2295,20 @@
             return;
           }
           if (F1Api.isNotStarted(e) && feedsCtx.playing == null) {
+            dplay('gaveUp', e, { cancelled: true }, trial);
             stopPlayer();
             return toast(feedsCtx.title + (feedsCtx.start ? ' starts ' + when(feedsCtx.start) + '.' : ' hasn\'t started yet.'), 8000);
           }
+          if (!(from && Player.stream() === from.stream)) dplay('gaveUp', e, null, trial);   // a failed switch: the old feed still plays
           toast('Could not play: ' + (e.message || e), 8000);
         });
     }, function (e) {
       // The session could not be checked (no network): say so instead of doing nothing.
-      if (feedsCtx === ctx && exits === playerExits && seq === navSeq) toast('Could not reach F1 TV: ' + (e.message || e), 8000);
+      if (feedsCtx === ctx && exits === playerExits && seq === navSeq) {
+        dplay('gaveUp', { diag: { code: 'NETWORK_ERROR', platform: null } }, null, trial);
+        toast('Could not reach F1 TV: ' + (e.message || e), 8000);
+      }
+      diag('play.session-check-failed', { error: e });
     });
   }
 
@@ -2113,6 +2316,70 @@
    * Options for loading a feed again after a failed load: at the moment the viewer was at when a switch failed
    * (`from`, paused as they were), or at the one the failed load asked for (`opts`).
    */
+  /** Options for one of the app's own retries or fallbacks: part of the same attempt for the diagnostics upload. */
+  function recovering(o) { o.recover = true; return o; }
+
+  /** The kind of video, from F1's content subtype (live only once it actually plays live). */
+  function diagContent() {
+    var sub = String(feedsCtx.subtype || '').trim().toUpperCase();
+    if (sub === 'LIVE' || (sub === 'LIVE_EVENT' && feedsCtx.live)) return 'live';
+    if (sub === 'REPLAY') return 'replay';
+    if (sub === 'HIGHLIGHT' || sub === 'HIGHLIGHTS') return 'highlights';
+    if (!sub) return feedsCtx.live ? 'live' : 'unknown';
+    return 'other';
+  }
+
+  /**
+   * What F1 offered for this video (the diagnostics upload's offer): each request's answer family, the video chosen,
+   * its highest resolution and whether it has HEVC (from the manifest already read), and whether multiview could
+   * play here, worked out from that same manifest (no extra request).
+   */
+  function diagOffer(stream) {
+    try { return offerOf(stream); } catch (e) { return null; }   // a diagnostics slip must never fail playback
+  }
+
+  function offerOf(stream) {
+    var o = stream.offers || {}, fam = ['not_asked', 'no_answer', 'hls', 'dash', 'wv_dash', 'wv_cenc_dash', 'hdr_hls', 'hdr_cmaffp_hls', 'other'];
+    var pick = function (v) { return fam.indexOf(v) >= 0 ? v : 'not_asked'; };
+    var out = { web: pick(o.web), hdr: pick(o.hdr), cenc: pick(o.cenc), multiview: 'unknown' };
+    if (o.chosen === 'web' || o.chosen === 'hdr' || o.chosen === 'cenc') out.chosen = o.chosen;
+    // Live HDR's info is the SDR live timeline's (the helper swaps in the HDR video): no facts about the HDR video there.
+    var offer = !(stream.hdrEncrypted && stream.live) && stream.info && stream.info.offer;
+    var video = offer ? (offer.kind === 'hls' ? offer.variants : offer.video) : null;
+    if (video && video.length) {
+      var heights = [], codecs = true, hevc = false;
+      video.forEach(function (v) {
+        var h = /x(\d+)$/.exec(v.res || '');
+        if (h && +h[1] > 0) heights.push(+h[1]);
+        if (!v.codecs) codecs = false;
+        if (/\b(hvc1|hev1)\./.test(v.codecs || '')) hevc = true;
+      });
+      if (heights.length) out.max_height = Math.min(8192, Math.max.apply(null, heights));
+      if (hevc || codecs) out.hevc = hevc;
+      out.multiview = mvPossible(stream, offer);
+    }
+    return out;
+  }
+
+  /** Whether some multiview layout could play this video on this TV: 'hevc', 'h264', 'none' or 'unknown'. */
+  function mvPossible(stream, offer) {
+    if (!mvLayouts() || feedsCtx.feeds.length < 2) return 'none';
+    if (stream.hdrEncrypted && feedsCtx.live) return 'unknown';   // live multiview: decided on the HDR offer's own grid
+    if (!mvKind(stream)) return 'none';
+    if (offer.kind !== 'hls') return 'unknown';
+    var range = stream.hdr ? 'HLG' : null, heights = [], unread = false;
+    offer.variants.forEach(function (v) {
+      var h = /x(\d+)$/.exec(v.res || '');
+      if (!h || !v.codecs) unread = true;
+      var isRange = range ? v.range === range : !v.range || v.range === 'SDR';
+      if (h && /\b(hvc1|hev1)\./.test(v.codecs || '') && isRange && heights.indexOf(+h[1]) < 0) heights.push(+h[1]);
+    });
+    // Without codecs or sizes the playlist doesn't say: unknown rather than a definite no.
+    if (!heights.length && unread) return 'unknown';
+    var engines = mvLayouts().order.map(function (layout) { return mvEngineFor(layout, { hdr: !!stream.hdr, heights: heights }, stream); });
+    return engines.indexOf('hevc') >= 0 ? 'hevc' : engines.indexOf('h264') >= 0 ? 'h264' : 'none';
+  }
+
   function sameMoment(from, opts) {
     var o = {};
     if (from) {
@@ -2138,8 +2405,11 @@
       if (screen !== 'player' || Player.stream() !== stream || Player.isPaused() || stream.retried) return;
       // Moved either way: it plays (the viewer may have jumped back).
       if (Math.abs(Player.position() - from) > 0.5) return;
+      diag('play.no-start', { stream: diagStream(stream), waitedMs: stream.hdr ? 25000 : 15000, position: from, retry: !!opts.retry });
       playbackFailed(stream);
-      if (opts.retry && !stream.hdr && (!stream.capsPath || sdrPath() === stream.capsRoute)) return;
+      var last = opts.retry && !stream.hdr && (!stream.capsPath || sdrPath() === stream.capsRoute);
+      dplay('failed', null, null, { noProgress: true, final: last });
+      if (last) return;
       toast('The video didn\'t start, trying again…', 3000);
       // Through playFeed so it queues behind any other load instead of racing it.
       // AVPlay reports no position until it plays: 0 is no moment of the stream, so the retry repeats the request.
@@ -2216,6 +2486,7 @@
     mvFrames();
     if (screen !== 'player') return;
     if (!loadingFeed) playbackProgress();
+    if (!loadingFeed && !pending && uploading()) dplay('tick', Player.position(), Player.isPaused(), !!document.hidden);
     var pos = Player.position();
     var r = Player.range();
     // While a stream (re)loads it has no position yet.
@@ -2316,7 +2587,7 @@
   /** Reopens the current live feed at live, or (wall = unix seconds) time-shifted to that moment. */
   function goLive(wall) {
     closePanel();
-    playFeed(feedsCtx.index, wall ? { liveAt: wall } : {});
+    playFeed(feedsCtx.index, wall ? { liveAt: wall, jump: true } : { jump: true });
   }
 
   function behindLive() {
@@ -2421,6 +2692,8 @@
     mvAhead = null;   // prepared for this video only
     clearWatching();
     queuedFeed = null;   // a feed switch asked for while loading must not restart playback
+    if (typeof Diag !== 'undefined') Diag.playing(null);
+    dplay('leave');
     liveFocus = false;
     saveProgress();
     loadingFeed = false;
@@ -3385,6 +3658,25 @@
     if (typeof Launcher !== 'undefined' && Launcher.setUpdates) Launcher.setUpdates(Settings.get('updates') !== 'off');
   }
 
+  /** The app's state for the diagnostics log. */
+  function diagState() {
+    var o = { screen: screen, loadingFeed: loadingFeed, queuedFeed: !!queuedFeed, seeking: !!pending,
+      settings: { hdr: Settings.get('hdr'), audio: Settings.get('audio'), subtitles: Settings.get('subtitles'), timing: Settings.get('timing') } };
+    if (feedsCtx) {
+      o.video = { contentId: feedsCtx.contentId, live: !!feedsCtx.live, feeds: feedsCtx.feeds.length, index: feedsCtx.index,
+        playing: feedsCtx.playing, hdrFailed: !!feedsCtx.hdrFailed, hdrFailures: feedsCtx.hdrFailures || 0, cencFailed: !!feedsCtx.cencFailed };
+    }
+    return o;
+  }
+
+  /** Start-up's result for the diagnostics upload, with the time since the launch began. */
+  function diagStarted(outcome, noHome) {
+    if (typeof DiagUpload === 'undefined') return;
+    var t0 = 0;
+    try { t0 = performance.timing.navigationStart; } catch (e) { /* unknown */ }
+    DiagUpload.started(outcome, t0 && !noHome ? Date.now() - t0 : null);
+  }
+
   function boot() {
     syncUpdateSetting();
     useLogo();
@@ -3396,23 +3688,37 @@
     setInterval(tickClock, 15000);
     setInterval(updateOsd, 500);
 
-    Player.on('error', function (msg) {
+    Player.on('error', function (msg, info) {
+      diag('player.error', { message: msg, code: info, stream: diagStream(Player.stream()) }, 'error');
       toast(msg, 8000);
       $('spinner').classList.add('hidden');
       // Loading errors are handled by the load catch/start watch, once native preparation settles.
       if (screen !== 'player' || loadingFeed) return;
       var s = Player.stream();
       playbackFailed(s);
-      if (s && !s.grid && s.capsPath && (s.hdr || sdrPath() !== s.capsRoute)) {
+      var fallback = !!(s && !s.grid && s.capsPath && (s.hdr || sdrPath() !== s.capsRoute));
+      // A failure while playing (the load's own catch or start watch records the others); final when nothing follows.
+      dplay('failed', null, info ? { diag: info } : null, { runtime: true, final: !fallback });
+      if (fallback) {
         if (s.hdr) feedsCtx.hdrFailed = true;
         var wall = Player.wallClock(Player.position());
-        playFeed(feedsCtx.index, wall ? { liveAt: wall } : { startAt: Player.position() });
+        playFeed(feedsCtx.index, recovering(wall ? { liveAt: wall } : { startAt: Player.position() }));
       }
     });
     // During a jump the pending-seek logic owns the spinner (it waits a moment before showing it).
+    var stallSince = 0;   // buffering while playing (not while loading or jumping), for the diagnostics log
     Player.on('buffering', function (b) {
       if (!pending) $('spinner').classList.toggle('hidden', !b);
+      dplay('buffering', b, !!pending || loadingFeed);
+      if (b && !stallSince && !pending && !loadingFeed) stallSince = Date.now();
+      if (!b && stallSince) {
+        var ms = Date.now() - stallSince;
+        stallSince = 0;
+        if (ms >= 2000) diag('player.stall', { ms: ms, position: Player.position(), stream: diagStream(Player.stream()) });
+        else if (ms >= 500) diagTrail('player.buffering', { ms: ms });
+      }
     });
+    if (typeof Diag !== 'undefined') Diag.provide('app', diagState);
     setInterval(checkPending, 100);
     Player.on('ended', function () {
       var s = Player.stream();
@@ -3441,11 +3747,18 @@
       .then(function () { return F1Api.refreshConfig(); })
       .then(function () { return ensureSession(); })
       .then(function (ok) {
-        if (!ok) return F1Api.refreshLocation().then(function () { showLogin(); });
-        enterBrowse(function () { resumeWatching(); });
+        // Sign-in has no time to Home.
+        if (!ok) return F1Api.refreshLocation().then(function () { showLogin(); diagStarted('ok', true); });
+        enterBrowse(function () {
+          diagStarted('ok');
+          // Not over a resumed video: the question waits for a start that shows Home.
+          if (!resumeWatching()) askDiagnosticsOnce();
+        });
       })
       .catch(function (e) {
+        diag('app.startup-failed', { error: e }, 'error');
         showLogin('Startup problem: ' + e.message);
+        diagStarted('failed');
       });
   }
 
