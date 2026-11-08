@@ -510,3 +510,71 @@ test('play asks for HDR first; the Chromecast cenc request only comes when HDR h
   assert.equal((await noHdr.F1Api.play('42', null, { hdr: true, cenc: true })).cenc, true);
   assert.equal(noHdr.calls.filter((c) => /PLAY/.test(c.url))[0].init.headers['x-f1-device-info'], 'device=tvos;');
 });
+
+// The diagnostics log (js/diag.js) recording: streamInfo then also sums up what a manifest offers.
+const RECORDING = { Diag: { recording: () => true, provide() {} } };
+
+test('streamInfo sums up what an HLS master offers, for the diagnostics log', async () => {
+  const master = ['#EXTM3U',
+    '#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,URI="skd://abc",KEYFORMAT="com.apple.streamingkeydelivery"',
+    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",LANGUAGE="eng",NAME="English",URI="eng.m3u8"',
+    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",LANGUAGE="deu",NAME="Deutsch",URI="deu.m3u8"',
+    '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="s",LANGUAGE="fra",NAME="Français",URI="fra.m3u8"',
+    '#EXT-X-STREAM-INF:BANDWIDTH=18000000,RESOLUTION=3840x2160,CODECS="hvc1.2.4.L153.B0,mp4a.40.2",VIDEO-RANGE=HLG,FRAME-RATE=50.000',
+    'v2160.m3u8',
+    '#EXT-X-STREAM-INF:BANDWIDTH=7000000,RESOLUTION=1920x1080,CODECS="hvc1.1.6.L120.B0,mp4a.40.2",VIDEO-RANGE=SDR',
+    'v1080.m3u8'].join('\n');
+  const variant = '#EXTM3U\n#EXT-X-PROGRAM-DATE-TIME:2026-10-25T20:00:00Z\n#EXTINF:6,\n1.mp4\n#EXT-X-ENDLIST\n';
+  const { F1Api } = api((url) => ({ body: /master/.test(url) ? master : variant }), RECORDING);
+  const info = await F1Api.streamInfo('https://cdn/vod/master.m3u8?sig=1');
+  assert.deepEqual(plain(info.offer), {
+    kind: 'hls',
+    variants: [
+      { kbps: 18000, res: '3840x2160', codecs: 'hvc1.2.4.L153.B0,mp4a.40.2', range: 'HLG', fps: 50 },
+      { kbps: 7000, res: '1920x1080', codecs: 'hvc1.1.6.L120.B0,mp4a.40.2', range: 'SDR', fps: null }
+    ],
+    audio: ['eng', 'deu'], subtitles: ['fra'], keyFormats: ['SAMPLE-AES com.apple.streamingkeydelivery']
+  });
+});
+
+test('streamInfo sums up what a DASH manifest offers: ladder, languages and DRM', async () => {
+  const mpd = `<MPD type="static" xmlns="urn:mpeg:dash:schema:mpd:2011"><Period start="PT0S">
+    <AdaptationSet contentType="video" codecs="avc1.640028" frameRate="50">
+      <ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cbcs"/>
+      <ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"><cenc:pssh>AAAA</cenc:pssh></ContentProtection>
+      <SegmentTemplate timescale="1000" duration="5760"/>
+      <Representation id="1" bandwidth="6000000" width="1920" height="1080"/>
+      <Representation id="2" bandwidth="800000" width="640" height="360"/>
+    </AdaptationSet>
+    <AdaptationSet contentType="audio" lang="eng" codecs="mp4a.40.2"><Representation id="a" bandwidth="128000"/></AdaptationSet>
+    <AdaptationSet contentType="text" lang="spa" mimeType="application/mp4" codecs="stpp"><Representation id="t" bandwidth="1"/></AdaptationSet>
+  </Period></MPD>`;
+  const { F1Api } = api(() => ({ body: mpd }), RECORDING);
+  const info = await F1Api.streamInfo('https://cdn/vod/index.mpd');
+  assert.deepEqual(plain(info.offer), {
+    kind: 'dash',
+    video: [{ kbps: 6000, res: '1920x1080', codecs: 'avc1.640028', fps: '50' }, { kbps: 800, res: '640x360', codecs: 'avc1.640028', fps: '50' }],
+    audio: ['eng mp4a.40.2'], subtitles: ['spa'], schemes: ['cbcs'], systems: ['widevine']
+  });
+  assert.doesNotMatch(JSON.stringify(info.offer), /AAAA/);
+});
+
+test('offer summaries read codecs and subtitle types given only on the Representations', async () => {
+  const mpd = `<MPD type="static"><Period start="PT0S">
+    <AdaptationSet contentType="video"><SegmentTemplate timescale="1" duration="6"/>
+      <Representation id="v" bandwidth="5000000" width="1920" height="1080" codecs="hvc1.2.4.L123.B0"/></AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" lang="eng"><Representation id="a" bandwidth="96000" codecs="mp4a.40.2"/></AdaptationSet>
+    <AdaptationSet mimeType="application/mp4" lang="eng"><Representation id="t" codecs="stpp"/></AdaptationSet>
+  </Period></MPD>`;
+  const info = await api(() => ({ body: mpd }), RECORDING).F1Api.streamInfo('https://cdn/vod/index.mpd');
+  assert.deepEqual(plain(info.offer.video), [{ kbps: 5000, res: '1920x1080', codecs: 'hvc1.2.4.L123.B0', fps: null }]);
+  assert.deepEqual(plain(info.offer.audio), ['eng mp4a.40.2']);
+  assert.deepEqual(plain(info.offer.subtitles), ['eng']);
+});
+
+test('without the diagnostics log recording, streamInfo parses no offer', async () => {
+  const mpd = '<MPD type="static"><Period start="PT0S"><AdaptationSet contentType="video"><Representation bandwidth="1"/></AdaptationSet></Period></MPD>';
+  const off = { Diag: { recording: () => false, provide() {} } };
+  assert.equal((await api(() => ({ body: mpd }), off).F1Api.streamInfo('https://cdn/a.mpd')).offer, undefined);
+  assert.equal((await api(() => ({ body: mpd })).F1Api.streamInfo('https://cdn/a.mpd')).offer, undefined);
+});

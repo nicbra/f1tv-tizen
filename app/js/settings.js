@@ -8,7 +8,8 @@ var Settings = (function () {
     subtitles: '',       // subtitle language, '' = off
     spoilerFree: false,  // blur the artwork of replays and highlights
     hdr: true,           // 4K HDR where the subscription and TV allow it; off: always SDR
-    updates: true        // look for a newer release on GitHub once a day
+    updates: true,       // look for a newer release on GitHub once a day
+    diagnostics: false   // opt-in: keep a diagnostics log of playback problems (js/diag.js); no menu entry yet
   };
   var values = {};
 

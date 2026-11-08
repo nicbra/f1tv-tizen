@@ -29,12 +29,18 @@ var F1Api = (function () {
 
   function loginStatus() { return state.ascendon ? 'R' : 'A'; }
 
+  /** Diagnostics log (js/diag.js), when it is loaded. */
+  function diag(kind, data, level) { if (typeof Diag !== 'undefined') Diag.note(kind, data, level); }
+
   function http(url, opts) {
     opts = opts || {};
     return fetch(url, {
       method: opts.method || 'GET',
       headers: opts.headers || {},
       body: opts.body
+    }).catch(function (e) {
+      diag('api.network', { url: url, error: e });
+      throw e;
     }).then(function (res) {
       return res.text().then(function (text) {
         var data = null;
@@ -44,6 +50,8 @@ var F1Api = (function () {
           var err = new Error(msg);
           err.status = res.status;
           err.data = data;
+          // An HTML 403 is CloudFront's per-IP block ("Request blocked"), not an F1 TV answer.
+          diag('api.http', { url: url, status: res.status, message: msg, blocked: !data && /Request blocked/i.test(text) });
           throw err;
         }
         return data;
@@ -385,6 +393,69 @@ var F1Api = (function () {
     });
   }
 
+  /** What an HLS master offers, for the diagnostics log: variants (size, rate, codecs, range), languages, key formats. */
+  function hlsOffer(master) {
+    var attrs = function (line) {
+      var o = {}, re = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/g, m;
+      while ((m = re.exec(line))) o[m[1]] = m[2].replace(/^"|"$/g, '');
+      return o;
+    };
+    var variants = [], audio = [], text = [], keys = [];
+    master.split('\n').forEach(function (l) {
+      if (l.indexOf('#EXT-X-STREAM-INF:') === 0) {
+        var a = attrs(l.slice(18));
+        variants.push({ kbps: Math.round(+a.BANDWIDTH / 1000) || null, res: a.RESOLUTION || null, codecs: a.CODECS || null,
+          range: a['VIDEO-RANGE'] || null, fps: +a['FRAME-RATE'] || null });
+      } else if (l.indexOf('#EXT-X-MEDIA:') === 0) {
+        var x = attrs(l.slice(13));
+        (x.TYPE === 'AUDIO' ? audio : x.TYPE === 'SUBTITLES' ? text : []).push(x.LANGUAGE || x.NAME || '?');
+      } else if (/^#EXT-X-(SESSION-)?KEY:/.test(l)) {
+        var k = attrs(l.replace(/^#EXT-X-(SESSION-)?KEY:/, ''));
+        keys.push((k.METHOD || '?') + (k.KEYFORMAT ? ' ' + k.KEYFORMAT : ''));
+      }
+    });
+    return { kind: 'hls', variants: variants, audio: unique(audio), subtitles: unique(text), keyFormats: unique(keys) };
+  }
+
+  /** The same for a DASH manifest: representations per type, DRM schemes and systems. */
+  function dashOffer(mpd) {
+    var video = [], audio = [], text = [], schemes = [], systems = [];
+    (mpd.match(/<AdaptationSet\b[\s\S]*?<\/AdaptationSet>/g) || []).forEach(function (set) {
+      var head = /<AdaptationSet\b[^>]*>/.exec(set)[0];
+      var get = function (s, n) { var m = new RegExp('\\s' + n + '="([^"]*)"').exec(s); return m ? m[1] : null; };
+      // Type and codecs can be on the AdaptationSet or only on its Representations.
+      var rep = (/<Representation\b[^>]*>/.exec(set) || [''])[0];
+      var mime = get(head, 'mimeType') || get(rep, 'mimeType') || '';
+      var codecs = get(head, 'codecs') || get(rep, 'codecs');
+      var type = get(head, 'contentType') || mime.split('/')[0];
+      if (type !== 'video' && type !== 'audio' && (/^(text|application)\//.test(mime) || /^(stpp|wvtt)/.test(codecs || ''))) type = 'text';
+      if (type === 'video') {
+        (set.match(/<Representation\b[^>]*>/g) || []).forEach(function (r) {
+          video.push({ kbps: Math.round(+get(r, 'bandwidth') / 1000) || null, res: (get(r, 'width') || get(head, 'width')) + 'x' +
+            (get(r, 'height') || get(head, 'height')), codecs: get(r, 'codecs') || codecs, fps: get(r, 'frameRate') || get(head, 'frameRate') });
+        });
+      } else if (type === 'audio') audio.push((get(head, 'lang') || '?') + (codecs ? ' ' + codecs : ''));
+      else if (type === 'text') text.push(get(head, 'lang') || get(rep, 'lang') || '?');
+      (set.match(/<ContentProtection\b[^>]*>/g) || []).forEach(function (cp) {
+        var v = get(cp, 'value'), id = (get(cp, 'schemeIdUri') || '').toLowerCase();
+        if (/^(cenc|cbcs|cens|cbc1)$/.test(v || '')) schemes.push(v);
+        systems.push(/edef8ba9/.test(id) ? 'widevine' : /9a04f079/.test(id) ? 'playready' : /94ce86fb/.test(id) ? 'fairplay' :
+          /mp4protection/.test(id) ? null : id.slice(0, 40));
+      });
+    });
+    return { kind: 'dash', video: video, audio: unique(audio), subtitles: unique(text), schemes: unique(schemes),
+      systems: unique(systems.filter(Boolean)) };
+  }
+
+  function unique(list) { return list.filter(function (x, i) { return list.indexOf(x) === i; }); }
+
+  /** For the diagnostics log, only while it records: what the manifest offers. Never fails the stream. */
+  function withOffer(info, read, text) {
+    if (typeof Diag === 'undefined' || !Diag.recording()) return info;
+    try { info.offer = read(text); } catch (e) { /* unknown layout */ }
+    return info;
+  }
+
   function dashInfo(url) {
     return manifest(url, /<MPD\b/).then(function (mpd) {
       var attr = function (re) { var m = re.exec(mpd); return m ? m[1] : null; };
@@ -403,7 +474,7 @@ var F1Api = (function () {
       var segDur = (+attr(/<SegmentTemplate\b[^>]*\sduration="(\d+)"/) || +attr(/<S\b[^>]*\sd="(\d+)"/) || 0) / ts;
       // Session replays say contentType="video"; highlights only mimeType="video/mp4".
       var video = (/<AdaptationSet\b[^>]*(?:contentType="video"|mimeType="video\/)[\s\S]*?<\/AdaptationSet>/.exec(mpd) || [''])[0];
-      return {
+      return withOffer({
         // The video qualities' declared bitrates, lowest first.
         videoBitrates: (video.match(/<Representation\b[^>]*>/g) || []).map(function (r) {
           return +((/\sbandwidth="(\d+)"/.exec(r) || [])[1] || 0);
@@ -414,7 +485,7 @@ var F1Api = (function () {
         windowEnd: windowStart + span / ts,
         epochAtZero: dynamic ? ast : (pto / ts) - periodStart,
         delay: isoSeconds(attr(/suggestedPresentationDelay="([^"]+)"/)) || 25
-      };
+      }, dashOffer, mpd);
     });
   }
 
@@ -423,7 +494,9 @@ var F1Api = (function () {
    * which give the real clock time of segments; marks maps player positions to Unix seconds.
    */
   function hlsInfo(url) {
+    var offer = null;
     return manifest(url, /^\s*#EXTM3U/).then(function (master) {
+      offer = withOffer({}, hlsOffer, master).offer || null;
       var lines = master.split('\n');
       for (var i = 0; i < lines.length - 1; i++) {
         if (lines[i].indexOf('#EXT-X-STREAM-INF') === 0) {
@@ -442,8 +515,10 @@ var F1Api = (function () {
         }
       });
       var live = !/#EXT-X-ENDLIST/.test(playlist) && !/PLAYLIST-TYPE:VOD/.test(playlist);
-      return { dynamic: live, windowStart: 0, windowEnd: pos, delay: 25, marks: marks,
+      var info = { dynamic: live, windowStart: 0, windowEnd: pos, delay: 25, marks: marks,
         epochAtZero: marks.length ? marks[0].wall - marks[0].pos : 0, encrypted: hasKeys(playlist) };
+      if (offer) info.offer = offer;
+      return info;
     });
   }
 
@@ -515,3 +590,12 @@ var F1Api = (function () {
     imageUrl: imageUrl
   };
 })();
+
+// The subscription tier (the location entitlement, e.g. PRO or PREMIUM) for the diagnostics log: only to read
+// problems by what F1 offers each tier, never to decide anything in the app.
+if (typeof Diag !== 'undefined') {
+  Diag.provide('account', function () {
+    var l = F1Api.state.location;
+    return { signedIn: !!F1Api.state.ascendon, tier: (l && l.entitlement) || null };
+  });
+}

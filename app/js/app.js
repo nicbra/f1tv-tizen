@@ -56,6 +56,11 @@
     toast.timer = setTimeout(function () { t.classList.add('hidden'); }, ms || 5000);
   }
 
+  /** Diagnostics log (js/diag.js), when it is loaded. */
+  function diag(kind, data, level) { if (typeof Diag !== 'undefined') Diag.note(kind, data, level); }
+  function diagStream(s) { return typeof Diag !== 'undefined' ? Diag.stream(s) : null; }
+  function diagTrail(kind, data) { if (typeof Diag !== 'undefined') Diag.trail(kind, data); }
+
   function el(tag, cls, text) {
     var e = document.createElement(tag);
     if (cls) e.className = cls;
@@ -1280,6 +1285,9 @@
     var from = opts.switching && playing ? { wall: Player.wallClock(Player.position()), at: Date.now(),
       pos: Player.position(), paused: Player.isPaused(), index: feedsCtx.index, stream: Player.stream() } : null;
     switchPause = from ? (opts.switchPaused != null ? opts.switchPaused : from.paused) : null;
+    var askedAt = Date.now();
+    diagTrail('play.request', { feed: f && f.title, switching: !!from, retry: !!opts.retry, hdrRetry: !!opts.hdrRetry,
+      startAt: opts.startAt, liveAt: opts.liveAt, fromStart: !!opts.fromStart });
     return ensureSession().then(function (ok) {
       // Gone back meanwhile (renewing the session can take a while).
       if (feedsCtx !== ctx || exits !== playerExits || seq !== navSeq) return;
@@ -1307,6 +1315,11 @@
         .then(function () { return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(), cenc: cencWanted() }); })
         .then(function (s) {
           stream = s;
+          // For the diagnostics log: which video and feed this stream is.
+          stream.contentId = feedsCtx.contentId;
+          stream.channelId = f.channelId;
+          stream.feed = f.title;
+          diagTrail('play.offer', { streamType: s.streamType, hdr: !!s.hdr, cenc: !!s.cenc, ms: Date.now() - askedAt });
           stream.live = feedsCtx.live;
           stream.multiFeed = feedsCtx.feeds.length > 1;
           // Live HDR plays on the official live DASH timeline (the helper swaps in the HLG video).
@@ -1348,6 +1361,7 @@
           $('spinner').classList.add('hidden');
           towerHold = false;
           Timing.load(feedsCtx.timingMeta, F1Api.state.ascendon, feedsCtx.live);
+          if (stream && Player.stream() === stream && typeof Diag !== 'undefined') Diag.playing(stream);
           if (stream && Player.stream() === stream && !opts.retry) watchStart(stream, opts);
         })
         .catch(function (e) {
@@ -1356,6 +1370,8 @@
           // Stopped by the viewer while it loaded (Shaka rejects the interrupted load): no error, and no
           // reason to give up on HDR for this video.
           if (feedsCtx !== ctx || exits !== playerExits || (e && e.message === 'cancelled')) return;
+          diag('play.failed', { error: e, stream: diagStream(stream), switching: !!from, retry: !!opts.retry,
+            hdrRetry: !!opts.hdrRetry, afterMs: Date.now() - askedAt }, 'error');
           // A failed switch leaves the previous feed playing: it is still the current one (not
           // feedsCtx.index, which a superseded switch may have moved on).
           if (from && Player.stream() === from.stream) {
@@ -1374,6 +1390,8 @@
             } else {
               feedsCtx.cencFailed = true;   // this video plays the usual cbcs stream on AVPlay from now on
             }
+            diag('play.fallback', { to: hdrFailure ? (feedsCtx.hdrFailed ? 'sdr' : 'hdr-again') : 'cbcs',
+              hdrFailures: feedsCtx.hdrFailures || 0 });
             // Queue the retry behind this load; a newer feed request still wins.
             var recovery = Object.assign({}, opts, hdrFailure ? { hdrRetry: true } : {});
             if (from) recovery.switchPaused = switchPause != null ? switchPause : from.paused;
@@ -1396,6 +1414,7 @@
     }, function (e) {
       // The session could not be checked (no network): say so instead of doing nothing.
       if (feedsCtx === ctx && exits === playerExits && seq === navSeq) toast('Could not reach F1 TV: ' + (e.message || e), 8000);
+      diag('play.session-check-failed', { error: e });
     });
   }
 
@@ -1411,6 +1430,7 @@
       if (screen !== 'player' || Player.stream() !== stream || Player.isPaused() || stream.retried) return;
       // Moved either way: it plays (the viewer may have jumped back).
       if (Math.abs(Player.position() - from) > 0.5) return;
+      diag('play.no-start', { stream: diagStream(stream), waitedMs: stream.hdr ? 25000 : 15000, position: from });
       toast('The video didn\'t start, trying again…', 3000);
       // Through playFeed so it queues behind any other load instead of racing it.
       // AVPlay reports no position until it plays: 0 is no moment of the stream, so the retry repeats the request.
@@ -1626,6 +1646,7 @@
   function leavePlayer() {
     playerExits++;
     queuedFeed = null;   // a feed switch asked for while loading must not restart playback
+    if (typeof Diag !== 'undefined') Diag.playing(null);
     liveFocus = false;
     saveProgress();
     if (scrub) scrubCancel();
@@ -2202,6 +2223,17 @@
     img.src = 'img/logo.png';
   }
 
+  /** The app's state for the diagnostics log. */
+  function diagState() {
+    var o = { screen: screen, loadingFeed: loadingFeed, queuedFeed: !!queuedFeed, seeking: !!pending,
+      settings: { hdr: Settings.get('hdr'), audio: Settings.get('audio'), subtitles: Settings.get('subtitles'), timing: Settings.get('timing') } };
+    if (feedsCtx) {
+      o.video = { contentId: feedsCtx.contentId, live: !!feedsCtx.live, feeds: feedsCtx.feeds.length, index: feedsCtx.index,
+        playing: feedsCtx.playing, hdrFailed: !!feedsCtx.hdrFailed, hdrFailures: feedsCtx.hdrFailures || 0, cencFailed: !!feedsCtx.cencFailed };
+    }
+    return o;
+  }
+
   function boot() {
     useLogo();
     Keys.register();
@@ -2210,9 +2242,24 @@
     setInterval(tickClock, 15000);
     setInterval(updateOsd, 500);
 
-    Player.on('error', function (msg) { toast(msg, 8000); $('spinner').classList.add('hidden'); });
+    Player.on('error', function (msg) {
+      diag('player.error', { message: msg, stream: diagStream(Player.stream()) }, 'error');
+      toast(msg, 8000);
+      $('spinner').classList.add('hidden');
+    });
     // During a jump the pending-seek logic owns the spinner (it waits a moment before showing it).
-    Player.on('buffering', function (b) { if (!pending) $('spinner').classList.toggle('hidden', !b); });
+    var stallSince = 0;   // buffering while playing (not while loading or jumping), for the diagnostics log
+    Player.on('buffering', function (b) {
+      if (!pending) $('spinner').classList.toggle('hidden', !b);
+      if (b && !stallSince && !pending && !loadingFeed) stallSince = Date.now();
+      if (!b && stallSince) {
+        var ms = Date.now() - stallSince;
+        stallSince = 0;
+        if (ms >= 2000) diag('player.stall', { ms: ms, position: Player.position(), stream: diagStream(Player.stream()) });
+        else if (ms >= 500) diagTrail('player.buffering', { ms: ms });
+      }
+    });
+    if (typeof Diag !== 'undefined') Diag.provide('app', diagState);
     setInterval(checkPending, 100);
     Player.on('ended', function () {
       if (screen !== 'player' || upNext) return;   // the "Next" / "Broadcast ended" card is counting down already
@@ -2234,6 +2281,7 @@
         enterBrowse();
       })
       .catch(function (e) {
+        diag('app.startup-failed', { error: e }, 'error');
         showLogin('Startup problem: ' + e.message);
       });
   }

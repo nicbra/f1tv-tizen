@@ -328,10 +328,12 @@ async function boot(options = {}) {
     driverInfo: async () => ({}), seasonProgress: async () => ({ rounds: [], drivers: {}, teams: {} }),
     driverSeason: () => net.season(), summary: () => ({ wins: 0, podiums: 0, poles: 0, fastestLaps: 0, best: null, avg: null, dnfs: 0 })
   };
+  const localStorage = { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); },
+    removeItem: (k) => { delete store[k]; } };
   const context = vm.createContext({
     document,
-    window: { addEventListener: (t, fn) => { windowListeners[t] = fn; } },
-    localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } },
+    window: { addEventListener: (t, fn) => { windowListeners[t] = fn; }, localStorage },
+    localStorage,
     setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, setInterval: clock.setInterval, clearInterval: clock.clearInterval,
     Date: clock.Date, Math, JSON, Promise, encodeURIComponent, decodeURIComponent, URL, Worker, fetch,
     Image: class { set src(v) { this._src = v; } },
@@ -353,6 +355,12 @@ async function boot(options = {}) {
     // options.av: the real player.js on that fake AVPlay instead of the Player stub.
     Player: options.av ? undefined : player
   });
+  // options.diag: the real diagnostics log, recording as on personal TV builds, loaded before the other
+  // scripts as in index.html (they register their state with it as they load).
+  if (options.diag) {
+    vm.runInContext('var DIAG_BUILD = { record: true, label: "test" };', context);
+    vm.runInContext(readFileSync('app/js/diag.js', 'utf8'), context, { filename: 'diag.js' });
+  }
   if (options.av) {
     class SimpleTextDisplayer { append() {} }
     class ShakaPlayer {
@@ -2012,4 +2020,32 @@ test('after a 50 s rewind the bar says behind live and the LIVE button goes back
   await app.press('DOWN', 'ENTER');          // the LIVE button
   await app.advance(1500);
   assert.equal(opens(av).length, count + 1, 'LIVE button did nothing at ' + Math.round(trueLag) + ' s behind real time (bar: "' + label + '"); toast: ' + app.toast());
+});
+
+test('the diagnostics log keeps a failed feed switch with its details, but no URL query or DRM data', async () => {
+  const app = await boot({ diag: true });
+  await play(app, 'Race');
+  app.player.pos = 3000;
+  app.net.play = (id, ch) => Promise.resolve({ url: 'https://cdn/' + id + '/' + ch + '/master.m3u8?token=URLSECRET',
+    streamType: 'SDR_HD_DASHWV', licenseUrl: 'https://lic.example/la?auth=LASECRET',
+    licenseHeaders: { ascendontoken: 'HDRSECRET', customdata: 'DRMSECRET' } });
+  app.player.hold = deferred();
+  await app.press('CH_DOWN');
+  app.player.hold.reject(new Error('Load failed for https://cdn/101/1033/master.m3u8?token=URLSECRET'));
+  app.player.hold = null;
+  await app.advance(1500);
+  const stored = app.context.localStorage.getItem('f1tv.diag');
+  const log = JSON.parse(stored);
+  const failed = log.find((e) => e.k === 'play.failed');
+  assert.ok(failed, log.map((e) => e.k).join(' '));
+  assert.match(failed.d.error.message, /^Load failed for https:\/\/cdn\/…\/master\.m3u8$/);
+  assert.equal(failed.d.switching, true);
+  assert.equal(failed.d.stream.streamType, 'SDR_HD_DASHWV');
+  assert.equal(failed.d.stream.drm, 'cbcs');
+  assert.equal(String(failed.d.stream.channelId), '1033');
+  assert.ok(failed.trail.some((t) => t.k === 'play.request'));
+  assert.ok(failed.trail.some((t) => t.k === 'play.offer' && t.d.streamType === 'SDR_HD_DASHWV'));
+  assert.equal(failed.s.app.screen, 'player');
+  assert.equal(failed.s.account.tier, 'PRO');
+  assert.doesNotMatch(stored, /URLSECRET|LASECRET|HDRSECRET|DRMSECRET|TOKEN|ENT\b/);
 });

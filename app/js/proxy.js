@@ -79,3 +79,12 @@ var StreamProxy = (function () {
 
   return { ensure: ensure, manifest: manifest, hdrManifest: hdrManifest, hdrLive: hdrLive };
 })();
+
+// The helper's recent requests (CDN host, status, ms; no paths or tokens), added to warnings and errors.
+if (typeof Diag !== 'undefined') {
+  Diag.provideAsync('helper', function () {
+    var ask = fetch('http://127.0.0.1:18765/log').then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (list) { return Array.isArray(list) ? list.slice(-15) : null; });
+    return Promise.race([ask, new Promise(function (resolve) { setTimeout(function () { resolve(null); }, 2000); })]);
+  });
+}
