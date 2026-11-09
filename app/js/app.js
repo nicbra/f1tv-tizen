@@ -1296,24 +1296,40 @@
    */
   var mvSource = null;
 
+  /** Reads the playing offer's HEVC heights (once per stream); resolves the source once known (null: unread). */
   function mvReadSource() {
     var s = Player.stream();
-    if (!s || !s.url || (mvSource && mvSource.url === s.url)) return;
+    if (!s || !s.url) return Promise.resolve(null);
+    if (mvSource && mvSource.url === s.url) return mvSource.ready;
     var src = mvSource = { url: s.url, hdr: !!s.hdr, heights: null };
     // A failed read is asked again the next time (all layouts are shown meanwhile; a missing size fails when played).
-    HdrStream.heights(s.url, src.hdr ? 'HLG' : 'SDR').then(function (h) { src.heights = h; }, function () { if (mvSource === src) mvSource = null; });
+    src.ready = HdrStream.heights(s.url, src.hdr ? 'HLG' : 'SDR').then(function (h) { src.heights = h; return src; },
+      function () { if (mvSource === src) mvSource = null; return null; });
+    return src.ready;
   }
 
   /**
-   * Whether a layout can play: enough feeds, the offer has its feeds' heights (once known), and the TV decodes
-   * its picture. F1 codes 270p-720p HEVC inside the same 960x544 cells, so smaller feeds don't make it lighter.
+   * How a layout plays, or null if it can't. 'hevc': the helper's tiled HEVC picture, when the offer has its feeds'
+   * heights (once known) and the TV decodes the picture (F1 codes 270p-720p HEVC inside the same 960x544 cells, so
+   * smaller feeds don't make it lighter). 'h264': the offer has no HEVC at all (2018-2024 replays): the big feed plays
+   * on AVPlay and up to three small 540p ones come from one stream decoded in software (MvSoftware, js/mvsoft.js).
    */
-  function mvFits(layout) {
+  function mvEngine(layout) {
     var L = mvLayouts(), l = L.layouts[layout], sh = L.shape(layout), src = mvSource;
-    if (!l || l.feeds.length > feedsCtx.feeds.length) return false;
-    if (src && src.heights && l.feeds.some(function (h) { return src.heights.indexOf(h) < 0; })) return false;
-    return Player.hevcDecodes(sh.width, sh.height, src ? src.hdr : hdrWanted());
+    if (!l || l.feeds.length > feedsCtx.feeds.length) return null;
+    var missing = src && src.heights && l.feeds.some(function (h) { return src.heights.indexOf(h) < 0; });
+    if (!missing) return Player.hevcDecodes(sh.width, sh.height, src ? src.hdr : hdrWanted()) ? 'hevc' : null;
+    var s = Player.stream();
+    return src.heights.length === 0 && mvSoftLayout(l) && !feedsCtx.live && s && mvKind(s) === 'sdr' &&
+      typeof MvSoftware !== 'undefined' && MvSoftware.supported() ? 'h264' : null;
   }
+
+  /** Layouts the H.264 multiview plays: one big feed (AVPlay) and up to three small 540p ones (software). */
+  function mvSoftLayout(l) {
+    return l.feeds[0] > 540 && l.feeds.length - 1 <= 3 && l.feeds.slice(1).every(function (h) { return h === 540; });
+  }
+
+  function mvFits(layout) { return !!mvEngine(layout); }
 
   function multiviewAvailable() {
     if (!feedsCtx || feedsCtx.feeds.length < 2 || !mvLayouts()) return false;
@@ -1355,7 +1371,8 @@
       cells.push(c);
     });
     box.appendChild(pic);
-    if (sh.width >= 3840) box.appendChild(el('span', 'mv-badge', '4K'));
+    // 4K: the HEVC grid's picture (an H.264 multiview's big feed is the feed itself).
+    if (sh.width >= 3840 && mvEngine(layout) !== 'h264') box.appendChild(el('span', 'mv-badge', '4K'));
     return { box: box, cells: cells };
   }
 
@@ -1375,6 +1392,8 @@
    */
   /** The feed a multiview's commentary and subtitles come from: its chosen one while shown, else the big feed. */
   function mvSound(mv) {
+    // H.264: only the big feed has sound (AVPlay plays it; the small ones are pictures).
+    if (mv.engine === 'h264') return mv.slots[0];
     return mv.audio != null && mv.slots.indexOf(mv.audio) >= 0 ? mv.audio : mv.slots[0];
   }
 
@@ -1386,7 +1405,8 @@
       return chain.then(function () {
         return (k ? new Promise(function (r) { setTimeout(r, 800); }) : Promise.resolve()).then(function () {
           // The sound's feed gets the full offer (licence, commentary, the clock); the others their HDR video alone.
-          return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, { hdr: hdrWanted(), hdrOnly: idx !== sound });
+          // H.264: the usual offers (there is no HDR or HEVC to ask for).
+          return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, mv.engine === 'h264' ? {} : { hdr: hdrWanted(), hdrOnly: idx !== sound });
         }).then(function (s) {
           mvCheck(s, list[0], idx);
           list.push(s);
@@ -1533,22 +1553,57 @@
     return timing && 1080 - a.height >= 200 ? 'top' : 'center';
   }
 
+  /** Where a layout's feeds show on the screen (the timing data's room left free): [{ left, top, width, height }]. */
+  function mvPlaces(layout) { return mvLayouts().onScreen(layout, 1920, 1080, mvAlign(layout)); }
+
+  function mvBigRect(layout) {
+    var r = mvPlaces(layout)[0];
+    return [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)];
+  }
+
+  /**
+   * H.264 multiview: its small feeds, once the big one plays (MvSoftware draws them under the frames' mask). If they
+   * fail they start once more; failing again, the big feed plays alone (as when a multiview doesn't start).
+   */
+  function mvSoftStart(stream, retried) {
+    var g = stream.grid;
+    MvSoftware.start({ streams: g.streams.slice(1), rects: mvPlaces(g.layout).slice(1), canvas: $('mv-soft'),
+      clock: { position: function () { return Player.exactPosition(); }, playing: function () { return Player.stream() === stream && !Player.isPaused(); } },
+      onError: function (e) {
+        if (Player.stream() !== stream || screen !== 'player') return;
+        if (!retried) {
+          toast('The small feeds stopped, starting them again…', 3000);
+          return setTimeout(function () { if (Player.stream() === stream && screen === 'player') mvSoftStart(stream, true); }, 2000);
+        }
+        toast('Multiview didn\'t work (' + ((e && e.message) || e) + ').', 8000);
+        if (feedsCtx.multiview) {
+          feedsCtx.multiview = null;
+          playFeed(feedsCtx.index, { switching: true, retrying: true });   // retrying: the message above stays
+        }
+      } });
+  }
+
+  function mvSoftStop() { if (typeof MvSoftware !== 'undefined') MvSoftware.stop(); }
+
   function mvFrames() {
     var s = screen === 'player' && Player.stream(), grid = s && s.grid, box = $('mv-frames');
     var shown = grid && mvLayouts() && (grid.shown || grid), labels = Settings.get('mvLabels') !== false;
     var align = shown ? mvAlign(shown.layout) : '';
-    var key = shown ? shown.layout + '|' + shown.slots.join() + '|' + labels + '|' + align : '';
+    var key = shown ? shown.layout + '|' + shown.slots.join() + '|' + labels + '|' + align + '|' + (grid.engine || '') : '';
     if (key === mvDrawn) return;
     mvDrawn = key;
     box.innerHTML = '';
     box.classList.toggle('hidden', !key);
+    var places = key && mvPlaces(shown.layout), soft = !!key && grid.engine === 'h264';
     if (Player.setGridRect) {
       var a = shown && mvLayouts().area(shown.layout, 1920, 1080, align);
-      Player.setGridRect(a && align === 'top' ? [0, 0, 1920, Math.round(a.height)] : null);
+      // H.264: AVPlay shows the big feed alone, in its place; the small ones are drawn there (MvSoftware).
+      Player.setGridRect(soft ? mvBigRect(shown.layout) : a && align === 'top' ? [0, 0, 1920, Math.round(a.height)] : null);
     }
+    if (soft) MvSoftware.place(places.slice(1));
     if (!key) return placeSubtitles(null);
     var M = 6, R = 16;   // margin from the feed's edge, corner radius (screen pixels)
-    var rects = mvLayouts().onScreen(shown.layout, 1920, 1080, align).map(function (r) {
+    var rects = places.map(function (r) {
       return { left: r.left + M, top: r.top + M, width: r.width - 2 * M, height: r.height - 2 * M };
     });
     placeSubtitles(rects);
@@ -1627,6 +1682,7 @@
     // until it has failed HDR_TRIES times.
     if (opts.switching && !opts.hdrRetry && feedsCtx.hdrFailed && (feedsCtx.hdrFailures || 0) < HDR_TRIES) feedsCtx.hdrFailed = false;
     var f = feedsCtx.feeds[i], mv = feedsCtx.multiview;
+    mvSoftStop();   // an H.264 multiview's small feeds belong to what played
     var playing = screen === 'player' && Player.engineName();
     var from = opts.switching && playing ? { wall: Player.wallClock(Player.position()), at: Date.now(),
       pos: Player.position(), paused: Player.isPaused(), index: feedsCtx.index, stream: Player.stream() } : null;
@@ -1659,10 +1715,14 @@
         .then(function () {
           if (!mv) return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(), cenc: cencWanted() });
           // Multiview: the first feed's offer gives the clock, licence and commentary; the player builds the grid.
-          return mvStreams(mv).then(function (list) {
+          // How it plays (mvEngine) needs the playing offer's HEVC heights: a resumed multiview hasn't read them yet.
+          return (mv.engine ? Promise.resolve() : mvReadSource()).then(function () {
+            if (!mv.engine) mv.engine = mvEngine(mv.layout) || 'hevc';
+            return mvStreams(mv);
+          }).then(function (list) {
             // audio: the feed whose commentary and subtitles play (mvSound), audioPos: its place in the layout.
             var lead = mv.slots.indexOf(mvSound(mv)), s = Object.assign({}, list[lead]);
-            s.grid = { streams: list, layout: mv.layout, slots: mv.slots.slice(), audio: mv.slots[lead], audioPos: lead };
+            s.grid = { streams: list, layout: mv.layout, slots: mv.slots.slice(), audio: mv.slots[lead], audioPos: lead, engine: mv.engine };
             return s;
           });
         })
@@ -1692,6 +1752,8 @@
             if (shift > 5) stream.startDelay = shift;
             start = null;
           }
+          // H.264 multiview: AVPlay shows the big feed in its place from the start.
+          if (stream.grid && stream.grid.engine === 'h264') Player.setGridRect(mvBigRect(stream.grid.layout));
           if (!from) return Player.load(stream, start).then(function () { feedsCtx.playing = i; });
           var t0 = Date.now();
           return Player.switchTo(stream, start).then(function () {
@@ -1709,6 +1771,7 @@
           $('spinner').classList.add('hidden');
           towerHold = false;
           if (Player.stream() === stream) feedsCtx.prepareRetried = false;
+          if (stream && stream.grid && stream.grid.engine === 'h264' && Player.stream() === stream) mvSoftStart(stream);
           Timing.load(feedsCtx.timingMeta, F1Api.state.ascendon, feedsCtx.live);
           if (stream && Player.stream() === stream && !opts.retry) watchStart(stream, opts);
         })
@@ -2098,6 +2161,7 @@
     $('tower').classList.add('hidden');
     $('screen-player').classList.remove('tower-on');
     showSubtitle(null);
+    mvSoftStop();
     Player.unload();
     $('spinner').classList.add('hidden');
   }
@@ -2433,7 +2497,7 @@
 
     // In a multiview: which feed the commentary and subtitles come from (it loads the multiview anew).
     var mvNow = feedsCtx.multiview, grid0 = Player.stream() && Player.stream().grid;
-    if (mvNow && grid0 && mvNow.slots.length > 1) {
+    if (mvNow && grid0 && mvNow.slots.length > 1 && grid0.engine !== 'h264') {
       deferredSetting('Sound from', mvNow.slots, function () { return grid0.audio; }, function (idx) {
         var f = feedsCtx.feeds[idx];
         return f ? (f.full || f.title) : '';
@@ -2558,6 +2622,10 @@
     if (!focus) focus = 'layout:' + draft.layout;
     var names = ['off'].concat(mvLayouts().order.filter(mvFits));
 
+    // H.264 streams (no HEVC to tile): the small feeds come from Samsung's software decoder (js/mvsoft.js).
+    if (names.some(function (n) { return n !== 'off' && mvEngine(n) === 'h264'; })) {
+      box.appendChild(el('div', 'panel-note', 'Multiview for H.264 streams is experimental. HEVC was not introduced in F1TV until 2025.'));
+    }
     box.appendChild(el('div', 'panel-head', 'Layout'));
     var strip = el('div', 'mv-thumbs'), row = null;
     box.appendChild(strip);

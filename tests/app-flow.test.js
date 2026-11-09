@@ -222,6 +222,10 @@ const TIMING_INDEX = { Meetings: [{ Key: 1252, Sessions: [{ Key: 9658, Name: 'Qu
 // ---------- the app ----------
 
 async function boot(options = {}) {
+  // options.mvSoftware: this TV decodes the H.264 multiview's small feeds in software (Samsung's EMSS).
+  const mvSoft = { starts: [], stops: 0, places: [], supported: () => !!options.mvSoftware,
+    start(o) { mvSoft.starts.push(o); return Promise.resolve(); }, stop() { mvSoft.stops++; return Promise.resolve(); },
+    place(r) { mvSoft.places.push(r); }, running: () => false, status: () => null };
   const clock = makeClock(options.now || NOW);
   const pages = Object.assign({}, PAGES, options.pages);
   const { document } = makeDom();
@@ -304,6 +308,7 @@ async function boot(options = {}) {
     setGridRect(r) { player.gridRect = r; },
     stream: () => player.current,
     engineName: () => player.engine,
+    exactPosition: () => player.pos,
     position: () => (player.engine ? player.pos : 0),
     // player.live: a live stream with an hour of DVR window up to its live edge (window positions 1000-4600).
     range: () => (!player.engine ? { start: 0, end: 0 } : player.live ? { start: 1000, end: 4600 } : { start: 0, end: 7200 }),
@@ -357,7 +362,9 @@ async function boot(options = {}) {
     HdrStream: { heights: async (url, range) => (options.heights ? options.heights(url, range) : [270, 360, 540, 720, 1080, 1620, 2160]) },
     Updates: { check: async () => ({}), status: () => ({ page: 'https://github.com/nicbra/f1tv-tizen', current: '1.0.0' }), firstNotice: () => false },
     // options.av: the real player.js on that fake AVPlay instead of the Player stub.
-    Player: options.av ? undefined : player
+    Player: options.av ? undefined : player,
+    // The H.264 multiview's small feeds (js/mvsoft.js): what the app asks of them.
+    MvSoftware: mvSoft
   });
   if (options.av) {
     class SimpleTextDisplayer { append() {} }
@@ -400,6 +407,7 @@ async function boot(options = {}) {
   const $ = (id) => document.getElementById(id);
   const KEYS = context.Keys.codes;
   const app = {
+    mvSoft,
     context, clock, net, player, timing, requests, exits, saved, $, deferred, api, auth, stats, store,
     advance: (ms) => clock.advance(ms),
     async press(...names) {
@@ -949,6 +957,7 @@ test('watch options open a multiview page: layouts as pictures, then a feed for 
   assert.equal(app.focused(), 'One feed', 'the current choice is focused');
   // Layouts that need more feeds than the video has are left out (this race has three).
   assert.ok(!/2×2/.test(app.$('panel-list').textContent));
+  assert.ok(!/experimental/.test(app.$('panel-list').textContent), 'the HEVC multiview has no H.264 note');
   await app.moveTo(/^Big \+ 2$/, ['RIGHT']);
   await app.press('ENTER');
   // The chosen layout, larger, with the current feed in the big place.
@@ -1140,6 +1149,91 @@ test('a multiview from clear SDR offers (as Pro gets), also on a TV without HDR:
   assert.doesNotMatch(app.$('osd-feed').textContent, /HDR/);
 });
 
+// H.264 replays (2018-2024) have no HEVC to tile: the big feed plays on AVPlay in its place and the small ones are
+// decoded in software from one interleaved stream (js/mvsoft.js), under the same frames, names and timing data.
+test('an H.264 replay (no HEVC) offers the layouts with a big feed: AVPlay shows it in its place, the small ones play in software', async () => {
+  const app = await premiumHdr({ heights: () => [], mvSoftware: true });
+  await play(app, 'Race');
+  const asked = [];
+  app.net.play = (id, channel, opts) => { asked.push(opts); return Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' }); };
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  // Layouts of one big feed and small 540p ones only (all four equal ones would all be software).
+  assert.ok(!/2×2/.test(app.$('panel-list').textContent));
+  assert.match(app.$('panel-list').textContent, /Multiview for H\.264 streams is experimental/);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(3000);
+  const s = app.player.current;
+  assert.equal(s.grid.engine, 'h264');
+  assert.equal(s.grid.layout, 'side2');
+  assert.equal(s.grid.streams.length, 3);
+  assert.match(s.url, /\/main\.m3u8$/, 'AVPlay plays the big feed itself');
+  assert.equal(s.grid.audio, s.grid.slots[0], 'the sound comes from the big feed');
+  assert.ok(asked.length === 3 && asked.every((o) => !o.hdr && !o.hdrOnly), 'the usual offers');
+  // AVPlay's picture goes to the big feed's place (the left two thirds), not the whole screen.
+  const r = app.player.gridRect;
+  assert.ok(r && r[0] >= 0 && r[2] > 1000 && r[2] < 1400 && r[3] < 1080, 'big feed rect ' + r);
+  // The small feeds start once the big one plays: two offers, their two places on the screen, the canvas.
+  assert.equal(app.mvSoft.starts.length, 1);
+  const o = app.mvSoft.starts[0];
+  assert.equal(o.streams.length, 2);
+  assert.deepEqual(o.streams.map((x) => x.url), s.grid.streams.slice(1).map((x) => x.url));
+  assert.equal(o.rects.length, 2);
+  assert.ok(o.rects.every((x) => x.left >= r[0] + r[2] - 1), 'the small places are right of the big one');
+  assert.equal(o.canvas, app.$('mv-soft'));
+  // The same frames and names over them as for the HEVC grids.
+  await app.advance(600);
+  assert.equal(app.$('mv-frames').children.filter((c) => /mv-label/.test(c.className)).length, 3);
+  // No sound choice: only the big feed has sound.
+  await app.press('UP');
+  assert.ok(!/Sound from/.test(app.$('panel-list').textContent));
+  await app.press('BACK');
+  // A feed from the list plays alone again: the small feeds stop.
+  const stops = app.mvSoft.stops;
+  await app.press('UP');
+  await app.pick(/^1VER/, ['DOWN']);
+  await app.advance(600);
+  assert.ok(!app.player.current.grid);
+  assert.ok(app.mvSoft.stops > stops);
+  assert.ok(app.$('mv-frames').classList.contains('hidden'));
+});
+
+test('H.264 multiview: small feeds that fail start once more, then the big feed plays alone', async () => {
+  const app = await premiumHdr({ heights: () => [], mvSoftware: true });
+  await play(app, 'Race');
+  app.net.play = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' });
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(3000);
+  assert.equal(app.mvSoft.starts.length, 1);
+  app.mvSoft.starts[0].onError(new Error('helper: no such segment'));
+  assert.match(app.$('toast').textContent, /starting them again/);
+  await app.advance(2500);
+  assert.equal(app.mvSoft.starts.length, 2, 'started once more');
+  assert.ok(app.player.current.grid, 'still the multiview');
+  app.mvSoft.starts[1].onError(new Error('helper: no such segment'));
+  await app.advance(3000);
+  assert.match(app.$('toast').textContent, /Multiview didn't work \(helper: no such segment\)/);
+  assert.ok(!app.player.current.grid, 'the big feed alone');
+  assert.match(app.player.current.url, /\/main\.m3u8$/);
+  assert.equal(app.mvSoft.starts.length, 2);
+});
+
+test('an H.264 replay offers no multiview on a TV without Samsung\'s software decoding', async () => {
+  const app = await premiumHdr({ heights: () => [], mvSoftware: false });
+  await play(app, 'Race');
+  // The first opening reads the offer's HEVC heights (meanwhile every layout counts, as before); then none fits.
+  await app.press('UP');
+  await app.press('BACK');
+  await app.advance(500);
+  await app.press('UP');
+  assert.equal(app.$('panel-title').textContent, 'Watch options');
+  assert.ok(!/Multiview/.test(app.$('panel-list').textContent));
+});
+
 test('a multiview mixing HDR and SDR offers falls back to the big feed alone', async () => {
   const app = await premiumHdr();
   await play(app, 'Race');
@@ -1151,6 +1245,29 @@ test('a multiview mixing HDR and SDR offers falls back to the big feed alone', a
   await app.advance(3000);
   assert.ok(!app.player.current.grid);
   assert.match(app.$('toast').textContent, /no matching multiview stream for/);
+});
+
+test('after a restart an H.264 multiview comes back as one (its engine waits for the offer\'s HEVC heights)', async () => {
+  const sdr = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' });
+  const app = await premiumHdr({ heights: () => [], mvSoftware: true, play: sdr });
+  app.net.info = async () => ({ epochAtZero: 1.7e9, windowStart: 0, windowEnd: 7200 });
+  await play(app, 'Race');
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(3000);
+  assert.equal(app.player.current.grid.engine, 'h264');
+  app.player.pos = 2345;
+  await app.advance(3100);
+  const again = await premiumHdr({ store: app.store, info: app.net.info, play: sdr, heights: () => [], mvSoftware: true });
+  await again.advance(4000);
+  assert.ok(!again.player.current.grid, 'the big feed first, alone');
+  again.player.progress = true;
+  await again.advance(5000);
+  assert.equal(again.player.current.grid.layout, 'side2');
+  assert.equal(again.player.current.grid.engine, 'h264');
+  assert.equal(again.mvSoft.starts.length, 1);
 });
 
 test('after a restart the app continues the same video at the same moment, also a multiview', async () => {

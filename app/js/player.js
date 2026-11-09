@@ -315,6 +315,7 @@ var Player = (function () {
       isLive: function () { return P().isLive(); },
       range: function () { return P().seekRange(); },
       position: function () { return V().currentTime; },
+      exactPosition: function () { return V().currentTime; },
       bufferedEnd: function () { var b = V().buffered; return b.length ? b.end(b.length - 1) : 0; },
       seekTo: function (t, done) { V().currentTime = t; if (done) done(); },
       // The viewer's pause counts even while showFrame plays a switched-to feed until it has a picture.
@@ -434,7 +435,9 @@ var Player = (function () {
       av = webapis.avplay;
       startAt = startTime;
       if (captions) { captions.stop(); captions = null; }
-      if (s.grid) {
+      // An H.264 multiview (grid.engine 'h264') plays the big feed's own stream here, in the grid rect; its small
+      // feeds are the app's (js/mvsoft.js).
+      if (s.grid && s.grid.engine !== 'h264') {
         var gridPrefs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
         var gridReady = s.info && s.info.dynamic ? StreamProxy.gridLive(s, s.startDelay, gridPrefs) :
           StreamProxy.gridManifest(s.grid.streams, s.grid.layout, gridPrefs, startTime, s.grid.audioPos || 0);
@@ -610,7 +613,7 @@ var Player = (function () {
       try { av.setStreamingProperty('ADAPTIVE_INFO', adaptive); } catch (e) { /* keep default */ }
       // A multiview changes by a seek to the same moment: it plays on sooner with less buffer (its segments are
       // built ahead by the stream helper).
-      var resume = s.grid ? tuning.gridResumeBuffer : tuning.resumeBuffer;
+      var resume = s.grid && s.grid.engine !== 'h264' ? tuning.gridResumeBuffer : tuning.resumeBuffer;
       try {
         if (resume) av.setBufferingParam('PLAYER_BUFFER_FOR_RESUME', 'PLAYER_BUFFER_SIZE_IN_SECOND', resume);
       } catch (e) {
@@ -796,6 +799,8 @@ var Player = (function () {
       isLive: function () { return live; },
       range: range,
       position: function () { return posMs / 1000; },
+      // AVPlay's own clock (position() follows its time callbacks, up to ~0.3 s behind): costs a few ms per call.
+      exactPosition: function () { try { var ms = av.getCurrentTime(); return ms > 0 ? ms / 1000 : posMs / 1000; } catch (e) { return posMs / 1000; } },
       bufferedEnd: function () { return posMs / 1000; },
       seekTo: function (t, done) { seek(t * 1000, done); },
       paused: function () { return isPaused; },
@@ -990,6 +995,8 @@ var Player = (function () {
     isPaused: proxy('paused', false),
     range: proxy('range', { start: 0, end: 0 }),
     position: proxy('position', 0),
+    /** The position from the engine's own clock (for keeping other pictures in step: the H.264 multiview's small feeds). */
+    exactPosition: proxy('exactPosition', 0),
     bufferedEnd: proxy('bufferedEnd', 0),
     engineName: function () { return engineName; },
     /**

@@ -11,6 +11,7 @@
  *   POST /hdr/<id> -> a live HLG video AdaptationSet; /mpd?...&hdr=<id> puts it in place of the
  *       official video, with that video's current SegmentTimeline; &notext=1 drops subtitle sets
  *   GET /log -> the last requests (kind, CDN host, status, time, error; no paths or tokens), for diagnosis
+ *   POST /stitch/<id> { kind: 'h264x', ... } -> an H.264 replay's small multiview feeds interleaved (stitchx/)
  *   POST /stitch/<id> {"urls": [feed manifests], "height": 540} -> multiview (experiment, stitch.js):
  *       GET /stitch/<id>.mpd, /stitch/<id>/init.mp4 and /stitch/<id>/<number>.m4s give the feeds
  *       stacked into one video, with the first feed's audio and subtitles
@@ -403,6 +404,19 @@ function buildGrid(body, cb) {
 
 var stitches = {};   // id -> { kind, feeds, count, init, cfg, cache, at } (and mpd for the H.264 stack)
 
+/*
+ * POST /stitch/<id> { kind: 'h264x', feeds: [{ playlist }], interleave: true, feedTag: true, ... } (stitchx/helper-route.js):
+ * an H.264 replay's small multiview feeds (2018-2024 have no HEVC) as ONE stream of their frames one after another, each
+ * picture marked with its feed; the app decodes it with Samsung's software decoder beside the big feed on AVPlay
+ * (js/mvsoft.js). GET /stitch/<id>/init.mp4 and /<n>.m4s give it, segments built on demand like the HEVC grids'.
+ */
+// The TV's Node lacks these ES2015 helpers.
+if (!Object.assign) Object.assign = function (t) { for (var i = 1; i < arguments.length; i++) { var o = arguments[i]; if (o) for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) t[k] = o[k]; } return t; };
+if (!Array.prototype.fill) Array.prototype.fill = function (v) { for (var i = 0; i < this.length; i++) this[i] = v; return this; };
+var stitchx = null, stitchxError = null;
+try { stitchx = require('./stitchx/helper-route.js')({ fetchAll: fetchAll, send: send, toBuf: toBuf, f1Cdn: f1Cdn, port: PORT, stitches: stitches }); }
+catch (e) { stitchxError = String(e && e.message || e); console.log('stitchx unavailable: ' + stitchxError); }
+
 /**
  * Fetches all urls in parallel. F1's CDN sometimes refuses one of a burst (HTTP 403, Mexico 2026 grids)
  * although the file exists: such answers, server errors and network errors are retried three times,
@@ -500,7 +514,7 @@ function stitchManifest(mpd, manifestUrl, id, first, stacked, feeds) {
 
 function stitchRequest(req, res, u) {
   if (!stitch) return send(res, 501, toBuf('stitching unavailable'));
-  var m = /^\/stitch\/([a-z0-9-]{1,64})(?:\.mpd|\/(init\.mp4|\d+\.m4s|layout|prepare))?$/.exec(u.pathname);
+  var m = /^\/stitch\/([a-z0-9-]{1,64})(?:\.mpd|\/(init\.mp4|audio-init\.mp4|a?\d+\.m4s|layout|prepare))?$/.exec(u.pathname);
   if (!m) return send(res, 404, toBuf('not found'));
   var id = m[1], what = m[2] || (/\.mpd$/.test(u.pathname) ? 'mpd' : null);
   if (req.method === 'POST' && (!what || what === 'layout' || what === 'prepare')) {
@@ -516,6 +530,7 @@ function stitchRequest(req, res, u) {
       }
       if (what === 'layout') return hevcRegridPost(res, id, body);
       if (body.kind === 'hevc') return hevcGridPost(res, id, body);
+      if (body.kind === 'h264x') return stitchx ? stitchx.post(res, id, body) : send(res, 501, toBuf('stitchx unavailable: ' + stitchxError));
       var urls = (body.urls || []).map(String);
       if (urls.length < 2 || urls.length > 4 || !urls.every(f1Cdn)) return send(res, 400, toBuf('need 2-4 F1 manifests'));
       fetchAll(urls, function (err, mpds) {
@@ -547,6 +562,7 @@ function stitchRequest(req, res, u) {
   var s = stitches[id];
   if (!s || !what) return send(res, 404, toBuf('not found'));
   s.at = Date.now();
+  if (s.kind === 'h264x') return stitchx.get(res, s, what, id);
   if (what === 'mpd') return send(res, 200, s.mpd, 'application/dash+xml');
   if (what === 'init.mp4') return send(res, 200, s.init, 'video/mp4');
   var number = parseInt(what, 10);

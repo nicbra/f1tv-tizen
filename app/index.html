@@ -82,6 +82,8 @@
   <!-- Player -->
   <section id="screen-player" class="screen hidden">
     <object id="av-player" type="application/avplayer" class="hidden"></object>
+    <!-- H.264 multiview: the small feeds, drawn by js/mvsoft.js under the frames' mask -->
+    <canvas id="mv-soft" class="mv-soft hidden"></canvas>
     <div id="mv-frames" class="mv-frames hidden"></div>
     <div id="mv-data" class="mv-data hidden"></div>
     <video id="video" autoplay></video>
@@ -160,6 +162,7 @@
   <script src="js/ttml.js"></script>
   <script src="js/proxy.js"></script>
   <script src="js/player.js"></script>
+  <script src="js/mvsoft.js"></script>
   <script src="js/timing.js"></script>
   <script src="js/stats.js"></script>
   <script src="js/updates.js"></script>

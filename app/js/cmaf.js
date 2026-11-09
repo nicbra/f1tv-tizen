@@ -69,6 +69,63 @@
     if (!timescale) throw new Error('invalid track timescale');
     return { timescale: timescale, baseTime: tv ? uint64(fragment, t.payload + 4) : uint32(fragment, t.payload + 4) };
   }
+  /**
+   * An H.264 init segment's video track (for feeding a decoder packet by packet, e.g. Samsung's EMSS):
+   * { timescale, codec ('avc1.PPCCLL'), extradata (the avcC payload), width, height }.
+   */
+  function videoTrack(init) {
+    var all = boxes(init, 0, init.length), mdhd = collect(init, all, 'mdhd'), avc1 = collect(init, all, 'avc1');
+    if (mdhd.length !== 1 || avc1.length !== 1) throw new Error('not one H.264 video track');
+    var m = mdhd[0], v = avc1[0];
+    needPayload(m, 24); needPayload(v, 78);
+    var avcC = boxes(init, v.payload + 78, v.end).filter(function (b) { return b.type === 'avcC'; })[0];
+    if (!avcC) throw new Error('no avcC');
+    needPayload(avcC, 4);
+    var hex = '';
+    for (var i = 1; i < 4; i++) hex += (init[avcC.payload + i] < 16 ? '0' : '') + init[avcC.payload + i].toString(16);
+    return { timescale: uint32(init, m.payload + (init[m.payload] ? 20 : 12)), codec: 'avc1.' + hex.toUpperCase(),
+      extradata: init.slice(avcC.payload, avcC.end), width: init[v.payload + 24] * 256 + init[v.payload + 25],
+      height: init[v.payload + 26] * 256 + init[v.payload + 27] };
+  }
+  /**
+   * A fragmented MP4 media segment's samples (one track; every moof + mdat pair):
+   * [{ pts, dts, duration (seconds), key, data (a view into `fragment`) }].
+   */
+  function samples(fragment, timescale) {
+    var out = [], moof = null;
+    boxes(fragment, 0, fragment.length).forEach(function (box) {
+      if (box.type === 'moof') { moof = box; return; }
+      if (box.type !== 'mdat' || !moof) return;
+      var inner = boxes(fragment, moof.payload, moof.end);
+      var tfhd = collect(fragment, inner, 'tfhd')[0], tfdt = collect(fragment, inner, 'tfdt')[0], trun = collect(fragment, inner, 'trun')[0];
+      if (!tfhd || !tfdt || !trun) throw new Error('fragment without tfhd/tfdt/trun');
+      var q = tfhd.payload, tf = uint32(fragment, q) % 16777216; q += 8;
+      if (tf & 1) q += 8;
+      if (tf & 2) q += 4;
+      var defDur = 0, defSize = 0, defFlags = 0;
+      if (tf & 8) { defDur = uint32(fragment, q); q += 4; }
+      if (tf & 16) { defSize = uint32(fragment, q); q += 4; }
+      if (tf & 32) defFlags = uint32(fragment, q);
+      var dts = fragment[tfdt.payload] ? uint64(fragment, tfdt.payload + 4) : uint32(fragment, tfdt.payload + 4);
+      var r = trun.payload, rv = fragment[r], rf = uint32(fragment, r) % 16777216, count = uint32(fragment, r + 4);
+      r += 8;
+      var at = box.payload, firstFlags = null;
+      if (rf & 1) { var off = uint32(fragment, r); at = moof.start + (off > 2147483647 ? off - 4294967296 : off); r += 4; }
+      if (rf & 4) { firstFlags = uint32(fragment, r); r += 4; }
+      for (var i = 0; i < count; i++) {
+        var dur = defDur, size = defSize, flags = i === 0 && firstFlags !== null ? firstFlags : defFlags, cto = 0;
+        if (rf & 0x100) { dur = uint32(fragment, r); r += 4; }
+        if (rf & 0x200) { size = uint32(fragment, r); r += 4; }
+        if (rf & 0x400) { flags = uint32(fragment, r); r += 4; }
+        if (rf & 0x800) { cto = uint32(fragment, r); if (rv && cto > 2147483647) cto -= 4294967296; r += 4; }
+        if (at + size > fragment.length) throw new Error('sample beyond its segment');
+        out.push({ pts: (dts + cto) / timescale, dts: dts / timescale, duration: dur / timescale, key: !(flags & 0x10000), data: fragment.subarray(at, at + size) });
+        at += size; dts += dur;
+      }
+      moof = null;
+    });
+    return out;
+  }
   function encryption(init) {
     var root = boxes(init, 0, init.length), descriptions = collect(init, root, 'tenc'), schemes = collect(init, root, 'schm');
     if (!descriptions.length) return null;
@@ -204,5 +261,5 @@
     else { if (size > 4294967295) throw new Error('movie metadata exceeds 32-bit size'); put32(out, m.start, size); }
     return out;
   }
-  return { timing: timing, encryption: encryption, playlist: playlist, template: template, manifest: manifest, addPssh: addPssh };
+  return { timing: timing, videoTrack: videoTrack, samples: samples, encryption: encryption, playlist: playlist, template: template, manifest: manifest, addPssh: addPssh };
 });

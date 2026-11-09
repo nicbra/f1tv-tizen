@@ -20,10 +20,11 @@ BV. I have shamelessly added the F1 logo in the app.
   switch 4K HDR off in the settings (your name in the top bar).
 - All of F1 TV's feeds: the main broadcast, F1 Live, an onboard camera for each driver, the
   tracker and the data channel. Switching feeds keeps you at the same moment of the session.
-- Multiview: up to four feeds at once, in sync, as one 4K HDR picture. Choose a layout (a 2×2
-  grid, side by side, one big feed with three small ones, or picture in picture) and which feed
-  goes where. The timing data fills the space the feeds leave free. Needs F1 TV Premium and a
-  4K HDR TV.
+- Multiview: up to four feeds at once, in sync, as one 4K HDR picture. Choose between different layouts, together with the live timing data.
+  Needs F1 TV Premium, as Pro tier cannot show play multiple feeds at once.
+  Even replays from 2018 to 2024 get multiview too! The officical apps doesn't provide this, but we do.
+  F1 TV introduced HEVC encoding in 2025 for better multifeed decoding capabilities.
+  Before that, only H.264 was provided, but We have integrated an experimental way of decoding that for multifeed view too. Expect some quality issues with this.
 - A timing tower in sync with the video: positions, gaps, lap times, tyres, pit stops and track
   status. The gap times are shown with 3 decimals, that F1TV for some reason removed from their
   feed.
@@ -162,6 +163,16 @@ The app uses plain JavaScript compatible with Chromium 76 (Tizen 6.0). Source fi
   They use F1's timing archive for replays and SignalR for live sessions.
 - `service/service.js` runs on the TV and fixes an incorrect `senc` sample count in live audio
   segments that AVPlay rejects. Video goes straight to F1's CDN; decryption stays with Widevine.
+- Multiview: `service/stitch-hevc.js` puts the feeds' HEVC tiles side by side in one picture,
+  which AVPlay plays (`js/layouts.js` has the layouts). H.264 has no tiles, so for older replays
+  the big feed plays on AVPlay on its own and `service/stitchx/` interleaves the small feeds into
+  one stream: their frames one after another, each marked with its feed in an extra coded row.
+  `js/mvsoft.js` decodes that stream with Samsung's software decoder (EMSS, the only decoder an
+  app can use beside AVPlay), starts it in step with the big feed and follows its pauses and
+  seeks; `js/mvsoft-worker.js` updates each feed's rectangle in a retained, visible WebGL canvas,
+  without transferring ImageBitmaps between the worker and page. The source color metadata is
+  preserved when the stream is rewritten. The frames, names and timing data around the feeds
+  are the same for both.
 
 ## Building it yourself
 

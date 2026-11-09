@@ -124,3 +124,27 @@ test('HLG qualities share one adaptation set so native ABR cannot select SDR', (
   assert.equal((mpd.match(/<AdaptationSet contentType="video"/g)||[]).length, 1);
   assert.equal((mpd.match(/<Representation/g)||[]).length, 3);
 });
+
+// The H.264 multiview reads the helper's interleaved stream packet by packet (js/mvsoft.js); written here with the
+// helper's own writer (service/stitchx/fmp4.js) and read back.
+test('CMAF reads an H.264 video track and its samples (pts, dts, duration, key frames, data)', () => {
+  const Fmp4 = require('../app/service/stitchx/fmp4.js');
+  const sps = new Uint8Array([0x67, 0x4d, 0x40, 0x1f, 0xda, 0x01, 0xe0]), pps = new Uint8Array([0x68, 0xee, 0x3c, 0x80]);
+  const init = new Uint8Array(Fmp4.init({ sps, pps, width: 960, height: 544, track: 1 }));
+  const track = cmaf.videoTrack(init);
+  assert.equal(track.codec, 'avc1.4D401F');
+  assert.equal(track.width, 960);
+  assert.equal(track.height, 544);
+  assert.equal(track.timescale, 90000);
+  assert.equal(track.extradata[0], 1);   // avcC configurationVersion
+  const au = (...b) => new Uint8Array([0, 0, 0, 1].concat(b));
+  const frag = new Uint8Array(Fmp4.fragment(1, 180000, [
+    { data: au(0x65, 1, 2, 3), duration: 1800, cto: 3600, sync: true },
+    { data: au(0x41, 4, 5), duration: 1800, cto: -1800, sync: false },
+    { data: au(0x01, 6), duration: 1800, cto: 0, sync: false }], { track: 1 }));
+  const s = cmaf.samples(frag, track.timescale);
+  assert.equal(s.length, 3);
+  assert.deepEqual(s.map((x) => [x.dts, x.pts, x.duration, x.key]), [[2, 2.04, 0.02, true], [2.02, 2, 0.02, false], [2.04, 2.04, 0.02, false]]);
+  // Length-prefixed NAL units: 4-byte size, then the unit.
+  assert.deepEqual(Array.from(s[0].data), [0, 0, 0, 4, 0x65, 1, 2, 3]);
+});
