@@ -522,3 +522,22 @@ test('play asks for HDR first; the Chromecast cenc request only comes when HDR h
   assert.equal((await noHdr.F1Api.play('42', null, { hdr: true, cenc: true })).cenc, true);
   assert.equal(noHdr.calls.filter((c) => /PLAY/.test(c.url))[0].init.headers['x-f1-device-info'], 'device=tvos;');
 });
+
+test('learned native cbcs avoidance rejects encrypted HDR in favour of the cenc SDR offer', async () => {
+  const encrypted = { ...HDR, streamType: 'HDR_UHD_CMAFFP', laURL: 'https://lic/fairplay' };
+  const { F1Api, calls } = signedIn((url, init) => ({ body: url === HDR.url
+    ? MASTER + '#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.apple.streamingkeydelivery",URI="skd://00112233-4455-6677-8899-aabbccddeeff"\n'
+    : { resultObj: init.headers['x-f1-device-info'] === 'device=tvos;' ? encrypted
+      : init.headers['x-f1-device-info'] === 'device=chromecast;' ? CAST : { url: 'https://cdn/sdr.mpd', streamType: 'SDR_HD_DASHWV_SINGLE' } } }));
+  const stream = await F1Api.play('42', '1033', { hdr: true, cenc: true, cbcs: false });
+  assert.equal(stream.hdrEncrypted, undefined);
+  assert.equal(stream.cenc, true);
+  assert.equal(calls.filter((c) => c.url.includes('/CONTENT/PLAY')).length, 3);
+});
+
+test('learned native cbcs avoidance still accepts clear HDR replay offers', async () => {
+  const { F1Api } = signedIn((url) => ({ body: url === HDR.url ? MASTER : { resultObj: HDR } }));
+  const stream = await F1Api.play('42', null, { hdr: true, cenc: true, cbcs: false });
+  assert.equal(stream.hdr, true);
+  assert.equal(stream.hdrEncrypted, undefined);
+});

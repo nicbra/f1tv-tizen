@@ -156,9 +156,11 @@ through the installer.
 The app uses plain JavaScript compatible with Chromium 76 (Tizen 6.0). Source files are in `app/`:
 
 - `js/api.js` handles F1 TV requests; `js/auth.js` handles pairing and token renewal.
-- `js/player.js` uses **AVPlay** for encrypted streams and single-feed videos. It supports CBCS
-  encryption and starts long video segments faster than Shaka. **Shaka Player** handles
-  unencrypted replays with multiple feeds, preloading feed switches in the background.
+- `js/player.js` uses **Shaka Player** for Chromecast cenc streams (live and replays), clear HDR
+  and unencrypted multi-feed replays. **AVPlay** handles encrypted HDR, cbcs fallback and single-feed
+  videos, with native cenc as another fallback. `js/caps.js` remembers playback results and recent
+  native crashes per TV firmware, and probes browser Widevine after startup. Learned failures guide
+  the next choice; `Caps.report()` in DevTools shows the evidence.
 - `js/timing.js` and `js/timing-worker.js` match timing data to the video's UTC timestamps.
   They use F1's timing archive for replays and SignalR for live sessions.
 - `service/service.js` runs on the TV and fixes an incorrect `senc` sample count in live audio

@@ -5,7 +5,7 @@ const vm = require('node:vm');
 
 // opts: encryptedHdr (keys in the HDR variant playlist), gate(contentId) (a promise the play request waits for).
 function playback(load, capable = true, opts = {}) {
-  const nodes = {}, requests = [], loads = [], timers = [], infos = [];
+  const nodes = {}, requests = [], loads = [], timers = [], infos = [], offers = [];
   let current = null, paused = false;
   function start(stream, position, switching) {
     current = stream;
@@ -15,25 +15,30 @@ function playback(load, capable = true, opts = {}) {
   }
   const context = vm.createContext({
     Keys: { codes: {} }, window: { addEventListener() {} },
-    document: { getElementById: (id) => nodes[id] || (nodes[id] = {
+    document: { addEventListener() {}, getElementById: (id) => nodes[id] || (nodes[id] = {
       style: {}, classList: { add() {}, remove() {}, toggle() {} }
     }) },
     setTimeout: (fn, ms) => { timers.push({ fn, ms }); }, clearTimeout() {},
+    setInterval: (fn, ms) => { timers.push({ fn, ms, interval: true }); }, clearInterval() {},
+    localStorage: { getItem: () => null, setItem() {} },
     F1Api: {
       state: {}, isNotStarted: () => false, savePosition: async () => {},
       play: async (id, channel, o) => {
         requests.push({ id, channel, hdr: o.hdr, cenc: o.cenc });
+        offers.push(o);
+        const hdr = o.hdr && !(opts.authorizedHdr && o.cbcs === false);
+        const drm = opts.protected ? { licenseUrl: 'https://lic/wv' } : {};
         if (opts.gate) await opts.gate(id);
-        if (o.cenc && !o.hdr) return { url: 'https://cdn/cast.mpd', cenc: true, channel };
-        return o.hdr ? { url: 'https://cdn/hdr.m3u8', hdr: true, channel, ...(opts.authorizedHdr ? {hdrEncrypted:true,licenseUrl:'https://lic/wv',widevineManifestUrl:'https://cdn/sdr.mpd'} : {}) } : { url: 'https://cdn/stream.m3u8', channel };
+        if (o.cenc && !hdr && !opts.declineCenc) return { url: 'https://cdn/cast.mpd', cenc: true, channel, ...drm };
+        return hdr ? { url: 'https://cdn/hdr.m3u8', hdr: true, channel, ...(opts.authorizedHdr ? {hdrEncrypted:true,licenseUrl:'https://lic/wv',widevineManifestUrl:'https://cdn/sdr.mpd'} : {}) } : { url: 'https://cdn/stream.m3u8', channel, ...drm };
       },
-      streamInfo: async (url) => (infos.push(url), { dynamic: false, windowStart: 0, windowEnd: 600,
+      streamInfo: async (url) => (infos.push(url), opts.info || { dynamic: false, windowStart: 0, windowEnd: 600,
         encrypted: !!opts.encryptedHdr && url.includes('hdr') })
     },
     Timing: { load() {}, label: () => '', supported: () => false, isReady: () => false },
     Settings: { get: (k) => (opts.settings && k in opts.settings ? opts.settings[k] : k === 'hdr') },
     Player: {
-      hdrCapable: () => capable, cencCapable: () => !!opts.cencCapable, engineName: () => current ? 'shaka' : null,
+      hdrCapable: () => capable, cencCapable: () => !!opts.cencCapable, engineName: () => current ? (current.cencAvplay || current.hdrEncrypted || (!current.cenc && current.licenseUrl) ? 'avplay' : 'shaka') : null,
       unload: async () => {}, stream: () => current,
       load: (s, p) => start(s, p, false), switchTo: (s, p) => start(s, p, true),
       position: () => opts.position ? opts.position(current) : 120, wallClock: () => null, isLive: () => false, isPaused: () => paused, togglePause: () => { paused = !paused; },
@@ -41,6 +46,10 @@ function playback(load, capable = true, opts = {}) {
       tracks: () => ({ audio: [], text: [] })
     }
   });
+  if (opts.caps) {
+    vm.runInContext(readFileSync('app/js/caps.js', 'utf8'), context);
+    for (const path of opts.caps) { context.Caps.failed(path); context.Caps.failed(path); }
+  }
   // Expose the playback entry points without booting the browse/login screens.
   const source = readFileSync('app/js/app.js', 'utf8').replace("window.addEventListener('load', boot);", `
     ensureSession = function () { return Promise.resolve(true); };
@@ -48,7 +57,7 @@ function playback(load, capable = true, opts = {}) {
       set: function (ctx) { feedsCtx = ctx; screen = 'feeds'; } };
   `);
   vm.runInContext(source, context);
-  return { app: context.testApp, nodes, requests, loads, timers, infos, pause: () => {paused=true;}, isPaused: () => paused };
+  return { app: context.testApp, context, offers, nodes, requests, loads, timers, infos, pause: () => {paused=true;}, isPaused: () => paused };
 }
 
 const video = (extra) => ({ contentId: '42', index: 0, live: false,
@@ -272,11 +281,118 @@ test('replays ask for the cenc stream when the browser can decrypt it; a failed 
   assert.equal(h.loads.at(-1).stream.cenc, undefined);
 });
 
-test('live sessions, and browsers without cenc, keep the usual request', async () => {
+test('live SDR asks for cenc too; browsers without cenc keep the usual request', async () => {
   for (const [live, cencCapable] of [[true, true], [false, false]]) {
     const h = playback(null, true, { cencCapable, settings: { hdr: false } });
     h.app.set(video({ live })); h.app.play(0, {});
     for (let i = 0; i < 3; i++) await settle();
-    assert.deepEqual(h.requests.map((r) => r.cenc), [false]);
+    assert.deepEqual(h.requests.map((r) => r.cenc), [cencCapable]);
   }
+});
+
+test('live Shaka cenc keeps the requested DVR position; its failed start falls back to helper cbcs', async () => {
+  for (const fail of [false, true]) {
+    const h = playback(async (s) => { if (fail && s.cenc) throw Error('Shaka refused'); }, false,
+      { caps: [], cencCapable: true, protected: true, info: { dynamic: true, epochAtZero: 1700000000, delay: 25, windowStart: 0, windowEnd: 600 } });
+    h.app.set(video({ live: true })); h.app.play(0, { startAt: 87 });
+    for (let i = 0; i < 8; i++) await settle();
+    assert.equal(h.loads[0].stream.cenc, true);
+    assert.equal(h.loads[0].position, 87);
+    assert.equal(h.loads[0].stream.startDelay, undefined);
+    assert.equal(h.loads[0].stream.cencAvplay, false);
+    if (fail) {
+      assert.deepEqual(h.requests.map((r) => r.cenc), [true, false]);
+      assert.equal(h.loads[1].stream.capsPath, 'avplay:cbcs');
+      assert.equal(h.loads[1].position, null);
+      assert.ok(h.loads[1].stream.startDelay > 5);
+      assert.equal(h.context.Caps.report().paths['shaka:cenc'].failed, 1);
+    }
+  }
+});
+
+test('avoided native cbcs requests cenc for live and replay, rejects encrypted HDR and falls back to native cenc', async () => {
+  for (const live of [false, true]) {
+    const h = playback(async (s) => { if (s.cenc && !s.cencAvplay) throw Error('Shaka refused'); }, true,
+      { caps: ['avplay:cbcs'], cencCapable: true, protected: true, authorizedHdr: true, encryptedHdr: true });
+    h.app.set(video({ live })); h.app.play(0, { startAt: 87 });
+    for (let i = 0; i < 8; i++) await settle();
+    assert.equal(h.loads.length, 2);
+    assert.ok(h.loads.every((l) => l.stream.cenc && !l.stream.hdr));
+    assert.ok(h.offers.every((o) => o.cenc && o.cbcs === false));
+    assert.equal(h.loads[1].stream.cencAvplay, true);
+    assert.equal(h.loads[1].stream.capsPath, 'avplay:cenc');
+    assert.equal(h.loads[1].position, 87);
+  }
+});
+
+test('browser cenc refusal and avoided native cbcs go straight to native cenc, including live helper DVR', async () => {
+  for (const live of [false, true]) {
+    const h = playback(null, true, { caps: ['avplay:cbcs'], protected: true, authorizedHdr: true,
+      info: { dynamic: live, epochAtZero: 1700000000, delay: 25, windowStart: 0, windowEnd: 600 } });
+    h.app.set(video({ live })); h.app.play(0, { startAt: 87 }); await settle();
+    assert.equal(h.loads.length, 1);
+    assert.equal(h.loads[0].stream.cencAvplay, true);
+    assert.equal(h.loads[0].position, live ? null : 87);
+    assert.equal(h.loads[0].stream.startDelay > 5, live);
+  }
+});
+
+test('this TV keeps clear HDR on Shaka, encrypted HDR on AVPlay, and cenc replays with no negative record', async () => {
+  for (const kind of ['clear', 'encrypted', 'sdr']) {
+    const h = playback(null, true, { caps: [], cencCapable: true, protected: kind === 'sdr',
+      authorizedHdr: kind === 'encrypted', settings: { hdr: kind !== 'sdr' } });
+    h.app.set(video()); h.app.play(0, {}); await settle();
+    const s = h.loads[0].stream;
+    assert.equal(h.loads.length, 1);
+    assert.equal(!!s.hdr, kind !== 'sdr');
+    assert.equal(h.context.Player.engineName(), kind === 'encrypted' ? 'avplay' : 'shaka');
+    assert.equal(!!s.cenc, kind === 'sdr');
+  }
+});
+
+test('clear HDR replays remain available when native HDR is avoided; live skips that offer', async () => {
+  for (const live of [false, true]) {
+    const h = playback(null, true, { caps: ['avplay:hdr'], cencCapable: true, protected: true });
+    h.app.set(video({ live })); h.app.play(0, {}); await settle();
+    assert.equal(h.requests[0].hdr, !live);
+    assert.equal(!!h.loads[0].stream.hdr, !live);
+    assert.equal(h.offers[0].cbcs, false);
+  }
+});
+
+test('a protected path is ok only once position advances; only playing native DRM arms a crash marker', async () => {
+  for (const native of [false, true]) {
+    let pos = 0;
+    const h = playback(null, false, { caps: [], protected: true, cencCapable: !native, position: () => pos });
+    h.app.set(video()); h.app.play(0, {}); await settle();
+    const path = native ? 'avplay:cbcs' : 'shaka:cenc';
+    h.app.update(); assert.equal(h.context.Caps.report().paths[path], undefined);
+    pos = 2; h.app.update(); h.app.update();
+    assert.equal(h.context.Caps.report().paths[path].ok, 1);
+    assert.equal(!!h.context.Caps.report().playing, native);
+    h.pause(); h.app.update(); assert.equal(h.context.Caps.report().playing, undefined);
+    h.app.stop(); assert.equal(h.context.Caps.report().playing, undefined);
+  }
+});
+
+test('start watches record each failed path, then try native cbcs and native cenc without looping', async () => {
+  const h = playback(null, false, { caps: [], cencCapable: true, protected: true });
+  h.app.set(video({ live: true })); h.app.play(0, {}); await settle();
+  let watched = 0;
+  for (const path of ['shaka:cenc', 'avplay:cbcs', 'avplay:cenc']) {
+    const watches = h.timers.filter((t) => t.ms === 15000);
+    watches[watched++].fn(); await settle();
+    assert.equal(h.context.Caps.report().paths[path].failed, 1);
+  }
+  assert.equal(h.loads.length, 3);
+});
+
+test('a declined cenc offer that fails as cbcs cannot cause an unbounded fallback loop', async () => {
+  const h = playback(async () => { throw Error('failed'); }, false,
+    { caps: [], cencCapable: true, protected: true, declineCenc: true });
+  h.app.set(video()); h.app.play(0, {});
+  for (let i = 0; i < 8; i++) await settle();
+  assert.equal(h.loads.length, 2);
+  assert.equal(h.context.Caps.report().paths['avplay:cbcs'].failed, 2);
+  assert.equal(h.context.Caps.report().paths['shaka:cenc'], undefined);
 });

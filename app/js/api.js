@@ -187,8 +187,8 @@ var F1Api = (function () {
   }
 
   /**
-   * F1 encrypts its DRM streams for the web with cbcs, which only AVPlay can decrypt on Samsung TVs; asked
-   * as a Chromecast, it gives the same stream with cenc, which the browser (Shaka) can. An extra request,
+   * F1's normal protected streams are cbcs. Asked as a Chromecast it gives the same stream in cenc,
+   * including live (measured in PR #3 on Tizen 5); browser Widevine can play that on Shaka. An extra request,
    * like the HDR one: its answer is used only when it is cenc Widevine DASH, otherwise `normal`.
    */
   function cencOffer(normal, contentId, channelId) {
@@ -216,7 +216,9 @@ var F1Api = (function () {
     // only when it is HDR (playHdr). Otherwise (Pro gets SDR from it) the normal request, as before.
     var request = opts && opts.hdr
       ? playHdr(contentId, channelId).then(function (hdr) {
-        if (!hdr) return next();
+        // Apple TV is the only 4K HDR offer: clear HLS on some replays, cbcs on others and live.
+        // There is no cenc HDR. Keep clear HDR when the TV has learned to avoid native cbcs.
+        if (!hdr || (hdr.hdrEncrypted && opts.cbcs === false)) return next();
         if (!hdr.hdrEncrypted) return hdr;
         // Multiview's other feeds: the HDR stream alone, one PLAY session each. The first feed's Widevine
         // offer has the licence and the clock; F1 limits how many streams an account plays at once.

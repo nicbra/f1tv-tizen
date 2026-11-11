@@ -111,6 +111,7 @@
   function tickClock() { $('clock').textContent = hhmm(Date.now()); }
 
   function exitApp() {
+    if (typeof Caps !== 'undefined') Caps.crashEnd();
     try { tizen.application.getCurrentApplication().exit(); } catch (e) { /* desktop */ }
   }
 
@@ -1070,6 +1071,40 @@
     });
   }
 
+  // What the app has learned about playing copy-protected video on this TV (js/caps.js), in words.
+  var CAPS_NAMES = { 'shaka:cenc': 'Shaka, CENC', 'avplay:cbcs': 'AVPlay, CBCS', 'avplay:cenc': 'AVPlay, CENC',
+    'avplay:hdr': 'AVPlay, 4K HDR' };
+
+  function capsSummary() {
+    var paths = Caps.report().paths, n = 0;
+    Object.keys(paths).forEach(function (k) { n += paths[k].ok + paths[k].failed + paths[k].crashed; });
+    return n ? 'Learned from ' + n + ' video start' + (n === 1 ? '' : 's') : 'Nothing learned yet';
+  }
+
+  function capsText() {
+    var r = Caps.report(), yes = function (v) { return v === true ? 'yes' : v === false ? 'no' : 'not checked yet'; };
+    var lines = ['The app tries different ways of playing copy-protected video and remembers what works on this TV.',
+      '', 'Browser copy protection', '• cenc: ' + yes(r.browser.cenc), '• cbcs: ' + yes(r.browser.cbcs), '',
+      'Ways of playing'];
+    Object.keys(CAPS_NAMES).forEach(function (k) {
+      var p = r.paths[k];
+      var counts = p ? p.ok + ' played, ' + p.failed + ' failed, ' + p.crashed + ' crashed' : 'not tried yet';
+      lines.push('• ' + CAPS_NAMES[k] + ': ' + counts + (Caps.avoided(k) ? ' (avoided)' : ''));
+    });
+    lines.push('', 'Firmware ' + r.firmware);
+    return lines.join('\n');
+  }
+
+  function showCaps(idx) {
+    ask('Playback on this TV', capsText(), [{ label: 'Close', value: false }, { label: 'Forget', value: true }], 'notes')
+      .then(function (forget) {
+        if (!forget) return;
+        Caps.reset();
+        toast('Forgotten. The app learns again from the next videos.', 4000);
+        openAccount(idx);
+      });
+  }
+
   function openVersion(focus) {
     var u = Updates.status();
     var instruction = Updates.installedBy() === 'installer'
@@ -1126,7 +1161,10 @@
             backStack.push(function () { openAccount(idx); });
             openVersion();
           } },
-        toggle('updates', 'Automatic update checks', 'Check for new versions daily.'),
+        toggle('updates', 'Automatic update checks', 'Check for new versions daily.')
+      ]).concat(typeof Caps !== 'undefined' ? [
+        { what: 'Playback on this TV', sub: capsSummary(), run: function (idx) { showCaps(idx); } }
+      ] : []).concat([
         { info: true, what: 'Unofficial F1 TV app', sub: 'Not affiliated with Formula 1.' }
       ])
     }, focus || 0);
@@ -1309,14 +1347,63 @@
 
   var HDR_TRIES = 3;   // HDR failures before a video stays SDR
 
-  /** Replays' DRM streams in cenc on Shaka (see F1Api cencOffer); after a failure, AVPlay as before. */
-  function cencWanted() {
-    return !feedsCtx.live && !feedsCtx.cencFailed && !!(Player.cencCapable && Player.cencCapable());
+  function pathUsable(path) { return typeof Caps === 'undefined' || Caps.usable(path); }
+
+  function pathFailed(path) {
+    return path === 'shaka:cenc' ? feedsCtx.cencFailed : path === 'avplay:cbcs' ? feedsCtx.cbcsFailed : feedsCtx.avCencFailed;
   }
 
+  /**
+   * Tizen 6/QE55Q77A: browser cenc works, browser cbcs doesn't, AVPlay cbcs works. Tizen 5 (PR #3):
+   * AVPlay cbcs fails after the live licence or hangs preparing replays, but cenc works. Tizen 9/S90C
+   * (issue #1): native Widevine kills the app after 8-45 s; Shaka cenc works. Learn these per firmware.
+   */
+  function sdrPath() {
+    var paths = ['shaka:cenc', 'avplay:cbcs', 'avplay:cenc'];
+    if (!(Player.cencCapable && Player.cencCapable())) paths.shift();
+    for (var i = 0; i < paths.length; i++) {
+      if (!pathFailed(paths[i]) && pathUsable(paths[i])) return paths[i];
+    }
+    // Exhausted the preferred paths: still try an untried one, even if old evidence was bad.
+    for (var j = 0; j < paths.length; j++) if (!pathFailed(paths[j])) return paths[j];
+    return paths[paths.length - 1];
+  }
+
+  function nativeHdrUsable() { return pathUsable('avplay:hdr') && pathUsable('avplay:cbcs'); }
+
   function hdrWanted() {
-    // Live too: F1's live HLG plays as native DASH through the helper (HdrStream.live).
-    return Settings.get('hdr') && !feedsCtx.hdrFailed && Player.hdrCapable();
+    // Live needs native cbcs HDR. Replays can still accept a clear Apple TV HLS offer (api.js).
+    return Settings.get('hdr') && !feedsCtx.hdrFailed && Player.hdrCapable() && (!feedsCtx.live || nativeHdrUsable());
+  }
+
+  function failPath(path) {
+    if (path === 'shaka:cenc') feedsCtx.cencFailed = true;
+    else if (path === 'avplay:cbcs') feedsCtx.cbcsFailed = true;
+    else if (path === 'avplay:cenc') feedsCtx.avCencFailed = true;
+  }
+
+  function playbackFailed(stream) {
+    if (!stream || !stream.capsPath || stream.capsFailed) return;
+    stream.capsFailed = true;
+    if (typeof Caps !== 'undefined') {
+      Caps.failed(stream.capsPath);
+      if (Player.stream() === stream) Caps.crashEnd();
+    }
+    failPath(stream.capsPath);
+    // The server may decline the cenc offer and return cbcs. Don't request that same dead end forever.
+    if (!stream.hdr) failPath(stream.capsRoute);
+  }
+
+  /** Position advancing, rather than load/prepare succeeding, is evidence that the path plays. */
+  function playbackProgress() {
+    var s = Player.stream();
+    if (!s || !s.capsPath || typeof Caps === 'undefined') return;
+    if (!s.capsOk && !s.capsFailed && !Player.isPaused() && s.capsPosition != null && Player.position() > s.capsPosition + 0.5) {
+      s.capsOk = true;
+      Caps.ok(s.capsPath);
+    }
+    if (s.capsOk && !s.capsFailed && !s.capsEnded && Player.engineName() === 'avplay' && !Player.isPaused()) Caps.crashStart(s.capsPath);
+    else Caps.crashEnd();
   }
 
   /*
@@ -1390,6 +1477,7 @@
   }
 
   function mvCheck(s, first, idx) {
+    if (s.hdrEncrypted && !nativeHdrUsable()) throw new Error('HDR playback is unavailable on this TV');
     if (!mvKind(s) || (first && mvKind(s) !== mvKind(first))) throw new Error('no matching multiview stream for ' + feedsCtx.feeds[idx].title);
   }
 
@@ -1448,7 +1536,7 @@
         return (k ? new Promise(function (r) { setTimeout(r, 800); }) : Promise.resolve()).then(function () {
           // The sound's feed gets the full offer (licence, commentary, the clock); the others their HDR video alone.
           // H.264: the usual offers (there is no HDR or HEVC to ask for).
-          return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, mv.engine === 'h264' ? {} : { hdr: hdrWanted(), hdrOnly: idx !== sound });
+          return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, mv.engine === 'h264' ? {} : { hdr: hdrWanted(), hdrOnly: idx !== sound, cbcs: nativeHdrUsable() });
         }).then(function (s) {
           mvCheck(s, list[0], idx);
           list.push(s);
@@ -1482,7 +1570,7 @@
       return chain.then(function () {
         if (have[idx]) { list.push(have[idx]); return null; }
         return new Promise(function (r) { setTimeout(r, 800); }).then(function () {
-          return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, { hdr: !!g.streams[0].hdr, hdrOnly: true });
+          return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, { hdr: !!g.streams[0].hdr, hdrOnly: true, cbcs: nativeHdrUsable() });
         }).then(function (x) {
           mvCheck(x, g.streams[0], idx);
           have[idx] = x;
@@ -1774,10 +1862,10 @@
         renderTower();
       }
       showOsd();
-      var stream;
+      var stream, route = sdrPath();
       return (from || playing ? Promise.resolve() : Player.unload())
         .then(function () {
-          if (!mv) return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(), cenc: cencWanted() });
+          if (!mv) return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(), cenc: route !== 'avplay:cbcs', cbcs: nativeHdrUsable() });
           // Multiview: the first feed's offer gives the clock, licence and commentary; the player builds the grid.
           // How it plays (mvEngine) needs the playing offer's HEVC heights: a resumed multiview hasn't read them yet.
           return (mv.engine ? Promise.resolve() : mvReadSource()).then(function () {
@@ -1794,6 +1882,10 @@
           stream = s;
           stream.live = feedsCtx.live;
           stream.multiFeed = feedsCtx.feeds.length > 1;
+          stream.capsRoute = route;
+          stream.cencAvplay = !!stream.cenc && route === 'avplay:cenc';
+          if (stream.licenseUrl) stream.capsPath = stream.hdrEncrypted ? 'avplay:hdr' :
+            (stream.cenc ? (stream.cencAvplay || stream.grid ? 'avplay:cenc' : 'shaka:cenc') : 'avplay:cbcs');
           // Live HDR plays on the official live DASH timeline (the helper swaps in the HLG video).
           var timeline = stream.hdrEncrypted && stream.live ? stream.widevineManifestUrl : stream.url;
           return F1Api.streamInfo(timeline).then(function (info) { stream.info = info; }, function () {});
@@ -1809,9 +1901,10 @@
           var start = startPosition(stream.info, opts, from);
           // Live (dynamic) streams on AVPlay can't seek at start-up; instead the local service
           // time-shifts the manifest so the player's own live edge lies at the chosen moment
-          // (it starts `delay` before its edge, hence the extra info.delay).
+          // (it starts `delay` before its edge, hence the extra info.delay). Shaka cenc keeps the
+          // requested position and seeks the DVR window itself (shaka_SDR, ba4275d).
           var info = stream.info;
-          if (start != null && info && info.dynamic && info.epochAtZero > 1e9 && stream.licenseUrl) {
+          if (start != null && info && info.dynamic && info.epochAtZero > 1e9 && stream.licenseUrl && (!stream.cenc || stream.cencAvplay)) {
             var shift = Date.now() / 1000 - (info.epochAtZero + start) - info.delay;
             if (shift > 5) stream.startDelay = shift;
             start = null;
@@ -1834,10 +1927,13 @@
         .then(function () {
           $('spinner').classList.add('hidden');
           towerHold = false;
-          if (Player.stream() === stream) feedsCtx.prepareRetried = false;
+          if (Player.stream() === stream) {
+            feedsCtx.prepareRetried = false;
+            stream.capsPosition = Player.position();
+          }
           if (stream && stream.grid && stream.grid.engine === 'h264' && Player.stream() === stream) mvSoftStart(stream);
           Timing.load(feedsCtx.timingMeta, F1Api.state.ascendon, feedsCtx.live);
-          if (stream && Player.stream() === stream && !opts.retry) watchStart(stream, opts);
+          if (stream && Player.stream() === stream) watchStart(stream, opts);
         })
         .catch(function (e) {
           $('spinner').classList.add('hidden');
@@ -1850,6 +1946,14 @@
           if (from && Player.stream() === from.stream) {
             feedsCtx.index = feedsCtx.playing != null ? feedsCtx.playing : from.index;
             $('osd-feed').textContent = feedLabel(from.stream);
+          }
+          playbackFailed(stream);
+          // An SDR engine failed before starting. Try the next path at the requested moment;
+          // native cenc still goes through the helper, as in PR #3.
+          if (!mv && stream && !stream.hdr && stream.capsPath && sdrPath() !== stream.capsRoute &&
+              !(e && e.code === 'PLAYER_STUCK')) {
+            if (!queuedFeed && screen === 'player') playFeed(i, sameMoment(from, opts));
+            return;
           }
           // AVPlay's preparation hung (player.js PREPARE_MS): one more try opens over it, as BACK and trying again
           // did (Mexico 2026 multiview). Another hang, or a player that won't open again, needs the app restarted;
@@ -1939,6 +2043,8 @@
       if (screen !== 'player' || Player.stream() !== stream || Player.isPaused() || stream.retried) return;
       // Moved either way: it plays (the viewer may have jumped back).
       if (Math.abs(Player.position() - from) > 0.5) return;
+      playbackFailed(stream);
+      if (opts.retry && !stream.hdr && (!stream.capsPath || sdrPath() === stream.capsRoute)) return;
       toast('The video didn\'t start, trying again…', 3000);
       // Through playFeed so it queues behind any other load instead of racing it.
       // AVPlay reports no position until it plays: 0 is no moment of the stream, so the retry repeats the request.
@@ -2014,6 +2120,7 @@
   function updateOsd() {
     mvFrames();
     if (screen !== 'player') return;
+    if (!loadingFeed) playbackProgress();
     var pos = Player.position();
     var r = Player.range();
     // While a stream (re)loads it has no position yet.
@@ -2211,6 +2318,7 @@
 
   /** Stops playback and clears the player's overlays, staying on the player screen. */
   function leavePlayer() {
+    if (typeof Caps !== 'undefined') Caps.crashEnd();
     playerExits++;
     feedLoadSeq++;
     clearTimeout(feedLoadTimer);
@@ -3184,13 +3292,28 @@
     setInterval(tickClock, 15000);
     setInterval(updateOsd, 500);
 
-    Player.on('error', function (msg) { toast(msg, 8000); $('spinner').classList.add('hidden'); });
+    Player.on('error', function (msg) {
+      toast(msg, 8000);
+      $('spinner').classList.add('hidden');
+      // Loading errors are handled by the load catch/start watch, once native preparation settles.
+      if (screen !== 'player' || loadingFeed) return;
+      var s = Player.stream();
+      playbackFailed(s);
+      if (s && !s.grid && s.capsPath && (s.hdr || sdrPath() !== s.capsRoute)) {
+        if (s.hdr) feedsCtx.hdrFailed = true;
+        var wall = Player.wallClock(Player.position());
+        playFeed(feedsCtx.index, wall ? { liveAt: wall } : { startAt: Player.position() });
+      }
+    });
     // During a jump the pending-seek logic owns the spinner (it waits a moment before showing it).
     Player.on('buffering', function (b) {
       if (!pending) $('spinner').classList.toggle('hidden', !b);
     });
     setInterval(checkPending, 100);
     Player.on('ended', function () {
+      var s = Player.stream();
+      if (s) s.capsEnded = true;
+      if (typeof Caps !== 'undefined') Caps.crashEnd();
       if (screen !== 'player' || upNext) return;   // the "Next" / "Broadcast ended" card is counting down already
       if (!offerNextPart(stopPlayer)) stopPlayer();
     });

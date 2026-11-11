@@ -858,23 +858,7 @@ var Player = (function () {
   function init(videoEl, avEl) {
     els.video = videoEl;
     els.av = avEl;
-    probeCenc();
     return ShakaEngine.init();
-  }
-
-  /*
-   * Whether the browser's Widevine decrypts cenc streams (Tizen 6 does; it refuses F1's usual cbcs).
-   * Asked once at start-up, long before the first video.
-   */
-  var cencSupport = false;
-
-  function probeCenc() {
-    try {
-      navigator.requestMediaKeySystemAccess('com.widevine.alpha', [{ initDataTypes: ['cenc'],
-        videoCapabilities: [{ contentType: 'video/mp4; codecs="avc1.4d402a"', encryptionScheme: 'cenc' }],
-        audioCapabilities: [{ contentType: 'audio/mp4; codecs="mp4a.40.2"', encryptionScheme: 'cenc' }] }])
-        .then(function () { cencSupport = true; }, function () { /* AVPlay only */ });
-    } catch (e) { /* no EME */ }
   }
 
   var hdrSupport = null;
@@ -915,7 +899,7 @@ var Player = (function () {
     if (stream.grid) return AvEngine;
     if (stream.hdrEncrypted && stream.licenseUrl && hasAvPlay()) return AvEngine;
     // F1's cenc stream (asked as a Chromecast): the browser decrypts it, so Shaka plays it.
-    if (stream.cenc) return ShakaEngine;
+    if (stream.cenc) return stream.cencAvplay && hasAvPlay() ? AvEngine : ShakaEngine;
     // AVPlay picks SDR variants from HDR playlists; Shaka can be told to prefer HLG.
     if (stream.hdr) return ShakaEngine;
     if (!hasAvPlay()) return ShakaEngine;
@@ -938,6 +922,7 @@ var Player = (function () {
   var teardown = null;
 
   function unload() {
+    if (typeof Caps !== 'undefined') Caps.crashEnd();
     var e = engine;
     engine = null;
     if (!e) return teardown || Promise.resolve();
@@ -1009,7 +994,7 @@ var Player = (function () {
     init: init,
     hdrCapable: hdrCapable,
     hevcDecodes: hevcDecodes,
-    cencCapable: function () { return cencSupport; },
+    cencCapable: function () { return typeof Caps !== 'undefined' && Caps.browser('cenc') !== false; },
     load: load,
     unload: unload,
     seekBy: seekBy,

@@ -843,3 +843,31 @@ test('cenc feed switches load in place instead of preloading beside the playing 
   assert.equal(P.stream().url, 'https://cdn/onboard.mpd');
   assert.notEqual(P.videos[1].muted, true, 'the second element (preloading) was never used');
 });
+
+test('live cenc uses Shaka DVR directly; an explicitly selected native cenc fallback uses the helper', async () => {
+  const av = fakeAvPlay();
+  const P = await player(av, undefined, () => Promise.resolve());
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); });
+  await P.load(Object.assign({}, LIVE, { cenc: true }), 600);
+  assert.equal(P.engineName(), 'shaka');
+  assert.equal(names(av).includes('open'), false);
+  await P.load(Object.assign({}, LIVE, { cenc: true, cencAvplay: true, startDelay: 600 }), null);
+  assert.equal(P.engineName(), 'avplay');
+  assert.match(av.calls.find((c) => c[0] === 'open')[1], /&shift=600&audio=eng$/);
+  assert.ok(names(av).includes('setDrm'));
+});
+
+test('player uses saved browser EME evidence without issuing a launch probe, and clears native crash state on unload', async () => {
+  let supported = null, ended = 0;
+  const P = await player(fakeAvPlay(), undefined, undefined, {
+    Caps: { browser: () => supported, crashEnd: () => { ended++; } },
+    navigator: { requestMediaKeySystemAccess: () => { throw Error('player must not probe at launch'); } }
+  });
+  assert.equal(P.cencCapable(), true, 'unknown tries cenc optimistically until the delayed strict probe');
+  supported = true; assert.equal(P.cencCapable(), true);
+  supported = false; assert.equal(P.cencCapable(), false);
+  await P.load(LIVE, null);
+  const before = ended;
+  await P.unload();
+  assert.equal(ended, before + 1);
+});

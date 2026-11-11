@@ -286,12 +286,13 @@ async function boot(options = {}) {
     current: null, engine: null, pos: 0, paused: false, loads: [], listeners: {}, hold: null,
     init: async () => {},
     hdrCapable: () => !!options.hdrCapable,
+    cencCapable: () => !!options.capsRouting && context.Caps.browser('cenc') !== false,
     // Which multiview pictures the TV decodes (all by default): (width, height, hdr) => boolean.
     hevcDecodes: (w, h, hdr) => (options.hevcDecodes ? options.hevcDecodes(w, h, hdr) : true),
     kind: 'shaka',   // or 'avplay': which engine the stub plays as
     load(s, start) {
       player.current = s;
-      player.engine = player.kind;
+      player.engine = options.capsRouting ? (s.cenc && !s.cencAvplay ? 'shaka' : 'avplay') : player.kind;
       player.pos = start || 0;
       player.paused = false;
       player.loads.push({ url: s.url, start });
@@ -375,6 +376,7 @@ async function boot(options = {}) {
     // The H.264 multiview's small feeds (js/mvsoft.js): what the app asks of them.
     MvSoftware: mvSoft
   });
+  vm.runInContext(readFileSync('app/js/caps.js', 'utf8'), context, { filename: 'caps.js' });
   if (options.av) {
     class SimpleTextDisplayer { append() {} }
     class ShakaPlayer {
@@ -418,7 +420,7 @@ async function boot(options = {}) {
   const KEYS = context.Keys.codes;
   const app = {
     mvSoft,
-    context, clock, net, player, timing, requests, exits, saved, $, deferred, api, auth, stats, store,
+    context, clock, net, player, timing, requests, exits, saved, $, deferred, api, auth, stats, store, windowListeners,
     advance: (ms) => clock.advance(ms),
     async press(...names) {
       for (const name of names) {
@@ -2922,4 +2924,119 @@ test('after a 50 s rewind the bar says behind live and the LIVE button goes back
   await app.press('DOWN', 'ENTER');          // the LIVE button
   await app.advance(1500);
   assert.equal(opens(av).length, count + 1, 'LIVE button did nothing at ' + Math.round(trueLag) + ' s behind real time (bar: "' + label + '"); toast: ' + app.toast());
+});
+
+// Per-TV learning through the real app and Caps, with controlled offers and player progress.
+function learnedStore(paths) {
+  const record = { version: 1, firmware: 'unknown', browser: { cenc: true, cbcs: false }, paths: {} };
+  for (const path of paths) record.paths[path] = { ok: 0, failed: 0, crashed: 2, last: NOW };
+  return { 'f1tv.caps': JSON.stringify(record) };
+}
+function protectedOffers(offers) {
+  return (id, channel, opts) => {
+    offers.push(opts);
+    return Promise.resolve({ url: 'https://cdn/' + id + '/' + (opts.cenc ? 'cenc' : 'cbcs') + '.mpd',
+      streamType: 'DASH_WV', licenseUrl: 'https://lic', cenc: !!opts.cenc });
+  };
+}
+
+test('live SDR starts on Shaka cenc; a start-watch failure falls back to native cbcs and learns when it plays', async () => {
+  const offers = [];
+  const app = await boot({ capsRouting: true, settings: { hdr: false }, play: protectedOffers(offers) });
+  await playLive(app);
+  assert.equal(app.player.engine, 'shaka');
+  assert.equal(offers[0].cenc, true);
+  assert.equal(app.context.Caps.report().paths['shaka:cenc'], undefined);
+  await app.advance(16000);
+  assert.equal(app.player.engine, 'avplay');
+  assert.equal(offers[1].cenc, false);
+  assert.equal(app.context.Caps.report().paths['shaka:cenc'].failed, 1);
+  assert.equal(app.context.Caps.report().playing, undefined);
+  app.player.progress = true;
+  await app.advance(2000);
+  assert.equal(app.context.Caps.report().paths['avplay:cbcs'].ok, 1);
+  assert.equal(app.context.Caps.report().playing.path, 'avplay:cbcs');
+  app.context.document.hidden = true;
+  app.context.document.listeners.visibilitychange.forEach((fn) => fn());
+  assert.equal(app.context.Caps.report().playing, undefined);
+  await app.advance(1000);
+  assert.equal(app.context.Caps.report().playing, undefined);
+  app.context.document.hidden = false;
+  await app.advance(1000);
+  assert.equal(app.context.Caps.report().playing.path, 'avplay:cbcs');
+  app.windowListeners.beforeunload();
+  assert.equal(app.context.Caps.report().playing, undefined);
+});
+
+test('remembered cbcs crashes skip native live HDR, request cenc for live and replays, and recover on native cenc', async () => {
+  for (const live of [true, false]) {
+    const offers = [];
+    const app = await boot({ capsRouting: true, hdrCapable: true, store: learnedStore(['avplay:cbcs']), play: protectedOffers(offers) });
+    if (live) await playLive(app);
+    else { await app.pick(/^Race/); await app.advance(100); await app.pick(/^INTERNATIONAL/); await app.advance(500); }
+    assert.equal(app.player.engine, 'shaka');
+    assert.equal(offers[0].cenc, true);
+    assert.equal(offers[0].cbcs, false);
+    if (live) assert.equal(offers[0].hdr, false);
+    app.player.listeners.error('Shaka DRM error');
+    await app.advance(1000);
+    assert.equal(app.player.engine, 'avplay');
+    assert.equal(app.player.current.cencAvplay, true);
+    assert.ok(offers.every((o) => o.cenc && o.cbcs === false));
+    assert.equal(app.context.Caps.report().paths['shaka:cenc'].failed, 1);
+  }
+});
+
+test('native cbcs error learns a failure, clears the marker and falls back to cenc', async () => {
+  const offers = [];
+  const app = await boot({ capsRouting: true, settings: { hdr: false }, store: learnedStore(['shaka:cenc']), play: protectedOffers(offers) });
+  await playLive(app);
+  assert.equal(app.player.current.capsPath, 'avplay:cbcs');
+  app.player.progress = true; await app.advance(2000);
+  assert.ok(app.context.Caps.report().playing);
+  app.player.listeners.error('Player error'); await app.advance(1000);
+  assert.equal(app.context.Caps.report().paths['avplay:cbcs'].failed, 1);
+  assert.equal(app.player.current.capsPath, 'avplay:cenc');
+  assert.equal(app.player.current.cencAvplay, true);
+});
+
+test('multiview offers also exclude encrypted HDR when native cbcs is avoided', async () => {
+  const offers = [];
+  const app = await premiumHdr({ store: learnedStore(['avplay:cbcs']), play: (id, channel, opts) => {
+    offers.push(opts);
+    return opts.cbcs === false ? Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8' }) : premiumOffer(id, channel);
+  } });
+  await play(app, 'Race');
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(3000);
+  assert.ok(app.player.current.grid);
+  assert.ok(app.player.current.grid.streams.every((s) => !s.hdrEncrypted));
+  assert.ok(offers.every((o) => o.cbcs === false));
+});
+
+test('About shows what the app learned about playback on this TV, in words, and can forget it', async () => {
+  const store = learnedStore(['avplay:cbcs']);
+  const record = JSON.parse(store['f1tv.caps']);
+  record.paths['shaka:cenc'] = { ok: 3, failed: 1, crashed: 0, last: NOW };
+  store['f1tv.caps'] = JSON.stringify(record);
+  const app = await boot({ store });
+  await app.press('UP');
+  await app.pick(/^Nicholas$/, ['RIGHT']);
+  const row = app.$('list-inner').querySelectorAll('.list-row').find((r) => /^Playback on this TV/.test(r.textContent));
+  assert.equal(row.textContent, 'Playback on this TVLearned from 6 video starts');
+  await app.pick(/^Playback on this TV/, ['DOWN']);
+  const text = app.$('dialog-text').textContent;
+  assert.equal(app.$('dialog-title').textContent, 'Playback on this TV');
+  assert.match(text, /• cenc: yes\n• cbcs: no/);
+  assert.match(text, /• Shaka, CENC: 3 played, 1 failed, 0 crashed\n/);
+  assert.match(text, /• AVPlay, CBCS: 0 played, 0 failed, 2 crashed \(avoided\)/);
+  assert.match(text, /• AVPlay, 4K HDR: not tried yet/);
+  // Forget: everything learned goes, the browser check stays.
+  await app.pick(/^Forget$/, ['RIGHT']);
+  assert.deepEqual(app.context.Caps.report().paths, {});
+  assert.equal(app.context.Caps.report().browser.cenc, true);
+  assert.match(app.toast(), /Forgotten/);
 });
