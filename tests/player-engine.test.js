@@ -304,6 +304,49 @@ test('the outgoing Shaka feed reaching its end during a feed switch does not end
   assert.equal(ended, 0);
 });
 
+test('a Shaka unload that never finishes holds the next load for 10 s at most', async () => {
+  const av = fakeAvPlay();
+  const timers = [];
+  const P = await player(av, undefined, undefined, { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; }, clearTimeout: () => {} });
+  const clear = { url: 'https://ott-video-fer-cf.formula1.com/x/index.m3u8', licenseUrl: '', multiFeed: true, info: { dynamic: false } };
+  await P.load(clear, null).catch(() => {});
+  assert.equal(P.engineName(), 'shaka');
+  P.context.shaka.Player.prototype.unload = () => new Promise(() => {});   // never finishes
+  const next = P.load(Object.assign({}, clear, { multiFeed: false }), null);
+  for (let k = 0; k < 5; k++) await new Promise(setImmediate);
+  assert.ok(!names(av).includes('open'), 'waits for the unload first');
+  const limit = timers.find((t) => t.ms === 10000);
+  assert.ok(limit, 'a limit: ' + timers.map((t) => t.ms).join());
+  limit.fn();
+  await next;
+  assert.equal(P.engineName(), 'avplay');
+  assert.ok(names(av).includes('open'));
+});
+
+test('after a Shaka unload that never finished, the next Shaka load gets fresh players', async () => {
+  const timers = [];
+  const P = await player(fakeAvPlay(), undefined, undefined,
+    { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; }, clearTimeout: () => {} });
+  const clear = { url: 'https://ott-video-fer-cf.formula1.com/x/index.m3u8', licenseUrl: '', multiFeed: true, info: { dynamic: false } };
+  await P.load(clear, null).catch(() => {});   // on Shaka (the fake stream fails to load, which is enough here)
+  const Old = P.context.shaka.Player, destroyed = [], fresh = [];
+  Old.prototype.unload = () => new Promise(() => {});   // the old players never finish unloading
+  Old.prototype.destroy = function () { destroyed.push(this); return new Promise(() => {}); };
+  P.context.shaka.Player = class extends Old {
+    constructor() { super(); fresh.push(this); }
+    unload() { return Promise.resolve(); }
+    load(url) { this.loaded = url; return Promise.reject(new Error('recorded')); }   // the fake video can't play
+  };
+  const next = P.load(Object.assign({}, clear, { url: 'https://ott-video-fer-cf.formula1.com/y/index.m3u8' }), null);
+  for (let k = 0; k < 5; k++) await new Promise(setImmediate);
+  timers.find((t) => t.ms === 10000).fn();
+  await next.catch(() => {});
+  assert.equal(P.engineName(), 'shaka');
+  assert.equal(destroyed.length, 2, 'both stuck players dropped');
+  assert.equal(fresh.length, 2, 'a fresh player per slot');
+  assert.ok(fresh.some((p) => p.loaded === 'https://ott-video-fer-cf.formula1.com/y/index.m3u8'), 'the new video loads on a fresh player');
+});
+
 test('unloading waits for preparation, then stops and closes the native player', async () => {
   const av = fakeAvPlay();
   const P = await player(av);

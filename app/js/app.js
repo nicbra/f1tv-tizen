@@ -1244,6 +1244,8 @@
   // player
 
   var loadingFeed = false;   // a playFeed load is running
+  var feedLoadSeq = 0;       // only the current load may release the queue
+  var feedLoadTimer = null;  // bounds how long a load can hold the queue
   var playerExits = 0;       // counts leavePlayer calls: a load that outlives one was abandoned by the viewer
   var queuedFeed = null;     // the latest request made meanwhile: [i, opts]
   var switchPause = null;    // during a feed switch: whether the viewer wants it paused (keys pressed meanwhile count)
@@ -1255,13 +1257,16 @@
   function playFeed(i, opts) {
     if (loadingFeed) { queuedFeed = [i, opts]; return; }
     loadingFeed = true;
-    var finished = false;
+    var seq = ++feedLoadSeq, finished = false;
     function done() {
-      if (finished) return;
+      if (finished || seq !== feedLoadSeq) return;
       finished = true;
+      clearTimeout(feedLoadTimer);
+      feedLoadTimer = null;
       loadingFeed = false;
       if (queuedFeed) { var q = queuedFeed; queuedFeed = null; playFeed(q[0], q[1]); }
     }
+    feedLoadTimer = setTimeout(done, 30000);
     loadFeed(i, opts).then(done, done);
   }
 
@@ -1527,7 +1532,7 @@
     });
   }
 
-  /** A rounded rectangle path (no ctx.roundRect in this browser). */
+  /** A rounded rectangle path (no ctx.roundRect in this browser; r 0: square corners). */
   function roundedRect(ctx, x, y, w, h, r) {
     ctx.beginPath();
     ctx.moveTo(x + r, y);
@@ -1536,6 +1541,15 @@
     ctx.arcTo(x, y + h, x, y, r);
     ctx.arcTo(x, y, x + w, y, r);
     ctx.closePath();
+  }
+
+  /** Whether a layout's places put a feed over the big one (picture in picture). */
+  function mvHasInset(rects) {
+    var areas = rects.map(function (r) { return r.width * r.height; }), most = Math.max.apply(Math, areas);
+    var big = areas.filter(function (a) { return a === most; }).length === 1 ? rects[areas.indexOf(most)] : null;
+    return !!big && rects.some(function (r) {
+      return r !== big && r.left < big.left + big.width && r.left + r.width > big.left && r.top < big.top + big.height && r.top + r.height > big.top;
+    });
   }
 
   /**
@@ -1567,7 +1581,10 @@
    */
   function mvSoftStart(stream, retried) {
     var g = stream.grid;
+    mvSoftShown = false;
+    mvFrames();
     MvSoftware.start({ streams: g.streams.slice(1), rects: mvPlaces(g.layout).slice(1), canvas: $('mv-soft'),
+      onShown: function () { if (Player.stream() !== stream) return; mvSoftShown = true; mvFrames(); },
       clock: { position: function () { return Player.exactPosition(); }, playing: function () { return Player.stream() === stream && !Player.isPaused(); } },
       onError: function (e) {
         if (Player.stream() !== stream || screen !== 'player') return;
@@ -1583,13 +1600,17 @@
       } });
   }
 
-  function mvSoftStop() { if (typeof MvSoftware !== 'undefined') MvSoftware.stop(); }
+  var mvSoftShown = false;   // the H.264 multiview's small feeds have their first picture
+
+  function mvSoftStop() { mvSoftShown = false; if (typeof MvSoftware !== 'undefined') MvSoftware.stop(); }
 
   function mvFrames() {
     var s = screen === 'player' && Player.stream(), grid = s && s.grid, box = $('mv-frames');
     var shown = grid && mvLayouts() && (grid.shown || grid), labels = Settings.get('mvLabels') !== false;
     var align = shown ? mvAlign(shown.layout) : '';
-    var key = shown ? shown.layout + '|' + shown.slots.join() + '|' + labels + '|' + align + '|' + (grid.engine || '') : '';
+    // H.264: until the small feeds' first picture, only the big feed gets its frame and name (mvSoftShown).
+    var waiting = !!shown && grid.engine === 'h264' && !mvSoftShown;
+    var key = shown ? shown.layout + '|' + shown.slots.join() + '|' + labels + '|' + align + '|' + (grid.engine || '') + '|' + waiting : '';
     if (key === mvDrawn) return;
     mvDrawn = key;
     box.innerHTML = '';
@@ -1603,10 +1624,21 @@
     if (soft) MvSoftware.place(places.slice(1));
     if (!key) return placeSubtitles(null);
     var M = 6, R = 16;   // margin from the feed's edge, corner radius (screen pixels)
-    var rects = places.map(function (r) {
-      return { left: r.left + M, top: r.top + M, width: r.width - 2 * M, height: r.height - 2 * M };
+    // Picture in picture: square corners, and no margin on the screen's edges (the big feed none at all); only
+    // where the inset meets the big feed is there a margin.
+    var pip = mvHasInset(places), radius = pip ? 0 : R;
+    var rects = places.map(function (p) {
+      var e = pip ? { l: p.left <= 1, t: p.top <= 1, r: p.left + p.width >= 1919, b: p.top + p.height >= 1079 } : {};
+      var l = e.l ? p.left : p.left + M, t = e.t ? p.top : p.top + M;
+      var r = e.r ? p.left + p.width : p.left + p.width - M, b = e.b ? p.top + p.height : p.top + p.height - M;
+      return { left: l, top: t, width: r - l, height: b - t };
     });
     placeSubtitles(rects);
+    if (waiting) {
+      rects = rects.slice(0, 1);
+      var names = shown.slots.slice(1).map(function (i) { var fd = feedsCtx && feedsCtx.feeds[i]; return fd ? fd.title : ''; });
+      box.appendChild(el('div', 'mv-loading', 'Loading ' + names.filter(Boolean).join(', ') + '…'));
+    }
     var canvas = el('canvas', 'mv-mask'), ctx = canvas.getContext && canvas.getContext('2d');
     canvas.width = 1920;
     canvas.height = 1080;
@@ -1617,10 +1649,10 @@
       rects.forEach(function (r) {
         // An inset over an earlier feed gets its black margin back, then its own hole.
         ctx.globalCompositeOperation = 'source-over';
-        roundedRect(ctx, r.left - 2 * M, r.top - 2 * M, r.width + 4 * M, r.height + 4 * M, R + 2 * M);
+        roundedRect(ctx, r.left - 2 * M, r.top - 2 * M, r.width + 4 * M, r.height + 4 * M, radius && radius + 2 * M);
         ctx.fill();
         ctx.globalCompositeOperation = 'destination-out';
-        roundedRect(ctx, r.left, r.top, r.width, r.height, R);
+        roundedRect(ctx, r.left, r.top, r.width, r.height, radius);
         ctx.fill();
       });
       ctx.globalCompositeOperation = 'source-over';
@@ -1640,13 +1672,13 @@
 
   /**
    * Where subtitles go in a multiview (`rects`: the feeds on screen; null: one feed, the usual place): at the
-   * bottom of the big feed when the layout has one, else across the whole picture. Clear of an inset over the
-   * big feed, and above the player bar when it shows.
+   * bottom of the big feed when the layout has one, else across the whole picture, above the player bar when it
+   * shows. Picture in picture (an inset over the big feed) keeps the usual place, as with one feed.
    */
   function placeSubtitles(rects) {
-    var box = $('subtitle');
-    box.classList.toggle('mv', !!rects);
-    if (!rects) return;
+    var box = $('subtitle'), inset = !!rects && mvHasInset(rects);
+    box.classList.toggle('mv', !!rects && !inset);
+    if (!rects || inset) return;
     var areas = rects.map(function (r) { return r.width * r.height; }), most = Math.max.apply(Math, areas);
     var big = areas.filter(function (a) { return a === most; }).length === 1 ? rects[areas.indexOf(most)] : null;
     var t = big || rects.reduce(function (u, r) {
@@ -1655,11 +1687,6 @@
         height: Math.max(u.top + u.height, r.top + r.height) - top };
     });
     var cx = t.left + t.width / 2, bottomY = t.top + t.height, half = t.width / 2 - 24;
-    // An inset in the big feed's lower part: the lines stay beside it.
-    rects.forEach(function (r) {
-      if (r === t || r.top > bottomY || r.top + r.height < bottomY - 220 || r.left > t.left + t.width || r.left + r.width < t.left) return;
-      half = Math.min(half, r.left >= cx ? r.left - cx - 24 : cx - (r.left + r.width) - 24);
-    });
     var bottom = 1080 - bottomY + 28;
     box.style.setProperty('--sub-x', Math.round(cx) + 'px');
     box.style.setProperty('--sub-width', Math.max(400, Math.round(half * 2)) + 'px');
@@ -2148,11 +2175,15 @@
   /** Stops playback and clears the player's overlays, staying on the player screen. */
   function leavePlayer() {
     playerExits++;
+    feedLoadSeq++;
+    clearTimeout(feedLoadTimer);
+    feedLoadTimer = null;
     mvAhead = null;   // prepared for this video only
     clearWatching();
     queuedFeed = null;   // a feed switch asked for while loading must not restart playback
     liveFocus = false;
     saveProgress();
+    loadingFeed = false;
     if (scrub) scrubCancel();
     pending = null;
     closePanel();
@@ -3112,7 +3143,6 @@
     // During a jump the pending-seek logic owns the spinner (it waits a moment before showing it).
     Player.on('buffering', function (b) {
       if (!pending) $('spinner').classList.toggle('hidden', !b);
-      mvBuffering(b);
     });
     setInterval(checkPending, 100);
     Player.on('ended', function () {

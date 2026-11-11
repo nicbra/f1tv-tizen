@@ -87,7 +87,7 @@ var MvSoftware = (function () {
   /**
    * Starts the small feeds. opts: { streams: the small feeds' offers (layout order), rects: [{ left, top, width,
    * height }] where each shows (screen pixels), clock: { position() (s, the big feed's), playing() },
-   * canvas: the element to draw on, onError(e) }. Resolves once it plays (or failed: onError).
+   * canvas: the element to draw on, onError(e), onShown() (the first picture is drawn) }. Resolves once it plays (or failed: onError).
    */
   function start(opts) {
     var requested = ++gen;
@@ -161,7 +161,6 @@ var MvSoftware = (function () {
       c.width = box.width; c.height = box.height;
       c.style.left = box.left + 'px'; c.style.top = box.top + 'px';
       c.style.width = box.width + 'px'; c.style.height = box.height + 'px';
-      c.classList.remove('hidden');
       var offscreen = c.transferControlToOffscreen();
       var w = run.worker = new Worker('js/mvsoft-worker.js');
       run.ready = new Promise(function (ok) { run.readyNow = ok; });
@@ -169,6 +168,12 @@ var MvSoftware = (function () {
       w.onmessage = function (e) {
         var d = e.data;
         if (d.stats) run.stats = d.stats;
+        // The canvas shows from the first picture on (until then the page says the feeds are loading: onShown).
+        if (d.stats && d.stats.pulled > 0 && !run.shown && cur === run && !run.stopped) {
+          run.shown = true;
+          c.classList.remove('hidden');
+          if (opts.onShown) opts.onShown();
+        }
         if (d.ready) run.readyNow();
         if (d.stopped) run.ackNow();
         if (d.error) fail(run, new Error('worker: ' + d.error));

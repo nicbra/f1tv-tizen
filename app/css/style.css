@@ -279,6 +279,8 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .mv-mask { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; }
 /* H.264 multiview: the small feeds (software-decoded, js/mvsoft.js), under the mask and names. */
 .mv-soft { position: absolute; z-index: 4; pointer-events: none; }
+.mv-loading { position: absolute; left: 50%; bottom: 32px; transform: translateX(-50%); padding: 6px 16px; border-radius: 8px;
+  background: rgba(0, 0, 0, 0.66); color: #fff; font-size: 26px; white-space: nowrap; }
 .mv-label { position: absolute; display: flex; align-items: center; padding: 3px 10px; border-radius: 8px;
   background: rgba(0, 0, 0, 0.6); font-size: 20px; font-weight: 700; white-space: nowrap; }
 .mv-label .feed-num { margin-right: 6px; }

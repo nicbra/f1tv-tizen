@@ -155,6 +155,10 @@ var Player = (function () {
     }
 
     function load(stream, startTime) {
+      return renewStuck().then(function () { return loadSlot(stream, startTime); });
+    }
+
+    function loadSlot(stream, startTime) {
       var slot = slots[cur], gen = ++generation;
       configure(slot, stream);
       slot.v.muted = false;
@@ -297,11 +301,36 @@ var Player = (function () {
       return { audio: P().getAudioLanguages().map(lang), text: P().getTextLanguages().map(lang) };
     }
 
+    // Slots whose Shaka player didn't finish unloading in time (see unload): replaced before the next load.
+    var stuckSlots = [];
+
     function unload() {
       licenseHeaders = {};
       generation++;
       slots.forEach(function (s) { s.v.classList.add('hidden'); s.v.style.zIndex = ''; });
-      return Promise.all(slots.map(function (s) { return s.p.unload(); }));
+      // Shaka's unload has been seen never to finish on the TV (2026-11-11, switching to a multiview): the next load
+      // waits for it (Player.unload's teardown), so it gets 10 s; then the next load goes on, and a Shaka load first
+      // gets fresh players for the slots still unloading (renewStuck).
+      var pending = slots.slice(), timer;
+      var done = Promise.all(slots.map(function (s) {
+        return s.p.unload().then(function () { pending.splice(pending.indexOf(s), 1); });
+      })).then(function () { clearTimeout(timer); });
+      return Promise.race([done, new Promise(function (ok) {
+        timer = setTimeout(function () { stuckSlots = stuckSlots.concat(pending); ok(); }, 10000);
+      })]);
+    }
+
+    /** New Shaka players on the same video elements for the slots whose old player never finished unloading. */
+    function renewStuck() {
+      var old = stuckSlots;
+      stuckSlots = [];
+      return Promise.all(old.map(function (s) {
+        try { s.p.destroy(); } catch (e) { /* stuck already: it is dropped either way */ }
+        return makeSlot(s.v).then(function (fresh) {
+          var k = slots.indexOf(s);
+          if (k >= 0) slots[k] = fresh;
+        });
+      }));
     }
 
     return {

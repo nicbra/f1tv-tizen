@@ -641,6 +641,75 @@ test('stopping while a load runs drops a feed switch asked for meanwhile', async
   assert.equal(app.screen(), 'feeds');
 });
 
+test('leaving the player frees a load that never settles for the next feed', async () => {
+  const app = await boot();
+  app.player.hold = deferred();
+  await play(app, 'Race');
+  await app.press('CH_DOWN');           // a queued switch must be dropped on exit
+  await app.stop();
+  assert.equal(app.screen(), 'feeds');
+  app.player.hold = null;
+  await app.pick(/^INTERNATIONAL/);
+  assert.equal(app.screen(), 'player');
+  assert.equal(app.player.loads.length, 2);
+  assert.equal(app.player.loads.at(-1).url, 'https://cdn/101/main.m3u8');
+});
+
+test('a load that never settles releases the queued feed after 30 seconds', async () => {
+  const app = await boot();
+  await app.pick(/^Race/);
+  await app.advance(100);
+  app.player.hold = deferred();
+  const started = app.clock.now();
+  await app.press('ENTER');             // INTERNATIONAL: held inside the player
+  await app.press('CH_DOWN');           // F1 LIVE: queued
+  app.player.hold = null;
+  await app.advance(30000 - (app.clock.now() - started) - 1);
+  assert.equal(app.player.loads.length, 1, 'keep serializing before the deadline');
+  await app.advance(1);
+  assert.equal(app.player.loads.length, 2, 'start the queued feed at the deadline');
+  assert.equal(app.player.loads.at(-1).url, 'https://cdn/101/1033.m3u8');
+});
+
+test('a late load completion cannot release a newer load or its queued feed', async () => {
+  for (const abandoned of [true, false]) {
+    const app = await boot();
+    const old = deferred(), newer = deferred();
+    app.player.hold = old;
+    await play(app, 'Race');
+    if (abandoned) {
+      await app.stop();
+      app.player.hold = newer;
+      await app.pick(/^F1 LIVE/);
+    } else {
+      await app.press('CH_DOWN');
+      app.player.hold = newer;
+      await app.advance(30000);
+    }
+    assert.equal(app.player.loads.length, 2, abandoned ? 'restart after exit' : 'restart after timeout');
+    await app.press('CH_DOWN');         // onboard: waits for the newer load
+    old.resolve();
+    await app.advance(0);
+    assert.equal(app.player.loads.length, 2, 'the old completion must not start the onboard');
+    await app.press('RIGHT');
+    assert.match(app.toast(), /Loading/, 'the newer load must still count as loading');
+    app.player.hold = null;
+    newer.resolve();
+    await app.advance(0);
+    assert.equal(app.player.loads.length, 3, 'the newer completion releases its queue');
+    assert.equal(app.player.loads.at(-1).url, 'https://cdn/101/1009.m3u8');
+  }
+});
+
+test('buffering shows the spinner and passes on without an error (the player\'s own stall handling runs after it)', async () => {
+  const app = await boot();
+  await play(app, 'Race');
+  assert.doesNotThrow(() => app.player.listeners.buffering(true));
+  assert.ok(!app.$('spinner').classList.contains('hidden'));
+  assert.doesNotThrow(() => app.player.listeners.buffering(false));
+  assert.ok(app.$('spinner').classList.contains('hidden'));
+});
+
 test('BACK on the feed list while the session renews does not start the video', async () => {
   const app = await boot();
   await app.pick(/^Race/);
@@ -1182,9 +1251,16 @@ test('an H.264 replay (no HEVC) offers the layouts with a big feed: AVPlay shows
   assert.equal(o.rects.length, 2);
   assert.ok(o.rects.every((x) => x.left >= r[0] + r[2] - 1), 'the small places are right of the big one');
   assert.equal(o.canvas, app.$('mv-soft'));
-  // The same frames and names over them as for the HEVC grids.
+  // Until the small feeds have a picture: only the big feed's frame and name, and a line saying they load.
   await app.advance(600);
-  assert.equal(app.$('mv-frames').children.filter((c) => /mv-label/.test(c.className)).length, 3);
+  const frames = () => app.$('mv-frames').children;
+  assert.equal(frames().filter((c) => /mv-label/.test(c.className)).length, 1);
+  assert.match(frames().filter((c) => /mv-loading/.test(c.className))[0].textContent, /^Loading .+, .+…$/);
+  // Then the same frames and names over them as for the HEVC grids.
+  o.onShown();
+  await app.advance(600);
+  assert.equal(frames().filter((c) => /mv-label/.test(c.className)).length, 3);
+  assert.equal(frames().filter((c) => /mv-loading/.test(c.className)).length, 0);
   // No sound choice: only the big feed has sound.
   await app.press('UP');
   assert.ok(!/Sound from/.test(app.$('panel-list').textContent));
@@ -1313,6 +1389,24 @@ async function playingBig2(app) {
   app.player.current.grid.id = 'g1';
   return app.player.current.grid;
 }
+
+test('subtitles in picture in picture keep the usual place, as with one feed', async () => {
+  for (const name of ['Picture in picture ½', 'Picture in picture ⅓']) {
+    const app = await premiumHdr({ play: premiumOffer, settings: { subtitles: 'eng' } });
+    app.player.kind = 'avplay';
+    await play(app, 'Race');
+    await app.press('UP');
+    await app.pick(/^Multiview/, ['UP']);
+    await app.pick(new RegExp('^' + name + '$'), ['RIGHT']);
+    await app.pick(/^Show multiview/, ['DOWN']);
+    await app.advance(3600);
+    assert.equal(app.player.current.grid.layout.slice(0, 3), 'pip');
+    app.player.listeners.subtitle({ text: 'Box, box', ms: 3000 });
+    const box = app.$('subtitle');
+    assert.ok(!box.classList.contains('hidden'));
+    assert.ok(!box.classList.contains('mv'), name + ': the usual place');
+  }
+});
 
 test('a failed rearrangement does not bring the viewer back to the player after they left', async () => {
   const app = await premiumHdr({ play: premiumOffer });
@@ -1892,7 +1986,8 @@ test('a feed asked for while an abandoned load finishes is dropped when the view
   await app.pick(/^INTERNATIONAL/);          // waits for its stream
   await app.press('BACK', 'BACK');           // bar, then stop: back on the feed list, the load still out
   assert.equal(app.screen(), 'feeds');
-  await app.press('ENTER');                  // picked again: queued behind it
+  await app.press('ENTER');                  // picked again: starts immediately despite the abandoned load
+  await app.stop();
   await app.press('BACK');                   // and back to Home after all
   assert.equal(app.screen(), 'browse');
   stream.resolve({ url: 'https://cdn/101/main.m3u8', streamType: 'HLS' });

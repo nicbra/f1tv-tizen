@@ -1,22 +1,12 @@
 /*
- * StitchX: several H.264 feeds stacked into one picture by rewriting slice headers only, also when the feeds are NOT
- * encoded in lockstep (frame types, decode order and references differ per feed, as F1's 2018-2024 replays do).
+ * StitchX: interleave H.264 feeds into one stream, each picture a whole frame of one feed. The feeds may have
+ * different frame types, decode orders and references. Slice payloads are copied unchanged; headers carry the
+ * new frame numbers, picture order, explicit reference lists and reference marking. Each segment starts with
+ * an intra frame in every feed and is planned independently. An optional coded row identifies the picture's feed.
  *
- * How: every feed's slices are copied unchanged into a region (full width, regions stacked); only headers change.
- * - Stitched pictures are issued in display-time order of the feeds' next frames: a picture carries the REAL slices
- *   of the feeds whose next frame (in their own decode order) is due at that display time T, and COPY slices (all
- *   P_Skip from one chosen reference picture: an exact copy) for the others. The last picture issued for each T is
- *   "complete": every region shows its feed at T (copied from where that frame was decoded).
- * - Each REAL slice gets an explicit reference list (ref_pic_list_modification) pointing every original reference at
- *   the stitched picture where that frame was decoded; reference marking is explicit (MMCO), so each picture stays
- *   exactly as long as a later slice or copy needs it.
- * - POC = 2T + d (d: the extra pictures at the same T), so implicit weighted bi-prediction and temporal direct see
- *   the original POC distances in the common case (d = 0).
- * Segments start with an IDR frame in every feed: each segment is planned on its own.
- *
- * StitchX.stitchSegment(feeds, opts) -> { aus: [Uint8Array Annex B access units], pictures: plan, sps, info }
- *   feeds[f]: the feed's access units of one segment in decode order, as TsDemux gives them: [{ data (Annex B), pts }].
- *   Display times come from the PTS (the feeds share one clock; POC restarts at every IDR, PTS doesn't).
+ * StitchX.interleaveSegment(feeds, opts) -> { aus: [Uint8Array Annex B access units], pictures: plan, sps, info }
+ *   feeds[f]: access units of one segment in decode order, as TsDemux gives them: [{ data (Annex B), pts }].
+ *   Display times come from PTS (the feeds share one clock; POC restarts at every IDR, PTS does not).
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
@@ -215,12 +205,7 @@
   function writePps(p) {
     var w = new Writer();
     w.ue(0); w.ue(0); w.u(1, 1); w.u(1, 0);
-    // Slice groups (FMO, map type 2: rectangles; the last group is what they leave). Baseline-only in the standard: an
-    // experiment for decoders that take it anyway (opts.fmo).
-    if (p.groups && p.groups.length) {
-      w.ue(p.groups.length); w.ue(2);
-      p.groups.forEach(function (g) { w.ue(g[0]); w.ue(g[1]); });
-    } else w.ue(0);
+    w.ue(0);                     // no slice groups
     w.ue(p.l0 - 1); w.ue(p.l1 - 1); w.u(1, p.weighted); w.u(2, p.bipred);
     w.se(p.initQpMinus26); w.se(p.initQsMinus26); w.se(p.chromaQpOffset);
     w.u(1, 1); w.u(1, p.constrainedIntra); w.u(1, 0);
@@ -333,9 +318,9 @@
     return w.bytes();
   }
 
-  // ---------------------------------------------------------------- CABAC (copy slices: every macroblock P_Skip)
-  var RANGE_LPS = null, TRANS_LPS = null, SKIP_INIT = null, INIT_I = null, INIT_PB = null;
-  function tables(t) { RANGE_LPS = t.rangeTabLPS; TRANS_LPS = t.transIdxLPS; SKIP_INIT = t.skipInit; INIT_I = t.initI; INIT_PB = t.initPB; }
+  // ---------------------------------------------------------------- CABAC for the feed identity row
+  var RANGE_LPS = null, TRANS_LPS = null, INIT_I = null, INIT_PB = null;
+  function tables(t) { RANGE_LPS = t.rangeTabLPS; TRANS_LPS = t.transIdxLPS; INIT_I = t.initI; INIT_PB = t.initPB; }
 
   function Cabac() { this.low = 0; this.range = 510; this.first = true; this.outstanding = 0; this.w = new Writer(); }
   Cabac.prototype.put = function (b) {
@@ -370,47 +355,19 @@
       this.w.align(0);
     } else this.renorm();
   };
-  // 9.3.4.4 EncodeBypass.
-  Cabac.prototype.bypass = function (bin) {
-    this.low <<= 1;
-    if (bin) this.low += this.range;
-    if (this.low >= 1024) { this.put(1); this.low -= 1024; }
-    else if (this.low < 512) this.put(0);
-    else { this.low -= 512; this.outstanding++; }
-  };
   function context(mn, qp) {
     var pre = Math.max(1, Math.min(126, ((mn[0] * Math.max(0, Math.min(51, qp))) >> 4) + mn[1]));
     return pre <= 63 ? { state: 63 - pre, mps: 0 } : { state: pre - 64, mps: 1 };
   }
-  // Slice data of `mbs` P_Skip macroblocks (P slice, cabac_init_idc 0, SliceQP qp): every mb_skip_flag has neighbours
-  // that are unavailable or skipped, so ctxIdxInc is 0 (ctxIdx 11); end_of_slice_flag after each macroblock.
-  var skipCache = {};
-  function skipData(mbs, qp) {
-    var key = mbs + '/' + qp;
-    if (skipCache[key]) return skipCache[key];
-    var c = new Cabac(), ctx = context(SKIP_INIT[0][0], qp);
-    for (var i = 0; i < mbs; i++) { c.decision(ctx, 1); c.terminate(i === mbs - 1 ? 1 : 0); }
-    return (skipCache[key] = c.w.bytes());
-  }
-
-  /*
-   * The frame stamp (opts.stamp): slice data for the guard row under the regions. Macroblock 0 is I_PCM with luma
-   * `value` (235: this picture is complete, 16: it is not) and chroma 128, so a renderer can tell complete pictures
-   * from the ones in between (a shader reads one texel). The other macroblocks: P_Skip (P slice; they copy the gray
-   * row) or, in the IDR picture (an I slice), I_PCM gray. CABAC (9.3): P slice with cabac_init_idc 0; the row above
-   * is another slice, so neighbour B is unavailable; I_PCM = mb_type bin then the terminate bin 1, which flushes and
-   * byte-aligns the engine (pcm_alignment_zero_bits), then the samples, then the engine starts afresh (9.3.1.2).
-   */
-  var stampCache = {};
-  // width: macroblocks per row when the slice spans several rows (intra only: mb_type's context counts the neighbour
-  // above too).
-  function stampData(mbs, value, qp, intra, width) {
-    width = width || mbs;
-    var key = mbs + '/' + value + '/' + qp + '/' + (intra ? 'I' : 'P') + '/' + width;
-    if (stampCache[key]) return stampCache[key];
+  // Feed identity: the first macroblock is I_PCM with the feed's luma value, the rest stay gray. The first picture
+  // uses an intra row; later pictures copy gray with P_Skip. The slice above is separate, so its neighbours are unavailable.
+  var tagCache = {};
+  function feedTagData(mbs, value, qp, intra) {
+    var key = mbs + '/' + value + '/' + qp + '/' + (intra ? 'I' : 'P');
+    if (tagCache[key]) return tagCache[key];
     var c = new Cabac(), init = intra ? INIT_I : INIT_PB[0];
     var ctx = function (i) { return context(init[i], qp); };
-    var skip = [ctx(11), ctx(12)], intraInP = ctx(14), notNxN = ctx(17), iType = [ctx(3), ctx(4), ctx(5)];
+    var skip = [ctx(11), ctx(12)], intraInP = ctx(14), notNxN = ctx(17), iType = [ctx(3), ctx(4)];
     function pcm(luma) {
       c.terminate(1);
       for (var i = 0; i < 256; i++) c.w.u(8, luma);
@@ -419,7 +376,7 @@
     }
     for (var m = 0; m < mbs; m++) {
       if (intra) {
-        c.decision(iType[(m % width ? 1 : 0) + (m >= width ? 1 : 0)], 1);   // mb_type bin 0 (ctxIdx 3 + condTermFlagA + B: I_PCM neighbours count)
+        c.decision(iType[m ? 1 : 0], 1);   // mb_type: only the left I_PCM neighbour is available in this row
         pcm(m === 0 ? value : 128);
       } else if (m === 0) {
         c.decision(skip[0], 0);                    // mb_skip_flag 0
@@ -431,7 +388,7 @@
       }
       c.terminate(m === mbs - 1 ? 1 : 0);          // end_of_slice_flag
     }
-    return (stampCache[key] = c.w.bytes());
+    return (tagCache[key] = c.w.bytes());
   }
 
   // ---------------------------------------------------------------- a feed's frames, references and POCs
@@ -526,136 +483,6 @@
     return list;
   }
 
-  /*
-   * Slice data for an edge picture (opts.edges): a P slice (cabac_init_idc 0, SliceQP qp, two active L0 references)
-   * covering whole macroblock rows from firstMb, every macroblock one of
-   *   { t: 'copy' }               P_L0_16x16, ref_idx 1, motion (0, 0), no residual (a copy that B frames' spatial direct
-   *                               prediction sees as non-zero-reference, see insertEdges)
-   *   { t: 'mv', ref, mv: [x, y] } P_L0_16x16, motion in quarter samples, no residual
-   *   { t: 'vert' }               I_16x16, vertical prediction (repeats the row above), chroma vertical, no residual
-   * Context selection per 9.3.3.1.1 with the neighbours A (left) and B (above) inside the slice.
-   */
-  function edgeSliceData(desc, width, firstMb, qp) {
-    var c = new Cabac(), ctxs = {};
-    var ctx = function (i) { return ctxs[i] || (ctxs[i] = context(INIT_PB[0][i], qp)); };
-    var info = [];   // per macroblock of the slice: { intra, ref, mv, mvd: [|x|, |y|] }
-    var at = function (m, dx, dy) {   // neighbour in the slice, or null
-      var a = firstMb + m, col = a % width, n = a + dx + dy * width;
-      if (col + dx < 0 || col + dx >= width || n < firstMb || n >= a) return null;
-      return info[n - firstMb] || null;
-    };
-    function mvPred(m, ref) {
-      var A = at(m, -1, 0), B = at(m, 0, -1), C = at(m, 1, -1) || at(m, -1, -1);
-      var geoB = B !== null, geoC = C !== null;
-      var pick = function (N) { return N && !N.intra ? { ref: N.ref, mv: N.mv } : { ref: -1, mv: [0, 0] }; };
-      var a = pick(A), b = pick(B), cc = pick(C);
-      if (!geoB && !geoC && A) { b = a; cc = a; }
-      var same = [a, b, cc].filter(function (x) { return x.ref === ref; });
-      if (same.length === 1) return same[0].mv.slice();
-      var med = function (x, y, z) { return Math.max(Math.min(x, y), Math.min(Math.max(x, y), z)); };
-      return [med(a.mv[0], b.mv[0], cc.mv[0]), med(a.mv[1], b.mv[1], cc.mv[1])];
-    }
-    function mvdComp(v, base, sum) {
-      var abs = Math.abs(v);
-      var inc = sum < 3 ? 0 : sum > 32 ? 2 : 1;
-      for (var b = 0; b < Math.min(abs, 9) + (abs < 9 ? 1 : 0); b++) {
-        var bin = b < Math.min(abs, 9) ? 1 : 0;
-        c.decision(ctx(base + (b === 0 ? inc : Math.min(b + 2, 6))), bin);
-      }
-      if (abs >= 9) {   // EG3 suffix
-        var s = abs - 9, k = 3;
-        while (s >= (1 << k)) { c.bypass(1); s -= (1 << k); k++; }
-        c.bypass(0);
-        while (k--) c.bypass((s >> k) & 1);
-      }
-      if (abs) c.bypass(v < 0 ? 1 : 0);
-    }
-    desc.forEach(function (d, m) {
-      var A = at(m, -1, 0), B = at(m, 0, -1);
-      c.decision(ctx(11 + (A ? 1 : 0) + (B ? 1 : 0)), 0);   // mb_skip_flag 0 (no neighbour is skipped)
-      if (d.t === 'vert') {
-        c.decision(ctx(14), 1);                 // mb_type prefix: intra
-        c.decision(ctx(17), 1);                 // not I_NxN
-        c.terminate(0);                         // not I_PCM
-        c.decision(ctx(18), 0);                 // luma cbp 0
-        c.decision(ctx(19), 0);                 // chroma cbp 0
-        c.decision(ctx(20), 0); c.decision(ctx(20), 0);   // Intra16x16PredMode 0: vertical
-        // intra_chroma_pred_mode 2 (vertical): TU 1 1 0
-        var chromaInc = (A && A.intra && A.chroma ? 1 : 0) + (B && B.intra && B.chroma ? 1 : 0);
-        c.decision(ctx(64 + chromaInc), 1); c.decision(ctx(67), 1); c.decision(ctx(67), 0);
-        c.decision(ctx(60), 0);                 // mb_qp_delta 0 (the previous macroblock had none)
-        // Intra16x16DCLevel coded_block_flag 0: an unavailable neighbour counts 1 for an intra macroblock, an inter one 0,
-        // an I_16x16 one its own flag (0).
-        var cbf = (A ? 0 : 1) + 2 * (B ? 0 : 1);
-        c.decision(ctx(85 + cbf), 0);
-        info[m] = { intra: true, chroma: 2, ref: -1, mv: [0, 0], mvd: [0, 0] };
-      } else {
-        var ref = d.t === 'copy' ? 1 : d.ref, mv = d.t === 'copy' ? [0, 0] : d.mv;
-        c.decision(ctx(14), 0); c.decision(ctx(15), 0); c.decision(ctx(16), 0);   // P_L0_16x16
-        // ref_idx_l0 (unary): bin 0 counts neighbours with ref_idx > 0
-        var refInc = (A && !A.intra && A.ref > 0 ? 1 : 0) + 2 * (B && !B.intra && B.ref > 0 ? 1 : 0);
-        for (var r = 0; r <= ref; r++) c.decision(ctx(54 + (r === 0 ? refInc : r === 1 ? 4 : 5)), r < ref ? 1 : 0);
-        var p = mvPred(m, ref), mvd = [mv[0] - p[0], mv[1] - p[1]];
-        mvdComp(mvd[0], 40, (A ? A.mvd[0] : 0) + (B ? B.mvd[0] : 0));
-        mvdComp(mvd[1], 47, (A ? A.mvd[1] : 0) + (B ? B.mvd[1] : 0));
-        // coded_block_pattern 0: luma bins see a neighbour 8x8 block as 1 when it is available (none has coefficients),
-        // chroma bin 0 sees 0 for every neighbour (no chroma coefficients anywhere).
-        var a = A ? 1 : 0, b = B ? 1 : 0;
-        c.decision(ctx(73 + a + 2 * b), 0);   // block 0: left MB, upper MB
-        c.decision(ctx(73 + 1 + 2 * b), 0);   // block 1: block 0, upper MB
-        c.decision(ctx(73 + a + 2), 0);       // block 2: left MB, block 0
-        c.decision(ctx(73 + 3), 0);           // block 3: block 2, block 1
-        c.decision(ctx(77), 0);               // chroma: none
-        info[m] = { intra: false, ref: ref, mv: mv, mvd: [Math.abs(mvd[0]), Math.abs(mvd[1])] };
-      }
-      c.terminate(m === desc.length - 1 ? 1 : 0);
-    });
-    return c.w.bytes();
-  }
-
-  // ---------------------------------------------------------------- the plan
-  /*
-   * Stitched pictures for one segment. Each: { T, d, regions: [{ real: frame } | { copy: pictureIndex }], complete }.
-   * Greedy: the earliest display time among the feeds' next frames (in their own decode order) goes next.
-   */
-  function plan(feeds, group) {
-    var n = feeds.length, next = feeds.map(function () { return 0; }), at = feeds.map(function () { return {}; });
-    var pics = [], perT = {};
-    function left() { return feeds.some(function (f, k) { return next[k] < f.frames.length; }); }
-    while (left()) {
-      // The next display time: the earliest among the feeds' next frames, or (opts.group) the one most feeds are ready
-      // for (fewer pictures when feeds diverge), earliest on a tie.
-      var T = Infinity, votes = {};
-      feeds.forEach(function (f, k) { if (next[k] < f.frames.length) { var t = f.frames[next[k]].T; T = Math.min(T, t); votes[t] = (votes[t] || 0) + 1; } });
-      if (group) Object.keys(votes).forEach(function (t) { t = +t; if (votes[t] > votes[T] || (votes[t] === votes[T] && t < T)) T = t; });
-      var pic = { T: T, d: perT[T] = (perT[T] === undefined ? 0 : perT[T] + 1), regions: [] };
-      feeds.forEach(function (f, k) {
-        var fr = next[k] < f.frames.length ? f.frames[next[k]] : null;
-        if (fr && fr.T === T) { pic.regions[k] = { real: fr }; fr.pic = pics.length; at[k][T] = pics.length; next[k]++; }
-      });
-      feeds.forEach(function (f, k) {
-        if (pic.regions[k]) return;
-        // This feed's frame at T, if decoded already; else whatever the previous picture shows there.
-        pic.regions[k] = { copy: at[k][T] !== undefined ? at[k][T] : pics.length - 1 };
-      });
-      // The first picture becomes the IDR picture: every feed must start with an intra frame (IDR, or an I frame).
-      if (pics.length === 0 && pic.regions.some(function (r) { return !r.real || r.real.slices.some(function (s) { return s.head.sliceType !== 2; }); })) throw new Error('feeds must all start with an intra frame');
-      pic.complete = feeds.every(function (f, k) { return at[k][T] !== undefined; });
-      pics.push(pic);
-    }
-    return pics;
-  }
-
-  /*
-   * opts.lanes: a lane is a group of feeds whose frames come in the same order (display indices in decode order) all
-   * through the segment; each picture carries one lane's frames, and lane k of n gets POC nT + k (2T + k for one or two
-   * lanes). POCs stay unique (H.264 8.2.1) and each feed's POC distances are its original ones (2 per frame) times
-   * n/2: for one or two lanes the original exactly; for more, H.264's implicit weights (DistScaleFactor >> 2) still come
-   * out the same for every pair of references within ~10 frames (checked per B slice: info.lanesMismatch counts
-   * reference pairs whose weights or temporal-direct scaling would change; 0 = exact). The last lane's frame T waits
-   * until every other lane's frame T is in, so its picture, shown last at T, is complete; the others are shown for 1 ms.
-   * The IDR picture holds all first frames; copies of it (POC 1 .. n-1) stand in for the other lanes' first frames.
-   */
   function implicitWeight(tb, td) {
     var clip = function (a, b, x) { return Math.max(a, Math.min(b, x)); };
     tb = clip(-128, 127, tb); td = clip(-128, 127, td);
@@ -663,136 +490,14 @@
     var tx = ((16384 + Math.abs((td / 2) | 0)) / td) | 0, dsf = clip(-1024, 1023, (tb * tx + 32) >> 6);
     return { w: (dsf >> 2) < -64 || (dsf >> 2) > 128 ? 32 : dsf >> 2, dsf: dsf };
   }
-  function planLanes(feeds) {
-    var n = feeds.length;
-    // POC 2T: the original distances when a feed's POC is 2 x its display index since its last IDR (x264, and F1 as far
-    // as seen); a B slice and its references are always inside one IDR period.
-    feeds.forEach(function (f, k) {
-      var tIdr = 0;
-      f.frames.forEach(function (fr) {
-        if (fr.idr) tIdr = fr.T;
-        if (fr.poc !== 2 * (fr.T - tIdr)) throw new Error('lanes: feed ' + k + ' POC ' + fr.poc + ' at display index ' + fr.T + ' (needs 2 x the index since its IDR)');
-      });
-      if (f.frames[0].T !== 0) throw new Error('lanes: feed ' + k + ' does not start with its first frame shown');
-      if (f.frames[0].slices.some(function (sl) { return sl.head.sliceType !== 2; })) throw new Error('feeds must all start with an intra frame');
-    });
-    // Lanes are groups of feeds whose frames come in the same order (display indices in decode order) all through the
-    // segment: such feeds share their pictures (F1's feeds often match; one picture per display time when all do).
-    var groups = [], laneOf = [];
-    feeds.forEach(function (f, k) {
-      var sig = f.frames.map(function (fr) { return fr.T; }).join(',');
-      var g = groups.filter(function (x) { return x.sig === sig; })[0];
-      if (!g) { g = { sig: sig, feeds: [] }; groups.push(g); }
-      g.feeds.push(k); laneOf[k] = groups.indexOf(g);
-    });
-    var G = groups.length, scale = Math.max(2, G), lastLane = G - 1;
-    var at = feeds.map(function () { return {}; }), next = groups.map(function () { return 1; }), pics = [];
-    pics.push({ T: 0, d: 0, regions: feeds.map(function (f) { return { real: f.frames[0] }; }), complete: true, lanePoc: 0 });
-    feeds.forEach(function (f, k) { f.frames[0].pic = 0; at[k][0] = 0; });
-    for (var l = 1; l < G; l++) {
-      pics.push({ T: 0, d: l, regions: feeds.map(function () { return { copy: 0 }; }), complete: true, lanePoc: l });
-      groups[l].feeds.forEach(function (k) { feeds[k].frames[0].pic = l; at[k][0] = l; });
-    }
-    groups.forEach(function (g) { g.count = feeds[g.feeds[0]].frames.length; });
-    // A B slice's colocated picture (RefPicList1[0], for direct prediction) must hold its feed's own macroblocks: the
-    // copy pictures that stand in for lanes' first frames don't (their P_Skip blocks would change spatial direct's
-    // colZeroFlag and break temporal direct's reference mapping). Such a segment is planned the default way.
-    feeds.forEach(function (f, k) {
-      if (laneOf[k] === 0) return;
-      f.frames.forEach(function (fr) {
-        fr.slices.forEach(function (sl) {
-          if (sl.head.sliceType === 1 && sl.lists[1] && sl.lists[1][0] === f.frames[0]) throw new Error('lanes: feed ' + k + ' predicts directly from its first frame');
-        });
-      });
-    });
-    function placed(k, T) { return at[k][T] !== undefined; }
-    while (groups.some(function (g, l) { return next[l] < g.count; })) {
-      // The earliest display time among the lanes' next frames that may go (the last lane's waits for the others' at T).
-      var pick = -1;
-      groups.forEach(function (g, l) {
-        if (next[l] >= g.count) return;
-        var T0 = feeds[g.feeds[0]].frames[next[l]].T;
-        if (l === lastLane && !feeds.every(function (f, i) { return laneOf[i] === lastLane || placed(i, T0); })) return;
-        if (pick < 0 || T0 < feeds[groups[pick].feeds[0]].frames[next[pick]].T) pick = l;
-      });
-      if (pick < 0) throw new Error('lanes: nothing can go next');
-      var j = next[pick]++, T = feeds[groups[pick].feeds[0]].frames[j].T, pic = { T: T, d: pick, regions: [], lanePoc: scale * T + pick };
-      groups[pick].feeds.forEach(function (k) { var fr = feeds[k].frames[j]; pic.regions[k] = { real: fr }; fr.pic = pics.length; at[k][T] = pics.length; });
-      feeds.forEach(function (f, i) { if (laneOf[i] !== pick) pic.regions[i] = { copy: placed(i, T) ? at[i][T] : pics.length - 1 }; });
-      pic.complete = feeds.every(function (f, i) { return placed(i, T); });
-      pics.push(pic);
-    }
-    n = scale;   // the POC distance per frame, for the check below
-    pics.lanes = G;
-    // Exactness: every B slice's reference pairs, original distances (2 per frame) against the stitched ones (n per frame).
-    var mismatch = 0;
-    feeds.forEach(function (f) {
-      f.frames.forEach(function (fr) {
-        fr.slices.forEach(function (sl) {
-          if (sl.head.sliceType !== 1) return;
-          (sl.lists[0] || []).forEach(function (r0) {
-            (sl.lists[1] || []).forEach(function (r1) {
-              if (!r0 || !r1) return;
-              var a = implicitWeight(2 * (fr.T - r0.T), 2 * (r1.T - r0.T)), b = implicitWeight(n * (fr.T - r0.T), n * (r1.T - r0.T));
-              if (a.w !== b.w || (!sl.head.directSpatial && a.dsf !== b.dsf)) mismatch++;
-            });
-          });
-        });
-      });
-    });
-    pics.mismatch = mismatch;
-    return pics;
-  }
-
-  /*
-   * opts.edges: after every picture that later pictures use, an edge picture: a copy of it (motion 0) whose bands between
-   * the regions repeat each region's edge rows, the way a decoder repeats a picture's edge for motion vectors that point
-   * outside it (so regions stop bleeding into each other). Later pictures use the edge picture instead (references and
-   * copies); its MMCO drops the original, so the DPB holds no more. POCs: see below (x4, B slices keep their distances). The copies
-   * are P_L0_16x16 with ref_idx 1 (both list entries are the original): for B frames whose colocated picture is an edge
-   * picture, spatial direct then never sees a "zero motion, reference 0" colocated block (colZeroFlag 0), which matches
-   * the original wherever its colocated block moved; where it stood still the predicted motion is usually zero anyway.
-   */
-  function insertEdges(pics) {
-    var used = pics.map(function () { return false; });
-    pics.forEach(function (p, j) {
-      p.regions.forEach(function (r) {
-        if (r.copy !== undefined) used[r.copy] = true;
-        else r.real.slices.forEach(function (s) { s.lists.forEach(function (L) { L.forEach(function (fr) { if (fr && fr.pic !== j) used[fr.pic] = true; }); }); });
-      });
-    });
-    var out = [], newIndex = [], edgeIndex = [];
-    pics.forEach(function (p, j) {
-      newIndex[j] = out.length; out.push(p);
-      if (used[j]) { edgeIndex[j] = out.length; out.push({ T: p.T, d: p.d + 0.5, regions: p.regions.map(function () { return {}; }), complete: p.complete, edgeOf: newIndex[j], basePoc: p.poc }); }
-    });
-    var target = function (j) { return edgeIndex[j] !== undefined ? edgeIndex[j] : newIndex[j]; };
-    pics.forEach(function (p) {
-      p.regions.forEach(function (r) {
-        if (r.copy !== undefined) r.copy = target(r.copy);
-        else { r.real.refPic = target(r.real.pic); r.real.pic = newIndex[r.real.pic]; }
-      });
-    });
-    // POCs x4: originals 4p (4p + 2 with B slices), edge pictures 4p + 2 (4p + 3 after a picture with B slices). A B
-    // slice's references are edge pictures of P/I pictures (4r + 2) and its own picture is 4c + 2: distances 4 x the
-    // original ones; all POCs unique (base POCs are).
-    var hasB = function (p) { return p.regions.some(function (r) { return r.real && r.real.slices.some(function (s) { return s.head.sliceType === 1; }); }); };
-    out.forEach(function (p) { if (p.edgeOf === undefined) { p.hasB = hasB(p); p.poc = 4 * p.poc + (p.hasB ? 2 : 0); } });
-    out.forEach(function (p) { if (p.edgeOf !== undefined) p.poc = 4 * p.basePoc + (out[p.edgeOf].hasB ? 3 : 2); });
-    out.edges = edgeIndex.filter(function (x) { return x !== undefined; }).length;
-    return out;
-  }
-
-  // Which pictures each picture uses (its slices' references and copy sources), and from that: reference status,
+  // Which pictures each picture uses (its slices' references), and from that: reference status,
   // the MMCOs that drop pictures once their last user is decoded, and the DPB sizes needed.
   function lifetimes(pics) {
     var last = pics.map(function (p, i) { return i === 0 ? 0 : -1; });
     pics.forEach(function (p, j) {
       p.uses = [];
-      if (p.edgeOf !== undefined) p.uses.push(p.edgeOf);
-      else p.regions.forEach(function (r) {
-        if (r.copy !== undefined) p.uses.push(r.copy);
-        else r.real.slices.forEach(function (s) { s.lists.forEach(function (L) { L.forEach(function (fr) { if (fr) p.uses.push(fr.refPic !== undefined ? fr.refPic : fr.pic); }); }); });
+      p.regions[0].real.slices.forEach(function (s) {
+        s.lists.forEach(function (L) { L.forEach(function (fr) { if (fr) p.uses.push(fr.pic); }); });
       });
       p.uses.forEach(function (u) { last[u] = Math.max(last[u], j); });
     });
@@ -817,8 +522,8 @@
   }
 
   // Pictures held at once (C.4.5.3): reference pictures plus decoded pictures still waiting for output, outputting the
-  // smallest POC first (equal POCs in decode order: the complete picture of a display time comes out last) whenever
-  // more than `reorder` wait. `marks[j]`: the pictures still marked as reference after picture j.
+  // smallest POC first whenever more than `reorder` wait. `marks[j]`: the pictures still marked as reference after
+  // picture j.
   function dpbPeak(pics, reorder, marks) {
     var waiting = [], peak = 0;
     pics.forEach(function (p, j) {
@@ -850,20 +555,6 @@
   // H.264 Table A-1 (level: [MaxMBPS, MaxFS, MaxDpbMbs]); a stream's DPB holds Min(MaxDpbMbs / frame MBs, 16) frames.
   var LEVELS = [[40, 245760, 8192, 32768], [41, 245760, 8192, 32768], [42, 522240, 8704, 34816], [50, 589824, 22080, 110400],
     [51, 983040, 36864, 184320], [52, 2073600, 36864, 184320]];
-  /*
-   * The level for a whole stitched stream (one SPS): the picture size, and at most one picture per feed and display
-   * time (lanes: exactly that; the default plan: each picture carries a frame of that display time). 3 x 540p at 50
-   * fps: 5.1; 4 x 540p, 3 x 720p or 2 x 1080p: 5.2. null if none fits.
-   */
-  function streamLevel(widthMbs, regionHeightMbs, feeds, fps, guardRows) {
-    // ... and a DPB with room for the references and the reordering lanes need (~5 frames per feed, 16 at most).
-    var frameMbs = widthMbs * (regionHeightMbs * feeds + (guardRows || 0)), mbps = frameMbs * feeds * fps, dpb = Math.min(16, 5 * feeds);
-    for (var i = 0; i < LEVELS.length; i++) {
-      var L = LEVELS[i];
-      if (frameMbs <= L[2] && mbps <= L[1] && Math.min(16, Math.floor(L[3] / frameMbs)) >= dpb) return L[0];
-    }
-    return null;
-  }
   // The fixed level of an interleaved stream: one feed's picture size, n feeds' pictures per second, DPB room for two
   // references per feed and the reordering (the same for every segment, so one SPS serves the stream).
   function interleaveLevel(widthMbs, heightMbs, feeds, fps) {
@@ -882,199 +573,12 @@
     return null;
   }
 
-  // ---------------------------------------------------------------- one segment
-  function stitchSegment(feedAus, opts) {
-    opts = opts || {};
-    if (!RANGE_LPS) throw new Error('StitchX.tables(cabac-tables.json) first');
-    var feeds = feedAus.map(analyse), base = feeds[0];
-    feeds.forEach(function (f, k) {
-      if (f.sps.widthMbs !== base.sps.widthMbs || f.sps.heightMbs !== base.sps.heightMbs) throw new Error('feed ' + k + ': other size');
-      ['initQpMinus26', 'chromaQpOffset', 'weighted', 'bipred', 'constrainedIntra'].forEach(function (key) {
-        if (f.pps[key] !== base.pps[key]) throw new Error('feed ' + k + ': PPS ' + key + ' differs');
-      });
-      if (f.sps.direct8x8 !== base.sps.direct8x8) throw new Error('feed ' + k + ': direct_8x8_inference differs');
-      if (f.frameDur !== base.frameDur) throw new Error('feed ' + k + ': other frame rate');
-      ['vuiAspect', 'vuiOverscan', 'videoSignal', 'chromaLoc'].forEach(function (key) {
-        if (JSON.stringify(f.sps[key]) !== JSON.stringify(base.sps[key])) throw new Error('feed ' + k + ': VUI ' + key + ' differs');
-      });
-      // F1's feeds share their PTS; a muxer may shift a feed by a fraction of a frame (our test feeds: audio priming).
-      // Display times count from each feed's own first frame, so only a whole frame or more is a misaligned segment.
-      if (Math.abs(f.firstPts - base.firstPts) >= base.frameDur / 2) throw new Error('feed ' + k + ': segment starts at another time');
-    });
-    var pics = null, life = null, fallback = null;
-    // The DPB the stream's fixed level allows (16 frames at most), known before planning.
-    var dpbFrames = 16, fixedL = opts.fixedLevel ? LEVELS.filter(function (x) { return x[0] === opts.fixedLevel; })[0] : null;
-    // opts.gap: macroblock rows of gray between the regions (motion vectors that reach past a feed's edge read gray, not
-    // the neighbouring feed; the app's black separators cover them). 0 = regions touch.
-    // opts.edges: three rows per seam (the band under a region, a helper row, the band over the next region).
-    // opts.edges: band rows on each side (true = 1): a band of that many rows under each region, a helper row, the same over the next.
-    var bandRows = opts.edges ? (opts.edges === true ? 1 : Math.max(1, Math.min(4, +opts.edges))) : 0;
-    var gapMbs = opts.edges ? 2 * bandRows + 1 : Math.max(0, Math.min(4, Math.floor(+opts.gap || 0))), extraRows = (opts.stamp ? 1 : 0) + gapMbs * (feeds.length - 1);
-    if (fixedL) dpbFrames = Math.min(16, Math.floor(fixedL[3] / (base.sps.widthMbs * (base.sps.heightMbs * feeds.length + extraRows))));
-    // opts.maxDpb: the decoder's own cap, below the level's. Samsung's 2021 TV (Tizen 6, MSE and AVPlay alike) refuses
-    // or fails on H.264 above FHD-class sizes that declare more than 7 reference frames, whatever the level says.
-    if (opts.maxDpb) dpbFrames = Math.min(dpbFrames, opts.maxDpb);
-    // The stream's reordering depth (one SPS for all segments). Under a 7-picture cap with F1-like feeds (2 references,
-    // IBBP): 2 feeds fit lanes (exact) with depth 4, 3 feeds fit the default plan with depth 3 (lanes then fall back).
-    var reorderDepthCap = opts.reorder != null ? opts.reorder : opts.maxDpb ? (feeds.length <= 2 ? 4 : 3) : null;
-    if (opts.lanes) {
-      // Lanes where they fit (references and pictures waiting for output within the level's DPB; four diverging feeds
-      // with 3 references each need ~20), else this segment is planned the default way (near-exact): one stream can
-      // mix both.
-      try {
-        pics = planLanes(feeds); life = lifetimes(pics);
-        if (life.peakRefs > dpbFrames) throw new Error('lanes need ' + life.peakRefs + ' reference pictures');
-        pics.forEach(function (p) { p.poc = p.lanePoc; });
-        var lanesReorder = Math.min(reorderDepthCap != null ? reorderDepthCap : 3 * feeds.length, dpbFrames);
-        if (reorderDepth(pics) > lanesReorder) throw new Error('lanes reorder deeper than ' + lanesReorder);
-        var lanesDpb = dpbPeak(pics, lanesReorder, pics.map(function (p) { return p.marked; }));
-        if (lanesDpb > dpbFrames) throw new Error('lanes need ' + lanesDpb + ' pictures in the DPB (' + dpbFrames + ' at this level)');
-      } catch (e) { fallback = String(e.message || e); pics = null; }
-    }
-    if (!pics) { pics = plan(feeds, opts.group); life = lifetimes(pics); }
-    var lanesUsed = !!opts.lanes && !fallback;
-    if (life.peakRefs > 16) throw new Error('needs ' + life.peakRefs + ' reference pictures at once (H.264 allows 16)');
-    var maxD = pics.reduce(function (m, p) { return Math.max(m, p.d); }, 0), scale = maxD <= 1 ? 2 : 4;
-    if (maxD > 3) throw new Error('more than 4 pictures for one display time');
-    // POCs are unique (H.264 8.2.1): 2T + d, or 4T + d when a display time needs more than two pictures. B slices
-    // then see POC distances x1 or x2 (+ d), which can change their implicit weights slightly; with B frames that
-    // nothing references (F1), such an error stays in that frame. opts.samePoc (experiment, NOT conforming): every
-    // picture of a display time gets the original 2T, exact in FFmpeg.
-    pics.forEach(function (p) { p.poc = lanesUsed ? p.lanePoc : opts.samePoc ? 2 * p.T : scale * p.T + p.d; });
-    var edgeCount = 0;
-    if (opts.edges) {
-      if (opts.fmo || opts.stamp) throw new Error('edges: not with fmo or stamp');
-      if (base.pps.constrainedIntra) throw new Error('edges: constrained intra prediction (the bands predict from copies)');
-      pics = insertEdges(pics); edgeCount = pics.edges; life = lifetimes(pics);
-    }
-    var W = base.sps.widthMbs, H = base.sps.heightMbs, n = feeds.length;
-    // opts.fmo: { width, height (macroblocks), at: [[x, y] per region] }: each region a slice-group rectangle at (x, y)
-    // instead of a full-width band; the regions must cover the picture, the last one taking what the others leave.
-    var fmo = opts.fmo || null, PW = fmo ? fmo.width : W;
-    function picMb(k, f) {
-      if (!fmo) return k * (H + gapMbs) * W + f;
-      var at = fmo.at[k]; return (at[1] + Math.floor(f / W)) * PW + at[0] + f % W;
-    }
-    // The level: picture size and pictures per second (a segment's pictures over its duration), DPB for the peak.
-    var guard = opts.stamp ? 1 : 0, G = gapMbs, stride = H + G, frameMbs = fmo ? fmo.width * fmo.height : W * (H * n + G * (n - 1) + guard), seconds = base.frames.length * (base.frameDur || 1800) / 90000;
-    var mbps = frameMbs * pics.length / seconds, lv;
-    if (opts.fixedLevel) {
-      // A stream of several segments has one SPS (an MP4 init segment): the level given, its DPB size, for every segment.
-      var L = LEVELS.filter(function (x) { return x[0] === opts.fixedLevel; })[0];
-      if (!L) throw new Error('unknown level ' + opts.fixedLevel);
-      if (frameMbs > L[2]) throw new Error('the stack is larger than level ' + L[0] + ' allows');
-      lv = { level: L[0], dpb: Math.min(16, Math.floor(L[3] / frameMbs)), mbps: L[1] };
-      if (life.peakRefs > lv.dpb) throw new Error('needs ' + life.peakRefs + ' reference pictures (level ' + L[0] + ' allows ' + lv.dpb + ')');
-      if (opts.edges && mbps > L[1]) throw new Error(Math.round(mbps) + ' macroblocks/s is more than level ' + L[0] + ' allows');
-    } else lv = levelFor(frameMbs, mbps, life.peakRefs);
-    if (!lv) throw new Error('no H.264 level fits ' + frameMbs + ' MBs x ' + Math.round(pics.length / seconds) + ' pictures/s');
-    if (opts.maxDpb && lv.dpb > opts.maxDpb) {
-      lv = { level: lv.level, dpb: opts.maxDpb, mbps: lv.mbps };
-      if (life.peakRefs > lv.dpb) throw new Error('needs ' + life.peakRefs + ' reference pictures (the decoder takes ' + lv.dpb + ')');
-    }
-    var sps = { profile: base.sps.profile, constraints: base.sps.constraints, level: Math.max(opts.level || 0, lv.level), log2FrameNum: 16, log2PocLsb: 16,
-      frameDur: isFinite(base.frameDur) && base.frameDur > 0 ? base.frameDur : 1800, refFrames: lv.dpb, widthMbs: fmo ? fmo.width : W, heightMbs: fmo ? fmo.height : H * n + G * (n - 1) + guard, vuiAspect: base.sps.vuiAspect, vuiOverscan: base.sps.vuiOverscan, videoSignal: base.sps.videoSignal, chromaLoc: base.sps.chromaLoc, direct8x8: base.sps.direct8x8, reorder: Math.min(reorderDepthCap != null ? reorderDepthCap : opts.lanes ? 3 * n : 4, lv.dpb), dpb: lv.dpb };
-    // One SPS for the whole stream (an MP4 init segment carries the first): a fixed reordering depth, checked here.
-    var needed = reorderDepth(pics);
-    if (needed > sps.reorder) throw new Error('this segment reorders ' + needed + ' pictures deep (SPS says ' + sps.reorder + ')');
-    var pps = { l0: base.pps.l0, l1: base.pps.l1, weighted: base.pps.weighted, bipred: base.pps.bipred, initQpMinus26: base.pps.initQpMinus26,
-      initQsMinus26: base.pps.initQsMinus26, chromaQpOffset: base.pps.chromaQpOffset, constrainedIntra: base.pps.constrainedIntra,
-      groups: fmo ? fmo.at.slice(0, n - 1).map(function (at) { return [at[1] * PW + at[0], (at[1] + H - 1) * PW + at[0] + W - 1]; }) : null };
-    var dpb = dpbPeak(pics, sps.reorder, pics.map(function (p) { return p.marked; }));
-    if (dpb > sps.dpb && !opts.noDpbCheck) throw new Error('needs ' + dpb + ' pictures in the DPB at once (' + sps.dpb + ' at level ' + sps.level + ')');
-    var spsNal = nalBytes(7, 3, writeSps(sps)), ppsNal = nalBytes(8, 3, writePps(pps));
-    var copyQp = 26 + pps.initQpMinus26, idr = (opts.segment || 0) & 0xffff;
-
-    // An edge picture's macroblocks, row by row: regions copied; per seam the band under the region (vertical
-    // prediction from its last row), a helper row whose motion puts the next region's first row in its last row
-    // (17 rows down), and the band over the next region (vertical prediction from that row).
-    var edgeData = null;
-    function edgeDesc() {
-      var desc = [];
-      for (var row = 0; row < n * H + (n - 1) * G; row++) {
-        var k = Math.floor(row / stride), within = row - k * stride, d;
-        if (within < H) d = { t: 'copy' };
-        else if (within - H === bandRows) d = { t: 'mv', ref: 1, mv: [0, 4 * (16 * (stride - within) - 15)] };
-        else d = { t: 'vert' };
-        for (var x = 0; x < W; x++) desc.push(d);
-      }
-      return desc;
-    }
-    var aus = pics.map(function (p, j) {
-      var nalType = j === 0 ? 5 : 1, refIdc = p.ref ? (j === 0 ? 3 : 2) : 0, out = j === 0 ? [spsNal, ppsNal] : [];
-      var common = { frameNum: p.frameNum, poc: p.poc, idr: idr, nalType: nalType, refIdc: refIdc, currPicNum: p.frameNum,
-        mmco: p.mmco.map(function (m) { return [1, p.frameNum - pics[m].frameNum - 1]; }) };
-      // The gaps: an I slice of gray I_PCM in the IDR picture, then P_Skip copies of the latest marked picture (gray
-      // there). Each gap goes right after its region: Main profile needs slices in increasing macroblock order.
-      if (p.edgeOf !== undefined) {
-        // An edge picture: one slice over the whole picture (see edgeDesc), both list entries the original.
-        var src = pics[p.edgeOf].frameNum;
-        var eHead = writeSliceHeader(Object.assign({}, common, { firstMb: 0, sliceType: 0, lists: [[src, src]],
-          weights: pps.weighted ? [1, 1, 0, 0, 0, 0] : null, cabacInit: 0, qpDelta: 0, deblock: 1 }), sps);
-        out.push(nalBytes(1, refIdc, concat([eHead, edgeData || (edgeData = edgeSliceData(edgeDesc(), W, 0, copyQp))])));
-        return concat(out);
-      }
-      var gsrc = j > 0 ? pics[j - 1].marked[pics[j - 1].marked.length - 1] : undefined, gIntra = gsrc === undefined, regionNals = [];
-      p.regions.forEach(function (r, k) {
-        var offset = k * stride * W;
-        if (r.real) {
-          r.real.slices.forEach(function (s) {
-            var h = s.head;
-            var lists = s.lists.slice(0, h.sliceType === 1 ? 2 : h.sliceType === 0 ? 1 : 0).map(function (L, l) {
-              // Entries the original list left empty are never used: fill them with any other live picture.
-              var spare = p.uses.filter(function (u) { return pics[u].ref; });
-              return L.map(function (fr, i) {
-                if (fr) return pics[fr.refPic !== undefined ? fr.refPic : fr.pic].frameNum;
-                var alt = spare.filter(function (u) { return L.every(function (x) { return !x || (x.refPic !== undefined ? x.refPic : x.pic) !== u; }); })[i % Math.max(1, spare.length)];
-                if (alt === undefined) throw new Error('no spare reference for an unused list entry');
-                return pics[alt].frameNum;
-              });
-            });
-            var head = writeSliceHeader(Object.assign({}, common, { firstMb: picMb(k, h.firstMb), sliceType: h.sliceType, directSpatial: h.directSpatial,
-              lists: lists, weights: h.weights, noOutput: 0, cabacInit: h.cabacInit, qpDelta: h.qpDelta,
-              deblock: h.deblock === 1 ? 1 : 2, alpha: h.alpha, beta: h.beta }), sps);
-            regionNals.push([picMb(k, h.firstMb), spliceNal(nalType, refIdc, head, s.nal, h.dataStart)]);
-          });
-        } else {
-          if (nalType === 5) throw new Error('an IDR picture can not copy');
-          // With explicit weighted prediction on (PPS), a P slice must carry a weight table: denominators 0 and no
-          // weights given means weight 1, offset 0, so the copy stays exact.
-          var head = writeSliceHeader(Object.assign({}, common, { firstMb: picMb(k, 0), sliceType: 0, lists: [[pics[r.copy].frameNum]],
-            weights: pps.weighted ? [1, 1, 0, 0] : null, cabacInit: 0, qpDelta: 0, deblock: 1 }), sps);
-          regionNals.push([picMb(k, 0), nalBytes(1, refIdc, concat([head, skipData(W * H, copyQp)]))]);
-        }
-        if (G && k < n - 1) {
-          var gHead = writeSliceHeader(Object.assign({}, common, { firstMb: (k * stride + H) * W, sliceType: gIntra ? 2 : 0,
-            lists: gIntra ? [] : [[pics[gsrc].frameNum]], weights: !gIntra && pps.weighted ? [1, 1, 0, 0] : null, cabacInit: 0, qpDelta: 0, deblock: 1 }), sps);
-          regionNals.push([(k * stride + H) * W, nalBytes(nalType, refIdc, concat([gHead, gIntra ? stampData(W * G, 128, copyQp, true, W) : skipData(W * G, copyQp)]))]);
-        }
-      });
-      regionNals.sort(function (a, b) { return a[0] - b[0]; }).forEach(function (x) { out.push(x[1]); });
-      if (guard) {
-        // The stamp row: P_Skip copies need a reference picture still marked: the latest one marked before this picture.
-        var stamp = p.complete ? 235 : 16, src = j > 0 ? pics[j - 1].marked[pics[j - 1].marked.length - 1] : undefined;
-        var intra = src === undefined;
-        var gh = writeSliceHeader(Object.assign({}, common, { firstMb: (n * H + G * (n - 1)) * W, sliceType: intra ? 2 : 0, lists: intra ? [] : [[pics[src].frameNum]],
-          weights: !intra && pps.weighted ? [1, 1, 0, 0] : null, cabacInit: 0, qpDelta: 0, deblock: 1 }), sps);
-        out.push(nalBytes(nalType, refIdc, concat([gh, stampData(W, stamp, copyQp, intra)])));
-      }
-      return concat(out);
-    });
-    return { aus: aus, pictures: pics, sps: sps, info: { pictures: pics.length, frames: feeds.map(function (f) { return f.frames.length; }),
-      complete: pics.filter(function (p) { return p.complete; }).length, peakRefs: life.peakRefs, dpbPeak: dpb, reorder: needed,
-      level: sps.level, picturesPerSecond: Math.round(pics.length / seconds), mbps: Math.round(mbps), overLevel: mbps > lv.mbps,
-      pocScale: lanesUsed ? 'lanes' : opts.samePoc ? 1 : scale, lanesMismatch: lanesUsed ? pics.mismatch : undefined, lanes: lanesUsed ? pics.lanes : undefined,
-      lanesFallback: fallback || undefined, gapRows: G * 16, edges: edgeCount || undefined,
-      extra: pics.length - feeds[0].frames.length } };
-  }
-
   // ---------------------------------------------------------------- interleaving in time
   /*
    * The feeds' frames one after another in ONE stream, each picture a whole frame of one feed (no stacking): every feed
    * keeps its own picture edges, so nothing bleeds across feeds and each picture decodes exactly as in its own stream
    * (headers rewritten only: frame_num, POC, explicit reference lists, MMCOs). Feed k's frame at display time T gets
-   * POC max(2, n) * T + k (the lanes scheme with one lane per feed, so implicit weights stay as they were; checked per
-   * B slice). A renderer that gets every decoded picture (Samsung's EMSS video texture mode) puts each feed's latest
+   * POC max(2, n) * T + k (implicit weights are checked per B slice). A renderer that gets every decoded picture (Samsung's EMSS video texture mode) puts each feed's latest
    * frame where the layout wants it: any layout from one hardware decoder. All feeds share one resolution.
    * Order: by display time, feed by feed, each feed's frames in their own decode order (a frame waits for the feed's
    * earlier ones in decode order).
@@ -1156,9 +660,9 @@
     return frames.filter(function (f) { return keep[f.T]; });
   }
 
-  // opts: { segment, fixedLevel, maxDpb, reorder, dropB, targetFps, feedTag }. Returns { aus, pictures, sps, info } like
-  // stitchSegment; picture j's feed is pictures[j].feed. dropB[k]: leave out feed k's non-reference frames (F1's B frames:
-  // nothing predicts from them, so the rest decodes the same): a third of the pictures (16.7 fps of 50), one reference.
+  // opts: { segment, fixedLevel, maxDpb, reorder, dropB, targetFps, feedTag, decodeOrder }.
+  // Returns { aus, pictures, sps, info }; picture j's feed is pictures[j].feed. dropB[k] leaves out feed k's
+  // non-reference frames (F1's B frames: nothing predicts from them, so the rest decodes the same).
   function interleaveSegment(feedAus, opts) {
     opts = opts || {};
     var feeds = feedAus.map(analyse), base = feeds[0];
@@ -1240,7 +744,7 @@
         var th = writeSliceHeader(Object.assign({}, common, { firstMb: H * W, sliceType: intra ? 2 : 0,
           lists: intra ? [] : [[pics[src].frameNum]], weights: !intra && pps.weighted ? [1, 1, 0, 0] : null,
           cabacInit: 0, qpDelta: 0, deblock: 1 }), sps);
-        out.push(nalBytes(nalType, refIdc, concat([th, stampData(W, tagValues[p.feed], 26 + pps.initQpMinus26, intra)])));
+        out.push(nalBytes(nalType, refIdc, concat([th, feedTagData(W, tagValues[p.feed], 26 + pps.initQpMinus26, intra)])));
       }
       return concat(out);
     });
@@ -1250,52 +754,31 @@
       feedTag: tagRows ? { row: H * 16, rows: 16, values: tagValues.slice(0, n) } : null } };
   }
 
-  // Sample timing for packaging (fMP4 trun), all in 90 kHz ticks: o = { start, frameDur, frames, delay, mode }.
-  // An interleaved stream (st.interleaved = n feeds): feed k's frame T at T + k / n of a frame (o.stepMs: T + k x that
-  // many ms, so feed 0's picture follows the longest gap: a renderer can tell where each display time starts).
-  // Presentation: display time T's pictures (in decode order) at T + 0, 1, 2.. ms; the last of them (complete) shows
-  // until T + 1. mode 'tile' (default): each sample's duration is its presentation duration, so the intervals tile
-  // the timeline, and decode times add those durations up in decode order; 'even': decode times spread evenly over
-  // the segment (durations then overlap and leave gaps in presentation; Firefox failed some seeks with it).
+  // Sample timing for interleaved fMP4 packaging, in 90 kHz ticks. Each feed's picture is offset within its frame.
+  // With spread, pictures in display order sit on an even grid across the segment. Grid points are multiples of
+  // 8 ticks plus the feed number, so PTS modulo 8 identifies the feed. Durations tile the presentation timeline;
+  // decode times add those durations in decode order.
   function samples(st, o) {
-    if (st.interleaved && o.stepMs && (st.interleaved - 1) * o.stepMs * 90 >= o.frameDur) throw new Error('stepMs: the feeds\' pictures must fit in one frame');
-    var pics = st.pictures, n = pics.length, segDur = o.frames * o.frameDur, dts, dur;
-    var pts = pics.map(function (p) { return o.start + p.T * o.frameDur + (st.interleaved ? Math.round(p.d * (o.stepMs ? o.stepMs * 90 : o.frameDur / st.interleaved)) : p.d * 90) + o.delay; });
-    // o.spread (interleaved): the pictures, in display order, on an even grid over the segment (no bursts of several
-    // feeds' pictures a few ms apart, which a renderer pulling one picture at a time can't take). Each picture moves at
-    // most about one grid step (~10 ms for Big + 3). Grid points are multiples of 8 ticks and the feed number is added,
-    // so pts mod 8 (in 90 kHz ticks) names the picture's feed.
-    if (o.spread && st.interleaved) {
+    var pics = st.pictures, n = pics.length, segDur = o.frames * o.frameDur;
+    var pts = pics.map(function (p) { return o.start + p.T * o.frameDur + Math.round(p.d * (o.frameDur / st.interleaved)) + o.delay; });
+    if (o.spread) {
       if (st.interleaved > 8) throw new Error('spread: at most 8 feeds');
-      // o.markEvery (e.g. 50): before every markEvery-th picture (and the first), an extra pause of o.markMs (default 12 ms);
-      // the other gaps shrink to keep the segment's length. A renderer that only knows when it got each picture finds its
-      // place again at these pauses (they are far apart, so the nearest one is never ambiguous).
-      var every = o.markEvery || 0, extra = every ? Math.round((o.markMs || 12) * 90) : 0, marks = every ? Math.floor((n - 1) / every) + 1 : 0;
-      var step = (segDur - marks * extra) / n;
-      if (!(step > 0)) throw new Error('spread: the marks leave no time for the pictures');
+      var step = segDur / n;
       var shown = pts.map(function (t, j) { return j; }).sort(function (a, b) { return pts[a] - pts[b]; });
-      shown.forEach(function (j, i) { pts[j] = Math.floor((o.start + o.delay + i * step + (every ? (Math.floor(i / every) + 1) * extra : 0)) / 8) * 8 + pics[j].feed; });
+      shown.forEach(function (j, i) { pts[j] = Math.floor((o.start + o.delay + i * step) / 8) * 8 + pics[j].feed; });
     }
-    if (o.mode === 'even') {
-      dts = pics.map(function (p, j) { return o.start + Math.round(j * segDur / n); });
-      dur = dts.map(function (t, j) { return (j + 1 < n ? dts[j + 1] : o.start + segDur) - t; });
-    } else {
-      var order = pts.map(function (t, j) { return j; }).sort(function (a, b) { return pts[a] - pts[b]; });
-      dur = [];
-      // The last picture lasts until the next segment's first one: with spread marks that one comes `lead` after the
-      // segment start (the pause), so without it the decode timeline would have a hole between segments (EMSS stalls).
-      var lead = o.spread && st.interleaved && o.markEvery ? Math.min.apply(null, pts) - o.start - o.delay : 0;
-      order.forEach(function (j, i) { dur[j] = (i + 1 < n ? pts[order[i + 1]] : o.start + segDur + o.delay + lead) - pts[j]; });
-      dts = [];
-      for (var j = 0, t = o.start; j < n; j++) { dts.push(t); t += dur[j]; }
-    }
+    var order = pts.map(function (t, j) { return j; }).sort(function (a, b) { return pts[a] - pts[b]; });
+    var dur = [];
+    order.forEach(function (j, i) { dur[j] = (i + 1 < n ? pts[order[i + 1]] : o.start + segDur + o.delay) - pts[j]; });
+    var dts = [];
+    for (var j = 0, t = o.start; j < n; j++) { dts.push(t); t += dur[j]; }
     return pics.map(function (p, j) {
       if (dts[j] > pts[j]) throw new Error('picture ' + j + ' would decode after it shows: raise the delay');
-      if (!(dur[j] > 0)) throw new Error('picture ' + j + ' gets no presentation time (stepMs too large?)');
+      if (!(dur[j] > 0)) throw new Error('picture ' + j + ' gets no presentation time');
       return { data: st.aus[j], duration: dur[j], cto: pts[j] - dts[j], sync: j === 0 };
     });
   }
 
-  return { tables: tables, stitchSegment: stitchSegment, interleaveSegment: interleaveSegment, interleaveLevel: interleaveLevel, samples: samples, streamLevel: streamLevel, analyse: analyse, nals: nals, parseSps: parseSps, parsePps: parsePps,
-    skipData: skipData, Reader: Reader, Writer: Writer, escape: escape, unescape: unescape, concat: concat };
+  return { tables: tables, interleaveSegment: interleaveSegment, interleaveLevel: interleaveLevel, samples: samples, analyse: analyse, nals: nals, parseSps: parseSps, parsePps: parsePps,
+    Reader: Reader, Writer: Writer, escape: escape, unescape: unescape, concat: concat };
 });

@@ -1,16 +1,15 @@
 /*
  * StitchX for the stream helper (app/service/service.js): an H.264 replay's feeds (2018-2024: clear HLS, MPEG-TS
- * segments, not in lockstep) as ONE stitched stream with the sound of one feed, served as DASH the way the helper
+ * segments, not in lockstep) as ONE interleaved stream with the sound of one feed, served as DASH the way the helper
  * serves its HEVC grids (segments built on demand, a few cached, the next one made ready ahead). ES5 for the TV's Node.
  *
  *   var route = require('./stitchx/helper-route.js')({ fetchAll: fetchAll, send: send, toBuf: toBuf, f1Cdn: f1Cdn, port: PORT,
  *     stitches: stitches });
- *   route.post(res, id, body)  body: { kind: 'h264x', feeds: [{ playlist }], audio: { feed, playlist } | { feed } | null,
- *                                      lanes: true, level: 51, maxDpb: 7, gap: 1, probe: segment index, ua }
- *     gap: a gray macroblock row between the feeds (under the app's black separators), against bleeding at the seams
- *     interleave: the feeds' frames one after another instead of stacked (no seams; for EMSS video texture), dropB: [bool
- *     per feed] leaves out that feed's B frames (16.7 fps of 50), reorder: the SPS reordering depth
- *     feeds' playlists: media playlists of one rung (540p: exact; 360p/270p: seams), segments aligned (F1's are)
+ *   route.post(res, id, body)  body: { kind: 'h264x', feeds: [{ playlist }], interleave: true,
+ *     feedTag: true, spread: true, decodeOrder: 'unlock', reorder: 4, maxDpb: 9, level: 51,
+ *     targetFps: [number per feed], dropB: [bool per feed], audio: null, probe: segment index }
+ *     feeds' playlists: media playlists of one rung and resolution, segments aligned (F1's are)
+ *     Optional audio also works with interleaved video; mvsoft.js plays sound separately and sends null.
  *     audio.playlist: the sound's own media playlist (segments aligned with the feeds'); without it, AAC muxed in the
  *     TS of feed `audio.feed`
  *     -> 201 { width, height, codecs, audioCodec, regions, regionRows, gapRows, visibleRows, delay, segments, duration, mpd }
@@ -72,7 +71,7 @@ module.exports = function (deps) {
       if (err) return answer(502, String(err));
       var entry;
       try {
-        var r = StitchSegment.build(bytes, { segment: n, start: s.feeds[0][n].start, delay: DELAY, level: s.level, lanes: s.lanes, maxDpb: s.maxDpb, gap: s.gap, interleave: s.interleave, dropB: s.dropB, reorder: s.reorder, stepMs: s.stepMs, feedTag: s.feedTag, targetFps: s.targetFps, decodeOrder: s.decodeOrder, spread: s.spread, markEvery: s.markEvery, markMs: s.markMs,
+        var r = StitchSegment.build(bytes, { segment: n, start: s.feeds[0][n].start, delay: DELAY, level: s.level, maxDpb: s.maxDpb, dropB: s.dropB, reorder: s.reorder, feedTag: s.feedTag, targetFps: s.targetFps, decodeOrder: s.decodeOrder, spread: s.spread,
           feeds: s.feeds.length, audio: s.audio ? { feed: s.audio.feed, separate: !!s.audioList } : null, init: !s.init });
         if (r.init && !s.init) s.init = r.init;
         entry = { number: n, video: r.video, audio: r.audio, ms: Date.now() - t0, info: r.info };
@@ -89,9 +88,10 @@ module.exports = function (deps) {
 
   // The request body, checked (it comes from the page, but the helper must never throw on it). null when bad.
   function checkBody(body) {
-    if (!body || typeof body !== 'object' || !Array.isArray(body.feeds)) return null;
+    if (!body || typeof body !== 'object' || !body.interleave || !Array.isArray(body.feeds)) return null;
     var n = body.feeds.length;
-    if (n < 2 || n > 4) return null;
+    // One small feed is enough for picture in picture: the big feed plays on AVPlay.
+    if (n < 1 || n > 4) return null;
     var urlOk = function (u) { return typeof u === 'string' && u.length > 0 && u.length < 2048; };
     if (!body.feeds.every(function (f) { return f && typeof f === 'object' && urlOk(f.playlist); })) return null;
     var audio = body.audio == null ? null : body.audio;
@@ -103,17 +103,16 @@ module.exports = function (deps) {
       audio = { feed: feed, playlist: audio.playlist || null, lang: typeof audio.lang === 'string' ? audio.lang.slice(0, 8) : null };
     }
     var probe = Math.floor(+body.probe || 0), level = Math.floor(+body.level || 0);
-    // Legacy conservative default for stacked/FHD AVPlay. EMSS at 1280x720 has since played with 9; callers must
-    // choose a cap for the actual route and size, not assume 7 is universal.
+    // The decoder cap depends on the route and picture size; mvsoft.js requests 9 at 1280x720.
     var maxDpb = body.maxDpb == null ? 7 : Math.floor(+body.maxDpb);
     if (!(maxDpb >= 1 && maxDpb <= 16)) return null;
     var reorder = body.reorder == null ? null : Math.floor(+body.reorder);
     if (reorder !== null && !(reorder >= 0 && reorder <= 16)) return null;
     if (body.decodeOrder != null && body.decodeOrder !== 'head' && body.decodeOrder !== 'unlock') return null;
     if (body.targetFps != null && (!Array.isArray(body.targetFps) || body.targetFps.length !== n || !body.targetFps.every(function (x) { return x === null || (typeof x === 'number' && isFinite(x) && x > 0 && x <= 50); }))) return null;
-    return { playlists: body.feeds.map(function (f) { return f.playlist; }), audio: audio, lanes: body.lanes !== false,
-      interleave: !!body.interleave, spread: !!body.spread, markEvery: body.markEvery >= 10 && body.markEvery <= 1000 ? Math.floor(body.markEvery) : 0, markMs: body.markMs >= 2 && body.markMs <= 40 ? +body.markMs : 0, feedTag: !!body.feedTag, targetFps: body.targetFps || null, decodeOrder: body.decodeOrder || null, stepMs: body.stepMs >= 1 && body.stepMs <= 10 ? Math.floor(body.stepMs) : null, dropB: Array.isArray(body.dropB) ? body.dropB.slice(0, n).map(function (x) { return !!x; }) : null, reorder: reorder,
-      level: level >= 40 && level <= 52 ? level : null, maxDpb: maxDpb, gap: body.gap ? 1 : 0, probe: isFinite(probe) && probe > 0 ? probe : 0,
+    return { playlists: body.feeds.map(function (f) { return f.playlist; }), audio: audio,
+      spread: !!body.spread, feedTag: !!body.feedTag, targetFps: body.targetFps || null, decodeOrder: body.decodeOrder || null, dropB: Array.isArray(body.dropB) ? body.dropB.slice(0, n).map(function (x) { return !!x; }) : null, reorder: reorder,
+      level: level >= 40 && level <= 52 ? level : null, maxDpb: maxDpb, probe: isFinite(probe) && probe > 0 ? probe : 0,
       ua: typeof body.ua === 'string' ? body.ua.slice(0, 300) : null };
   }
 
@@ -131,7 +130,7 @@ module.exports = function (deps) {
   function post(res, id, raw) {
     var body = checkBody(raw), answered = false;
     function reply(status, text, type) { if (answered) return; answered = true; deps.send(res, status, deps.toBuf(text), type); }
-    if (!body) return reply(400, 'need { kind: "h264x", feeds: [{ playlist }] x 2-4, audio: { feed, playlist } | null }');
+    if (!body) return reply(400, 'need { kind: "h264x", feeds: [{ playlist }] x 1-4, interleave: true, audio: { feed, playlist } | null }');
     try { loadTables(); } catch (e) { return reply(500, 'StitchX tables: ' + e); }
     var feeds = body.playlists, urls = feeds.slice(), audio = body.audio, ua = body.ua;
     if (audio && audio.playlist) urls.push(audio.playlist);
@@ -159,7 +158,7 @@ module.exports = function (deps) {
       if (!aligned) return reply(422, 'the feeds\' segments are not aligned');
       feedLists = feedLists.map(function (l) { return l.slice(0, count); });
       if (audioList) audioList = audioList.slice(0, count);
-      var s = { kind: 'h264x', feeds: feedLists, audio: audio, audioList: audioList, lanes: body.lanes, level: body.level, maxDpb: body.maxDpb, gap: body.gap, interleave: body.interleave, dropB: body.dropB, reorder: body.reorder, stepMs: body.stepMs, feedTag: body.feedTag, targetFps: body.targetFps, decodeOrder: body.decodeOrder, spread: body.spread, markEvery: body.markEvery, markMs: body.markMs,
+      var s = { kind: 'h264x', feeds: feedLists, audio: audio, audioList: audioList, level: body.level, maxDpb: body.maxDpb, dropB: body.dropB, reorder: body.reorder, feedTag: body.feedTag, targetFps: body.targetFps, decodeOrder: body.decodeOrder, spread: body.spread,
         cache: [], pending: {}, init: null, at: Date.now(), ua: ua };
       var probe = Math.min(count - 1, body.probe);
       build(s, probe, function (status, got) {

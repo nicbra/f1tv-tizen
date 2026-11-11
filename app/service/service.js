@@ -11,10 +11,8 @@
  *   POST /hdr/<id> -> a live HLG video AdaptationSet; /mpd?...&hdr=<id> puts it in place of the
  *       official video, with that video's current SegmentTimeline; &notext=1 drops subtitle sets
  *   GET /log -> the last requests (kind, CDN host, status, time, error; no paths or tokens), for diagnosis
+ *   POST /stitch/<id> { kind: 'hevc', ... } -> an HEVC multiview grid (stitch-hevc.js)
  *   POST /stitch/<id> { kind: 'h264x', ... } -> an H.264 replay's small multiview feeds interleaved (stitchx/)
- *   POST /stitch/<id> {"urls": [feed manifests], "height": 540} -> multiview (experiment, stitch.js):
- *       GET /stitch/<id>.mpd, /stitch/<id>/init.mp4 and /stitch/<id>/<number>.m4s give the feeds
- *       stacked into one video, with the first feed's audio and subtitles
  */
 'use strict';
 
@@ -319,8 +317,8 @@ function handle(req, res) {
 
 // --- Multiview by stitching (experiment) ---
 
-var stitch = null, stitchHevc = null;
-try { stitch = require('./stitch'); stitchHevc = require('./stitch-hevc'); } catch (e) { console.log('stitch unavailable: ' + e); }
+var stitchHevc = null;
+try { stitchHevc = require('./stitch-hevc'); } catch (e) { console.log('stitch unavailable: ' + e); }
 
 /** HEVC grid: a feed's media segment n (0-based) from its template or list. */
 /** n: the index in the playlist, or for live (`absolute`) the segment number itself (as in the DASH timeline). */
@@ -472,48 +470,8 @@ function fetchAll(urls, cb, parallel, ua, missing) {
   while (next < Math.min(limit, urls.length)) start(next++);
 }
 
-/** A feed's video template for the representation of the given height. */
-function feedVideo(mpd, manifestUrl, height) {
-  var set = (mpd.match(/<AdaptationSet\b[^>]*contentType="video"[\s\S]*?<\/AdaptationSet>/) || [])[0];
-  if (!set) throw new Error('no video set');
-  var tpl = (set.match(/<SegmentTemplate\b[^>]*>/) || [])[0];
-  var reps = set.match(/<Representation\b[^>]*>/g) || [];
-  var rep = reps.filter(function (r) { return attr(r, 'height') === String(height); })[0];
-  if (!tpl || !rep) throw new Error('no ' + height + 'p video');
-  var base = manifestUrl.split('?')[0];
-  base = base.substring(0, base.lastIndexOf('/') + 1);
-  var baseTag = (mpd.match(/<BaseURL>([^<]*)<\/BaseURL>/) || [])[1];
-  if (baseTag) base = urlLib.resolve(base, baseTag);
-  function fill(t) { return t.replace(/\$RepresentationID\$/g, attr(rep, 'id')).replace(/\$Bandwidth\$/g, attr(rep, 'bandwidth')); }
-  return { set: set, rep: rep, base: base, media: fill(attr(tpl, 'media')), init: fill(attr(tpl, 'initialization')),
-    start: +(attr(tpl, 'startNumber') || 1) };
-}
-
-function segmentUrl(feed, number) {
-  return urlLib.resolve(feed.base, feed.media.replace(/\$Number(?:%0(\d+)d)?\$/g, function (m, w) {
-    var s = String(number); while (s.length < (+w || 0)) s = '0' + s; return s;
-  }));
-}
-
-/** The first feed's manifest with its video replaced by the stacked video. */
-function stitchManifest(mpd, manifestUrl, id, first, stacked, feeds) {
-  var local = 'http://127.0.0.1:' + PORT + '/stitch/' + id;
-  var bandwidth = feeds.reduce(function (sum, f) { return sum + (+attr(f.rep, 'bandwidth') || 0); }, 0);
-  var rep = '<Representation id="stitch" bandwidth="' + bandwidth + '" codecs="' + stacked.codecs + '" frameRate="' +
-    (attr(first.rep, 'frameRate') || '50/1') + '" width="' + stacked.width + '" height="' + stacked.height + '"/>';
-  var set = first.set
-    .replace(/<InbandEventStream\b[^>]*\/>\s*/g, '')
-    .replace(/<Representation\b[^>]*\/>\s*/g, '')
-    .replace(/<Representation\b[\s\S]*?<\/Representation>\s*/g, '')
-    .replace(/(<SegmentTemplate\b[^>]*?)\smedia="[^"]*"/, '$1 media="' + local + '/$Number$.m4s"')
-    .replace(/(<SegmentTemplate\b[^>]*?)\sinitialization="[^"]*"/, '$1 initialization="' + local + '/init.mp4"')
-    .replace(/<\/AdaptationSet>$/, rep + '</AdaptationSet>');
-  mpd = rewriteManifest(mpd, manifestUrl);
-  return mpd.replace(/<AdaptationSet\b[^>]*contentType="video"[\s\S]*?<\/AdaptationSet>/, function () { return set; });
-}
-
 function stitchRequest(req, res, u) {
-  if (!stitch) return send(res, 501, toBuf('stitching unavailable'));
+  if (!stitchHevc) return send(res, 501, toBuf('stitching unavailable'));
   var m = /^\/stitch\/([a-z0-9-]{1,64})(?:\.mpd|\/(init\.mp4|audio-init\.mp4|a?\d+\.m4s|layout|prepare))?$/.exec(u.pathname);
   if (!m) return send(res, 404, toBuf('not found'));
   var id = m[1], what = m[2] || (/\.mpd$/.test(u.pathname) ? 'mpd' : null);
@@ -531,31 +489,7 @@ function stitchRequest(req, res, u) {
       if (what === 'layout') return hevcRegridPost(res, id, body);
       if (body.kind === 'hevc') return hevcGridPost(res, id, body);
       if (body.kind === 'h264x') return stitchx ? stitchx.post(res, id, body) : send(res, 501, toBuf('stitchx unavailable: ' + stitchxError));
-      var urls = (body.urls || []).map(String);
-      if (urls.length < 2 || urls.length > 4 || !urls.every(f1Cdn)) return send(res, 400, toBuf('need 2-4 F1 manifests'));
-      fetchAll(urls, function (err, mpds) {
-        if (err) return send(res, 502, toBuf(String(err)));
-        var feeds, texts = mpds.map(function (b) { return b.toString('utf8'); });
-        try { feeds = texts.map(function (t, i) { return feedVideo(t, urls[i], body.height || 540); }); }
-        catch (e) { return send(res, 422, toBuf(String(e))); }
-        fetchAll(feeds.map(function (f) { return urlLib.resolve(f.base, f.init); }), function (err2, inits) {
-          if (err2) return send(res, 502, toBuf(String(err2)));
-          try {
-            var cfgs = inits.map(stitch.avcConfig);
-            cfgs.forEach(function (c, i) {
-              if (c.spsRaw.toString('hex') !== cfgs[0].spsRaw.toString('hex') || c.ppsRaw.toString('hex') !== cfgs[0].ppsRaw.toString('hex'))
-                throw new Error('feed ' + i + ' has different SPS/PPS');
-            });
-            var stacked = stitch.stackInit(inits[0], feeds.length, 50);
-            Object.keys(stitches).forEach(function (k) { if (Date.now() - stitches[k].at > 6 * 3600000) delete stitches[k]; });
-            stitches[id] = { feeds: feeds, init: stacked.init, cfg: cfgs[0], cache: [], at: Date.now(),
-              mpd: toBuf(stitchManifest(texts[0], urls[0], id, feeds[0], stacked, feeds), 'utf8') };
-            var ids = Object.keys(stitches);
-            if (ids.length > 2) delete stitches[ids[0]];
-            send(res, 201, toBuf(JSON.stringify({ width: stacked.width, height: stacked.height, codecs: stacked.codecs })), 'application/json');
-          } catch (e) { send(res, 422, toBuf(String(e && e.message || e))); }
-        });
-      });
+      return send(res, 400, toBuf('need kind hevc or h264x'));
     });
     return;
   }
@@ -566,7 +500,7 @@ function stitchRequest(req, res, u) {
   if (what === 'mpd') return send(res, 200, s.mpd, 'application/dash+xml');
   if (what === 'init.mp4') return send(res, 200, s.init, 'video/mp4');
   var number = parseInt(what, 10);
-  if (s.kind === 'hevc' && !(number >= 0 && number < s.count)) return send(res, 404, toBuf('no such segment'));
+  if (!(number >= 0 && number < s.count)) return send(res, 404, toBuf('no such segment'));
   segmentFor(s, number, function (status, body, timing) {
     res.f1 = timing;
     send(res, status, body, status === 200 ? 'video/mp4' : 'text/plain');
@@ -584,19 +518,19 @@ function segmentFor(s, number, cb) {
   s.at = Date.now();
   s.pending = s.pending || {};
   if (s.pending[number]) return s.pending[number].push(cb);
-  var waiting = s.pending[number] = [cb], first = s.feeds[0], hevc = s.kind === 'hevc';
+  var waiting = s.pending[number] = [cb];
   var t0 = Date.now(), timing = { segment: number };
   function answer(status, body) {
     delete s.pending[number];
     if (status !== 200) timing.why = String(body).slice(0, 200);
     waiting.forEach(function (w) { w(status, body, timing); });
   }
-  var segUrls = s.feeds.map(function (f) { return hevc ? hevcSegmentUrl(f, number) : segmentUrl(f, number - first.start + f.start); });
+  var segUrls = s.feeds.map(function (f) { return hevcSegmentUrl(f, number); });
   fetchAll(segUrls, function (err, segs) {
     timing.fetchMs = Date.now() - t0;
     if (err) return answer(502, toBuf(String(err)));
     var out, t1 = Date.now();
-    try { out = hevc ? stitchHevc.gridSegment(segs, s.cfg) : stitch.stackSegment(segs, s.cfg); }
+    try { out = stitchHevc.gridSegment(segs, s.cfg); }
     catch (e) { return answer(422, toBuf(String(e && e.message || e))); }
     timing.stitchMs = Date.now() - t1;
     timing.mb = Math.round(out.length / 1e5) / 10;
