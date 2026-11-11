@@ -21,7 +21,7 @@
   var timingState = null;  // latest timing state for the playing position
   var towerHold = false;   // a fresh load is running: the player's clock still belongs to the last stream
   var subtitleTimer = null;
-  var accountGrid = null;
+  var versionGrid = null;
   var checkingUpdate = false;
   var playbackFeedbackTimer = null;
   var seasonUri = null;    // the season page, which links every race weekend's page
@@ -127,10 +127,15 @@
 
   // dialog
 
-  /** Shows a choice dialog; resolves with the chosen option's value, or null on BACK. */
-  function ask(title, text, options) {
+  /**
+   * Shows a choice dialog; resolves with the chosen option's value, or null on BACK. textClass: e.g. 'notes' for long
+   * text read line by line (left-aligned).
+   */
+  function ask(title, text, options, textClass) {
     $('dialog-title').textContent = title;
-    $('dialog-text').textContent = text || '';
+    var content = $('dialog-text');
+    content.className = 'muted' + (textClass ? ' ' + textClass : '');   // index.html's class, plus the kind
+    content.textContent = text || '';
     var box = $('dialog-actions');
     box.innerHTML = '';
     var row = options.map(function (o) {
@@ -140,8 +145,13 @@
       return b;
     });
     $('dialog').classList.remove('hidden');
+    content.scrollTop = 0;
     return new Promise(function (resolve) {
-      var g = new Focus.Grid([row], { onSelect: function (b) { close(b._value); } });
+      var scrollable = content.scrollHeight > content.clientHeight;
+      var g = new Focus.Grid(scrollable ? [[content], row] : [row], {
+        onSelect: function (b) { if (b !== content) close(b._value); }
+      });
+      g.r = scrollable ? 1 : 0;
       function close(v) { $('dialog').classList.add('hidden'); dialog = null; if (grid) grid.apply(); resolve(v); }
       dialog = { grid: g, close: close };
       g.apply();
@@ -1021,12 +1031,17 @@
     }).catch(function (e) { if (seq === navSeq) $('list-sub').textContent = 'Could not load the season: ' + e.message; });
   }
 
+  // The app may stay open for days: the daily check (and notice) also runs from an hourly timer (Updates.check asks
+  // GitHub once a day at most). Not over a playing video: the notice waits for the next hour off the player.
+  var updateTimer = null;
+
   function checkForUpdate() {
-    if (!Settings.get('updates')) return;
+    if (!updateTimer) updateTimer = setInterval(checkForUpdate, 3600000);
+    if (!Settings.get('updates') || screen === 'player') return;
     Updates.check().then(function (u) {
-      if (u.available && Updates.firstNotice(u.latest)) {
-        toast('F1 TV ' + u.latest + ' is available. Run the installer on your computer again to update.' +
-          (Auth.token() ? ' Details under your name → About.' : ''), 12000, 'notice');
+      if (u.available && screen !== 'player' && Updates.noticeToday()) {
+        toast('App update available: v' + u.latest +
+          (Auth.token() ? '\nDetails in the settings' : ''), 12000, 'notice');
       }
     });
   }
@@ -1034,25 +1049,46 @@
   function checkForUpdateNow(focus) {
     if (checkingUpdate) return;
     checkingUpdate = true;
-    openAccount(focus);
+    openVersion(focus);
     toast('Checking for updates…', 16000);
     Updates.check(true).then(function (u) {
       checkingUpdate = false;
-      if (screen === 'list' && grid === accountGrid) {
-        openAccount(grid.r);
+      if (screen === 'list' && grid === versionGrid) {
+        openVersion(grid.r);
         if (dialog) dialog.grid.apply();
       }
       if (u.error) {
         toast('Could not check for updates.', 8000);
       } else if (u.available) {
-        toast('F1 TV ' + u.latest + ' is available. Run the installer on your computer again: ' +
-          u.page.replace(/^https:\/\//, ''), 12000, 'notice');
+        toast('App update available: v' + u.latest +
+          (Auth.token() ? '\nDetails in the settings' : ''), 12000, 'notice');
       } else if (u.current) {
         toast('F1 TV ' + u.current + ' is up to date.');
       } else {
         toast('Latest release: F1 TV ' + u.latest + '. Could not read the installed version.', 8000);
       }
     });
+  }
+
+  function openVersion(focus) {
+    var u = Updates.status();
+    var instruction = Updates.installedBy() === 'installer'
+      ? 'Run the installer from ' + u.page.replace(/^https:\/\//, '') + ' on your computer again.' : 'Update from Apps2Samsung.';
+    renderList({
+      title: 'F1 TV ' + (u.current || '?'),
+      sub: u.available ? 'Update available: v' + u.latest + ' · ' + instruction : 'Up to date',
+      rows: [
+        { what: checkingUpdate ? 'Checking for updates…' : 'Check for updates now', run: checkForUpdateNow },
+        { day: 'Release notes' }
+      ].concat((u.releases || []).map(function (release) {
+        return { what: 'v' + release.version,
+          sub: release.version === u.current ? 'Installed' : Updates.newer(release.version, u.current) ? 'New' : '',
+          run: function () {
+            ask('F1 TV ' + release.version, release.notes || 'No release notes provided.', [{ label: 'Close', value: true }], 'notes');
+          } };
+      }))
+    }, focus || 0);
+    versionGrid = grid;
   }
 
   function openAccount(focus) {
@@ -1084,15 +1120,16 @@
           });
         } },
         { day: 'About' },
-        { info: true, what: 'Version ' + (u.current || '?'), badge: u.available ? 'Update' : '', badgeCls: u.available ? 'live' : '',
-          sub: u.available ? 'Version ' + u.latest + ' available. Run the installer on your computer again: ' + site
-            : (u.latest ? 'Up to date · ' : '') + site },
-        { what: checkingUpdate ? 'Checking for updates…' : 'Check for updates now', run: checkForUpdateNow },
+        { what: 'Version ' + (u.current || '?'),
+          sub: u.available ? 'Update is available to v' + u.latest : (u.latest ? 'Up to date · ' : '') + site,
+          run: function (idx) {
+            backStack.push(function () { openAccount(idx); });
+            openVersion();
+          } },
         toggle('updates', 'Automatic update checks', 'Check for new versions daily.'),
         { info: true, what: 'Unofficial F1 TV app', sub: 'Not affiliated with Formula 1.' }
       ])
     }, focus || 0);
-    accountGrid = grid;
   }
 
   // feeds
@@ -3102,6 +3139,14 @@
     if (dialog) {
       e.preventDefault();
       if (key === K.BACK) return dialog.close(null);
+      var content = $('dialog-text');
+      if (dialog.grid.current() === content && (key === K.UP || key === K.DOWN)) {
+        var end = Math.max(0, content.scrollHeight - content.clientHeight);
+        if (key === K.UP || content.scrollTop < end) {
+          content.scrollTop = Math.max(0, Math.min(end, content.scrollTop + (key === K.UP ? -100 : 100)));
+          return;
+        }
+      }
       return dialog.grid.handle(key);
     }
     if (screen === 'player') { e.preventDefault(); return playerKey(key); }

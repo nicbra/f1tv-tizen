@@ -26,6 +26,7 @@ function makeDom() {
       this.children = []; this.parentNode = null; this.style = { setProperty(k, v) { this[k] = String(v); } }; this.className = ''; this.ownText = '';
       this.attrs = {}; this.html = ''; this.listeners = {};
       this.offsetTop = 0; this.offsetHeight = 0; this.offsetWidth = 0; this.clientHeight = 1000;
+      this.scrollHeight = 0; this.scrollTop = 0;
     }
     get classList() {
       const e = this, list = () => e.className.split(/\s+/).filter(Boolean);
@@ -272,6 +273,9 @@ async function boot(options = {}) {
   }
   const fetch = async (url) => {
     requests.push(url);
+    if (/api\.github\.com\/repos\/nicbra\/f1tv-tizen\/releases\?/.test(url) && options.releases) {
+      return { ok: true, json: async () => options.releases };
+    }
     if (/127\.0\.0\.1:18765\/ping/.test(url)) return { ok: true, status: 200, text: async () => 'ok' };   // the stream helper
     if (/livetiming.*\/2025\/Index\.json$/.test(url)) return { ok: true, status: 200, text: async () => JSON.stringify(TIMING_INDEX) };
     return { ok: false, status: 404, text: async () => '' };
@@ -345,7 +349,11 @@ async function boot(options = {}) {
     Date: clock.Date, Math, JSON, Promise, encodeURIComponent, decodeURIComponent, URL, Worker, fetch,
     Image: class { set src(v) { this._src = v; } },
     qrcode: () => ({ addData() {}, make() {}, createImgTag: () => '<img>' }),
-    tizen: { application: { getCurrentApplication: () => ({ exit: () => exits.push(clock.now()) }) } },
+    tizen: { application: { getCurrentApplication: () => ({ appInfo: { version: '1.0.0' }, exit: () => exits.push(clock.now()) }) } },
+    XMLHttpRequest: class {
+      open() {}
+      send() { this.status = 200; this.responseText = options.installMarker || ''; this.onload(); }
+    },
     Auth: options.signedOut ? {
       // Not paired: pairing shows a code and waits; tests resolve auth.pairing to sign in.
       token: () => auth.token, profile: () => (auth.token ? { firstName: 'Nicholas', lastName: '' } : {}), renew: async () => null,
@@ -360,7 +368,8 @@ async function boot(options = {}) {
     Stats: stats,
     // The HEVC heights in a stream's master playlist (multiview layouts need theirs).
     HdrStream: { heights: async (url, range) => (options.heights ? options.heights(url, range) : [270, 360, 540, 720, 1080, 1620, 2160]) },
-    Updates: { check: async () => ({}), status: () => ({ page: 'https://github.com/nicbra/f1tv-tizen', current: '1.0.0' }), firstNotice: () => false },
+    Updates: { check: async () => ({}), status: () => ({ page: 'https://github.com/nicbra/f1tv-tizen', current: '1.0.0' }), noticeToday: () => false,
+      installedBy: () => 'apps2samsung' },
     // options.av: the real player.js on that fake AVPlay instead of the Player stub.
     Player: options.av ? undefined : player,
     // The H.264 multiview's small feeds (js/mvsoft.js): what the app asks of them.
@@ -398,6 +407,7 @@ async function boot(options = {}) {
     resumePosition: (id) => net.resume(id),
     savePosition: async (...a) => { saved.push(a); }
   });
+  if (options.releases) vm.runInContext(readFileSync('app/js/updates.js', 'utf8'), context, { filename: 'updates.js' });
   vm.runInContext(readFileSync('app/js/app.js', 'utf8'), context, { filename: 'app.js' });
   windowListeners.load();
   // With player.progress on, the position moves on while it plays, as real playback does.
@@ -2493,13 +2503,178 @@ test('the Schedule header names the season the menu lists', async () => {
 
 test('the update notice does not send a signed-out viewer to an About page', async () => {
   const app = await boot({ signedOut: true });
-  app.context.Updates.check = async () => ({ available: true, latest: '1.2.0', current: '1.0.0', page: 'https://github.com/nicbra/f1tv-tizen' });
-  app.context.Updates.firstNotice = () => true;
+  app.context.Updates.check = async () => ({ available: true, latest: '1.3.0', current: '1.0.0', page: 'https://github.com/nicbra/f1tv-tizen' });
+  app.context.Updates.noticeToday = () => true;
   await app.press('ENTER');            // Browse without signing in
   await app.advance(300);
   assert.match(app.$('topnav').textContent, /Sign in$/);
-  assert.match(app.toast(), /1\.2\.0 is available/);
-  assert.doesNotMatch(app.toast(), /your name/);
+  assert.equal(app.toast(), 'App update available: v1.3.0');
+  assert.ok(app.$('toast').classList.contains('notice'));
+});
+
+test('automatic and manual update notices use two lines and the notice style', async () => {
+  const app = await boot({ releases: [{ tag_name: 'v1.3.0', body: 'New features' }] });
+  assert.equal(app.toast(), 'App update available: v1.3.0\nDetails in the settings');
+  assert.ok(app.$('toast').classList.contains('notice'));
+  await app.press('UP');
+  await app.pick(/^Nicholas$/, ['RIGHT']);
+  await app.pick(/^Version 1\.0\.0/, ['DOWN']);
+  await app.pick(/^Check for updates now/, ['DOWN']);
+  assert.equal(app.toast(), 'App update available: v1.3.0\nDetails in the settings');
+  assert.ok(app.$('toast').classList.contains('notice'));
+  assert.equal(app.requests.filter((url) => /api\.github\.com/.test(url)).length, 2);
+  const css = readFileSync('app/css/style.css', 'utf8');
+  assert.match(css, /\.toast\s*\{[^}]*white-space:\s*pre-line/);
+});
+
+test('About opens the version submenu with all releases, install instructions and BACK focus', async () => {
+  for (const source of ['installer', 'apps2samsung']) {
+    const app = await boot({
+      installMarker: source === 'installer' ? JSON.stringify({ installedBy: source, version: '1.0.0' }) : '',
+      releases: [
+        { tag_name: 'v1.2.0', body: '## Playback\n\n- **Fixed** [audio](https://example.test/audio).' },
+        { tag_name: 'v0.9.0', body: 'Older release' },
+        { tag_name: 'v1.10.0', body: '## Features\n\n- Better `navigation`.\n- Fixed audio.' },
+        { tag_name: 'v1.0.0', body: 'Running release' }
+      ]
+    });
+    await app.press('UP');
+    await app.pick(/^Nicholas$/, ['RIGHT']);
+    const version = app.$('list-inner').querySelectorAll('.list-row').find((row) => /^Version /.test(row.textContent));
+    assert.equal(version.textContent, 'Version 1.0.0Update is available to v1.10.0');
+    assert.equal(version.querySelector('.badge'), null);
+    assert.doesNotMatch(app.$('list-inner').textContent, /What's new|Check for updates now|Release notes|Run the installer|Update from Apps2Samsung/);
+    assert.match(app.$('list-inner').textContent, /Automatic update checks/);
+    await app.pick(/^Version 1\.0\.0/, ['DOWN']);
+    assert.equal(app.$('list-title').textContent, 'F1 TV 1.0.0');
+    assert.deepEqual(app.$('list-inner').children.map((row) => row.textContent), [
+      'Check for updates now', 'Release notes', 'v1.10.0New', 'v1.2.0New', 'v1.0.0Installed', 'v0.9.0'
+    ]);
+    assert.doesNotMatch(app.$('list-inner').textContent, /Automatic update checks/);
+    assert.equal(app.$('list-sub').textContent, 'Update available: v1.10.0 · ' + (source === 'installer'
+      ? 'Run the installer from github.com/nicbra/f1tv-tizen on your computer again.' : 'Update from Apps2Samsung.'));
+    await app.press('DOWN', 'ENTER');
+    assert.equal(app.$('dialog-title').textContent, 'F1 TV 1.10.0');
+    assert.equal(app.$('dialog-text').textContent, 'Features\n\n• Better navigation.\n• Fixed audio.');
+    assert.equal(app.$('dialog-actions').textContent, 'Close');
+    assert.equal(app.focused(), 'Close');
+    await app.press('ENTER');
+    assert.ok(app.$('dialog').classList.contains('hidden'));
+    assert.equal(app.focused(), 'v1.10.0New');
+    await app.pick(/^v1\.0\.0/, ['DOWN']);
+    assert.equal(app.$('dialog-text').textContent, 'Running release');
+    await app.press('BACK');
+    assert.equal(app.$('list-title').textContent, 'F1 TV 1.0.0');
+    assert.equal(app.focused(), 'v1.0.0Installed');
+    await app.press('DOWN', 'ENTER');
+    assert.equal(app.$('dialog-text').textContent, 'Older release');
+    await app.press('BACK', 'BACK');
+    assert.equal(app.$('list-title').textContent, 'Nicholas');
+    assert.equal(app.focused(), 'Version 1.0.0Update is available to v1.10.0');
+    assert.equal(app.requests.filter((url) => /api\.github\.com/.test(url)).length, 1, 'navigation uses cached releases');
+    await app.press('BACK');
+    assert.equal(app.screen(), 'browse');
+  }
+});
+
+test('the version row remains selectable when up to date, with installed and older notes', async () => {
+  const app = await boot({ releases: [{ tag_name: 'v0.9.0' }, { tag_name: 'v1.0.0', body: 'Current notes' }] });
+  await app.press('UP');
+  await app.pick(/^Nicholas$/, ['RIGHT']);
+  await app.moveTo(/^Version 1\.0\.0/, ['DOWN']);
+  assert.equal(app.focused(), 'Version 1.0.0Up to date · github.com/nicbra/f1tv-tizen');
+  await app.press('ENTER');
+  assert.equal(app.$('list-sub').textContent, 'Up to date');
+  assert.deepEqual(app.$('list-inner').children.map((row) => row.textContent), [
+    'Check for updates now', 'Release notes', 'v1.0.0Installed', 'v0.9.0'
+  ]);
+  await app.pick(/^v0\.9\.0/, ['DOWN']);
+  assert.equal(app.$('dialog-title').textContent, 'F1 TV 0.9.0');
+  assert.equal(app.$('dialog-text').textContent, 'No release notes provided.');
+});
+
+test('check-now redraws the version submenu, preserves focus and keeps the existing result toasts', async () => {
+  const app = await boot({ releases: [{ tag_name: 'v1.0.0' }] });
+  await app.press('UP');
+  await app.pick(/^Nicholas$/, ['RIGHT']);
+  await app.pick(/^Version /, ['DOWN']);
+  const pending = deferred();
+  app.context.Updates.check = (force) => { assert.equal(force, true); return pending.promise; };
+  await app.press('ENTER');
+  assert.equal(app.focused(), 'Checking for updates…');
+  assert.equal(app.toast(), 'Checking for updates…');
+  await app.press('ENTER');          // no duplicate check while pending
+  await app.press('DOWN');           // keep the viewer's focus if they move during the check
+  app.context.Updates.status = () => ({ current: '1.0.0', latest: '1.2.0', available: true,
+    releases: [{ version: '1.2.0', notes: 'New notes' }, { version: '1.0.0' }], page: 'https://github.com/nicbra/f1tv-tizen' });
+  pending.resolve({ current: '1.0.0', latest: '1.2.0', available: true });
+  await app.advance(100);
+  assert.equal(app.$('list-title').textContent, 'F1 TV 1.0.0');
+  assert.equal(app.focused(), 'v1.2.0New');
+  assert.equal(app.toast(), 'App update available: v1.2.0\nDetails in the settings');
+  await app.press('BACK');
+  assert.equal(app.focused(), 'Version 1.0.0Update is available to v1.2.0');
+  await app.press('ENTER');
+  for (const [result, message] of [
+    [{ error: true }, 'Could not check for updates.'],
+    [{ current: '1.0.0' }, 'F1 TV 1.0.0 is up to date.'],
+    [{ latest: '1.2.0' }, 'Latest release: F1 TV 1.2.0. Could not read the installed version.']
+  ]) {
+    app.context.Updates.check = async () => result;
+    await app.press('ENTER');
+    assert.equal(app.focused(), 'Check for updates now');
+    assert.equal(app.$('list-title').textContent, 'F1 TV 1.0.0');
+    assert.equal(app.toast(), message);
+  }
+});
+
+test('a check completed after BACK does not reopen the version submenu', async () => {
+  const app = await boot({ releases: [{ tag_name: 'v1.0.0' }] });
+  await app.press('UP');
+  await app.pick(/^Nicholas$/, ['RIGHT']);
+  await app.pick(/^Version /, ['DOWN']);
+  const pending = deferred();
+  app.context.Updates.check = () => pending.promise;
+  await app.press('ENTER', 'BACK');
+  pending.resolve({ current: '1.0.0' });
+  await app.advance(100);
+  assert.equal(app.$('list-title').textContent, 'Nicholas');
+  assert.match(app.focused(), /^Version /);
+});
+
+test('long release notes scroll with UP and DOWN and return to the Close button', async () => {
+  const app = await boot({ releases: [{ tag_name: 'v1.3.0', body: ('- A release note.\n').repeat(100) }] });
+  await app.press('UP');
+  await app.pick(/^Nicholas$/, ['RIGHT']);
+  await app.pick(/^Version /, ['DOWN']);
+  const text = app.$('dialog-text');
+  text.clientHeight = 560;
+  text.scrollHeight = 1230;           // fake the constrained text box's layout
+  await app.press('DOWN', 'ENTER');
+  assert.equal(app.focused(), 'Close');
+  assert.equal(text.scrollTop, 0);
+  await app.press('UP', 'DOWN');
+  assert.ok(text.classList.contains('focused'));
+  assert.equal(text.scrollTop, 100);
+  await app.press('UP', 'UP');
+  assert.equal(text.scrollTop, 0);
+  await app.press('ENTER');           // OK on the text does not close the dialog
+  assert.ok(!app.$('dialog').classList.contains('hidden'));
+  for (let i = 0; i < 7; i++) await app.press('DOWN');
+  assert.equal(text.scrollTop, 670);
+  assert.ok(text.classList.contains('focused'));
+  await app.press('DOWN');
+  assert.equal(app.focused(), 'Close');
+  await app.press('ENTER');
+  assert.equal(app.focused(), 'v1.3.0New');
+  await app.press('ENTER');
+  assert.equal(text.scrollTop, 0, 'reopening the notes resets scrolling');
+  await app.press('BACK');
+  assert.equal(app.focused(), 'v1.3.0New');
+  const css = readFileSync('app/css/style.css', 'utf8');
+  assert.match(css, /\.dialog-box p\s*\{[^}]*max-height:\s*560px/);
+  assert.match(css, /\.dialog-box p\s*\{[^}]*overflow-y:\s*auto/);
+  assert.match(css, /\.dialog-box p\s*\{[^}]*white-space:\s*pre-wrap/);
 });
 
 test('BACK to a weekend list shows the badges as they are now', async () => {

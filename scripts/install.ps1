@@ -194,6 +194,19 @@ function Get-InstalledVersion {
   return ''
 }
 
+function Write-InstallMarker([string]$Dir) {
+  $marker = $null
+  try {
+    $marker = [System.IO.Path]::GetTempFileName()
+    $json = @{ installedBy = 'installer'; version = $script:Version } | ConvertTo-Json -Compress
+    [System.IO.File]::WriteAllText($marker, $json, (New-Object System.Text.UTF8Encoding($false)))
+    Invoke-Sdb -s $script:Serial push $marker "$Dir/tmp/f1tv-installed.json" | Out-Null
+  } catch { # The marker must never prevent a successful install.
+  } finally {
+    if ($marker) { Remove-Item -LiteralPath $marker -ErrorAction SilentlyContinue }
+  }
+}
+
 function Install-App {
   $dir = ''
   foreach ($line in (Invoke-Sdb -s $script:Serial capability) -split "`n") {
@@ -205,7 +218,7 @@ function Install-App {
   $push = Invoke-Sdb -s $script:Serial push $script:Wgt $remote
   if ($script:SdbExit -ne 0) { Fail "Copying the app to the TV failed:`n$push" }
   $out = Invoke-Sdb -s $script:Serial shell 0 vd_appinstall $AppId $remote
-  if ($out -match 'install completed') { Write-Host 'Installed.'; return }
+  if ($out -match 'install completed') { Write-Host 'Installed.'; Write-InstallMarker $dir; return }
   if ($out -match '[Cc]ertificate.*chain|118, -12') {
     Fail "This TV only accepts apps signed with a Samsung certificate made for it (newer models do).`nBuild and sign the app yourself instead; see 'Building it yourself' in the README.`n`nThe TV said: $out"
   }
@@ -215,7 +228,7 @@ function Install-App {
     if ($answer -notmatch '^[yY]') { Fail 'Nothing changed.' }
     Invoke-Sdb -s $script:Serial shell 0 vd_appuninstall $AppId | Out-Null
     $out = Invoke-Sdb -s $script:Serial shell 0 vd_appinstall $AppId $remote
-    if ($out -match 'install completed') { Write-Host 'Installed.'; return }
+    if ($out -match 'install completed') { Write-Host 'Installed.'; Write-InstallMarker $dir; return }
   }
   Fail "The TV refused the app:`n$out"
 }
