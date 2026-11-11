@@ -47,6 +47,10 @@ jobs:
           node-version: '24'
           package-manager-cache: false
 
+      # The multiview stitching tests decode their output with ffmpeg and, in CI, must not skip those checks.
+      - name: Install ffmpeg (stitch pixel checks)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
       - name: Validate release tag and run tests
         run: |
           bash scripts/build-release.sh "$RELEASE_TAG" --check

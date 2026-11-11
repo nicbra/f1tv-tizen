@@ -206,14 +206,9 @@ body.avplay #video, body.avplay #video2 { display: none; }
 
 .toast { position: absolute; z-index: 30; left: 50%; bottom: 80px; transform: translateX(-50%); max-width: 1400px;
   background: var(--overlay); padding: 22px 34px;
-  font-size: 26px; line-height: 1.4; }
-/* A new version: an F1-red border that glows, pulsing a few times. */
-.toast.notice { border: 3px solid var(--red); box-shadow: 0 0 28px 6px rgba(225, 6, 0, 0.55);
-  animation: notice-glow 1.2s ease-in-out 4 alternate; }
-@keyframes notice-glow {
-  from { box-shadow: 0 0 12px 2px rgba(225, 6, 0, 0.35); }
-  to { box-shadow: 0 0 44px 12px rgba(225, 6, 0, 0.75); }
-}
+  font-size: 26px; line-height: 1.4; white-space: pre-line; }
+/* A new version: the lighter grey of rows and tiles, so it stands out from the dark screens behind it. */
+.toast.notice { background: var(--surface); box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6); }
 
 /* Lists (calendar, weekend, account) */
 .list-hero { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: center / cover no-repeat; opacity: 0.18; }
@@ -241,9 +236,12 @@ body.avplay #video, body.avplay #video2 { display: none; }
 /* Dialog */
 .dialog { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6);
   display: flex; align-items: center; justify-content: center; }
-.dialog-box { background: var(--surface); padding: 50px 70px; min-width: 820px; text-align: center; }
+.dialog-box { background: var(--surface); padding: 50px 70px; min-width: 820px; max-width: 1480px; text-align: center; }
 .dialog-box h2 { font-size: 42px; }
-.dialog-box p { margin-top: 14px; }
+.dialog-box p { margin-top: 14px; max-height: 560px; overflow-y: auto; white-space: pre-wrap; overflow-wrap: break-word; }
+/* Release notes: read line by line. */
+.dialog-box p.notes { text-align: left; line-height: 1.35; }
+.dialog-box p.focused { outline: 2px solid var(--focus); outline-offset: 8px; }
 .dialog-actions { margin-top: 36px; display: flex; justify-content: center; }
 .dialog-actions .btn { margin: 0 12px; }
 

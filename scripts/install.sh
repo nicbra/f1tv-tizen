@@ -233,7 +233,7 @@ installed_version() {
 }
 
 install_app() {
-  local dir remote out answer
+  local dir remote out answer marker
   dir="$(run_sdb capability | sed -n 's/^sdk_toolpath://p')"
   remote="${dir:-/home/owner/share/tmp/sdk_tools}/tmp/F1TV.wgt"
   step "Installing F1 TV $VERSION"
@@ -252,6 +252,11 @@ install_app() {
       case "$out" in *"install completed"*) say "Installed." ;; *) die "The TV refused the app:\n$out" ;; esac ;;
     *) die "The TV refused the app:\n$out" ;;
   esac
+  # Optional: the app remembers this version's source even after the TV clears its temp folder.
+  marker="$(mktemp)" || return 0
+  printf '{"installedBy":"installer","version":"%s"}\n' "$VERSION" > "$marker" &&
+    "$SDB" -s "$SERIAL" push "$marker" "${remote%/*}/f1tv-installed.json" >/dev/null 2>&1 || true
+  rm -f "$marker" || true
 }
 
 launch() {
