@@ -294,6 +294,18 @@ test('the helper refuses grids it cannot build, and rearranging one it does not 
   assert.equal((await call(s, 'GET', '/stitch/none/0.m4s')).status, 404);
 });
 
+test('a segment beyond a shorter feed of the grid is a 404, not a fetch of undefined', async () => {
+  // Regrids can land on replays whose feeds differ in length (the app checks, the helper must not
+  // crash): the first feed has two segments, the rest only one.
+  const { s } = helper(cdnRoutes());
+  const one = (i) => ({ init: CDN + 'f' + i + '/init.mp4', urls: [CDN + 'f' + i + '/seg_7.mp4'] });
+  const feeds = [Object.assign({}, one(0), { urls: one(0).urls.concat([CDN + 'f0/seg_7.mp4']) }), one(1), one(2), one(3)];
+  const made = await call(s, 'POST', '/stitch/g5', JSON.stringify({ kind: 'hevc', layout: 'grid2x2', feeds: feeds }));
+  assert.equal(made.status, 201, String(made.body));
+  assert.equal((await call(s, 'GET', '/stitch/g5/0.m4s')).status, 200);
+  assert.equal((await call(s, 'GET', '/stitch/g5/1.m4s')).status, 404, 'past the short feeds');
+});
+
 test('a segment still being built in the old arrangement does not answer requests made after a rearrangement', async () => {
   const routes = cdnRoutes();
   // A second segment per feed (the first one again, renumbered), whose answers wait for `open`.
@@ -316,4 +328,67 @@ test('a segment still being built in the old arrangement does not answer request
   assert.equal(a.status, 200);
   assert.equal(b.status, 200);
   assert.ok(!a.body.equals(b.body), 'the request after the change gets the new arrangement');
+});
+
+test('a corrupt trun sample count is refused instead of being allocated', () => {
+  const { seg } = clip('hevc0');
+  const at = seg.indexOf(Buffer.from('trun'));   // the type field: version/flags then follow
+  const bad = Buffer.from(seg);
+  bad.writeUInt32BE(0xffffffff, at + 8);        // sample_count
+  assert.throws(() => st.fragment(bad), /implausible trun sample count/);
+  assert.ok(st.fragment(seg).samples.length > 0, 'the intact segment still parses');
+});
+
+test('malformed grid descriptions are 400s, answered in the request callback, and the helper keeps going', async () => {
+  const { s } = helper(cdnRoutes());
+  for (const body of ['null', '[]', '"text"', JSON.stringify({ kind: 'hevc', feeds: [null] }), JSON.stringify({ kind: 'hevc', feeds: [{ init: 5 }] })]) {
+    assert.equal((await call(s, 'POST', '/stitch/m1', body)).status, 400, body);
+  }
+  assert.equal((await call(s, 'POST', '/stitch/m1', JSON.stringify({ kind: 'hevc', layout: 'grid2x2', feeds: feedsOf([0, 1, 2, 3]) }))).status, 201);
+  assert.equal((await call(s, 'POST', '/stitch/m1/layout', 'null')).status, 400);
+  assert.equal((await call(s, 'POST', '/stitch/m1/prepare', JSON.stringify({ feeds: 'x' }))).status, 400);
+});
+
+test('template feeds honour their own count, and a regrid onto shorter feeds is refused', async () => {
+  const routes = cdnRoutes();
+  [0, 1, 2, 3].forEach((i) => { routes[CDN + 'f' + i + '/seg_8.mp4'] = routes[CDN + 'f' + i + '/seg_7.mp4']; });
+  const { s, requested } = helper(routes);
+  const two = feedsOf([0, 1, 2, 3]).map((f) => Object.assign({}, f, { count: 2 }));
+  const uneven = two.map((f, i) => (i ? Object.assign({}, f, { count: 1 }) : f));
+  assert.equal((await call(s, 'POST', '/stitch/t1', JSON.stringify({ kind: 'hevc', layout: 'grid2x2', feeds: uneven }))).status, 201);
+  assert.equal((await call(s, 'GET', '/stitch/t1/1.m4s')).status, 404);
+  assert.ok(!requested.some((r) => /f[123]\/seg_8/.test(r.href)), 'no request past a feed\'s end');
+  assert.equal((await call(s, 'POST', '/stitch/t2', JSON.stringify({ kind: 'hevc', layout: 'grid2x2', feeds: two }))).status, 201);
+  const shorter = await call(s, 'POST', '/stitch/t2/layout', JSON.stringify({ kind: 'hevc', layout: 'grid2x2', feeds: feedsOf([3, 2, 1, 0]) }));
+  assert.equal(shorter.status, 422); assert.match(String(shorter.body), /shorter than the running grid/);
+  assert.equal((await call(s, 'GET', '/stitch/t2/1.m4s')).status, 200, 'the running grid is unchanged');
+});
+
+test('a trun table or sample that does not fit the segment is refused', () => {
+  const { seg } = clip('hevc0');
+  const at = seg.indexOf(Buffer.from('trun'));
+  const count = seg.readUInt32BE(at + 8);
+  const more = Buffer.from(seg); more.writeUInt32BE(count + 50, at + 8);
+  assert.throws(() => st.fragment(more), /implausible trun sample count/);
+  const fragment = st.fragment(seg);
+  assert.ok(fragment.trunFlags & 0x200, 'the clips carry per-sample sizes, like F1\'s');
+  // The first sample's size made larger than the segment.
+  const first = at + 12 + (fragment.trunFlags & 1 ? 4 : 0) + (fragment.trunFlags & 4 ? 4 : 0) + (fragment.trunFlags & 0x100 ? 4 : 0);
+  const big = Buffer.from(seg); big.writeUInt32BE(seg.length, first);
+  assert.throws(() => st.fragment(big), /sample outside the segment/);
+});
+
+test('a regrid onto feeds of which any is shorter than the running grid is refused; samples need a size', async () => {
+  const routes = cdnRoutes();
+  [0, 1, 2, 3].forEach((i) => { routes[CDN + 'f' + i + '/seg_8.mp4'] = routes[CDN + 'f' + i + '/seg_7.mp4']; });
+  const { s } = helper(routes);
+  const two = feedsOf([0, 1, 2, 3]).map((f) => Object.assign({}, f, { count: 2 }));
+  assert.equal((await call(s, 'POST', '/stitch/u1', JSON.stringify({ kind: 'hevc', layout: 'grid2x2', feeds: two }))).status, 201);
+  const mixed = two.map((f, i) => (i ? Object.assign({}, f, { count: 1 }) : f));
+  assert.equal((await call(s, 'POST', '/stitch/u1/layout', JSON.stringify({ kind: 'hevc', layout: 'grid2x2', feeds: mixed }))).status, 422);
+  // No per-sample sizes and no default size: nothing bounds the table.
+  const { seg } = clip('hevc0');
+  const at = seg.indexOf(Buffer.from('trun')), unsized = Buffer.from(seg);
+  unsized.writeUInt32BE(seg.readUInt32BE(at + 4) & ~0x200, at + 4);
+  assert.throws(() => st.fragment(unsized), /implausible trun sample count/);
 });

@@ -75,8 +75,13 @@ var Caps = (function () {
       navigator.requestMediaKeySystemAccess('com.widevine.alpha', [{ initDataTypes: ['cenc'],
         videoCapabilities: [{ contentType: 'video/mp4; codecs="avc1.4d402a"', encryptionScheme: scheme }] }])
         .then(function (access) {
-          var config = access.getConfiguration();
-          result(!!config.videoCapabilities && config.videoCapabilities.some(function (v) { return v.encryptionScheme === scheme; }));
+          var granted = access.getConfiguration().videoCapabilities || [];
+          if (!granted.length) return result(false);   // video was not granted for this scheme
+          // Engines before Chromium 58 drop the unknown encryptionScheme member: a granted video
+          // capability without it is "unknown" (null), not "no"; the TV's own playback evidence
+          // (ok/failed) still prunes the path if it really does not work there.
+          var known = granted.some(function (v) { return v.encryptionScheme != null; });
+          result(known ? granted.some(function (v) { return v.encryptionScheme === scheme; }) : null);
         }, function () { result(false); }).catch(function () { result(false); });
     } catch (e) { result(false); }
   }

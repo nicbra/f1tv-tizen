@@ -9,13 +9,17 @@ var Settings = (function () {
     spoilerFree: false,  // blur the artwork of replays and highlights
     hdr: true,           // 4K HDR where the subscription and TV allow it; off: always SDR
     multiview: 'side2',  // the multiview layout offered first (HdrStream.layouts; experiment)
-    updates: true        // look for a newer release on GitHub once a day
+    updates: 'automatic' // automatic | off (legacy booleans are read below)
   };
   var values = {};
 
   try { values = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { values = {}; }
 
-  function get(k) { return values[k] !== undefined ? values[k] : defaults[k]; }
+  function get(k) {
+    var v = values[k] !== undefined ? values[k] : defaults[k];
+    if (k === 'updates') return v === false || v === 'off' ? 'off' : 'automatic';
+    return v;
+  }
 
   function set(k, v) {
     values[k] = v;

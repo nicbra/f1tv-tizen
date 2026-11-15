@@ -135,7 +135,7 @@ function makeClock(start) {
     await settle();
   }
   return { setTimeout: (fn, ms) => add(fn, ms, false), clearTimeout: clear,
-    setInterval: (fn, ms) => add(fn, ms, true), clearInterval: clear, Date: FakeDate, advance, now: () => now };
+    setInterval: (fn, ms) => add(fn, ms, true), clearInterval: clear, Date: FakeDate, advance, jump: (ms) => { now += ms; timers.forEach((t) => { t.at += ms; }); }, now: () => now };
 }
 
 /** A promise the test resolves or rejects later. */
@@ -273,6 +273,9 @@ async function boot(options = {}) {
   }
   const fetch = async (url) => {
     requests.push(url);
+    if (/127\.0\.0\.1:18765\/launcher\/check/.test(url) && options.launcherResult) return { ok: true, json: async () => options.launcherResult };
+    if (/127\.0\.0\.1:18765\/launcher\/info/.test(url) && options.launcherInfo) return { ok: true, json: async () => options.launcherInfo };
+    if (/127\.0\.0\.1:18765\/launcher\/ack/.test(url)) return { ok: true, json: async () => ({ ok: true }) };
     if (/api\.github\.com\/repos\/nicbra\/f1tv-tizen\/releases\?/.test(url) && options.releases) {
       return { ok: true, json: async () => options.releases };
     }
@@ -309,7 +312,7 @@ async function boot(options = {}) {
       return (player.hold ? player.hold.promise : Promise.resolve()).then(() => { player.pos = start || 0; },
         (e) => { player.current = prev; throw e; });
     },
-    unload: async () => { player.engine = null; },
+    unload: () => { player.engine = null; return player.unloadHold ? player.unloadHold.promise : Promise.resolve(); },
     setGridRect(r) { player.gridRect = r; },
     stream: () => player.current,
     engineName: () => player.engine,
@@ -333,7 +336,7 @@ async function boot(options = {}) {
     tracks: () => player.trackList || { audio: [], text: [] },
     chosen: [],
     setAudio(l) { player.chosen.push(['audio', l]); }, setSubtitles(l) { player.chosen.push(['subtitles', l]); },
-    on(name, fn) { player.listeners[name] = fn; }
+    on(name, fn) { if (options.bootThrows) throw Error('broken synchronous boot'); player.listeners[name] = fn; }
   };
 
   const stats = {
@@ -344,6 +347,8 @@ async function boot(options = {}) {
   };
   const context = vm.createContext({
     document,
+    ...(options.launcher ? { Launcher: options.launcher, StreamProxy: { ensure: options.ensure || (async () => true) } } : {}),
+    ...(options.diag ? { Diag: options.diag } : {}),
     window: { addEventListener: (t, fn) => { windowListeners[t] = fn; } },
     localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } },
     setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, setInterval: clock.setInterval, clearInterval: clock.clearInterval,
@@ -369,7 +374,7 @@ async function boot(options = {}) {
     Stats: stats,
     // The HEVC heights in a stream's master playlist (multiview layouts need theirs).
     HdrStream: { heights: async (url, range) => (options.heights ? options.heights(url, range) : [270, 360, 540, 720, 1080, 1620, 2160]) },
-    Updates: { check: async () => ({}), status: () => ({ page: 'https://github.com/nicbra/f1tv-tizen', current: '1.0.0' }), noticeToday: () => false,
+    Updates: { check: async () => ({}), status: () => ({ page: 'https://github.com/nicbra/f1tv-tizen', current: '1.0.0' }),
       installedBy: () => 'apps2samsung' },
     // options.av: the real player.js on that fake AVPlay instead of the Player stub.
     Player: options.av ? undefined : player,
@@ -398,7 +403,7 @@ async function boot(options = {}) {
   // Multiview's layouts, loaded before app.js as in index.html.
   if (options.multiview) vm.runInContext(readFileSync('app/js/layouts.js', 'utf8'), context, { filename: 'layouts.js' });
   Object.assign(api, {
-    refreshConfig: async () => ({}), refreshLocation: async () => null,
+    refreshConfig: options.refreshConfig || (async () => ({})), refreshLocation: async () => null,
     login: () => net.login().then(() => { Object.assign(api.state, { ascendon: 'TOKEN', entitlement: 'ENT' }); }),
     menu: async () => [{ title: 'Home', uri: '/home' }, { title: '2026 Season', uri: '/season' }, { title: 'Archive', uri: '/archive' }],
     page: (id) => net.page(id === api.ARCHIVE_PAGE_ID ? '/archive' : '/home'),
@@ -409,9 +414,9 @@ async function boot(options = {}) {
     resumePosition: (id) => net.resume(id),
     savePosition: async (...a) => { saved.push(a); }
   });
-  if (options.releases) vm.runInContext(readFileSync('app/js/updates.js', 'utf8'), context, { filename: 'updates.js' });
+  if (options.releases || options.launcherResult) vm.runInContext(readFileSync('app/js/updates.js', 'utf8'), context, { filename: 'updates.js' });
   vm.runInContext(readFileSync('app/js/app.js', 'utf8'), context, { filename: 'app.js' });
-  windowListeners.load();
+  if (windowListeners.load) windowListeners.load();
   // With player.progress on, the position moves on while it plays, as real playback does.
   clock.setInterval(() => { if (player.progress && player.engine && !player.paused) player.pos += 0.1; }, 100);
   await clock.advance(100);
@@ -2503,21 +2508,18 @@ test('the Schedule header names the season the menu lists', async () => {
   assert.match(app.$('list-sub').textContent, /^2026 season/, app.$('list-sub').textContent);
 });
 
-test('the update notice does not send a signed-out viewer to an About page', async () => {
+test('automatic checks stay silent for a signed-out viewer', async () => {
   const app = await boot({ signedOut: true });
   app.context.Updates.check = async () => ({ available: true, latest: '1.3.0', current: '1.0.0', page: 'https://github.com/nicbra/f1tv-tizen' });
-  app.context.Updates.noticeToday = () => true;
   await app.press('ENTER');            // Browse without signing in
   await app.advance(300);
   assert.match(app.$('topnav').textContent, /Sign in$/);
-  assert.equal(app.toast(), 'App update available: v1.3.0');
-  assert.ok(app.$('toast').classList.contains('notice'));
+  assert.doesNotMatch(app.toast(), /update|Update/);
 });
 
-test('automatic and manual update notices use two lines and the notice style', async () => {
+test('automatic checks are silent and manual results keep the notice style', async () => {
   const app = await boot({ releases: [{ tag_name: 'v1.3.0', body: 'New features' }] });
-  assert.equal(app.toast(), 'App update available: v1.3.0\nDetails in the settings');
-  assert.ok(app.$('toast').classList.contains('notice'));
+  assert.doesNotMatch(app.toast(), /update|Update/);
   await app.press('UP');
   await app.pick(/^Nicholas$/, ['RIGHT']);
   await app.pick(/^Version 1\.0\.0/, ['DOWN']);
@@ -2527,6 +2529,15 @@ test('automatic and manual update notices use two lines and the notice style', a
   assert.equal(app.requests.filter((url) => /api\.github\.com/.test(url)).length, 2);
   const css = readFileSync('app/css/style.css', 'utf8');
   assert.match(css, /\.toast\s*\{[^}]*white-space:\s*pre-line/);
+});
+
+test('version screen labels the staging channel and leaves stable unlabelled', async () => {
+  for (const channel of [undefined, 'stable', 'prerelease']) {
+    const app = await boot({ launcher: { version: '1.0.0', channel, updates: false, ready() {} } });
+    await app.press('UP'); await app.pick(/^Nicholas$/, ['RIGHT']);
+    await app.pick(/^Version 1\.0\.0/, ['DOWN']);
+    assert.equal(app.$('list-title').textContent, 'F1 TV 1.0.0' + (channel === 'prerelease' ? ' · Staging' : ''));
+  }
 });
 
 test('About opens the version submenu with all releases, install instructions and BACK focus', async () => {
@@ -3017,6 +3028,18 @@ test('multiview offers also exclude encrypted HDR when native cbcs is avoided', 
   assert.ok(offers.every((o) => o.cbcs === false));
 });
 
+test('About tells an unknown browser answer (older engines) apart from one not checked yet', async () => {
+  const store = learnedStore(['avplay:cbcs']);
+  const record = JSON.parse(store['f1tv.caps']);
+  record.browser = { cenc: null };
+  store['f1tv.caps'] = JSON.stringify(record);
+  const app = await boot({ store });
+  await app.press('UP');
+  await app.pick(/^Nicholas$/, ['RIGHT']);
+  await app.pick(/^Playback on this TV/, ['DOWN']);
+  assert.match(app.$('dialog-text').textContent, /• cenc: unknown \(older browser\)\n• cbcs: not checked yet/);
+});
+
 test('About shows what the app learned about playback on this TV, in words, and can forget it', async () => {
   const store = learnedStore(['avplay:cbcs']);
   const record = JSON.parse(store['f1tv.caps']);
@@ -3039,4 +3062,276 @@ test('About shows what the app learned about playback on this TV, in words, and 
   assert.deepEqual(app.context.Caps.report().paths, {});
   assert.equal(app.context.Caps.report().browser.cenc, true);
   assert.match(app.toast(), /Forgotten/);
+});
+
+test('launcher confirms Home and sign-in rendering, and settings cycle through update modes', async () => {
+  for (const signedOut of [false, true]) {
+    let ready = 0;
+    const launcher = { version: '1.1.0', updates: false, ready() { ready++; } };
+    const app = await boot({ launcher, signedOut });
+    assert.ok(ready > 0);
+    if (signedOut) { assert.equal(app.screen(), 'login'); continue; }
+    await app.press('UP'); await app.pick(/^Nicholas$/, ['RIGHT']);
+    await app.moveTo(/^Updates/, ['DOWN']);
+    assert.match(app.focused(), /Automatic$/);
+    await app.press('ENTER'); assert.match(app.focused(), /Off$/);
+    await app.press('ENTER'); assert.match(app.focused(), /Automatic$/);
+  }
+});
+
+test('only reinstall pops up, once per version; a download applies once it closes; the version screen keeps both', async () => {
+  let restarts = 0;
+  const launcher = { version: '1.0.0', shellLevel: 1, updates: true, ready() {}, restart() { restarts++; } };
+  const result = { needsReinstall: '2.0.0', downloaded: '1.1.0', downloadedAt: NOW, releases: [
+    { version: '2.0.0', minShell: 2, notes: 'New shell' }, { version: '1.1.0', minShell: 1, notes: 'New bundle' }, { version: '1.0.0', notes: 'Current' }
+  ] };
+  const app = await boot({ launcher, launcherResult: result });
+  assert.equal(app.$('dialog-title').textContent, 'F1 TV 2.0.0 needs a reinstall');
+  assert.match(app.$('dialog-text').textContent, /Update from Apps2Samsung\.\n\nNew shell/);
+  await app.advance(3000); assert.equal(restarts, 0, 'not while the popup is open');
+  await app.press('ENTER'); await app.advance(700);
+  assert.ok(app.$('dialog').classList.contains('hidden')); assert.equal(restarts, 1, 'applies once it closes');
+  assert.equal(app.toast(), 'Applying new app update…');
+  await app.press('UP'); assert.equal(app.screen(), 'browse', 'keys do nothing while it applies');
+  // Came back on 1.0.0 (1.1.0 was tried once): no second reload, no second popup, the version screen tells.
+  const other = await boot({ launcher, store: app.store, launcherResult: result });
+  assert.ok(other.$('dialog').classList.contains('hidden'), 'reinstall is once per version across starts');
+  await other.press('UP'); await other.pick(/^Nicholas$/, ['RIGHT']); await other.pick(/^Version /, ['DOWN']);
+  assert.match(other.$('list-inner').textContent, /v2\.0\.0Needs reinstall/);
+  assert.match(other.$('list-inner').textContent, /v1\.1\.0Downloaded/);
+  assert.equal(restarts, 1);
+});
+
+test('release notes stay in the version screen after an update without a popup', async () => {
+  const launcher = { version: '1.1.0', shellLevel: 1, updates: true, ready() {} };
+  const app = await boot({ launcher, launcherResult: { releases: [{ version: '1.1.0', notes: 'Better playback' }] } });
+  assert.ok(app.$('dialog').classList.contains('hidden'));
+  await app.press('UP'); await app.pick(/^Nicholas$/, ['RIGHT']); await app.pick(/^Version /, ['DOWN']);
+  await app.pick(/^v1.1.0/, ['DOWN']);
+  assert.equal(app.$('dialog-text').textContent, 'Better playback');
+});
+
+function updateLauncher(onRestart) {
+  return { version: '1.0.0', shellLevel: 1, updates: true, ready() {}, restart: onRestart };
+}
+function hideApp(app) {
+  app.context.document.hidden = true;
+  app.context.document.listeners.visibilitychange.forEach((fn) => fn());
+}
+
+test('a downloaded update applies at once in the menus, with a message, and asks for one reload', async () => {
+  let restarts = 0;
+  const app = await boot({ launcher: updateLauncher(() => restarts++), launcherResult: {
+    downloaded: '1.1.0', downloadedAt: NOW, releases: [{ version: '1.1.0' }]
+  } });
+  await app.advance(700); assert.equal(restarts, 1);
+  assert.equal(app.toast(), 'Applying new app update…');
+  await app.advance(20000); assert.equal(restarts, 1, 'only one reload request');
+});
+
+test('a download found later applies within five minutes: the page asks the shell that often', async () => {
+  let restarts = 0;
+  const app = await boot({ launcher: updateLauncher(() => restarts++), launcherResult: { releases: [{ version: '1.0.0' }] } });
+  await app.advance(1000); assert.equal(restarts, 0);
+  app.context.Updates.check = () => Promise.resolve({ current: '1.0.0', downloaded: '1.1.0', downloadedAt: NOW });
+  await app.advance(300000); await app.advance(700); assert.equal(restarts, 1);
+});
+
+test('never during playback, even in the background: it applies once the player has closed', async () => {
+  let restarts = 0;
+  const app = await boot({ launcher: updateLauncher(() => restarts++), launcherResult: { releases: [{ version: '1.0.0' }] } });
+  await play(app, 'Race');
+  app.context.Updates.check = () => Promise.resolve({ current: '1.0.0', downloaded: '1.1.0', downloadedAt: NOW });
+  await app.advance(300000); hideApp(app); await app.advance(1100); assert.equal(restarts, 0);
+  await app.stop(); await app.advance(800); assert.equal(restarts, 1);
+});
+
+test('after playback, the update reload waits for the player to shut down (10 s at most)', async () => {
+  for (const finishes of [true, false]) {
+    let restarts = 0;
+    const app = await boot({ launcher: updateLauncher(() => restarts++), launcherResult: { releases: [{ version: '1.0.0' }] } });
+    await play(app, 'Race'); await app.advance(5000);
+    app.context.Updates.check = () => Promise.resolve({ current: '1.0.0', downloaded: '1.1.0', downloadedAt: NOW });
+    await app.advance(300000); assert.equal(restarts, 0, 'never while playing');
+    app.player.unloadHold = deferred();
+    await app.press('BACK'); await app.advance(3000);
+    assert.equal(app.screen(), 'feeds'); assert.equal(restarts, 0, 'not while the decoder may still be held');
+    if (finishes) { app.player.unloadHold.resolve(); await app.advance(400); assert.equal(restarts, 0); await app.advance(200); }
+    else await app.advance(7600);
+    assert.equal(restarts, 1, finishes ? 'half a second after the unload' : 'a stuck unload waits 10 s, then goes on');
+    await app.advance(20000); assert.equal(restarts, 1, 'once');
+  }
+});
+
+test('dialogs and text entry hold the update until they close', async () => {
+  for (const blocking of ['dialog', 'input', 'textarea', 'editable']) {
+    let restarts = 0;
+    const app = await boot({ launcher: updateLauncher(() => restarts++), launcherResult: { releases: [{ version: '1.1.0', notes: 'New' }] } });
+    if (blocking === 'dialog') {
+      await app.press('UP'); await app.pick(/^Nicholas$/, ['RIGHT']); await app.pick(/^Version /, ['DOWN']);
+      await app.pick(/^v1.1.0/, ['DOWN']);
+    } else app.context.document.activeElement = { tagName: blocking.toUpperCase(), isContentEditable: blocking === 'editable' };
+    app.context.Updates.check = () => Promise.resolve({ current: '1.0.0', downloaded: '1.1.0', downloadedAt: NOW });
+    await app.advance(300000); await app.advance(1100); assert.equal(restarts, 0);
+    hideApp(app); await app.advance(1100); assert.equal(restarts, 0);
+    if (blocking === 'dialog') await app.press('BACK');
+    else app.context.document.activeElement = null;
+    await app.advance(1700); assert.equal(restarts, 1, blocking);
+  }
+});
+
+test('a download completing during playback remains silent and applies when the viewer leaves the player', async () => {
+  let restarts = 0;
+  const app = await boot({ launcher: updateLauncher(() => restarts++), launcherResult: { releases: [{ version: '1.0.0' }] } });
+  const pending = deferred(); app.context.Updates.check = () => pending.promise;
+  await app.press('UP'); await app.pick(/^Nicholas$/, ['RIGHT']); await app.pick(/^Version /, ['DOWN']);
+  await app.press('ENTER', 'BACK', 'BACK'); await play(app, 'Race');
+  pending.resolve({ current: '1.0.0', downloaded: '1.1.0', downloadedAt: NOW });
+  await app.advance(500);
+  assert.equal(app.screen(), 'player'); assert.ok(app.$('dialog').classList.contains('hidden')); assert.equal(restarts, 0);
+  await app.stop(); await app.advance(800);
+  assert.ok(app.$('dialog').classList.contains('hidden')); assert.equal(restarts, 1);
+});
+
+test('readiness precedes pending or failed startup network; synchronous boot errors never confirm', async () => {
+  for (const failure of [false, true]) {
+    let ready = 0, asked = false;
+    const app = await boot({ launcher: { ...updateLauncher(() => {}), ready() { ready++; } }, refreshConfig() {
+      assert.equal(ready, 1); asked = true;
+      return failure ? Promise.reject(Error('offline')) : new Promise(() => {});
+    } });
+    assert.ok(asked); assert.equal(ready, 1);
+    if (failure) assert.match(app.$('login-status').textContent, /Startup problem: offline/);
+    else assert.ok(!app.$('screen-start').classList.contains('hidden'));
+  }
+  let ready = 0;
+  await assert.rejects(boot({ bootThrows: true, launcher: { ...updateLauncher(() => {}), ready() { ready++; } } }), /broken synchronous boot/);
+  assert.equal(ready, 0);
+});
+
+
+test('stale cached downloads cannot trigger reload loops after rollback, bad marks or revocation', async () => {
+  let restarts = 0;
+  const app = await boot({ launcher: { ...updateLauncher(() => restarts++), blockedUpdates: ['1.1.0'] }, launcherResult: {
+    downloaded: '1.1.0', downloadedAt: NOW - 86400000, releases: [{ version: '1.1.0' }]
+  } });
+  hideApp(app); app.clock.jump(86400000); await app.advance(1100);
+  assert.equal(restarts, 0);
+});
+
+test('launcher receives automatic-update setting at boot and whenever it changes', async () => {
+  const calls = [];
+  const app = await boot({ launcher: { ...updateLauncher(() => {}), setUpdates: (value) => calls.push(value) } });
+  assert.deepEqual(calls, [true]);
+  await app.press('UP'); await app.pick(/^Nicholas$/, ['RIGHT']); await app.moveTo(/^Updates/, ['DOWN']);
+  await app.press('ENTER'); assert.deepEqual(calls, [true, false]);
+  await boot({ launcher: { ...updateLauncher(() => {}), setUpdates: (value) => calls.push(value) }, store: app.store });
+  assert.deepEqual(calls, [true, false, false]);
+  await app.press('ENTER'); assert.deepEqual(calls, [true, false, false, true]);
+});
+
+test('older pending downloads and disabled launcher updates never reload', async () => {
+  for (const [version, enabled] of [['1.2.0', true], ['1.0.0', false]]) {
+    let restarts = 0;
+    const app = await boot({ launcher: { ...updateLauncher(() => restarts++), version, updates: enabled },
+      store: { 'f1tv.update': JSON.stringify({ downloaded: '1.1.0', downloadedAt: NOW - 86400000 }) }, launcherResult: { releases: [{ version: '1.1.0' }] } });
+    hideApp(app); app.clock.jump(86400000); await app.advance(1100); assert.equal(restarts, 0);
+  }
+});
+
+test('failed apply does not loop on another start, but a new downloaded version can apply', async () => {
+  let restarts = 0;
+  const launcher = updateLauncher(() => restarts++);
+  const result = { downloaded: '1.1.0', downloadedAt: NOW, releases: [{ version: '1.1.0' }] };
+  const first = await boot({ launcher, launcherResult: result }); await first.advance(700); assert.equal(restarts, 1);
+  // The reload came back on 1.0.0 (the new version failed): no second try of 1.1.0.
+  const second = await boot({ launcher, launcherResult: result, store: first.store }); hideApp(second);
+  await second.advance(300000); await second.advance(1100); assert.equal(restarts, 1);
+  const third = await boot({ launcher, store: second.store, launcherResult: { ...result, downloaded: '1.2.0' } });
+  await third.advance(700); assert.equal(restarts, 2);
+});
+
+test('while an update applies, keys and new playback do nothing, so the reload never cuts a video', async () => {
+  let restarts = 0;
+  const app = await boot({ launcher: updateLauncher(() => restarts++), launcherResult: { releases: [{ version: '1.0.0' }] } });
+  await play(app, 'Race'); await app.advance(5000);
+  app.context.Updates.check = () => Promise.resolve({ current: '1.0.0', downloaded: '1.1.0' });
+  await app.advance(300000);
+  app.player.unloadHold = deferred();
+  await app.press('BACK'); await app.advance(300);
+  assert.equal(app.screen(), 'feeds'); assert.equal(app.toast(), 'Applying new app update…');
+  const loads = app.player.loads.length;
+  await app.press('ENTER'); await app.advance(3000);
+  app.player.unloadHold.resolve(); await app.advance(600); assert.equal(restarts, 1);
+  await app.advance(3000);
+  assert.equal(app.screen(), 'feeds'); assert.equal(app.player.loads.length, loads, 'no video started');
+});
+
+test('a player that throws while shutting down still lets the update reload, within 10 s', async () => {
+  let restarts = 0;
+  const app = await boot({ launcher: updateLauncher(() => restarts++), launcherResult: { releases: [{ version: '1.0.0' }] } });
+  app.context.Player.unload = () => { throw new Error('stuck'); };
+  app.context.Updates.check = () => Promise.resolve({ current: '1.0.0', downloaded: '1.1.0' });
+  await app.advance(300000); await app.advance(600);
+  assert.equal(restarts, 1);
+});
+
+test('update checks run from the start, also while the app waits for sign-in', async () => {
+  let checks = 0;
+  const app = await boot({ signedOut: true, launcher: updateLauncher(() => {}), launcherResult: { releases: [{ version: '1.0.0' }] } });
+  assert.equal(app.screen(), 'login');
+  app.context.Updates.check = () => { checks++; return Promise.resolve({ current: '1.0.0' }); };
+  await app.advance(300000 * 3 + 1000);
+  assert.equal(checks, 3);
+});
+
+test('a version confirms itself only once its own helper answers', async () => {
+  let ready = 0, answer;
+  const ensure = () => new Promise((resolve, reject) => { answer = { resolve, reject }; });
+  const app = await boot({ launcher: { ...updateLauncher(() => {}), ready() { ready++; } }, ensure });
+  assert.equal(ready, 0, 'not before the helper');
+  answer.resolve(); await app.advance(100); assert.equal(ready, 1);
+  let readyLater = 0, failing;
+  const broken = await boot({ launcher: { ...updateLauncher(() => {}), ready() { readyLater++; } }, ensure: () => new Promise((r, f) => { failing = f; }) });
+  failing(new Error('helper down')); await broken.advance(100);
+  assert.equal(readyLater, 0, 'a version whose helper never answers is not confirmed (the shell rolls it back)');
+});
+
+test('failed starts the shell kept go into the diagnostics log once, then are acknowledged', async () => {
+  const notes = [];
+  const diag = { note: (kind, data, level) => notes.push([kind, data.version, data.reason, level]) };
+  const launcherInfo = { state: { events: [{ id: 4, at: 1, version: '1.2.0', reason: 'page: start timeout' }, { id: 5, at: 2, version: '1.2.0', reason: 'page: script error' }] } };
+  const app = await boot({ launcher: updateLauncher(() => {}), diag, launcherInfo });
+  await app.advance(100);
+  assert.deepEqual(notes, [['launcher.failed-start', '1.2.0', 'page: start timeout', 'warn'], ['launcher.failed-start', '1.2.0', 'page: script error', 'warn']]);
+  assert.ok(app.requests.some((u) => /\/launcher\/ack\?through=5$/.test(u)));
+  const quiet = await boot({ launcher: updateLauncher(() => {}), launcherInfo });
+  await quiet.advance(100);
+  assert.ok(!quiet.requests.some((u) => /launcher\/(info|ack)/.test(u)), 'without a diagnostics log they stay with the shell');
+});
+
+test('an update applies with a full app restart where the shell offers one', async () => {
+  let relaunches = 0, restarts = 0;
+  const app = await boot({ launcher: { ...updateLauncher(() => restarts++), relaunch() { relaunches++; } },
+    launcherResult: { downloaded: '1.1.0', releases: [{ version: '1.1.0' }] } });
+  await app.advance(700);
+  assert.equal(relaunches, 1); assert.equal(restarts, 0);
+});
+
+test('whether the full restart works is learned per TV: a late return means it did not, and reloads are used', async () => {
+  let relaunches = 0, restarts = 0;
+  const launcher = () => ({ ...updateLauncher(() => restarts++), relaunch() { relaunches++; } });
+  const first = await boot({ launcher: launcher(), launcherResult: { downloaded: '1.1.0', releases: [{ version: '1.1.0' }] } });
+  await first.advance(700);
+  assert.equal(relaunches, 1); assert.ok(JSON.parse(first.store['f1tv.relaunch']).pending);
+  // The app came back only five minutes later (the viewer reopened it): the restart doesn't work on this TV.
+  first.store['f1tv.relaunch'] = JSON.stringify({ pending: NOW - 300000 });
+  const second = await boot({ launcher: launcher(), store: first.store, launcherResult: { downloaded: '1.2.0', releases: [{ version: '1.2.0' }] } });
+  assert.deepEqual(JSON.parse(second.store['f1tv.relaunch']), { failed: true });
+  await second.advance(700);
+  assert.equal(relaunches, 1); assert.equal(restarts, 1, 'a page reload instead');
+  // Back within a minute: it works.
+  const store = { 'f1tv.relaunch': JSON.stringify({ pending: NOW - 10000 }) };
+  const quick = await boot({ launcher: launcher(), store });
+  assert.deepEqual(JSON.parse(quick.store['f1tv.relaunch']), { ok: true });
 });

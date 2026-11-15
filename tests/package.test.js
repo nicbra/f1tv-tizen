@@ -29,15 +29,15 @@ test('the Titillium font ships with its licence', () => {
 
 test('config.xml points at files that exist', () => {
   for (const [, ref] of config.matchAll(/<(?:content|icon|tizen:content) src="([^"]+)"/g)) {
-    assert.ok(existsSync(path.join('app', ref)), ref + ' is missing');
+    assert.ok(existsSync(ref.startsWith('launcher/') ? path.join('shell', ref.slice(9)) : path.join('app', ref)), ref + ' is missing');
   }
 });
 
 test('the background service id is the one the app launches', () => {
   const pkg = /package="([^"]+)"/.exec(config)[1];
   const service = /<tizen:service id="([^"]+)"/.exec(config)[1];
-  assert.match(read('app/js/proxy.js'), /pkg \+ '\.Proxy'/);
-  assert.equal(service, pkg + '.Proxy');
+  assert.match(read('app/js/proxy.js'), /pkg \+ '\.Helper'/);
+  assert.equal(service, pkg + '.Helper');
 });
 
 test('the app id the installers launch matches config.xml', () => {

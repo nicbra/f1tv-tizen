@@ -1,11 +1,12 @@
 # Install or update F1 TV from Windows.
 #
 #   irm https://raw.githubusercontent.com/nicbra/f1tv-tizen/HEAD/scripts/install.ps1 | iex
-#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Tv 192.168.1.50] [-Force] [-Check] [-Wgt F1TV.wgt]
+#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Tv 192.168.1.50] [-Force] [-Check] [-Staging] [-Wgt F1TV.wgt]
 #
 #   -Tv     skip the network search (TV: Settings > General > Network > Network Status)
 #   -Force  reinstall even if the TV already has this version
 #   -Check  only check the TV and download, don't install
+#   -Staging follow releases including prereleases
 #   -Wgt    install this package instead of the latest GitHub release
 #
 # Enable Developer Mode with this computer as Host PC IP (see README).
@@ -13,6 +14,7 @@ param(
   [string]$Tv = '',
   [switch]$Force,
   [switch]$Check,
+  [switch]$Staging,
   [string]$Wgt = ''
 )
 
@@ -143,15 +145,21 @@ function Get-Wgt {
     return
   }
   Step "Looking up the latest release of $Repo"
+  $endpoint = if ($Staging) { 'releases?per_page=20' } else { 'releases/latest' }
+  $assetName = if ($Staging) { 'F1TV-staging.wgt' } else { 'F1TV.wgt' }
   try {
-    $release = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ Accept = 'application/vnd.github+json' } -TimeoutSec 60
+    $release = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/$endpoint" -Headers @{ Accept = 'application/vnd.github+json' } -TimeoutSec 60
   } catch { Fail "Couldn't get the latest release from GitHub ($Repo)." }
+  if ($Staging) {
+    $release = @($release | Where-Object { -not $_.draft -and @($_.assets | Where-Object { $_.name -eq $assetName }).Count } | Select-Object -First 1)[0]
+    if (-not $release) { Fail "No published release has $assetName." }
+  }
   $script:Version = "$($release.tag_name)" -replace '^v', ''
-  $asset = @($release.assets | Where-Object { $_.name -eq 'F1TV.wgt' })[0]
-  $sum = @($release.assets | Where-Object { $_.name -eq 'F1TV.wgt.sha256' })[0]
-  if (-not $asset -or -not $sum) { Fail "The latest release ($($script:Version)) has no F1TV.wgt and F1TV.wgt.sha256." }
+  $asset = @($release.assets | Where-Object { $_.name -eq $assetName })[0]
+  $sum = @($release.assets | Where-Object { $_.name -eq "$assetName.sha256" })[0]
+  if (-not $asset -or -not $sum) { Fail "The latest release ($($script:Version)) has no $assetName and $assetName.sha256." }
   New-Item -ItemType Directory -Force -Path $Cache | Out-Null
-  $script:Wgt = Join-Path $Cache "F1TV-$($script:Version).wgt"
+  $script:Wgt = Join-Path $Cache "$($assetName -replace '\.wgt$', '')-$($script:Version).wgt"
   if (Test-Path -LiteralPath $script:Wgt) { return }
   Write-Host "Downloading F1 TV $($script:Version)"
   $part = "$($script:Wgt).part"

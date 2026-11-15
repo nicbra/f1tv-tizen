@@ -117,7 +117,6 @@ test('EME waits ten seconds, asks video-only for each scheme and verifies the gr
 });
 
 for (const [name, probe] of [
-  ['missing scheme', () => Promise.resolve({ getConfiguration: () => ({ videoCapabilities: [{ contentType: 'video/mp4' }] }) })],
   ['audio-only grant', () => Promise.resolve({ getConfiguration: () => ({ audioCapabilities: [{ encryptionScheme: 'cenc' }] }) })],
   ['different scheme', (config) => Promise.resolve({ getConfiguration: () => ({ videoCapabilities: [{ encryptionScheme: config.videoCapabilities[0].encryptionScheme === 'cenc' ? 'cbcs' : 'cenc' }] }) })],
   ['refusal', () => Promise.reject(Error('unsupported'))],
@@ -125,6 +124,16 @@ for (const [name, probe] of [
 ]) test('EME does not accept ' + name, async () => {
   const h = boot({}, { probe }); [...h.timers.values()].find((t) => t.ms === 10000).fn(); await settled();
   assert.equal(h.caps.browser('cenc'), false); assert.equal(h.caps.browser('cbcs'), false);
+});
+
+test('an old engine that drops the encryptionScheme member keeps the browser path unknown', async () => {
+  // Chromium before 58 drops unknown dictionary members: access is granted, but the configuration
+  // reports no scheme. That is "unknown" (null), so cencCapable keeps shaka:cenc selectable and the
+  // TV's own playback evidence decides.
+  const probe = () => Promise.resolve({ getConfiguration: () => ({ videoCapabilities: [{ contentType: 'video/mp4' }] }) });
+  const h = boot({}, { probe }); [...h.timers.values()].find((t) => t.ms === 10000).fn(); await settled();
+  assert.equal(h.caps.browser('cenc'), null); assert.equal(h.caps.browser('cbcs'), null);
+  assert.equal(boot(h.store).caps.browser('cenc'), null, 'persisted as unknown, not as a refusal');
 });
 
 test('encrypted HDR stays avoided when native cbcs is the last SDR resort', () => {

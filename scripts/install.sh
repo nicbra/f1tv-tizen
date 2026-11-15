@@ -2,11 +2,12 @@
 # Install or update F1 TV from Linux or macOS. Requires curl and unzip.
 #
 #   curl -fsSL https://raw.githubusercontent.com/nicbra/f1tv-tizen/HEAD/scripts/install.sh | bash
-#   bash install.sh [TV address] [--force] [--check] [--wgt F1TV.wgt]
+#   bash install.sh [TV address] [--force] [--check] [--staging] [--wgt F1TV.wgt]
 #
 #   TV address  skip the network search (TV: Settings > General > Network > Network Status)
 #   --force     reinstall even if the TV already has this version
 #   --check     only check the TV and download, don't install
+#   --staging   follow releases including prereleases
 #   --wgt FILE  install this package instead of the latest GitHub release
 #
 # Enable Developer Mode with this computer as Host PC IP (see README).
@@ -21,7 +22,7 @@ CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/f1tv-tizen"
 CURL_API=(curl -fsSL --connect-timeout 15 --max-time 60)
 CURL_GET=(curl -fL --connect-timeout 15 --speed-limit 1024 --speed-time 30 --progress-bar)
 
-TV="" WGT="" FORCE=0 CHECK=0 VERSION="" SDB="" SERIAL=""
+TV="" WGT="" FORCE=0 CHECK=0 STAGING=0 VERSION="" SDB="" SERIAL=""
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -30,7 +31,7 @@ die()  { printf '\nError: %b\n' "$*" >&2; exit 1; }
 ask()  { local a=""; printf '%s' "$1" > /dev/tty; read -r a < /dev/tty || true; printf '%s' "$a"; }
 
 usage() {
-  say "Usage: install.sh [TV address] [--force] [--check] [--wgt F1TV.wgt]"
+  say "Usage: install.sh [TV address] [--force] [--check] [--staging] [--wgt F1TV.wgt]"
   say "Installs or updates the F1 TV app on a Samsung TV in Developer Mode."
 }
 
@@ -39,6 +40,7 @@ while [ $# -gt 0 ]; do
     --wgt) [ $# -ge 2 ] || die "--wgt needs a file"; WGT="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
     --check) CHECK=1; shift ;;
+    --staging) STAGING=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) usage; exit 1 ;;
     *) TV="$1"; shift ;;
@@ -186,6 +188,31 @@ wgt_version() {
     sed -n 's/.* version="\([^"]*\)".*/\1/p'
 }
 
+# Extract release objects without jq/Python, including compact JSON and braces in notes.
+# GitHub returns newest first. Stop at the first non-draft containing the staging WGT.
+staging_release() {
+  awk '
+    { for (i = 1; i <= length($0); i++) {
+      c = substr($0, i, 1)
+      if (depth) obj = obj c
+      if (quoted) {
+        if (escaped) escaped = 0
+        else if (c == "\\") escaped = 1
+        else if (c == "\"") quoted = 0
+      } else if (c == "\"") quoted = 1
+      else if (c == "{") { if (!depth) obj = c; depth++ }
+      else if (c == "}") {
+        depth--
+        if (!depth && obj ~ /"draft"[[:space:]]*:[[:space:]]*false/ &&
+            obj ~ /"browser_download_url"[[:space:]]*:[[:space:]]*"[^" ]*\/F1TV-staging\.wgt"/) {
+          print obj; exit
+        }
+      }
+    }
+    if (depth) obj = obj " "
+  }'
+}
+
 get_wgt() {
   if [ -n "$WGT" ]; then
     [ -f "$WGT" ] || die "$WGT doesn't exist."
@@ -193,15 +220,21 @@ get_wgt() {
     return
   fi
   step "Looking up the latest release of $REPO"
-  local api url sumurl want
-  api="$("${CURL_API[@]}" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/releases/latest")" ||
+  local api url sumurl want endpoint asset
+  endpoint="releases/latest" asset="F1TV.wgt"
+  if [ "$STAGING" = 1 ]; then endpoint="releases?per_page=20"; asset="F1TV-staging.wgt"; fi
+  api="$("${CURL_API[@]}" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/$endpoint")" ||
     die "Couldn't get the latest release from GitHub ($REPO)."
+  if [ "$STAGING" = 1 ]; then
+    api="$(printf '%s\n' "$api" | staging_release)"
+    [ -n "$api" ] || die "No published release has $asset."
+  fi
   VERSION="$(field "$api" tag_name)"
   VERSION="${VERSION#v}"
-  url="$(printf '%s\n' "$api" | sed -n 's/.*"browser_download_url" *: *"\([^"]*\/F1TV\.wgt\)".*/\1/p' | head -1)"
-  sumurl="$(printf '%s\n' "$api" | sed -n 's/.*"browser_download_url" *: *"\([^"]*\/F1TV\.wgt\.sha256\)".*/\1/p' | head -1)"
-  [ -n "$url" ] && [ -n "$sumurl" ] || die "The latest release ($VERSION) has no F1TV.wgt and F1TV.wgt.sha256."
-  WGT="$CACHE/F1TV-$VERSION.wgt"
+  url="$(printf '%s\n' "$api" | sed -n "s/.*\"browser_download_url\" *: *\"\([^\"]*\/${asset%.wgt}\.wgt\)\".*/\1/p" | head -1)"
+  sumurl="$(printf '%s\n' "$api" | sed -n "s/.*\"browser_download_url\" *: *\"\([^\"]*\/${asset%.wgt}\.wgt\.sha256\)\".*/\1/p" | head -1)"
+  [ -n "$url" ] && [ -n "$sumurl" ] || die "The latest release ($VERSION) has no $asset and $asset.sha256."
+  WGT="$CACHE/${asset%.wgt}-$VERSION.wgt"
   if [ -f "$WGT" ]; then return; fi
   say "Downloading F1 TV $VERSION"
   mkdir -p "$CACHE"
@@ -292,4 +325,5 @@ main() {
   launch
 }
 
+# tests/release_test.py loads everything above this bare 'main' line; keep the marker plain.
 main

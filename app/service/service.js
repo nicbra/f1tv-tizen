@@ -3,7 +3,7 @@
  * having hundreds in the fragment. Correcting the count lets AVPlay accept them; the entries
  * are empty (constant IV, no subsamples). Widevine handles decryption; video goes to the CDN.
  *
- *   GET /ping -> "ok"
+ *   GET /ping -> "ok" (the installed shell wraps this with the bundle version)
  *   GET /mpd?u=<url>[&shift=<seconds>][&audio=eng][&text=eng] -> rewritten manifest
  *       shift delays the live edge; audio/text put the preferred tracks first for AVPlay.
  *   GET /s/<b64 base>/<file> -> segment with its sample count patched if needed
@@ -69,22 +69,45 @@ function logged(req, res, u) {
  */
 var browserUa = null;   // the TV browser's user agent, once the app has sent it (multiview)
 
-function fetchBuffer(target, redirects, cb, ua) {
-  var opts = urlLib.parse(target);
-  opts.headers = { 'User-Agent': ua || browserUa || UA };
-  var lib = opts.protocol === 'http:' ? http : https;
-  var req = lib.get(opts, function (res) {
+/**
+ * Where a manifest may redirect to: https to a DNS name, no IP literal or local name. A name filter only (names are not
+ * resolved), against redirects to the home network spelled as addresses or local names.
+ */
+function publicHttps(u) {
+  var m = /^https:\/\/([a-z0-9.-]+)(?::\d+)?\//i.exec(u || '');
+  return !!m && /\.[a-z]{2,}$/i.test(m[1]) && !/(^|\.)(localhost|local|lan|home|internal)$/i.test(m[1]);
+}
+
+/** `allowed(url)`, when given, must hold for every redirect target too. */
+function fetchBuffer(target, redirects, cb, ua, allowed) {
+  var over = false;
+  function done(err, status, body, headers, finalUrl) { if (over) return; over = true; cb(err, status, body, headers, finalUrl); }
+  // Only http(s): anything else (a missing segment URL, file://) must fail this request, not the helper.
+  if (typeof target !== 'string' || !/^https?:\/\//.test(target)) return done(new Error('not an http(s) URL'));
+  var req;
+  try {
+    var opts = urlLib.parse(target);
+    opts.headers = { 'User-Agent': ua || browserUa || UA };
+    req = (opts.protocol === 'http:' ? http : https).get(opts, answered);
+  } catch (e) { return done(e); }
+  function answered(res) {
     if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
       res.resume();
-      return fetchBuffer(urlLib.resolve(target, res.headers.location), redirects - 1, cb, ua);
+      var next;
+      try { next = urlLib.resolve(target, res.headers.location); } catch (e) { return done(e); }
+      if (allowed && !allowed(next)) return done(new Error('redirect to a host that is not allowed'));
+      return fetchBuffer(next, redirects - 1, done, ua, allowed);
     }
-    var chunks = [];
-    res.on('data', function (c) { chunks.push(c); });
-    res.on('end', function () { cb(null, res.statusCode, Buffer.concat(chunks), res.headers, target); });
-    res.on('error', function (e) { cb(e); });
-  });
-  req.setTimeout(15000, function () { req.abort(); });
-  req.on('error', function (e) { cb(e); });
+    var chunks = [], size = 0;
+    // A bounded buffer: an endless or lying response must not take the helper down with it.
+    res.on('data', function (c) { size += c.length; if (size > 32 * 1024 * 1024) { req.abort(); return done(new Error('response too large')); } chunks.push(c); });
+    res.on('end', function () { done(null, res.statusCode, Buffer.concat(chunks), res.headers, target); });
+    res.on('error', function (e) { done(e); });
+    res.on('aborted', function () { done(new Error('response cut off')); });
+  }
+  // Answer the caller on time even if aborting emits nothing on this Node version.
+  req.setTimeout(15000, function () { done(new Error('timeout')); req.abort(); });
+  req.on('error', function (e) { done(e); });
 }
 
 // Buffer.from is missing on very old Node versions; new Buffer() is deprecated on new ones.
@@ -125,6 +148,8 @@ function patchSenc(buf) {
   var trun = findBox(buf, 'trun', traf + 8, trafEnd);
   var senc = findBox(buf, 'senc', traf + 8, trafEnd);
   if (trun < 0 || senc < 0) return buf;
+  // A truncated segment (a CDN edge serving a short moof) is served unpatched, not a crash.
+  if (buf.readUInt32BE(senc) < 16 || buf.readUInt32BE(trun) < 16 || senc + 16 > buf.length || trun + 16 > buf.length) return buf;
   var sencFlags = buf.readUInt32BE(senc + 8) & 0xffffff;
   if (sencFlags !== 0 || buf.readUInt32BE(senc + 12) !== 0) return buf;
   buf.writeUInt32BE(buf.readUInt32BE(trun + 12), senc + 12);
@@ -149,22 +174,29 @@ function timeShift(mpd, shift, nowMs) {
   var astText = attr(mpd.slice(0, mpd.indexOf('>', mpd.indexOf('<MPD'))), 'availabilityStartTime');
   if (!astText || !/type="dynamic"/.test(mpd)) return mpd;
   var ast = Date.parse(astText);
-  var periodStart = isoSeconds(attr((/<Period\b[^>]*>/.exec(mpd) || [''])[0], 'start'));
+  var periodTag = (/<Period\b[^>]*>/.exec(mpd) || [''])[0];
+  var periodStart = isoSeconds(attr(periodTag, 'start')), periodDuration = isoSeconds(attr(periodTag, 'duration'));
+  // Built for F1's single-Period manifests: a first Period's length must not cap later ones' timelines.
+  if ((mpd.match(/<Period\b/g) || []).length !== 1) periodDuration = 0;
   var edgeSeconds = (nowMs - shift * 1000 - ast) / 1000 - periodStart; // shifted edge, period time
 
   var shifted = mpd.replace(/<SegmentTemplate\b([^>]*)>([\s\S]*?)<\/SegmentTemplate>/g, function (all, attrs, inner) {
     var ts = +attr(attrs, 'timescale') || 1, pto = +attr(attrs, 'presentationTimeOffset') || 0;
     var cut = pto + edgeSeconds * ts; // media time of the shifted live edge
+    var periodEnd = periodDuration > 0 ? pto + periodDuration * ts : Infinity;
     inner = inner.replace(/<SegmentTimeline>([\s\S]*?)<\/SegmentTimeline>/, function (x, body) {
-      var out = [], t = null;
-      body.replace(/<S\b([^>]*)\/>/g, function (tag, a) {
+      var list = [], out = [], t = 0;   // the first S starts at 0 when it has no t
+      body.replace(/<S\b([^>]*)\/>/g, function (tag, a) { list.push(a); return tag; });
+      list.forEach(function (a, i) {
         if (attr(a, 't') != null) t = +attr(a, 't');
         var d = +attr(a, 'd'), r = +(attr(a, 'r') || 0);
-        if (t == null || !d) return tag;
-        var n = Math.max(0, Math.min(r + 1, Math.floor((cut - t) / d)));
+        if (!d) return;
+        // r="-1" repeats up to the next S's t, or to the Period's end (open while live: a sliding window).
+        var span = r + 1, nextT = i + 1 < list.length ? attr(list[i + 1], 't') : null;
+        if (r < 0) span = Math.max(0, Math.ceil(((nextT != null ? +nextT : periodEnd) - t) / d));
+        var n = Math.max(0, Math.min(span, Math.floor((cut - t) / d)));
         if (n > 0) out.push('<S t="' + t + '" d="' + d + '"' + (n > 1 ? ' r="' + (n - 1) + '"' : '') + '/>');
-        t += (r + 1) * d;
-        return tag;
+        t += (span === Infinity ? n : span) * d;
       });
       return '<SegmentTimeline>' + out.join('') + '</SegmentTimeline>';
     });
@@ -212,7 +244,8 @@ function preferLanguages(mpd, prefs) {
   var order = blocks.map(function (b) { return b.text; });
   ['audio', 'text'].forEach(function (kind) {
     var lang = prefs[kind];
-    if (!lang) return;
+    // A language code, not RegExp source: anything else is served unsorted (never a crash).
+    if (!lang || !/^[a-z]{2,9}$/i.test(lang)) return;
     var slots = [], sets = [];
     blocks.forEach(function (b, i) { if (setKind(b.text) === kind) { slots.push(i); sets.push(b.text); } });
     var pick = sets.filter(function (t) { return new RegExp('lang="' + lang + '(-[^"]*)?"').test(t); })[0];
@@ -248,6 +281,16 @@ function handle(req, res) {
   var u = urlLib.parse(req.url, true);
   if (u.pathname === '/ping') return send(res, 200, toBuf('ok'));
   if (u.pathname === '/log') return send(res, 200, toBuf(JSON.stringify(recent)), 'application/json');
+  // "Check for updates now": this bundle's downloader (the page then reads the result from the shell). Like the shell's
+  // own /launcher/ routes, only the app's own pages may ask: it goes online (a caller could burn GitHub's rate limit).
+  if (u.pathname === '/updates/check' && req.method === 'POST') {
+    var origin = req.headers && req.headers.origin;
+    if (origin && origin !== 'null' && origin !== 'file://') return send(res, 403, toBuf('local page required'));
+    if (!bundleUpdates) return send(res, 404, toBuf('no launcher'));
+    return bundleUpdates.check(function (err) {
+      send(res, err ? 502 : 200, toBuf(JSON.stringify(err ? { error: String(err.message || err) } : { ok: true })), 'application/json');
+    });
+  }
   res = logged(req, res, u);
 
   if (/^\/(?:vod\/[a-z0-9-]{1,64}\.mpd|hdr\/[a-z0-9-]{1,64})$/.test(u.pathname)) {
@@ -279,6 +322,8 @@ function handle(req, res) {
 
   if (u.pathname === '/mpd' && u.query.u) {
     var manifestUrl = String(u.query.u);
+    // Only F1's CDNs, like the audio route: CORS is open, so anything else would make this a proxy into the home network.
+    if (!f1Cdn(manifestUrl)) return send(res, 403, toBuf('forbidden'));
     return fetchBuffer(manifestUrl, 3, function (err, status, body, headers, finalUrl) {
       if (err) return send(res, 502, toBuf(String(err)));
       if (status !== 200) return send(res, status, body);
@@ -298,7 +343,7 @@ function handle(req, res) {
       if (+u.query.shift > 0) mpd = timeShift(mpd, +u.query.shift, Date.now());
       if (u.query.audio || u.query.text) mpd = preferLanguages(mpd, { audio: u.query.audio, text: u.query.text });
       send(res, 200, toBuf(mpd, 'utf8'), 'application/dash+xml');
-    });
+    }, null, publicHttps);
   }
 
   var m = /^\/s\/([^/]+)\/(.+)$/.exec(u.pathname);
@@ -324,6 +369,7 @@ try { stitchHevc = require('./stitch-hevc'); } catch (e) { console.log('stitch u
 /** n: the index in the playlist, or for live (`absolute`) the segment number itself (as in the DASH timeline). */
 function hevcSegmentUrl(feed, n) {
   if (feed.urls) return feed.urls[n];
+  if (!feed.absolute && feed.count != null && !(n < feed.count)) return null;   // past a replay feed's end
   return feed.media.replace(/\$Number(?:%0(\d+)d)?\$/g, function (m, w) {
     var s = String(feed.absolute ? n : feed.startNumber + n); while (s.length < (+w || 0)) s = '0' + s; return s;
   });
@@ -357,6 +403,8 @@ function hevcRegridPost(res, id, body) {
     if (err) return send(res, status, toBuf(err));
     // The licence AVPlay has is for the running grid's key.
     if (grid.cfg.enc !== old.cfg.enc) return send(res, 422, toBuf('the new feeds are encrypted differently'));
+    // The player keeps the running grid's manifest: shorter replay feeds would leave its last segments missing.
+    if (!grid.live && grid.count < old.count) return send(res, 422, toBuf('the new feeds are shorter than the running grid'));
     grid.init = old.init;
     // Builds under way finish for whoever asked for them, in the old arrangement; a request from now on gets the
     // new one (grid.pending starts empty), or the picture would switch back for a segment and the frames not match.
@@ -370,14 +418,16 @@ function hevcRegridPost(res, id, body) {
 
 /** Fetches the feeds' init and probe segments, prepares the grid and stitches the probe; cb(status, error, grid). */
 function buildGrid(body, cb) {
-  var feeds = body.feeds || [];
+  var feeds = body && Array.isArray(body.feeds) ? body.feeds : [];
   if (feeds.length < 1 || feeds.length > 9) return cb(400, 'need 1-9 feeds');
+  if (!feeds.every(function (f) { return f && typeof f === 'object' && typeof f.init === 'string' && (Array.isArray(f.urls) || typeof f.media === 'string'); })) return cb(400, 'bad feeds');
   var live = !!body.live, count0 = feeds[0].urls ? feeds[0].urls.length : feeds[0].count;
   var probe = live ? +body.probe : Math.max(0, Math.min(count0 - 1, +body.probe || 0)), all = [];
   if (live && !(probe > 0 && feeds.every(function (f) { return f.absolute && f.media; }))) return cb(400, 'live grids need absolute numbers');
   feeds.forEach(function (f) { all.push(f.init, hevcSegmentUrl(f, probe)); });
   if (!all.every(function (u) { return f1Cdn(String(u)); })) return cb(400, 'need F1 media');
-  var count = live ? Infinity : feeds[0].urls ? feeds[0].urls.length : feeds[0].count, ua = body.ua ? String(body.ua).slice(0, 300) : null;
+  // A replay grid is as long as its shortest feed.
+  var count = live ? Infinity : Math.min.apply(Math, feeds.map(function (f) { return f.urls ? f.urls.length : +f.count || 0; })), ua = body.ua ? String(body.ua).slice(0, 300) : null;
   // Akamai serves a stream only to the user agent that opened it: the manifest and commentary too.
   if (ua) browserUa = ua;
   if (body.prepareOnly) {
@@ -476,22 +526,27 @@ function stitchRequest(req, res, u) {
   if (!m) return send(res, 404, toBuf('not found'));
   var id = m[1], what = m[2] || (/\.mpd$/.test(u.pathname) ? 'mpd' : null);
   if (req.method === 'POST' && (!what || what === 'layout' || what === 'prepare')) {
-    var chunks = [];
-    req.on('data', function (b) { chunks.push(b); });
+    var chunks = [], size = 0;
+    req.on('data', function (b) { size += b.length; if (size <= 2 * 1024 * 1024) chunks.push(b); });
     req.on('end', function () {
+      if (size > 2 * 1024 * 1024) return send(res, 413, toBuf('grid description too large'));
       var body;
       try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (e) { return send(res, 400, toBuf('bad json')); }
-      if (what === 'prepare') {
-        if (!stitches[id]) return send(res, 404, toBuf('no such grid'));
-        body.prepareOnly = true;
-        return buildGrid(body, function (status, err) { send(res, status, toBuf(err || '')); });
-      }
-      if (what === 'layout') return hevcRegridPost(res, id, body);
-      if (body.kind === 'hevc') return hevcGridPost(res, id, body);
-      if (body.kind === 'h264x') return stitchx ? stitchx.post(res, id, body) : send(res, 501, toBuf('stitchx unavailable: ' + stitchxError));
-      return send(res, 400, toBuf('need kind hevc or h264x'));
+      if (!body || typeof body !== 'object') return send(res, 400, toBuf('need a grid description'));
+      try { posted(body); } catch (e) { send(res, 400, toBuf('bad grid description: ' + String(e && e.message || e))); }
     });
     return;
+  }
+  function posted(body) {
+    if (what === 'prepare') {
+      if (!stitches[id]) return send(res, 404, toBuf('no such grid'));
+      body.prepareOnly = true;
+      return buildGrid(body, function (status, err) { send(res, status, toBuf(err || '')); });
+    }
+    if (what === 'layout') return hevcRegridPost(res, id, body);
+    if (body.kind === 'hevc') return hevcGridPost(res, id, body);
+    if (body.kind === 'h264x') return stitchx ? stitchx.post(res, id, body) : send(res, 501, toBuf('stitchx unavailable: ' + stitchxError));
+    return send(res, 400, toBuf('need kind hevc or h264x'));
   }
   var s = stitches[id];
   if (!s || !what) return send(res, 404, toBuf('not found'));
@@ -526,6 +581,8 @@ function segmentFor(s, number, cb) {
     waiting.forEach(function (w) { w(status, body, timing); });
   }
   var segUrls = s.feeds.map(function (f) { return hevcSegmentUrl(f, number); });
+  // A feed with fewer segments than the first (regridded onto unequal replays) has nothing here: 404.
+  if (segUrls.some(function (u) { return u == null; })) return answer(404, toBuf('no such segment'));
   fetchAll(segUrls, function (err, segs) {
     timing.fetchMs = Date.now() - t0;
     if (err) return answer(502, toBuf(String(err)));
@@ -551,17 +608,26 @@ function warmNext(s, number) {
   });
 }
 
-function start() {
+var bundleUpdates = null;   // the update downloader (updates.js), when the launcher's shell runs this helper
+function start(options) {
+  if (options && options.launcher && !bundleUpdates) {
+    try { bundleUpdates = require('./updates').create(options.launcher); bundleUpdates.start(); }
+    catch (e) { console.log('updates unavailable: ' + e); bundleUpdates = null; }
+  }
+  if (options && options.externalServer) return;
   if (server) return;
   server = http.createServer(handle);
   server.on('error', function (e) { console.log('proxy error: ' + e); });
   server.listen(PORT, '127.0.0.1');
 }
 
+module.exports.handle = handle;
 module.exports.onStart = start;
 module.exports.useHdrVideo = useHdrVideo;
 module.exports.onRequest = start;
 module.exports.onExit = function () {
+  if (bundleUpdates) bundleUpdates.stop();
+  bundleUpdates = null;
   if (server) server.close();
   server = null;
 };

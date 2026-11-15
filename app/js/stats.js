@@ -89,7 +89,11 @@ var Stats = (function () {
         if (s) sprint[r.round] = { pos: +s.position || null, points: +s.points || 0 };
       });
       var races = all[0].RaceTable.Races.map(function (r) {
-        var res = r.Results[0];
+        // A round can be listed before it has a result row: still to come (pending), not a DNF.
+        var res = (r.Results || [])[0];
+        if (!res) return { round: +r.round, name: shortRace(r.raceName), country: r.Circuit.Location.country,
+          pos: null, posText: '', grid: null, points: 0, status: '', fastest: false,
+          quali: quali[r.round] || null, sprint: sprint[r.round] || null, pending: true };
         return {
           round: +r.round, name: shortRace(r.raceName), country: r.Circuit.Location.country,
           pos: classified(res) ? +res.position : null, posText: res.positionText,

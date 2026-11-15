@@ -516,6 +516,8 @@ var HdrStream = (function () {
         body.probe = Math.min.apply(Math, feeds.map(function (f) { return f.recent; }));
         body.feeds = feeds.map(function (f) { return { init: f.init, media: f.media, absolute: true }; });
       } else {
+        var count = feeds[0].urls.length;
+        feeds.forEach(function (f) { if (f.urls.length !== count) fail('feeds differ in length'); });
         var probe = 0, t = 0;
         while (opts.at > 0 && probe < feeds[0].durations.length - 1 && t + feeds[0].durations[probe] <= opts.at) t += feeds[0].durations[probe++];
         body.probe = probe;

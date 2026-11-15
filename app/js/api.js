@@ -89,7 +89,10 @@ var F1Api = (function () {
   function fetchEntitlement() {
     var url = [BASE, '2.0', 'R', LANG, PAGE_PLATFORM, 'ALL/USER/ENTITLEMENT'].join('/');
     return http(url, { headers: { ascendontoken: state.ascendon } }).then(function (data) {
-      state.entitlement = data.resultObj.entitlementToken;
+      // HTTP 200 can still carry a fault or an empty resultObj; say so rather than fail on undefined.
+      var token = data && data.resultObj && data.resultObj.entitlementToken;
+      if (!token) throw new Error((data && data.resultObj && data.resultObj.message) || 'no entitlement token');
+      state.entitlement = token;
       return state.entitlement;
     });
   }

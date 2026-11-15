@@ -2,7 +2,7 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), vm = require('node:vm'), path = require('node:path');
 const flush = async () => { for (let i = 0; i < 80; i++) await Promise.resolve(); };
-function harness() {
+function harness(mediaFails) {
   const events = [], timers = new Map(), workers = [], posts = [], errors = [];
   let serial = 0, position = 0, canvas;
   const parent = { insertBefore() {}, replaceChild(fresh, old) { assert.equal(old, canvas); canvas = fresh; fresh.parentNode = parent; events.push('replace canvas'); } };
@@ -43,6 +43,8 @@ function harness() {
     fetch: async (url, options) => {
       if (options && options.method === 'POST') { posts.push(JSON.parse(options.body)); return { status: 201, text: async () => JSON.stringify({ segments: 100, visibleRows: 540, feedTag: { row: 544, values: [32, 96, 160] } }) }; }
       if (/\.m4s$|init\.mp4$/.test(url)) return { ok: true, arrayBuffer: async () => new ArrayBuffer(1) };
+      if (mediaFails === 'empty' && !/master/.test(url)) return { ok: true, url, text: async () => '#EXTM3U\n' };
+      if (mediaFails && !/master/.test(url)) return { ok: false, status: 503, text: async () => 'gone' };
       return { ok: true, url, text: async () => /master/.test(url) ? '#EXT-X-STREAM-INF:RESOLUTION=960x540,CODECS="avc1.4d401f"\nmedia.m3u8' : '#EXTINF:3.84,\na.ts\n'.repeat(100) };
     },
     setTimeout: (fn, ms) => { const id = ++serial; timers.set(id, { fn, ms, interval: false }); return id; },
@@ -95,4 +97,18 @@ test('an unacknowledged worker keeps its source alive and blocks another decoder
   h.workers[0].ack(); await flush(); assert.ok(h.events.includes('destroy source'));
   await h.api.start(h.opts()); assert.equal(h.workers.length, 2);
   const stopped = h.api.stop(); h.workers[1].ack(); await stopped;
+});
+
+test('a segment playlist that answers an error is reported, not turned into a NaN start clock', async () => {
+  const h = harness(true);   // the media playlist fetches fail; the master and the helper still answer
+  await h.api.start(h.opts());
+  assert.ok(h.errors.some((m) => /segment playlist 503/.test(m)), 'onError was called with the status');
+  assert.equal(h.workers.length, 0, 'no worker was started for a failed begin');
+});
+
+test('a segment playlist without segments is reported too, not a start clock of undefined', async () => {
+  const h = harness('empty');
+  await h.api.start(h.opts());
+  assert.ok(h.errors.some((m) => /without segments/.test(m)), String(h.errors));
+  assert.equal(h.workers.length, 0);
 });

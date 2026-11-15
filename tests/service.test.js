@@ -6,7 +6,7 @@ const url = require('node:url');
 const vm = require('node:vm');
 
 /** Loads service.js with fake http/https modules that answer from `routes` (url -> response). */
-function service(routes) {
+function service(routes, opts = {}) {
   const requested = [];
   const lib = {
     get(opts, cb) {
@@ -22,7 +22,8 @@ function service(routes) {
         res.emit('end');
       });
       return { setTimeout() {}, on() {}, abort() {} };
-    }
+    },
+    ...(opts.http || {})
   };
   const module = { exports: {} };
   const context = vm.createContext({
@@ -30,7 +31,7 @@ function service(routes) {
     module, Buffer, Uint8Array, console, Date
   });
   vm.runInContext(readFileSync('app/service/service.js', 'utf8'), context);
-  return { s: context, requested };
+  return { s: context, requested, module };
 }
 
 /** Calls the request handler and resolves with { status, headers, body }. */
@@ -86,6 +87,19 @@ test('patchSenc returns other data unchanged', () => {
   assert.deepEqual(s.patchSenc(Buffer.from(truncated)), truncated);
 });
 
+test('patchSenc leaves intact boxes that are too short for their fields alone', () => {
+  const { s } = service();
+  // Well-formed enclosing boxes, but a senc (or trun) too small to hold its sample count, at the very end of the
+  // buffer: reading the count would run past it (an exception in the helper's fetch callback).
+  const short = (sencBody, trunBody) => box('moof', Buffer.concat([box('mfhd', u32(0, 7)), box('traf', Buffer.concat([
+    box('tfhd', u32(0, 1)), box('trun', trunBody), box('senc', sencBody)]))]));
+  for (const seg of [short(u32(0, 0).subarray(0, 4), u32(0, 300)), short(u32(0, 0), u32(0, 300).subarray(0, 4))]) {
+    assert.equal(s.patchSenc(seg), seg);
+  }
+  const whole = segment({ trunCount: 345 });
+  assert.equal(sencCount(s.patchSenc(whole)), 345, 'whole segments are still patched');
+});
+
 test('isoSeconds parses manifest durations', () => {
   const { s } = service();
   assert.equal(s.isoSeconds('PT25S'), 25);
@@ -138,6 +152,16 @@ test('timeShift splits a repeated run at the cut and keeps later runs out', () =
   assert.match(out, /<S t="0" d="6000" r="9"\/><S t="60000" d="5000" r="3"\/><\/SegmentTimeline>/);
 });
 
+test('timeShift keeps what lies before the cut of an open-ended run (r="-1")', () => {
+  const { s } = service();
+  // r="-1" (repeat to the period's end, a sliding live window) has no finite span to cap by: the same
+  // 90 segments as with an explicit r="99" must survive the shift, not none at all.
+  const mpd = LIVE_MPD.replace('<S t="0" d="6000" r="99"/>', '<S t="0" d="6000" r="-1"/>');
+  const out = s.timeShift(mpd, 60, AST + 600000);
+  assert.match(out, /<SegmentTimeline><S t="0" d="6000" r="89"\/><\/SegmentTimeline>/);
+  assert.match(out, /contentType="video"/, 'the adaptation set is not dropped');
+});
+
 test('timeShift leaves static manifests and manifests without a start time alone', () => {
   const { s } = service();
   const vod = LIVE_MPD.replace('type="dynamic"', 'type="static"');
@@ -184,11 +208,53 @@ test('rewriteManifest points the period at the CDN and only audio at the local p
   assert.doesNotMatch(out, /<AdaptationSet contentType="video"><BaseURL>/);
 });
 
+test('the launcher shell contract: the delegate exports handle and never owns the socket when external', () => {
+  const servers = [];
+  const http = {
+    createServer(handler) {
+      const server = { handler, on() {}, listen(port, addr) { this.port = port; this.addr = addr; } };
+      servers.push(server);
+      return server;
+    }
+  };
+  const { module } = service(null, { http });
+  // shell/service.js requires delegate.handle or the bundle cannot start on the TV.
+  assert.equal(typeof module.exports.handle, 'function', 'module.exports.handle must exist');
+  assert.equal(typeof module.exports.onStart, 'function', 'module.exports.onStart must exist');
+  module.exports.onStart({ externalServer: true });
+  module.exports.onRequest({ externalServer: true });
+  assert.equal(servers.length, 0, 'the shell owns port 18765; a delegated start must not listen again');
+  // Standalone use (packages without the shell) still creates its own server.
+  module.exports.onStart();
+  assert.equal(servers.length, 1);
+  assert.equal(servers[0].port, 18765);
+  assert.equal(servers[0].addr, '127.0.0.1');
+});
+
 test('GET /ping answers ok', async () => {
   const { s } = service();
   const r = await get(s, '/ping');
   assert.equal(r.status, 200);
   assert.equal(String(r.body), 'ok');
+});
+
+test('GET /mpd answers a malformed language preference with the unsorted manifest, not a crash', async () => {
+  const src = 'https://cdn.formula1.com/live/main/index.mpd';
+  const { s } = service({ [src]: { body: LANG_MPD } });
+  const r = await get(s, '/mpd?u=' + encodeURIComponent(src) + '&audio=a(');
+  assert.equal(r.status, 200);
+  assert.equal(String(r.body), String((await get(s, '/mpd?u=' + encodeURIComponent(src))).body),
+    'the manifest is served as if no preference was given');
+});
+
+test('GET /mpd only fetches from F1 CDNs: no files, no home-network or other hosts', async () => {
+  const { s, requested } = service();
+  for (const target of ['file:///opt/usr/home/owner/secret.txt', 'http://192.168.1.1/', 'https://example.com/x.mpd',
+    'http://cdn.formula1.com/x.mpd', 'https://formula1.com.evil.test/x.mpd']) {
+    const r = await get(s, '/mpd?u=' + encodeURIComponent(target));
+    assert.equal(r.status, 403, target);
+  }
+  assert.equal(requested.length, 0);
 });
 
 test('GET /mpd serves the rewritten manifest with the preferred audio first', async () => {
@@ -376,4 +442,72 @@ test('F1\'s Akamai CDN is served like its own: audio segments and live manifests
   assert.equal(mpd.status, 200);
   assert.ok(mpd.body.toString().includes('/s/' + b64url('https://f1prodlive.akamaized.net/v2/x/Main/') + '/'));
   assert.equal((await get(s, '/s/' + b64url('https://f1prodlive.akamaized.net/v2/x/Main/') + '/a_1.mp4')).status, 200);
+});
+
+test('timeShift: an open run (r="-1") ends at the next S@t, and a timeline without a first t starts at 0', () => {
+  const { s } = service();
+  const runs = LIVE_MPD.replace('<S t="0" d="6000" r="99"/>', '<S t="0" d="6000" r="-1"/><S t="60000" d="5000" r="99"/>');
+  const out = s.timeShift(runs, 60, AST + 600000);   // cut at 540 s
+  assert.match(out, /<SegmentTimeline><S t="0" d="6000" r="9"\/><S t="60000" d="5000" r="95"\/><\/SegmentTimeline>/);
+  const untimed = s.timeShift(LIVE_MPD.replace('<S t="0" d="6000" r="99"/>', '<S d="6000" r="99"/>'), 60, AST + 600000);
+  assert.match(untimed, /<SegmentTimeline><S t="0" d="6000" r="89"\/><\/SegmentTimeline>/);
+});
+
+test('fetchBuffer always answers once: timeouts, cut-off responses and unusable redirects', async () => {
+  const calls = (fn) => new Promise((resolve) => { const got = []; fn((...a) => { got.push(a); setImmediate(() => resolve(got)); }); });
+  let onTimeout;
+  const hung = service(null, { http: { get() { return { setTimeout(ms, fn) { onTimeout = fn; }, on() {}, abort() {} }; } } }).s;
+  const p1 = calls((cb) => hung.fetchBuffer('https://cdn.formula1.com/a', 0, cb));
+  onTimeout();
+  const t = await p1; assert.equal(t.length, 1); assert.match(String(t[0][0]), /timeout/);
+  const cut = service(null, { http: { get(opts, cb) {
+    const res = new EventEmitter(); res.statusCode = 200; res.headers = {};
+    setImmediate(() => { cb(res); res.emit('data', Buffer.from('par')); res.emit('aborted'); });
+    return { setTimeout() {}, on() {}, abort() {} };
+  } } }).s;
+  const c = await calls((cb) => cut.fetchBuffer('https://cdn.formula1.com/a', 0, cb));
+  assert.equal(c.length, 1); assert.match(String(c[0][0]), /cut off/);
+  const odd = service(null, { http: { get(opts, cb) {
+    const res = new EventEmitter(); res.statusCode = 302; res.headers = { location: 'https://[' }; res.resume = () => {};
+    setImmediate(() => cb(res));
+    return { setTimeout() {}, on() {}, abort() {} };
+  } } }).s;
+  const r = await calls((cb) => odd.fetchBuffer('https://cdn.formula1.com/a', 3, cb));
+  assert.equal(r.length, 1); assert.ok(r[0][0] instanceof Error || r[0][1] >= 300);
+});
+
+test('timeShift: a last open run (r="-1") stops at the end of a Period with a duration', () => {
+  const { s } = service();
+  const mpd = LIVE_MPD.replace('<Period id="1" start="PT0S">', '<Period id="1" start="PT0S" duration="PT60S">')
+    .replace('<S t="0" d="6000" r="99"/>', '<S t="0" d="6000" r="-1"/>');
+  assert.match(s.timeShift(mpd, 60, AST + 600000), /<SegmentTimeline><S t="0" d="6000" r="9"\/><\/SegmentTimeline>/);
+  // Two Periods (not something F1 sends): a first Period's length must not cap the open run at 60 s.
+  const two = mpd.replace('</Period></MPD>', '</Period><Period id="2" start="PT60S"></Period></MPD>');
+  assert.match(s.timeShift(two, 60, AST + 600000), /<S t="0" d="6000" r="89"\/>/);
+});
+
+test('GET /mpd follows redirects only to public https hosts', async () => {
+  const src = 'https://cdn.formula1.com/live/main/index.mpd';
+  for (const [to, ok] of [['http://192.168.1.1/private', false], ['https://192.168.1.1/x', false], ['https://router.local/x', false],
+    ['https://f1-other.example.net/live/index.mpd', true]]) {
+    const { s, requested } = service({ [src]: { status: 302, headers: { location: to } }, [to]: { body: LANG_MPD } });
+    const r = await get(s, '/mpd?u=' + encodeURIComponent(src));
+    assert.equal(r.status, ok ? 200 : 502, to);
+    assert.equal(requested.includes(to), ok, to);
+  }
+});
+
+test('POST /updates/check is only for the app\'s own pages, like the shell\'s launcher routes', async () => {
+  const { s } = service();
+  const call = (origin) => new Promise((resolve) => {
+    const req = new EventEmitter();
+    req.url = '/updates/check'; req.method = 'POST';
+    if (origin !== undefined) req.headers = { origin };
+    const res = { writeHead(status) { this.status = status; }, end(body) { resolve({ status: this.status, body: String(body) }); } };
+    s.handle(req, res);
+  });
+  assert.deepEqual(await call('https://evil.test'), { status: 403, body: 'local page required' },
+    'a foreign origin never reaches the downloader');
+  assert.equal((await call('null')).status, 404, 'file:// pages reach the route (404: no launcher in this harness)');
+  assert.equal((await call()).status, 404, 'and so do requests without an Origin header');
 });

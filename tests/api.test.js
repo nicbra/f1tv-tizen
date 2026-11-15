@@ -61,6 +61,14 @@ test('login fetches the entitlement and location with the subscription token', a
   assert.equal(calls[1].init.headers.entitlementtoken, 'ENT');
 });
 
+test('a 200 answer without an entitlement token fails sign-in with the API message, not a TypeError', async () => {
+  const fault = api(() => ({ body: { resultObj: { message: 'Device limit reached' } } }));
+  await assert.rejects(fault.F1Api.login('ASC'), /Device limit reached/);
+  const empty = api(() => ({ body: {} }));
+  await assert.rejects(empty.F1Api.login('ASC'), /no entitlement token/);
+  for (const h of [fault.F1Api, empty.F1Api]) assert.ok(!h.state.entitlement, 'no entitlement was stored');
+});
+
 test('pages use the location entitlement and group, and anonymous access before sign-in', async () => {
   const { F1Api, calls } = api(() => ({ body: { resultObj: { containers: [{ id: 1 }] } } }));
   assert.equal((await F1Api.page(395)).length, 1);

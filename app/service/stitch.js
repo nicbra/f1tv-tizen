@@ -125,6 +125,7 @@ function fragment(seg) {
   var inMoof = boxes(seg, moof.d, moof.e), traf = inMoof.filter(function (x) { return x.type === 'traf'; })[0];
   var parts = boxes(seg, traf.d, traf.e), get = function (t) { return parts.filter(function (x) { return x.type === t; })[0]; };
   var tfhd = get('tfhd'), trun = get('trun'), senc = get('senc');
+  if (!traf || !tfhd || !trun) throw new Error('fragment without traf, tfhd or trun');
   var tf = u32(seg, tfhd.d) & 0xffffff, q = tfhd.d + 8, defDur = 0, defSize = 0, defFlags = 0;
   if (tf & 1) q += 8; if (tf & 2) q += 4;
   if (tf & 8) { defDur = u32(seg, q); q += 4; } if (tf & 16) { defSize = u32(seg, q); q += 4; } if (tf & 32) { defFlags = u32(seg, q); q += 4; }
@@ -133,6 +134,11 @@ function fragment(seg) {
   q = trun.d + 8;
   if (fl & 1) { offset = u32(seg, q) | 0; q += 4; }
   if (fl & 4) { firstFlags = u32(seg, q); q += 4; }
+  // A corrupt count must not allocate millions of samples or read past the box: the table has to fit in the trun,
+  // and samples without a size of their own still need their bytes in the segment.
+  var entry = 4 * ((fl & 0x100 ? 1 : 0) + (fl & 0x200 ? 1 : 0) + (fl & 0x400 ? 1 : 0) + (fl & 0x800 ? 1 : 0));
+  // F1's segments hold a few hundred samples (6 s at 50 fps); anything far above is corrupt.
+  if (count > 20000 || q + count * entry > trun.e || (!(fl & 0x200) && (!defSize || count * defSize > seg.length))) throw new Error('implausible trun sample count');
   var samples = [], pos = moof.s + offset, i;
   for (i = 0; i < count; i++) {
     var s = { dur: defDur, size: defSize, flags: i === 0 && firstFlags !== null ? firstFlags : defFlags, cto: 0, subs: null };
@@ -141,6 +147,7 @@ function fragment(seg) {
     if (fl & 0x400) { s.flags = u32(seg, q); q += 4; }
     if (fl & 0x800) { s.cto = u32(seg, q) | 0; q += 4; }
     s.at = pos; pos += s.size;
+    if (s.at < 0 || pos > seg.length) throw new Error('sample outside the segment');
     samples.push(s);
   }
   if (senc) {
@@ -148,7 +155,9 @@ function fragment(seg) {
     if (!(sf & 2) && u32(seg, senc.d + 4)) throw new Error('senc without subsamples');
     for (i = 0; i < u32(seg, senc.d + 4) && i < count; i++) {
       samples[i].subs = [];
+      if (r + 2 > senc.e) throw new Error('senc shorter than its entries');
       var k = u16(seg, r); r += 2;
+      if (r + 6 * k > senc.e) throw new Error('senc shorter than its entries');
       for (var j = 0; j < k; j++) { samples[i].subs.push([u16(seg, r), u32(seg, r + 2)]); r += 6; }
     }
   }

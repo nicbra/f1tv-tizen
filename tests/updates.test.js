@@ -9,6 +9,7 @@ function checker(fetch, cached, options = {}) {
   const markerRequests = [];
   const context = vm.createContext({
     fetch,
+    ...(options.launcher ? { Launcher: options.launcher } : {}),
     localStorage: {
       getItem: (key) => store[key] || null,
       setItem: (key, value) => { store[key] = value; }
@@ -32,7 +33,7 @@ function checker(fetch, cached, options = {}) {
 
 const release = (tag) => ({ ok: true, json: async () => [{ tag_name: tag }] });
 
-test('manual checks find a new release even when the daily cache is fresh', async () => {
+test('manual checks find a new release even when the hourly cache is fresh', async () => {
   const { updates, timers } = checker(async () => release('v0.2.0'), { at: Date.now(), latest: 'v0.1.0' });
   const result = await updates.check(true);
   assert.equal(result.latest, '0.2.0');
@@ -41,7 +42,7 @@ test('manual checks find a new release even when the daily cache is fresh', asyn
   assert.equal(timers.size, 0);
 });
 
-test('automatic checks still reuse a fresh daily cache', async () => {
+test('automatic checks still reuse a fresh hourly cache', async () => {
   const { updates } = checker(async () => { throw new Error('should use cache'); }, { at: Date.now(), latest: 'v0.2.0' });
   const result = await updates.check();
   assert.equal(result.latest, '0.2.0');
@@ -118,17 +119,6 @@ test('a failed automatic check (the network not up yet) is tried again an hour l
   assert.equal((await context.Updates.check()).latest, '0.3.0');
 });
 
-test('the update notice shows once a day, again the next day, for the same waiting version', () => {
-  let now = Date.parse('2026-11-11T09:00:00');
-  const Clock = class extends Date { constructor(...a) { super(...(a.length ? a : [now])); } static now() { return now; } };
-  const { updates } = checker(async () => { throw new Error('unused'); }, { at: now, latest: 'v0.2.0' }, { Date: Clock });
-  assert.equal(updates.noticeToday(), true, 'first time today');
-  now += 6 * 3600000;
-  assert.equal(updates.noticeToday(), false, 'later the same day');
-  now += 24 * 3600000;
-  assert.equal(updates.noticeToday(), true, 'the next day');
-});
-
 test('a matching marker remembers the installer after the TV temp file disappears', () => {
   const { updates, store, markerRequests } = checker(null, null, {
     marker: JSON.stringify({ installedBy: 'installer', version: '0.1.0' })
@@ -157,7 +147,7 @@ test('malformed, missing and failed marker reads are normal, including malformed
   }
 });
 
-test('release notes share the daily cache, sort numerically and include installed and old releases', async () => {
+test('release notes share the hourly cache, sort numerically and include installed and old releases', async () => {
   const requests = [];
   const { updates, store } = checker(async (url) => {
     requests.push(url);
@@ -211,4 +201,81 @@ test('installed and older release notes remain available when there is no update
   assert.deepEqual(Array.from(result.releases, (r) => r.version), ['0.1.0', '0.0.9']);
   const restarted = checker(null, null, { store });
   assert.deepEqual(Array.from(restarted.updates.status().releases, (r) => r.notes), ['Installed', 'Older']);
+});
+
+
+test('the running bundle is installed, rather than pending, in the cached downloaded status', () => {
+  const { updates } = checker(null, { latest: '1.1.0', downloaded: '1.1.0' }, { launcher: { version: '1.1.0' } });
+  const result = updates.status();
+  assert.equal(result.current, '1.1.0'); assert.equal(result.downloaded, null);
+});
+
+test('a manual check runs the bundle downloader first, then reads what the shell knows (also with automatic checks off)', async () => {
+  const requests = [];
+  const { updates, store } = checker(async (url, options) => {
+    requests.push([url, options.method]);
+    if (url.endsWith('/updates/check')) return { ok: true, json: async () => ({ ok: true }) };
+    return { ok: true, json: async () => ({ releases: [{ version: '1.1.0', notes: 'Notes' }], downloaded: '1.1.0' }) };
+  }, null, { launcher: { version: '1.0.0', updates: true } });
+  const result = await updates.check(true);
+  assert.equal(result.downloaded, '1.1.0'); assert.equal(JSON.parse(store['f1tv.update']).downloaded, '1.1.0');
+  assert.deepEqual(requests, [['http://127.0.0.1:18765/updates/check', 'POST'], ['http://127.0.0.1:18765/launcher/check?cached=1', 'POST']]);
+});
+
+test('a manual check whose downloader is unreachable is a failure, and still reads the shell', async () => {
+  const requests = [];
+  const { updates } = checker(async (url) => {
+    requests.push(url);
+    if (url.endsWith('/updates/check')) throw new Error('helper down');
+    return { ok: true, json: async () => ({ releases: [{ version: '1.0.0' }] }) };
+  }, null, { launcher: { version: '1.0.0', updates: true } });
+  const result = await updates.check(true);
+  assert.equal(result.error, true, 'a manual check whose downloader is down failed'); assert.equal(requests.length, 2, 'the shell is still read');
+});
+
+test('automatic page checks always ask the helper, which decides whether to go online (cached=1)', async () => {
+  const requests = [];
+  const { updates } = checker(async (url) => {
+    requests.push(url);
+    return { ok: true, json: async () => ({ releases: [{ version: '1.0.0' }] }) };
+  }, null, { launcher: { version: '1.0.0', updates: true } });
+  await updates.check(); await updates.check();
+  assert.deepEqual(requests, ['http://127.0.0.1:18765/launcher/check?cached=1', 'http://127.0.0.1:18765/launcher/check?cached=1']);
+});
+
+test('a helper check that fails reports an error, keeps the last known release and lets a manual retry ask again', async () => {
+  const requests = [];
+  const { updates, store } = checker(async (url) => {
+    requests.push(url);
+    return { ok: false, status: 502, json: async () => ({ error: 'Update check already running' }) };
+  }, { latest: '1.2.0', releases: [{ version: '1.2.0', notes: 'Known' }] }, { launcher: { version: '1.0.0', updates: true } });
+  const result = await updates.check(true);
+  assert.equal(result.error, true);
+  assert.equal(result.latest, '1.2.0', 'the last known release survives a failed check');
+  assert.equal(JSON.parse(store['f1tv.update']).latest, '1.2.0');
+  const again = await updates.check(true);
+  assert.equal(again.error, true);
+  assert.equal(requests.filter((u) => u.includes('/launcher/check')).length, 2, 'a manual retry is not suppressed by the page cache');
+});
+
+test('cached downloads older than a newly installed package are not pending', () => {
+  const { updates } = checker(null, { downloaded: '1.1.0' }, { launcher: { version: '1.2.0' } });
+  assert.equal(updates.status().downloaded, null);
+});
+
+test('an unsuccessful apply is remembered across starts, while a newer download may apply', () => {
+  const first = checker(null, {}, { launcher: { version: '1.0.0' } });
+  assert.equal(first.updates.attemptApply('1.1.0'), true);
+  assert.equal(JSON.parse(first.store['f1tv.update']).applyAttempt, '1.1.0');
+  const next = checker(null, null, { store: first.store, launcher: { version: '1.0.0' } });
+  assert.equal(next.updates.attemptApply('1.1.0'), false);
+  assert.equal(next.updates.attemptApply('1.0.0'), false);
+  assert.equal(next.updates.attemptApply('1.2.0'), true);
+});
+
+test('a future last-check timestamp is stale after the clock moves back', async () => {
+  let calls = 0;
+  const { updates } = checker(async () => { calls++; return release('v0.2.0'); }, { at: Date.now() + 86400000 });
+  await updates.check(); assert.equal(calls, 1);
+  await updates.check(); assert.equal(calls, 1);
 });

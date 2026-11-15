@@ -41,7 +41,11 @@ module.exports = function (deps) {
     text.split(/\r?\n/).forEach(function (line) {
       line = line.trim();
       if (line.indexOf('#EXTINF:') === 0) d = parseFloat(line.slice(8));
-      else if (line && line.charAt(0) !== '#') { out.push({ url: urlLib.resolve(base, line), start: t, duration: d }); t += d; }
+      else if (line && line.charAt(0) !== '#') {
+        // Every segment needs its own finite, positive #EXTINF: NaN or Infinity would pass the alignment check.
+        if (!(d > 0 && isFinite(d))) throw new Error('bad #EXTINF duration');
+        out.push({ url: urlLib.resolve(base, line), start: t, duration: d }); t += d; d = 0;
+      }
     });
     if (!out.length) throw new Error('an empty playlist');
     return out;

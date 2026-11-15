@@ -2,6 +2,7 @@
 # Build, sign and install the app on the TV.
 #   scripts/deploy.sh cert      one-time: create signing certificate + security profile
 #   scripts/deploy.sh build     package app/ into build/F1TV.wgt
+#   UPDATES=off|stable|prerelease (development only; default off, local override wins)
 #   scripts/deploy.sh install   connect to the TV, install and launch
 #   scripts/deploy.sh           build + install
 set -euo pipefail
@@ -21,6 +22,11 @@ pc_ip() { ip -4 route get "$TV_IP" | sed -n 's/.* src \([0-9.]*\).*/\1/p'; }
 cmd_cert() {
   [[ -f "$PW_FILE" ]] || head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' > "$PW_FILE"
   local pw; pw="$(cat "$PW_FILE")"
+  # A new certificate means a new key, which installed TVs refuse as an update. Change details with
+  # scripts/renew-author-cert.sh instead.
+  if [[ -f "$HOME/tizen-studio-data/keystore/author/$PROFILE-author.p12" ]]; then
+    echo "$PROFILE-author.p12 already exists; use scripts/renew-author-cert.sh to change it" >&2; exit 1
+  fi
   "$TIZEN" certificate -a "$PROFILE" -p "$pw" -c NO -ct Oslo -o "$PROFILE" -n "$PROFILE" \
     -e f1tv@example.com -f "$PROFILE-author"
   "$TIZEN" security-profiles add -n "$PROFILE" \
@@ -29,18 +35,45 @@ cmd_cert() {
 }
 
 cmd_build() {
+  case "${UPDATES:-off}" in
+    off|stable|prerelease) ;;
+    *) echo 'UPDATES must be off, stable or prerelease' >&2; return 1 ;;
+  esac
   rm -rf "$ROOT/build" && mkdir -p "$ROOT/build/src"
-  # APP_SRC: another copy of app/ (build-release.sh archives a tag and stamps its version).
-  cp -r "${APP_SRC:-$ROOT/app}/." "$ROOT/build/src/"
-  # Personal overrides that stay out of the repo: local/icon.png, local/logo.png and local/app/
-  # (copied over the bundled app files). Release builds (RELEASE=1) never include them.
-  if [[ -z "${RELEASE:-}" ]]; then
-    [[ -f "$ROOT/local/icon.png" ]] && cp "$ROOT/local/icon.png" "$ROOT/build/src/img/icon.png"
-    [[ -f "$ROOT/local/logo.png" ]] && cp "$ROOT/local/logo.png" "$ROOT/build/src/img/logo.png"
-    [[ -d "$ROOT/local/app" ]] && cp -r "$ROOT/local/app/." "$ROOT/build/src/"
+  # Apply personal bundle overrides before hashing; launcher-build.js is a shell override.
+  local source; source="$(mktemp -d)"
+  cp -r "${APP_SRC:-$ROOT/app}/." "$source/"
+  if [[ "${RELEASE:-}" != 1 ]]; then
+    [[ ! -f "$ROOT/local/icon.png" ]] || cp "$ROOT/local/icon.png" "$source/img/icon.png"
+    [[ ! -f "$ROOT/local/logo.png" ]] || cp "$ROOT/local/logo.png" "$source/img/logo.png"
+    [[ ! -d "$ROOT/local/app" ]] || cp -r "$ROOT/local/app/." "$source/"
   fi
-  "$TIZEN" package -t wgt -s "$PROFILE" -o "$ROOT/build" -- "$ROOT/build/src"
-  mv "$ROOT/build/"*.wgt "$ROOT/build/F1TV.wgt"
+  node "${BUILD_SCRIPT:-$ROOT/scripts/build-bundle.js}" "$source" "${SHELL_SRC:-$ROOT/shell}" "$ROOT/build"
+  if [[ "${RELEASE:-}" != 1 ]]; then
+    # Always disabled by default, including on a fresh clone without local/.
+    node - "$ROOT/build/src/launcher-build.js" "${UPDATES:-off}" <<'JS'
+const fs = require('fs');
+const file = process.argv[2], mode = process.argv[3];
+fs.writeFileSync(file, fs.readFileSync(file, 'utf8')
+  .replace('updates: true', 'updates: ' + (mode !== 'off'))
+  .replace("channel: 'stable'", "channel: '" + (mode === 'prerelease' ? 'prerelease' : 'stable') + "'"));
+JS
+    [[ ! -f "$source/launcher-build.js" ]] || cp "$source/launcher-build.js" "$ROOT/build/src/launcher-build.js"
+  fi
+  mkdir -p "$source/package"
+  "$TIZEN" package -t wgt -s "$PROFILE" -o "$source/package" -- "$ROOT/build/src"
+  mv "$source/package/"*.wgt "$ROOT/build/F1TV.wgt"
+  if [[ "${RELEASE:-}" == 1 ]]; then
+    # Reuse the assembled bundle verbatim; only the root channel override changes.
+    node - "$ROOT/build/src/launcher-build.js" <<'JS'
+const fs = require('fs'), file = process.argv[2];
+fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace("channel: 'stable'", "channel: 'prerelease'"));
+JS
+    "$TIZEN" package -t wgt -s "$PROFILE" -o "$source/package" -- "$ROOT/build/src"
+    mv "$source/package/"*.wgt "$ROOT/build/F1TV-staging.wgt"
+    cp "${SHELL_SRC:-$ROOT/shell}/launcher-build.js" "$ROOT/build/src/launcher-build.js"
+  fi
+  rm -rf "$source"
   echo "Built $ROOT/build/F1TV.wgt"
 }
 

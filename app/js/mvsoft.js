@@ -59,12 +59,17 @@ var MvSoftware = (function () {
 
   /** A media playlist's segment start times (seconds), for the segment the small feeds start at. */
   function starts(url) {
-    return fetch(url).then(function (r) { return r.text(); }).then(function (text) {
+    return fetch(url).then(function (r) {
+      // An error body has no segment times: reject, or the start clock becomes NaN and never settles.
+      if (!r.ok) throw new Error('segment playlist ' + r.status);
+      return r.text();
+    }).then(function (text) {
       var out = [], t = 0;
       text.split(/\r?\n/).forEach(function (line) {
-        var m = /^#EXTINF:([\d.]+)/.exec(line);
-        if (m) { out.push(t); t += parseFloat(m[1]); }
+        var m = /^#EXTINF:([\d.]+)/.exec(line), d = m ? parseFloat(m[1]) : 0;
+        if (m && d > 0 && isFinite(d)) { out.push(t); t += d; }
       });
+      if (!out.length) throw new Error('segment playlist without segments');
       return out;
     });
   }
@@ -162,7 +167,7 @@ var MvSoftware = (function () {
       c.style.left = box.left + 'px'; c.style.top = box.top + 'px';
       c.style.width = box.width + 'px'; c.style.height = box.height + 'px';
       var offscreen = c.transferControlToOffscreen();
-      var w = run.worker = new Worker('js/mvsoft-worker.js');
+      var w = run.worker = (typeof Launcher !== 'undefined' ? Launcher.worker('js/mvsoft-worker.js') : new Worker('js/mvsoft-worker.js'));
       run.ready = new Promise(function (ok) { run.readyNow = ok; });
       run.stoppedAck = new Promise(function (ok) { run.ackNow = ok; });
       w.onmessage = function (e) {

@@ -96,10 +96,9 @@ your computer is changed.
 
 ### Updating
 
-Run the installer again to update. The TV stays signed in.
+The app updates itself: it checks quietly in the background, downloads compatible updates and applies them. The TV stays signed in. Updates that change TV-side permissions still need a reinstall, and the app tells you when that happens.
 
-The app checks for updates daily. You can also check under your name → About →
-**Check for updates now**, even if automatic checks are off.
+You can also check under your name → About → **Check for updates now**, even if automatic checks are off.
 
 ### If something goes wrong
 
@@ -130,7 +129,7 @@ device profile. Removing it signs the TV out.
 
 The app never sees your F1 password: you sign in on F1's own website, on your phone. Your F1 TV
 login is only sent to formula1.com. Apart from F1, the app contacts `api.jolpi.ca` for the
-standings and GitHub once a day to look for updates, which you can turn off. There is no
+standings and GitHub to look for updates, which you can turn off. There is no
 tracking or analytics. All the source code is in this repository, GitHub Actions builds the
 release packages from it, and the installer checks them against their SHA-256 sums.
 

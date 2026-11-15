@@ -37,6 +37,8 @@
   // helpers
 
   function show(name) {
+    var leftPlayer = screen === 'player' && name !== 'player';
+    if (typeof Launcher !== 'undefined' && Launcher.playback) Launcher.playback(name === 'player');
     navSeq++;
     // A feed asked for while another loaded is dropped once the viewer goes anywhere but the player.
     if (name !== 'player') queuedFeed = null;
@@ -45,6 +47,9 @@
       $('screen-' + n).classList.toggle('hidden', n !== name);
     });
     screen = name;
+    if (name === 'player' && dialog && updateNoticeOpen) dialog.close(false);
+    if (name !== 'player') setTimeout(function () { showUpdateNotices(); applyDownloadedUpdate(); }, 100);
+    if (leftPlayer) setTimeout(checkForUpdate, 100);
   }
 
   /** kind 'notice': stands out, for things the viewer should act on (a new version). */
@@ -153,7 +158,7 @@
         onSelect: function (b) { if (b !== content) close(b._value); }
       });
       g.r = scrollable ? 1 : 0;
-      function close(v) { $('dialog').classList.add('hidden'); dialog = null; if (grid) grid.apply(); resolve(v); }
+      function close(v) { $('dialog').classList.add('hidden'); dialog = null; setTimeout(applyDownloadedUpdate, 0); if (grid) grid.apply(); resolve(v); }
       dialog = { grid: g, close: close };
       g.apply();
     });
@@ -1032,19 +1037,98 @@
     }).catch(function (e) { if (seq === navSeq) $('list-sub').textContent = 'Could not load the season: ' + e.message; });
   }
 
-  // The app may stay open for days: the daily check (and notice) also runs from an hourly timer (Updates.check asks
-  // GitHub once a day at most). Not over a playing video: the notice waits for the next hour off the player.
-  var updateTimer = null;
+  // Checks are silent. The page asks every 5 minutes from boot: with the launcher that is a local question (the
+  // bundle's helper checks hourly, the shell at each start), without it updates.js keeps its own hourly limit to
+  // GitHub. A download applies outside the player.
+  var updateTimer = null, updateStatus = null, applyingUpdate = false, updateNoticeOpen = false, launcherUiReady = false;
+
+  function launcherReady() {
+    if (typeof Launcher !== 'undefined' && !launcherUiReady) { launcherUiReady = true; Launcher.ready(); rememberUpdate(Updates.status()); }
+  }
+
+  function updateInstruction(u) {
+    return Updates.installedBy() === 'installer'
+      ? 'Run the installer from ' + u.page.replace(/^https:\/\//, '') + ' on your computer again.' : 'Update from Apps2Samsung.';
+  }
+
+  function showUpdateNotices() {
+    if ((typeof Launcher !== 'undefined' && !launcherUiReady) || screen === 'player' || screen === 'start' || !screen || dialog || !updateStatus) return;
+    var u = updateStatus, release;
+    if (u.needsReinstall && Updates.once && Updates.once('reinstall', u.needsReinstall)) {
+      release = (u.releases || []).filter(function (r) { return r.version === u.needsReinstall; })[0];
+      updateNoticeOpen = true;
+      ask('F1 TV ' + u.needsReinstall + ' needs a reinstall', updateInstruction(u) + '\n\n' + (release && release.notes || ''),
+        [{ label: 'Close', value: true }], 'notes').then(function () { updateNoticeOpen = false; showUpdateNotices(); });
+      return;
+    }
+  }
+
+  /*
+   * A downloaded update is used as soon as no video plays: in the menus it applies at once, with a message. Not while
+   * a dialog or text entry is open (the one-second timer retries). The reload waits for the player to finish shutting
+   * down: a reload while it still holds the TV's one video decoder left the new page without any video pipeline,
+   * hanging on Starting until the app restarted (QE55Q77A, 2026-11-16). 10 s at most, as the player itself waits.
+   */
+  function applyDownloadedUpdate() {
+    if (typeof Launcher === 'undefined' || !Launcher.updates || !launcherUiReady || applyingUpdate || screen === 'player' || dialog) return;
+    var entry = document.activeElement, tag = entry && entry.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (entry && entry.isContentEditable)) return;
+    var u = updateStatus;
+    if (!u || !u.downloaded || !Updates.newer(u.downloaded, Launcher.version) || (Launcher.blockedUpdates || []).indexOf(u.downloaded) >= 0) return;
+    if (!Updates.attemptApply(u.downloaded)) return;
+    applyingUpdate = true;
+    toast('Applying new app update…', 15000);
+    var restarted = false;
+    // A full app restart where the shell offers it and it has worked on this TV (a page reload kept the video
+    // hardware's state: the first HDR video after it fell back to SDR); otherwise a page reload.
+    function restart() {
+      if (restarted) return; restarted = true;
+      setTimeout(function () {
+        if (!Launcher.relaunch || !relaunchWorks()) return Launcher.restart();
+        try { localStorage.setItem(RELAUNCH, JSON.stringify({ pending: Date.now() })); } catch (e) { /* learned next time */ }
+        Launcher.relaunch();
+      }, 500);
+    }
+    setTimeout(restart, 10000);
+    Promise.resolve().then(function () { return Player.unload(); }).then(restart, restart);
+  }
+
+  /*
+   * Versions that failed a start (the shell keeps them, docs/LAUNCHER.md): into the diagnostics log, once each, then
+   * acknowledged. Without a diagnostics log in this build they stay with the shell (the latest twenty).
+   */
+  function reportFailedStarts() {
+    if (typeof Launcher === 'undefined' || typeof Diag === 'undefined' || !Diag.note) return;
+    fetch('http://127.0.0.1:18765/launcher/info').then(function (r) { return r.json(); }).then(function (info) {
+      var events = (info && info.state && info.state.events) || [];
+      if (!events.length) return;
+      events.forEach(function (e) { Diag.note('launcher.failed-start', { version: e.version, reason: e.reason, at: e.at }, 'warn'); });
+      return fetch('http://127.0.0.1:18765/launcher/ack?through=' + events[events.length - 1].id, { method: 'POST' });
+    }).catch(function () { /* next start */ });
+  }
+
+  /*
+   * Whether the full restart works on this TV, learned: it needs the helper service to outlive the closed app, which
+   * Samsung doesn't promise. A restart that brought the app back within a minute worked; if the next start came
+   * later (the viewer reopened it), it didn't, and updates use a page reload from then on.
+   */
+  var RELAUNCH = 'f1tv.relaunch';
+  function relaunchWorks() {
+    try { var r = JSON.parse(localStorage.getItem(RELAUNCH) || 'null'); return !(r && r.failed); } catch (e) { return true; }
+  }
+  function noteRelaunch() {
+    try {
+      var r = JSON.parse(localStorage.getItem(RELAUNCH) || 'null');
+      if (r && r.pending) localStorage.setItem(RELAUNCH, JSON.stringify(Math.abs(Date.now() - r.pending) < 60000 ? { ok: true } : { failed: true }));
+    } catch (e) { /* storage unavailable */ }
+  }
+
+  function rememberUpdate(u) { updateStatus = u; showUpdateNotices(); applyDownloadedUpdate(); }
 
   function checkForUpdate() {
-    if (!updateTimer) updateTimer = setInterval(checkForUpdate, 3600000);
-    if (!Settings.get('updates') || screen === 'player') return;
-    Updates.check().then(function (u) {
-      if (u.available && screen !== 'player' && Updates.noticeToday()) {
-        toast('App update available: v' + u.latest +
-          (Auth.token() ? '\nDetails in the settings' : ''), 12000, 'notice');
-      }
-    });
+    if (!updateTimer) updateTimer = setInterval(checkForUpdate, 300000);
+    if (Settings.get('updates') === 'off' || screen === 'player') return;
+    Updates.check().then(rememberUpdate);
   }
 
   function checkForUpdateNow(focus) {
@@ -1054,12 +1138,15 @@
     toast('Checking for updates…', 16000);
     Updates.check(true).then(function (u) {
       checkingUpdate = false;
+      rememberUpdate(u);
       if (screen === 'list' && grid === versionGrid) {
         openVersion(grid.r);
         if (dialog) dialog.grid.apply();
       }
       if (u.error) {
         toast('Could not check for updates.', 8000);
+      } else if (u.downloaded) {
+        toast(applyingUpdate ? 'Applying new app update…' : 'Downloaded v' + u.downloaded + ' will be used next start.', applyingUpdate ? 15000 : undefined);
       } else if (u.available) {
         toast('App update available: v' + u.latest +
           (Auth.token() ? '\nDetails in the settings' : ''), 12000, 'notice');
@@ -1082,7 +1169,7 @@
   }
 
   function capsText() {
-    var r = Caps.report(), yes = function (v) { return v === true ? 'yes' : v === false ? 'no' : 'not checked yet'; };
+    var r = Caps.report(), yes = function (v) { return v === true ? 'yes' : v === false ? 'no' : v === null ? 'unknown (older browser)' : 'not checked yet'; };
     var lines = ['The app tries different ways of playing copy-protected video and remembers what works on this TV.',
       '', 'Browser copy protection', '• cenc: ' + yes(r.browser.cenc), '• cbcs: ' + yes(r.browser.cbcs), '',
       'Ways of playing'];
@@ -1107,17 +1194,17 @@
 
   function openVersion(focus) {
     var u = Updates.status();
-    var instruction = Updates.installedBy() === 'installer'
-      ? 'Run the installer from ' + u.page.replace(/^https:\/\//, '') + ' on your computer again.' : 'Update from Apps2Samsung.';
+    var instruction = updateInstruction(u);
     renderList({
-      title: 'F1 TV ' + (u.current || '?'),
+      title: 'F1 TV ' + (u.current || '?') + (typeof Launcher !== 'undefined' && Launcher.channel && Launcher.channel !== 'stable' ? ' · Staging' : ''),
       sub: u.available ? 'Update available: v' + u.latest + ' · ' + instruction : 'Up to date',
       rows: [
         { what: checkingUpdate ? 'Checking for updates…' : 'Check for updates now', run: checkForUpdateNow },
         { day: 'Release notes' }
       ].concat((u.releases || []).map(function (release) {
         return { what: 'v' + release.version,
-          sub: release.version === u.current ? 'Installed' : Updates.newer(release.version, u.current) ? 'New' : '',
+          sub: release.minShell && typeof Launcher !== 'undefined' && release.minShell > Launcher.shellLevel ? 'Needs reinstall' :
+            release.version === u.downloaded ? 'Downloaded' : release.version === u.current ? 'Installed' : Updates.newer(release.version, u.current) ? 'New' : '',
           run: function () {
             ask('F1 TV ' + release.version, release.notes || 'No release notes provided.', [{ label: 'Close', value: true }], 'notes');
           } };
@@ -1161,7 +1248,14 @@
             backStack.push(function () { openAccount(idx); });
             openVersion();
           } },
-        toggle('updates', 'Automatic update checks', 'Check for new versions daily.')
+        { what: 'Updates', sub: 'Automatic update checks and installation preferences.',
+          badge: Settings.get('updates') === 'off' ? 'Off' : 'Automatic',
+          run: function (idx) {
+            var modes = ['automatic', 'off'];
+            Settings.set('updates', modes[(modes.indexOf(Settings.get('updates')) + 1) % modes.length]);
+            syncUpdateSetting();
+            openAccount(idx);
+          } }
       ]).concat(typeof Caps !== 'undefined' ? [
         { what: 'Playback on this TV', sub: capsSummary(), run: function (idx) { showCaps(idx); } }
       ] : []).concat([
@@ -1330,6 +1424,7 @@
    * Serialize loads: overlapping requests crash Samsung's player. The latest request wins.
    */
   function playFeed(i, opts) {
+    if (applyingUpdate) return;
     if (loadingFeed) { queuedFeed = [i, opts]; return; }
     loadingFeed = true;
     var seq = ++feedLoadSeq, finished = false;
@@ -1841,7 +1936,7 @@
     switchPause = from ? (opts.switchPaused != null ? opts.switchPaused : from.paused) : null;
     return ensureSession().then(function (ok) {
       // Gone back meanwhile (renewing the session can take a while).
-      if (feedsCtx !== ctx || exits !== playerExits || seq !== navSeq) return;
+      if (feedsCtx !== ctx || exits !== playerExits || seq !== navSeq || applyingUpdate) return;
       if (!ok) {
         // Signed out (the device key was refused): stop what plays, and let BACK return to browsing.
         if (screen === 'player') stopPlayer();
@@ -3243,6 +3338,8 @@
   // keys
 
   function onKey(e) {
+    // Applying an update: nothing may start (a player opened now would be cut off by the reload).
+    if (applyingUpdate) { e.preventDefault(); return; }
     var key = Keys.normalize(e);
     if (dialog) {
       e.preventDefault();
@@ -3284,10 +3381,17 @@
     img.src = 'img/logo.png';
   }
 
+  function syncUpdateSetting() {
+    if (typeof Launcher !== 'undefined' && Launcher.setUpdates) Launcher.setUpdates(Settings.get('updates') !== 'off');
+  }
+
   function boot() {
+    syncUpdateSetting();
     useLogo();
     Keys.register();
     document.addEventListener('keydown', onKey);
+    document.addEventListener('visibilitychange', applyDownloadedUpdate);
+    setInterval(applyDownloadedUpdate, 1000);
     tickClock();
     setInterval(tickClock, 15000);
     setInterval(updateOsd, 500);
@@ -3326,17 +3430,25 @@
       if (screen === 'browse' && currentPage && currentPage.kind === 'home' && grid && !dialog) refreshPage(currentPage);
     }, 120000);
 
-    Player.init($('video'), $('av-player'))
+    show('start');
+    noteRelaunch();
+    // Update checks from the start, also while sign-in or the network still holds the app (a fix may be waiting).
+    checkForUpdate();
+    // Confirmed once the synchronous boot screen is up and this version's own helper answers: before any
+    // network-dependent startup (an offline TV must not roll back a good version).
+    (typeof Launcher !== 'undefined' ? StreamProxy.ensure() : Promise.resolve())
+      .then(function () { launcherReady(); reportFailedStarts(); return Player.init($('video'), $('av-player')); })
       .then(function () { return F1Api.refreshConfig(); })
       .then(function () { return ensureSession(); })
       .then(function (ok) {
         if (!ok) return F1Api.refreshLocation().then(function () { showLogin(); });
-        enterBrowse(resumeWatching);
+        enterBrowse(function () { resumeWatching(); });
       })
       .catch(function (e) {
         showLogin('Startup problem: ' + e.message);
       });
   }
 
-  window.addEventListener('load', boot);
+  if (typeof Launcher !== 'undefined') boot();
+  else window.addEventListener('load', boot);
 })();

@@ -31,4 +31,4 @@ jobs:
           node --test tests/*.test.js
           python3 -m unittest discover -s tests -p '*_test.py'
           for script in scripts/*.sh; do bash -n "$script"; done
-          for script in app/js/*.js app/service/*.js; do node --check "$script"; done
+          for script in app/js/*.js app/service/*.js shell/*.js shell/vendor/*.js scripts/*.js; do node --check "$script"; done

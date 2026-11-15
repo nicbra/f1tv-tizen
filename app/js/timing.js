@@ -101,7 +101,7 @@ var Timing = (function () {
     if (key === loadedKey || (key === failure.key && Date.now() - failure.at < 60000)) return;
     stop();
     loadedKey = key;
-    if (!worker) { worker = new Worker('js/timing-worker.js'); worker.onmessage = onMessage; }
+    if (!worker) { worker = (typeof Launcher !== 'undefined' ? Launcher.worker('js/timing-worker.js') : new Worker('js/timing-worker.js')); worker.onmessage = onMessage; }
     resolvePath(meta, token).then(function (path) {
       if (loadedKey === key) worker.postMessage({ cmd: 'load', path: path, token: token, live: !!live, start: +meta.start || 0 });
     }).catch(function () {

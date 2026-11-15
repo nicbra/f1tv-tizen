@@ -27,7 +27,7 @@ test('settings start from the defaults', () => {
   assert.equal(Settings.get('audio'), 'eng');
   assert.equal(Settings.get('subtitles'), '');
   assert.equal(Settings.get('spoilerFree'), false);
-  assert.equal(Settings.get('updates'), true);
+  assert.equal(Settings.get('updates'), 'automatic');
 });
 
 test('settings are saved and read back, including false and empty values', () => {
@@ -45,6 +45,17 @@ test('settings survive corrupt or unwritable storage', () => {
   const { Settings } = settings(null, { failWrites: true });
   Settings.set('audio', 'fx');
   assert.equal(Settings.get('audio'), 'fx'); // kept for this session
+});
+
+test('update preferences migrate booleans and notify to Automatic or Off', () => {
+  assert.equal(settings('{"updates":true}').Settings.get('updates'), 'automatic');
+  assert.equal(settings('{"updates":false}').Settings.get('updates'), 'off');
+  assert.equal(settings('{"updates":"notify"}').Settings.get('updates'), 'automatic');
+  for (const mode of ['automatic', 'off']) {
+    const { Settings, store } = settings(null);
+    Settings.set('updates', mode);
+    assert.equal(settings(store['f1tv.settings']).Settings.get('updates'), mode);
+  }
 });
 
 // ---------- keys ----------
@@ -144,19 +155,35 @@ test('focus on an empty grid does nothing and other keys are not handled', () =>
 
 // ---------- the service launcher ----------
 
-function proxy({ upAfter = 0, launchFails = false } = {}) {
+/** Timers in due order on a virtual clock: each runs after pending promise work, and moves the clock to its time. */
+function fakeClock() {
+  let now = 0, seq = 0, pumping = false;
+  const timers = new Map();
+  function schedule() { if (!pumping && timers.size) { pumping = true; setImmediate(pump); } }
+  function pump() {
+    pumping = false;
+    let next = null;
+    for (const entry of timers) if (!next || entry[1].due < next[1].due) next = entry;
+    if (!next) return;
+    timers.delete(next[0]); now = Math.max(now, next[1].due); next[1].fn(); schedule();
+  }
+  return { now: () => now, setTimeout(fn, ms) { const id = ++seq; timers.set(id, { fn, due: now + (ms || 0) }); schedule(); return id; },
+    clearTimeout(id) { timers.delete(id); }, Date: { now: () => now } };
+}
+
+function proxy({ upAfter = 0, launchFails = false, upAt = null, fetch = null, launch = null, launcher = undefined } = {}) {
   let pings = 0;
-  const launched = [];
+  const launched = [], clock = fakeClock();
   const ctx = load(['proxy.js'], {
-    fetch: async (url) => { pings++; if (pings > upAfter) return { ok: true }; throw new Error('refused'); },
-    setTimeout: (fn) => setImmediate(fn),
+    fetch: fetch || (async () => { pings++; if (upAt != null ? clock.now() >= upAt : pings > upAfter) return { ok: true }; throw new Error('refused'); }),
+    setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, Date: clock.Date, Launcher: launcher,
     tizen: {
       application: { getCurrentApplication: () => ({ appInfo: { packageId: 'F1TVtizen1' } }),
-        launchAppControl: (ctl, id, ok, fail) => { launched.push(id); launchFails ? fail({ message: 'denied' }) : ok(); } },
+        launchAppControl: (ctl, id, ok, fail) => { launched.push(id); if (launch) return launch(ok, fail); launchFails ? fail({ message: 'denied' }) : ok(); } },
       ApplicationControl: function (op) { this.op = op; }
     }
   });
-  return { StreamProxy: ctx.StreamProxy, launched, pings: () => pings };
+  return { StreamProxy: ctx.StreamProxy, launched, pings: () => pings, clock };
 }
 
 test('the service is not launched when it already answers', async () => {
@@ -168,12 +195,33 @@ test('the service is not launched when it already answers', async () => {
 test('the service is launched by its id and awaited until it answers', async () => {
   const { StreamProxy, launched } = proxy({ upAfter: 3 });
   assert.equal(await StreamProxy.ensure(), true);
-  assert.deepEqual(launched, ['F1TVtizen1.Proxy']);
+  assert.deepEqual(launched, ['F1TVtizen1.Helper']);
 });
 
-test('ensure fails when the service cannot be launched or never answers', async () => {
+test('ensure fails when the service cannot be launched, and gives a refusing one 20 seconds', async () => {
   await assert.rejects(proxy({ upAfter: 99, launchFails: true }).StreamProxy.ensure(), /denied/);
-  await assert.rejects(proxy({ upAfter: 99 }).StreamProxy.ensure(), /did not start/);
+  const never = proxy({ upAfter: 1e9 });
+  await assert.rejects(never.StreamProxy.ensure(), /did not start/);
+  assert.ok(never.clock.now() >= 20000 && never.clock.now() <= 21000, String(never.clock.now()));
+});
+
+test('a slow helper start (6 s) is waited for, not given up after twenty quick refusals', async () => {
+  const slow = proxy({ upAt: 6000 });
+  assert.equal(await slow.StreamProxy.ensure(), true);
+  assert.ok(slow.clock.now() >= 6000 && slow.clock.now() < 7000);
+});
+
+test('a helper that accepts connections but never answers, or a launch that never calls back, end within the budget', async () => {
+  const wedged = proxy({ fetch: () => new Promise(() => {}) });
+  await assert.rejects(wedged.StreamProxy.ensure(), /did not start/);
+  assert.ok(wedged.clock.now() >= 20000 && wedged.clock.now() <= 29000, String(wedged.clock.now()));
+  // Headers arrive, the body never does: the whole exchange has the deadline.
+  const stalled = proxy({ launcher: { version: '1.0.0' }, fetch: async () => ({ ok: true, json: () => new Promise(() => {}) }) });
+  await assert.rejects(stalled.StreamProxy.ensure(), /did not start/);
+  assert.ok(stalled.clock.now() <= 29000, String(stalled.clock.now()));
+  const silent = proxy({ upAt: 12000, launch: () => {} });
+  assert.equal(await silent.StreamProxy.ensure(), true);
+  assert.deepEqual(silent.launched, ['F1TVtizen1.Helper']);
 });
 
 test('manifest URLs carry the stream, the time shift in whole seconds and the languages', () => {

@@ -59,10 +59,11 @@
       var protectionAbsent = d[i + 1] & 1, len = ((d[i + 3] & 3) << 11) | (d[i + 4] << 3) | (d[i + 5] >> 5);
       var head = protectionAbsent ? 7 : 9;
       if (len < head || i + len > d.length) break;
-      if (!out.config) {
-        var ri = (d[i + 2] >> 2) & 15;
-        out.config = { objectType: (d[i + 2] >> 6) + 1, rateIndex: ri, rate: RATES[ri], channels: ((d[i + 2] & 1) << 2) | (d[i + 3] >> 6) };
-      }
+      // Every frame: an unknown rate would put NaN frame times in the MP4, a changed one wrong times.
+      var ri = (d[i + 2] >> 2) & 15, objectType = (d[i + 2] >> 6) + 1, channels = ((d[i + 2] & 1) << 2) | (d[i + 3] >> 6);
+      if (!RATES[ri]) throw new Error('unsupported ADTS sample rate');
+      if (!out.config) out.config = { objectType: objectType, rateIndex: ri, rate: RATES[ri], channels: channels };
+      else if (out.config.rateIndex !== ri || out.config.objectType !== objectType || out.config.channels !== channels) throw new Error('ADTS configuration changed');
       out.frames.push({ pts: Math.round(pts + out.n * 1024 * 90000 / out.config.rate), data: d.subarray(i + head, i + len) });
       out.n++;
       i += len;

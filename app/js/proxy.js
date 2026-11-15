@@ -1,10 +1,30 @@
-/* Starts the app's background service (service/service.js) and builds URLs through it. */
+/* Starts the app's background service (launcher/service.js; service/service.js does the work) and builds URLs through it. */
 var StreamProxy = (function () {
   var BASE = 'http://127.0.0.1:18765';
   var vodSequence = 0;
 
-  function ping() {
-    return fetch(BASE + '/ping', { cache: 'no-store' }).then(function (r) { return r.ok; }, function () { return false; });
+  // A helper that accepts the connection but never answers (a wedged delegate) must not hang the player or the app's
+  // start. Chromium 47 has no AbortController: each step races a timer, and a late answer is ignored.
+  var PING_MS = 8000, LAUNCH_MS = 10000, ENSURE_MS = 20000;
+  function within(promise, ms, late) {
+    return new Promise(function (resolve, reject) {
+      var timer = setTimeout(function () { if (late) late(resolve, reject); else reject(new Error('helper did not answer')); }, ms);
+      promise.then(function (v) { clearTimeout(timer); resolve(v); }, function (e) { clearTimeout(timer); reject(e); });
+    });
+  }
+
+  /** Whether the helper answers, with this bundle's service code; the whole exchange within `ms`. */
+  function ping(ms) {
+    return within(fetch(BASE + '/ping', { cache: 'no-store' }).then(function (r) {
+      if (!r.ok) return false;
+      if (typeof Launcher === 'undefined') return true;
+      return r.json().then(function (info) {
+        if (info.version === Launcher.version && info.ok) return true;
+        // The fixed listener reloads the service delegate in place, preserving recovery routes.
+        return fetch(BASE + '/launcher/restart?version=' + encodeURIComponent(Launcher.version), { method: 'POST' })
+          .then(function (r) { if (!r.ok) return false; return r.json().then(function (info) { return info.version === Launcher.version; }); });
+      });
+    }), ms || PING_MS).catch(function () { return false; });
   }
 
   function launch() {
@@ -13,21 +33,27 @@ var StreamProxy = (function () {
         var pkg = tizen.application.getCurrentApplication().appInfo.packageId;
         tizen.application.launchAppControl(
           new tizen.ApplicationControl('http://tizen.org/appcontrol/operation/service'),
-          pkg + '.Proxy', resolve, function (e) { reject(new Error(e.message)); });
+          pkg + '.Helper', resolve, function (e) { reject(new Error(e.message)); });
       } catch (e) { reject(e); }
     });
   }
 
+  /**
+   * Resolves once the helper answers. A start can take a while (a cold Node start, or an update being installed),
+   * so it keeps asking for ENSURE_MS from the call, whether the pings are refused or hang.
+   */
   function ensure() {
+    var since = Date.now();
+    function left() { return ENSURE_MS - (Date.now() - since); }
     return ping().then(function (up) {
       if (up) return true;
-      return launch().then(function () {
-        var tries = 0;
+      // A launch that never calls back is not an answer either way: the pings decide.
+      return within(launch(), LAUNCH_MS, function (resolve) { resolve(); }).then(function () {
         return new Promise(function (resolve, reject) {
           (function wait() {
-            ping().then(function (ok) {
+            if (left() <= 0) return reject(new Error('Stream helper service did not start'));
+            ping(Math.max(1000, Math.min(PING_MS, left()))).then(function (ok) {
               if (ok) return resolve(true);
-              if (++tries > 20) return reject(new Error('Stream helper service did not start'));
               setTimeout(wait, 250);
             });
           })();

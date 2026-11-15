@@ -158,6 +158,20 @@ test('driverSeason merges race results with quali, sprint, fastest lap and grid'
     round: 1, name: 'Australian GP', country: 'Australia', pos: 1, posText: '1', grid: 2, points: 25,
     status: 'Finished', fastest: true, quali: 2, sprint: null
   });
+  const listed = Object.assign({}, race(5, 'Canadian Grand Prix'), {});   // listed, no result rows yet
+  const routes = seasonRoutes();
+  routes['/drivers/max_verstappen/results.json'] = raceTable([
+    ...routes['/drivers/max_verstappen/results.json'].MRData.RaceTable.Races,
+    listed
+  ]);
+  const withEmpty = load(routes);
+  const grown = plain(await withEmpty.stats.driverSeason('max_verstappen'));
+  assert.equal(grown.length, 5);
+  // The round with no result row is still to come (pending): not a rejection, and not counted as a DNF.
+  assert.deepEqual(grown[4], { round: 5, name: 'Canadian GP', country: 'Australia', pos: null, posText: '',
+    grid: null, points: 0, status: '', fastest: false, quali: null, sprint: null, pending: true });
+  const before = withEmpty.stats.summary(grown.slice(0, 4)), after = withEmpty.stats.summary(grown);
+  assert.equal(after.dnfs, before.dnfs); assert.equal(after.finishes, before.finishes);
   // grid "0" (pit lane start) becomes null; fastest-lap rank other than 1 is not fastest
   assert.equal(s[1].grid, null);
   assert.equal(s[1].fastest, false);
