@@ -293,8 +293,9 @@ async function boot(options = {}) {
   };
 
   // The video player: loads resolve unless the test holds them; positions move only when the test says.
+  // frames: decoded frames, as Shaka counts them (a number, from 0 at each load), or null (AVPlay counts none).
   const player = {
-    current: null, engine: null, pos: 0, paused: false, loads: [], listeners: {}, hold: null,
+    current: null, engine: null, pos: 0, paused: false, loads: [], listeners: {}, hold: null, frames: null,
     init: async () => {},
     hdrCapable: () => !!options.hdrCapable,
     cencCapable: () => !!options.capsRouting && context.Caps.browser('cenc') !== false,
@@ -306,6 +307,7 @@ async function boot(options = {}) {
       player.engine = options.capsRouting ? (s.cenc && !s.cencAvplay ? 'shaka' : 'avplay') : player.kind;
       player.pos = start || 0;
       player.paused = false;
+      if (player.frames != null) player.frames = 0;
       player.loads.push({ url: s.url, start });
       return player.hold ? player.hold.promise : Promise.resolve();
     },
@@ -317,8 +319,10 @@ async function boot(options = {}) {
       const prev = player.current;
       player.current = s;
       player.loads.push({ url: s.url, start });
-      return (player.hold ? player.hold.promise : Promise.resolve()).then(() => { player.pos = start || 0; },
-        (e) => { player.current = prev; throw e; });
+      return (player.hold ? player.hold.promise : Promise.resolve()).then(() => {
+        player.pos = start || 0;
+        if (player.frames != null) player.frames = 0;
+      }, (e) => { player.current = prev; throw e; });
     },
     unload: () => { player.engine = null; return player.unloadHold ? player.unloadHold.promise : Promise.resolve(); },
     setGridRect(r) { player.gridRect = r; },
@@ -326,6 +330,7 @@ async function boot(options = {}) {
     engineName: () => player.engine,
     exactPosition: () => player.pos,
     position: () => (player.engine ? player.pos : 0),
+    decodedFrames: () => (player.engine ? player.frames : null),
     // player.live: a live stream with an hour of DVR window up to its live edge (window positions 1000-4600).
     range: () => (!player.engine ? { start: 0, end: 0 } : player.live ? { start: 1000, end: 4600 } : { start: 0, end: 7200 }),
     bufferedEnd: () => player.pos,
@@ -446,8 +451,12 @@ async function boot(options = {}) {
   if (options.releases || options.launcherResult) vm.runInContext(readFileSync('app/js/updates.js', 'utf8'), context, { filename: 'updates.js' });
   vm.runInContext(readFileSync('app/js/app.js', 'utf8'), context, { filename: 'app.js' });
   if (windowListeners.load) windowListeners.load();
-  // With player.progress on, the position moves on while it plays, as real playback does.
-  clock.setInterval(() => { if (player.progress && player.engine && !player.paused) player.pos += 0.1; }, 100);
+  // With player.progress on, the position moves on while it plays, as real playback does (and frames are decoded, at 50 fps).
+  clock.setInterval(() => {
+    if (!player.progress || !player.engine || player.paused) return;
+    player.pos += 0.1;
+    if (player.frames != null) player.frames += 5;
+  }, 100);
   await clock.advance(100);
 
   const $ = (id) => document.getElementById(id);
@@ -900,6 +909,58 @@ test('jumping back soon after the start is not taken for a video that did not st
   await app.advance(200);
   assert.equal(app.player.pos, 1800);
   app.player.pos = 1500;      // the viewer went back five minutes, and it plays from there
+  await app.advance(20000);
+  assert.doesNotMatch(app.toast(), /didn't start/);
+  assert.equal(app.player.loads.length, 1);
+});
+
+// TV, 2026-11-19 (twice, each the first Shaka load after AVPlay): a 2024 TS replay jumped from 0 to 2.13 s and froze
+// there, 0 decoded frames (readyState 1 once, stuck seeking at readyState 3 once), a black picture until the viewer
+// left. Reopening it played at once.
+test('a Shaka start whose position jumps without a decoded frame is tried again; one that decodes is left alone', async () => {
+  const app = await boot();
+  app.player.frames = 0;      // Shaka counts decoded frames
+  await play(app, 'Race');
+  assert.equal(app.player.loads.length, 1);
+  app.player.pos = 2.13;      // the position jumped, but not one frame came out
+  await app.advance(15000);
+  assert.match(app.toast(), /didn't start, trying again/);
+  assert.equal(app.player.loads.length, 2);
+  assert.equal(app.player.loads[1].url, app.player.loads[0].url, 'the same feed again');
+  app.player.progress = true; // this time it plays
+  await app.advance(20000);
+  assert.equal(app.player.loads.length, 2, 'a start that decodes frames is not retried');
+});
+
+// The first clear HDR video after the app starts can freeze without a frame; player.js (reloadIfFrozen) loads it once
+// more after 5 s, which restarts the frame count. The start watch gives HDR 25 s.
+test('a frozen first HDR start that plays after the player\'s own reload stays HDR; one still frozen falls back to SDR', async () => {
+  for (const helps of [true, false]) {
+    const plays = [];
+    const app = await boot({ hdrCapable: true, play: (id, channel, opts) => {
+      plays.push(!!(opts && opts.hdr));
+      return Promise.resolve(opts && opts.hdr ? { url: 'https://cdn/' + id + '/hdr.m3u8', hdr: true } :
+        { url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' });
+    } });
+    app.player.frames = 0;
+    await play(app, 'Race');
+    assert.match(app.player.current.url, /hdr\.m3u8$/);
+    app.player.pos = 2.1;          // frozen: the position jumped, not one frame came out
+    await app.advance(5000);
+    app.player.frames = 0;         // player.js reloads it: a new count
+    if (helps) { await app.advance(7000); app.player.progress = true; }   // plays ~12 s after the start
+    await app.advance(helps ? 14000 : 21000);
+    assert.equal(/didn't start/.test(app.toast()), !helps, 'helps: ' + helps);
+    assert.deepEqual(plays, helps ? [true] : [true, false], 'helps: ' + helps);
+    assert.match(app.player.current.url, helps ? /hdr\.m3u8$/ : /main\.m3u8$/);
+  }
+});
+
+test('a start on AVPlay, which counts no frames, still plays once its position moves', async () => {
+  const app = await boot();
+  app.player.kind = 'avplay';
+  await play(app, 'Race');
+  app.player.progress = true;
   await app.advance(20000);
   assert.doesNotMatch(app.toast(), /didn't start/);
   assert.equal(app.player.loads.length, 1);

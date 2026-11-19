@@ -2396,15 +2396,18 @@
   /**
    * Retry once if playback hasn't started after 15 s; an HDR stream gets 25 s, since its first
    * segments have taken ~20 s when the CDN had to fetch them, and its retry falls back to SDR.
+   * Playing takes a position that moved and, where the engine counts them (Shaka), decoded frames: Shaka's first
+   * load of a 2024 TS replay after AVPlay jumped from 0 to 2.13 s and stayed there without a picture (0 frames, stuck
+   * seeking; TV, 2026-11-19). AVPlay reports no position until it plays, so there the position is enough.
    */
   function watchStart(stream, opts) {
-    var from = Player.position(), ctx = feedsCtx;
+    var from = Player.position(), frames = Player.decodedFrames(), ctx = feedsCtx;
     setTimeout(function () {
       // A newer load or another video has taken over; it has its own watch.
       if (feedsCtx !== ctx || loadingFeed) return;
       if (screen !== 'player' || Player.stream() !== stream || Player.isPaused() || stream.retried) return;
-      // Moved either way: it plays (the viewer may have jumped back).
-      if (Math.abs(Player.position() - from) > 0.5) return;
+      // Moved either way (the viewer may have jumped back), with pictures decoded meanwhile: it plays.
+      if (Math.abs(Player.position() - from) > 0.5 && decodedSince(frames) !== 0) return;
       diag('play.no-start', { stream: diagStream(stream), waitedMs: stream.hdr ? 25000 : 15000, position: from, retry: !!opts.retry });
       playbackFailed(stream);
       var last = opts.retry && !stream.hdr && (!stream.capsPath || sdrPath() === stream.capsRoute);
@@ -2424,6 +2427,16 @@
       else if (!Player.isLive() && from) again = { startAt: from, retry: true };
       playFeed(feedsCtx.index, again);
     }, stream.hdr ? 25000 : 15000);
+  }
+
+  /**
+   * Frames decoded since an earlier Player.decodedFrames() count, or null when either is unknown. A reload in
+   * between (Shaka's frozen-start reload, a new MediaSource) restarts the count.
+   */
+  function decodedSince(before) {
+    var now = Player.decodedFrames();
+    if (now == null || before == null) return null;
+    return now >= before ? now - before : now;
   }
 
   // Seconds a feed switch takes; the new feed starts this far ahead so it lines up. Learned per switch.

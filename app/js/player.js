@@ -245,6 +245,16 @@ var Player = (function () {
       }, 5000);
     }
 
+    /**
+     * Frames decoded since the video was loaded (Shaka's polyfill gives older Tizen the count too), or null without
+     * a count. Trusted at 0 like reloadIfFrozen and showFrame do: the frozen TS start (TV, 2026-11-19) sat seeking
+     * at 2.13 s with readyState 3 and 1080p known, so readyState doesn't tell it from a playing video.
+     */
+    function decodedFrames() {
+      var v = V(), q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
+      return q ? q.totalVideoFrames : null;
+    }
+
     /** Resolves once `seconds` of video are buffered ahead of the playhead (or after a timeout). */
     function whenBuffered(slot, seconds, ms) {
       return new Promise(function (resolve) {
@@ -393,6 +403,7 @@ var Player = (function () {
       range: function () { return P().seekRange(); },
       position: function () { return V().currentTime; },
       exactPosition: function () { return V().currentTime; },
+      decodedFrames: decodedFrames,
       bufferedEnd: function () { var b = V().buffered; return b.length ? b.end(b.length - 1) : 0; },
       seekTo: function (t, done) { V().currentTime = t; if (done) done(); },
       // The viewer's pause counts even while showFrame plays a switched-to feed until it has a picture.
@@ -917,6 +928,7 @@ var Player = (function () {
       position: function () { return posMs / 1000; },
       // AVPlay's own clock (position() follows its time callbacks, up to ~0.3 s behind): costs a few ms per call.
       exactPosition: function () { try { var ms = av.getCurrentTime(); return ms > 0 ? ms / 1000 : posMs / 1000; } catch (e) { return posMs / 1000; } },
+      decodedFrames: function () { return null; },   // AVPlay counts none (and reports no position until it plays)
       bufferedEnd: function () { return posMs / 1000; },
       seekTo: function (t, done) { seek(t * 1000, done); },
       paused: function () { return isPaused; },
@@ -1149,6 +1161,8 @@ var Player = (function () {
     position: proxy('position', 0),
     /** The position from the engine's own clock (for keeping other pictures in step: the H.264 multiview's small feeds). */
     exactPosition: proxy('exactPosition', 0),
+    /** Frames decoded since the load (a new load restarts the count), or null where the engine doesn't tell (AVPlay). */
+    decodedFrames: proxy('decodedFrames', null),
     bufferedEnd: proxy('bufferedEnd', 0),
     engineName: function () { return engineName; },
     /**

@@ -831,6 +831,26 @@ test('the first cenc video, stalled before any data (readyState 1), is loaded on
   }
 });
 
+test('decoded frames for the start watch: Shaka\'s count (also 0 while seeking at readyState 3), none on AVPlay', async () => {
+  const P = await player(fakeAvPlay({ duration: 6163000 }), undefined, () => Promise.resolve());
+  assert.equal(P.decodedFrames(), null, 'nothing loaded');
+  let frames = 0;
+  // The frozen TS start on the TV: stuck seeking at 2.13 s, readyState 3, not one frame.
+  P.videos.forEach((v) => Object.assign(v, { play: () => Promise.resolve(), readyState: 3, seeking: true, currentTime: 2.13,
+    getVideoPlaybackQuality: () => ({ totalVideoFrames: frames }) }));
+  P.forceEngine = 'shaka';
+  await P.load({ url: 'https://cdn/x.m3u8', multiFeed: true, info: { dynamic: false } }, null);
+  assert.equal(P.decodedFrames(), 0);
+  frames = 25;
+  assert.equal(P.decodedFrames(), 25);
+  delete P.videos[0].getVideoPlaybackQuality;
+  assert.equal(P.decodedFrames(), null, 'no count at all');
+  P.forceEngine = null;
+  await P.load(REPLAY, 600);
+  assert.equal(P.engineName(), 'avplay');
+  assert.equal(P.decodedFrames(), null);
+});
+
 test('cenc feed switches load in place instead of preloading beside the playing feed', async () => {
   const urls = [];
   const P = await player(fakeAvPlay(), undefined, (url) => { urls.push(url); return Promise.resolve(); });

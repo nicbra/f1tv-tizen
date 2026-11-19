@@ -41,7 +41,7 @@ function playback(load, capable = true, opts = {}) {
       hdrCapable: () => capable, cencCapable: () => !!opts.cencCapable, engineName: () => current ? (current.cencAvplay || current.hdrEncrypted || (!current.cenc && current.licenseUrl) ? 'avplay' : 'shaka') : null,
       unload: async () => {}, stream: () => current,
       load: (s, p) => start(s, p, false), switchTo: (s, p) => start(s, p, true),
-      position: () => opts.position ? opts.position(current) : 120, wallClock: () => null, isLive: () => false, isPaused: () => paused, togglePause: () => { paused = !paused; },
+      position: () => opts.position ? opts.position(current) : 120, decodedFrames: () => null, wallClock: () => null, isLive: () => false, isPaused: () => paused, togglePause: () => { paused = !paused; },
       range: () => ({ start: 0, end: 600 }), bufferedEnd: () => 150,
       tracks: () => ({ audio: [], text: [] })
     }
