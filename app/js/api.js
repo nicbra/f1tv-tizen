@@ -627,10 +627,11 @@ var F1Api = (function () {
     return /pre-?live|unavailable/i.test((err && err.message) || '');
   }
 
+  /** F1's resizer takes a JPEG quality number; its 'HI' is only 70, which shows blocks once the TV scales the UI to 4K (100: ~60 KB a tile). */
   function imageUrl(pictureUrl, w, h) {
     if (!pictureUrl) return '';
     if (pictureUrl.indexOf('http') === 0) return pictureUrl;
-    return BASE + '/image-resizer/image/' + pictureUrl + '?w=' + w + '&h=' + h + '&q=HI&o=L';
+    return BASE + '/image-resizer/image/' + pictureUrl + '?w=' + w + '&h=' + h + '&q=100&o=L';
   }
 
   return {

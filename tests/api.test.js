@@ -433,7 +433,7 @@ test('isNotStarted recognises the play API answers for sessions that have not be
 
 test('imageUrl sizes F1 image ids through the image resizer and keeps full URLs', () => {
   const { F1Api } = api();
-  assert.equal(F1Api.imageUrl('1000010403_abc', 384, 216), 'https://f1tv.formula1.com/image-resizer/image/1000010403_abc?w=384&h=216&q=HI&o=L');
+  assert.equal(F1Api.imageUrl('1000010403_abc', 384, 216), 'https://f1tv.formula1.com/image-resizer/image/1000010403_abc?w=384&h=216&q=100&o=L');
   assert.equal(F1Api.imageUrl('https://media.formula1.com/x.png', 1, 1), 'https://media.formula1.com/x.png');
   assert.equal(F1Api.imageUrl('', 1, 1), '');
 });
