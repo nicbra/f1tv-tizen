@@ -30,8 +30,8 @@ test('caps persists outcomes per path, last time, firmware and returns a detache
   const h = boot();
   h.caps.ok('shaka:cenc'); h.at(123456); h.caps.failed('avplay:cbcs');
   const report = h.caps.report();
-  assert.deepEqual(plain(report.paths['shaka:cenc']), { ok: 1, failed: 0, crashed: 0, last: 100000 });
-  assert.deepEqual(plain(report.paths['avplay:cbcs']), { ok: 0, failed: 1, crashed: 0, last: 123456 });
+  assert.deepEqual(plain(report.paths['shaka:cenc']), { ok: 1, failed: 0, crashed: 0, last: 100000, streak: 0 });
+  assert.deepEqual(plain(report.paths['avplay:cbcs']), { ok: 0, failed: 1, crashed: 0, last: 123456, streak: 1 });
   report.paths['avplay:cbcs'].failed = 99;
   assert.equal(boot(h.store).caps.report().paths['avplay:cbcs'].failed, 1);
   assert.equal(boot(h.store, { firmware: 'TV-2' }).caps.report().paths['avplay:cbcs'], undefined);
@@ -79,7 +79,7 @@ test('stop, normal exit, unload and hiding remove the marker and stop heartbeats
   }
 });
 
-test('avoidance requires two crashes, a crash plus failure, or repeated failures; successes remain evidence', () => {
+test('avoidance requires two crashes, a crash plus failure, or repeated failures; a good start clears failures, not crashes', () => {
   for (const sequence of [['crash', 'crash'], ['crash', 'failed'], ['failed', 'failed']]) {
     let h = boot();
     for (let i = 0; i < sequence.length; i++) {
@@ -87,10 +87,29 @@ test('avoidance requires two crashes, a crash plus failure, or repeated failures
       else h.caps.failed('avplay:cbcs');
       assert.equal(h.caps.usable('avplay:cbcs'), i === 0);
     }
+    // It played after all (the last resort): failed starts no longer count against it, crashes still do.
     h.caps.ok('avplay:cbcs');
     assert.equal(h.caps.report().paths['avplay:cbcs'].ok, 1);
-    assert.equal(h.caps.usable('avplay:cbcs'), false);
+    assert.equal(h.caps.usable('avplay:cbcs'), sequence[1] === 'failed');
+    h.caps.failed('avplay:cbcs');
+    assert.equal(h.caps.usable('avplay:cbcs'), sequence[0] === 'failed', sequence.join());
   }
+});
+
+test('failed starts between good ones never rule a path out (4K HDR: 31 good starts, 2 connection failures)', () => {
+  const h = boot();
+  for (let i = 0; i < 20; i++) h.caps.ok('avplay:hdr');
+  h.caps.failed('avplay:hdr');
+  for (let i = 0; i < 11; i++) h.caps.ok('avplay:hdr');
+  h.caps.failed('avplay:hdr');
+  assert.equal(h.caps.usable('avplay:hdr'), true);
+  h.caps.failed('avplay:hdr');
+  assert.equal(h.caps.usable('avplay:hdr'), false);
+  // A record from before the streak was kept: its successes count as the latest outcome.
+  const old = boot({ 'f1tv.caps': JSON.stringify({ version: 1, firmware: 'TV-1', browser: { cenc: true, cbcs: false },
+    paths: { 'avplay:hdr': { ok: 31, failed: 2, crashed: 0, last: 1 }, 'avplay:cenc': { ok: 0, failed: 2, crashed: 0, last: 1 } } }) });
+  assert.equal(old.caps.usable('avplay:hdr'), true);
+  assert.equal(old.caps.usable('avplay:cenc'), false);
 });
 
 test('even when every SDR path is avoided there is a usable last resort; HDR is never that last resort', () => {
@@ -134,6 +153,13 @@ test('an old engine that drops the encryptionScheme member keeps the browser pat
   const h = boot({}, { probe }); [...h.timers.values()].find((t) => t.ms === 10000).fn(); await settled();
   assert.equal(h.caps.browser('cenc'), null); assert.equal(h.caps.browser('cbcs'), null);
   assert.equal(boot(h.store).caps.browser('cenc'), null, 'persisted as unknown, not as a refusal');
+});
+
+test('without browser cenc the last resort is the native path that only failed, not the one that crashed', () => {
+  const h = boot({ 'f1tv.caps': JSON.stringify({ version: 1, firmware: 'TV-1', browser: { cenc: false, cbcs: false },
+    paths: { 'avplay:cbcs': { ok: 0, failed: 0, crashed: 2, last: 1 }, 'avplay:cenc': { ok: 0, failed: 2, crashed: 0, last: 1 } } }) });
+  assert.equal(h.caps.usable('avplay:cbcs'), false);
+  assert.equal(h.caps.usable('avplay:cenc'), true);
 });
 
 test('encrypted HDR stays avoided when native cbcs is the last SDR resort', () => {

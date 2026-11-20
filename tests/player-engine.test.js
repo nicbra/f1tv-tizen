@@ -197,6 +197,15 @@ test('HDR uses Shaka even for a single feed, selecting HLG and resetting to AUTO
   assert.equal(P.engineName(), 'avplay');
 });
 
+test("Shaka ignores the MPD's minBufferTime (F1's PT30S held live starts at playbackRate 0 for ~10 s)", async () => {
+  const P = await player(fakeAvPlay(), undefined, () => Promise.resolve());
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); v.paused = false; });
+  await P.load({ url: 'https://cdn/live.mpd', cenc: true, licenseUrl: 'https://lic', multiFeed: true, live: true, info: { dynamic: true } }, null);
+  assert.equal(P.engineName(), 'shaka');
+  assert.equal(P.configs.at(-1).manifest.dash.ignoreMinBufferTime, true);
+  assert.ok(P.configs.at(-1).streaming.rebufferingGoal <= 2);
+});
+
 const MIXED_HDR = `#EXTM3U
 #EXT-X-VERSION:7
 #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",URI="audio/en.m3u8"

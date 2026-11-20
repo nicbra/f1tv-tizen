@@ -21,7 +21,10 @@ var Caps = (function () {
 
   function count(path, outcome) {
     var p = record.paths[path] || (record.paths[path] = { ok: 0, failed: 0, crashed: 0, last: 0 });
+    p.streak = failures(p);
     p[outcome]++;
+    if (outcome === 'ok') p.streak = 0;
+    else if (outcome === 'failed') p.streak++;
     p.last = Date.now();
     save();
     changed('paths');
@@ -38,25 +41,39 @@ var Caps = (function () {
   }
   save();
 
+  /**
+   * Failed starts since the path last started fine. A start that fails now and then (a CDN or licence blip) is no
+   * evidence against a path that works: lifetime counts turned 4K HDR off on this TV after 31 good starts and 2
+   * connection failures (Las Vegas FP2, 2026-11-20). Crashes stay counted for good: on the Tizen 9 TV (issue #1)
+   * playback started fine and crashed seconds later, so a good start says nothing about them. Records from before
+   * `streak` existed don't tell the order: any success there counts as the latest outcome.
+   */
+  function failures(p) {
+    return p.streak != null ? p.streak : (p.ok > 0 ? 0 : p.failed);
+  }
+
   function avoided(path) {
     var p = record.paths[path];
-    return !!p && (p.crashed >= 2 || (p.crashed >= 1 && p.failed >= 1) || p.failed >= 2);
+    return !!p && (p.crashed >= 2 || (p.crashed >= 1 && failures(p) >= 1) || failures(p) >= 2);
   }
 
   function score(path) {
     var p = record.paths[path];
-    return p ? p.crashed * 2 + p.failed : 0;
+    return p ? p.crashed * 2 + failures(p) : 0;
   }
 
   function usable(path) {
     // HDR is optional and depends on native cbcs, even when cbcs is the only SDR last resort left.
     if (path === 'avplay:hdr' && avoided('avplay:cbcs')) return false;
     if (!avoided(path)) return true;
-    // Keep a last resort even if every SDR path has failed. HDR is optional, never the last resort.
-    var best = SDR[0];
-    for (var i = 0; i < SDR.length; i++) {
-      if (!avoided(SDR[i])) return false;
-      if (score(SDR[i]) < score(best)) best = SDR[i];
+    // Keep a last resort even if every SDR path has failed. HDR is optional, never the last resort. Only paths this TV
+    // has: with the browser's cenc refused, an untried Shaka path would otherwise leave no native path usable, and the
+    // app would take the first one even if it crashed (2 crashes) and the other only failed.
+    var sdr = SDR.filter(function (p) { return p !== 'shaka:cenc' || record.browser.cenc !== false; });
+    var best = sdr[0];
+    for (var i = 0; i < sdr.length; i++) {
+      if (!avoided(sdr[i])) return false;
+      if (score(sdr[i]) < score(best)) best = sdr[i];
     }
     return path === best;
   }

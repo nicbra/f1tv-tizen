@@ -192,7 +192,9 @@ var Player = (function () {
         streaming: { bufferingGoal: 30, rebufferingGoal: 1, bufferBehind: 90,
           retryParameters: { maxAttempts: 4, baseDelay: 1000, backoffFactor: 2 } },
         abr: { enabled: true, defaultBandwidthEstimate: 10000000, useNetworkInformation: false, switchInterval: 4 },
-        manifest: { hls: { ignoreManifestProgramDateTime: false } }
+        // F1's DASH says minBufferTime PT30S, and Shaka waits for max(that, rebufferingGoal) at playbackRate 0 before
+        // playing: a live start ~25 s from the edge can't buffer 30 s, so it sat frozen ~10 s (Las Vegas FP1, 2026-11-20).
+        manifest: { hls: { ignoreManifestProgramDateTime: false }, dash: { ignoreMinBufferTime: true } }
       });
     }
 

@@ -671,6 +671,24 @@ test('a page that fails after the viewer moved on does not wipe the page shown n
   assert.match(app.focused(), /^Race/);
 });
 
+test('a page load that fails after a refresh has drawn the page leaves the refreshed rails', async () => {
+  const app = await boot();
+  const held = deferred();
+  let first = true;
+  app.net.page = (uri) => (uri === '/home' && first ? (first = false, held.promise) : Promise.resolve(PAGES[uri] || []));
+  await app.press('UP');
+  await app.pick(/^Archive$/, ['RIGHT']);
+  await app.advance(100);
+  await app.pick(/^Home$/, ['UP', 'LEFT']);
+  await app.advance(100);
+  assert.match(app.$('rails').textContent, /Loading/);
+  await app.advance(120000);             // Home's periodic refresh draws it
+  assert.match(app.$('rails').textContent, /Latest/);
+  held.reject(new Error('HTTP 503'));
+  await app.advance(100);
+  assert.match(app.$('rails').textContent, /Latest/);
+});
+
 test('a jump while paused stops the spinner once it is there', async () => {
   const app = await boot();
   await play(app, 'Race');
@@ -1484,6 +1502,25 @@ test('after a restart the app continues the same video at the same moment, also 
   assert.equal(again.store['f1tv.watching'], '');
 });
 
+test('BACK from a video resumed at start-up shows Home with its rails, not Loading… for good', async () => {
+  const app = await boot();
+  app.net.info = async () => ({ epochAtZero: 1.7e9, windowStart: 0, windowEnd: 7200 });
+  await play(app, 'Race');
+  app.player.pos = 2345;
+  await app.advance(3100);
+  assert.ok(app.store['f1tv.watching']);
+  // The app restarts (a new version) and continues the video before Home's page has loaded.
+  const again = await boot({ store: app.store });
+  again.net.info = app.net.info;
+  await again.advance(4000);
+  assert.equal(again.screen(), 'player');
+  for (let i = 0; i < 4 && again.screen() !== 'browse'; i++) { await again.press('BACK'); await again.advance(500); }
+  assert.equal(again.screen(), 'browse');
+  await again.advance(1000);
+  assert.doesNotMatch(again.$('rails').textContent, /Loading…/);
+  assert.ok(again.$('rails').querySelectorAll('.tile').length > 0, 'Home has its tiles');
+});
+
 /** A Big + 2 multiview playing on AVPlay, with its grid id set as the player sets it. */
 async function playingBig2(app) {
   app.player.kind = 'avplay';
@@ -2185,6 +2222,156 @@ test('a live feed switch without the new feed\'s manifest facts goes to live, no
   await app.press('CH_DOWN');
   await app.advance(500);
   assert.equal(app.player.loads.at(-1).start, null);
+});
+
+test('a live feed switch that lands late starts the next switch further ahead (no drift from the live edge)', async () => {
+  // The other feeds' timelines start 100 s later than the main feed's: only their wall clocks line them up.
+  const app = await boot({ info: (url) => Promise.resolve({ dynamic: true, windowStart: 1000, windowEnd: 4600, delay: 25, marks: [],
+    epochAtZero: NOW / 1000 - 4600 + (/\/main\./.test(url) ? 0 : 100) }) });
+  app.player.live = true;
+  await app.pick(/^LIVEPractice 1/);
+  await app.advance(100);
+  await app.pick(/^INTERNATIONAL/);
+  await app.press('ENTER');              // Watch live
+  await app.advance(300);
+  app.player.pos = 4500;
+  await app.press('CH_DOWN');
+  await app.advance(500);
+  const lead1 = app.player.loads.at(-1).start - 4400;
+  // Shaka resolves the switch, but its picture moves later and from a keyframe before the target (Las Vegas FP1,
+  // 2026-11-20): 6 s on, it shows a moment 2 s earlier than the old feed would have.
+  app.player.pos = 4400 + 6 - 2;
+  await app.advance(6000);
+  await app.press('CH_DOWN');
+  await app.advance(500);
+  const lead2 = app.player.loads.at(-1).start - 4404;
+  assert.ok(lead2 - lead1 > 1.2 && lead2 - lead1 < 1.8, 'lead ' + lead1 + ' then ' + lead2);
+});
+
+test('a native live switch at LIVE plays the new feed at its own live point; one behind live is time-shifted', async () => {
+  const app = await boot({ play: (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.mpd',
+    streamType: 'SDR_HD_DASHWV', licenseUrl: 'https://lic' }),
+  // The edge (4600, the end of the range) is the wall clock minus the 25 s delay, as on the TV.
+  info: () => Promise.resolve({ dynamic: true, windowStart: 1000, windowEnd: 4600, delay: 25, marks: [], epochAtZero: NOW / 1000 - 4625 }) });
+  app.player.kind = 'avplay';
+  app.player.live = true;
+  await app.pick(/^LIVEPractice 1/);
+  await app.advance(100);
+  await app.pick(/^INTERNATIONAL/);
+  await app.press('ENTER');              // Watch live
+  await app.advance(300);
+  // At LIVE (AVPlay's own live point: 35 s behind real time, 10 s from the edge): the new feed's own live point too, not a
+  // shift by the lead that lands a segment-rounded few seconds later with every switch (Las Vegas FP2, 2026-11-20).
+  app.player.pos = 4590;
+  await app.press('CH_DOWN');
+  await app.advance(500);
+  assert.equal(app.player.loads.at(-1).start, null);
+  assert.equal(app.player.current.startDelay, undefined);
+  // Behind live: the helper shifts the manifest to the old feed's moment.
+  app.player.pos = 4500;
+  await app.advance(7000);
+  await app.press('CH_DOWN');
+  await app.advance(500);
+  assert.ok(app.player.current.startDelay > 60, 'shift ' + app.player.current.startDelay);
+});
+
+// The lead the next live switch uses (3 s unless something was learned), measured from position 4500.
+const nextLead = async (app) => {
+  app.player.pos = 4500;
+  await app.advance(7000);               // past any earlier sample's timer, no keys meanwhile
+  await app.press('CH_DOWN');
+  await app.advance(500);
+  return app.player.loads.at(-1).start - 4500;
+};
+
+const shakaLive = async () => {
+  const app = await boot();
+  await app.pick(/^LIVEPractice 1/);
+  await app.advance(100);
+  await app.pick(/^INTERNATIONAL/);
+  await app.press('ENTER');              // Watch live
+  await app.advance(300);
+  return app;
+};
+
+test('a switch the lead did not place teaches it nothing (the target lay past the live edge)', async () => {
+  const app = await shakaLive();
+  app.player.pos = 4598;                 // the lead puts the target past the window end: the stream's own edge
+  await app.press('CH_DOWN');
+  await app.advance(500);
+  assert.equal(app.player.loads.at(-1).start, null);
+  app.player.pos = 4602.5;               // 2 s behind where the old feed would be
+  await app.advance(6000);
+  const lead = await nextLead(app);
+  assert.ok(lead > 2.9 && lead < 3.6, 'lead ' + lead);
+});
+
+test('keys pressed while a switch loads keep it from teaching the lead', async () => {
+  const app = await shakaLive();
+  app.player.pos = 4500;
+  app.player.hold = deferred();
+  await app.press('CH_DOWN');
+  await app.advance(300);
+  await app.press('PAUSE');
+  await app.press('PLAY');
+  const held = app.player.hold;
+  app.player.hold = null;
+  held.resolve();
+  await app.advance(200);
+  app.player.pos = 4500 + 6 - 2;
+  await app.advance(6000);
+  const lead = await nextLead(app);
+  assert.ok(lead > 2.9 && lead < 3.6, 'lead ' + lead);
+});
+
+test('a switched feed frozen at its start teaches the lead nothing', async () => {
+  const app = await shakaLive();
+  app.player.pos = 4500;
+  await app.press('CH_DOWN');
+  await app.advance(500);
+  await app.advance(6000);               // the position never moves from the requested start
+  const lead = await nextLead(app);
+  assert.ok(lead > 2.9 && lead < 3.6, 'lead ' + lead);
+});
+
+const nativeLive = async () => {
+  const app = await boot({ play: (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.mpd',
+    streamType: 'SDR_HD_DASHWV', licenseUrl: 'https://lic' }),
+  info: () => Promise.resolve({ dynamic: true, windowStart: 1000, windowEnd: 4600, delay: 25, marks: [], epochAtZero: NOW / 1000 - 4625 }) });
+  app.player.kind = 'avplay';
+  app.player.live = true;
+  await app.pick(/^LIVEPractice 1/);
+  await app.advance(100);
+  await app.pick(/^INTERNATIONAL/);
+  await app.press('ENTER');              // Watch live
+  await app.advance(300);
+  return app;
+};
+
+test('a native switch made paused at LIVE keeps the paused moment (time-shifted), not the live point', async () => {
+  const app = await nativeLive();
+  app.player.pos = 4590;
+  await app.press('PAUSE');
+  await app.press('CH_DOWN');
+  await app.advance(500);
+  assert.ok(app.player.current.startDelay > 5, 'shift ' + app.player.current.startDelay);
+});
+
+test('the retry of a failed native switch at LIVE starts at the live point too', async () => {
+  const app = await nativeLive();
+  app.player.pos = 4590;
+  app.player.hold = deferred();
+  await app.press('CH_DOWN');
+  await app.advance(500);
+  const held = app.player.hold;
+  app.player.hold = null;
+  app.player.pos = 0;                    // the failed native player reports nothing
+  held.reject(new Error('Could not open stream: PLAYER_ERROR_CONNECTION_FAILED'));
+  await app.advance(5000);
+  const urls = app.player.loads.map((l) => l.url);
+  assert.ok(app.player.loads.length >= 3, urls.join());
+  assert.equal(app.player.loads.at(-1).start, null);
+  assert.equal(app.player.current.startDelay, undefined);
 });
 
 test('a driver\'s Grand Prix still to come shows its sprint without a trailing separator', async () => {
@@ -3040,6 +3227,20 @@ function protectedOffers(offers) {
       streamType: 'DASH_WV', licenseUrl: 'https://lic', cenc: !!opts.cenc });
   };
 }
+
+test('a Shaka start whose position moves without a decoded frame is no good start for Caps', async () => {
+  const offers = [];
+  const app = await boot({ capsRouting: true, settings: { hdr: false }, play: protectedOffers(offers) });
+  app.player.frames = 0;
+  await playLive(app);
+  assert.equal(app.player.engine, 'shaka');
+  app.player.pos += 2.13;                // the frozen start's jump (TV, 2026-11-19), no picture
+  await app.advance(2000);
+  assert.equal((app.context.Caps.report().paths['shaka:cenc'] || { ok: 0 }).ok, 0);
+  app.player.progress = true;            // now it plays
+  await app.advance(2000);
+  assert.equal(app.context.Caps.report().paths['shaka:cenc'].ok, 1);
+});
 
 test('live SDR starts on Shaka cenc; a start-watch failure falls back to native cbcs and learns when it plays', async () => {
   const offers = [];

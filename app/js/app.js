@@ -134,7 +134,13 @@
   /** Remembers the current screen (its DOM stays intact) so BACK can return to it. */
   function snapshot() {
     var s = screen, g = grid;
-    return function () { show(s); grid = g; if (grid) grid.apply(); };
+    return function () {
+      show(s);
+      grid = g;
+      // Its page finished loading while another screen was up (a video resumed at start-up): load it now.
+      if (s === 'browse' && currentPage && currentPage.dropped) return renderPage(currentPage);
+      if (grid) grid.apply();
+    };
   }
 
   function goBack() {
@@ -337,14 +343,23 @@
     rails.appendChild(el('div', 'empty', 'Loading…'));
     // The last page's tiles are gone; until this one loads only the top nav works.
     buildBrowseGrid([]);
-    var seq = navSeq;
+    var seq = navSeq, gen = pg.gen = (pg.gen || 0) + 1;
+    pg.dropped = false;
+    pg.layout = null;   // nothing drawn: a refresh meanwhile draws its rails
+    // Dropped if the viewer is elsewhere now; drawn if they came back to this page meanwhile. Only the page's latest
+    // load draws: a slow first one must not replace what a later render or refresh has drawn since.
+    var gone = function () {
+      if (currentPage !== pg || pg.gen !== gen) return true;
+      if (seq !== navSeq && screen !== 'browse') { pg.dropped = true; return true; }
+      return false;
+    };
     pg.load().then(function (containers) {
-      if (currentPage !== pg || seq !== navSeq) return;
+      if (gone()) return;
       var list = pageRails(pg, containers);
       pg.layout = railsLayout(list);
       drawRails(list, focus);
     }).catch(function (e) {
-      if (currentPage !== pg || seq !== navSeq) return;
+      if (gone()) return;
       rails.innerHTML = '';
       rails.appendChild(el('div', 'empty', 'Could not load: ' + e.message));
       buildBrowseGrid([], focus);
@@ -373,6 +388,8 @@
       var list = pageRails(pg, containers), layout = railsLayout(list);
       if (layout !== pg.layout) {
         pg.layout = layout;
+        pg.gen = (pg.gen || 0) + 1;   // a load still under way would draw older rails
+        pg.dropped = false;
         return drawRails(list, sameTileFocus(list));
       }
       var fresh = [];
@@ -1649,7 +1666,9 @@
   function playbackProgress() {
     var s = Player.stream();
     if (!s || !s.capsPath || typeof Caps === 'undefined') return;
-    if (!s.capsOk && !s.capsFailed && !Player.isPaused() && s.capsPosition != null && Player.position() > s.capsPosition + 0.5) {
+    // Where the engine counts frames (Shaka), a decoded one too: a frozen start can move its position (0 -> 2.13 s).
+    if (!s.capsOk && !s.capsFailed && !Player.isPaused() && s.capsPosition != null && Player.position() > s.capsPosition + 0.5 &&
+      Player.decodedFrames() !== 0) {
       s.capsOk = true;
       Caps.ok(s.capsPath);
     }
@@ -2103,7 +2122,12 @@
     mvSoftStop();   // an H.264 multiview's small feeds belong to what played
     var playing = screen === 'player' && Player.engineName();
     var from = opts.switching && playing ? { wall: Player.wallClock(Player.position()), at: Date.now(),
-      pos: Player.position(), paused: Player.isPaused(), index: feedsCtx.index, stream: Player.stream() } : null;
+      pos: Player.position(), paused: Player.isPaused(), index: feedsCtx.index, stream: Player.stream(), keyAt: lastKeyAt } : null;
+    // Playing at LIVE (paused, the viewer keeps the moment). A retry keeps the first attempt's answer: the failed
+    // native player it replaces reports position 0.
+    var atLive = opts.atLive != null ? !!opts.atLive :
+      !!from && !from.paused && Player.isLive() && Player.range().end - from.pos < LIVE_MARGIN;
+    if (from) from.atLive = atLive;
     switchPause = from ? (opts.switchPaused != null ? opts.switchPaused : from.paused) : null;
     var askedAt = Date.now();
     diagTrail('play.request', { feed: f && f.title, switching: !!from, retry: !!opts.retry, hdrRetry: !!opts.hdrRetry,
@@ -2181,6 +2205,8 @@
           if (stream.hdr && stream.live && !stream.hdrEncrypted) throw new Error('HDR: live needs the native path');
           $('osd-feed').textContent = feedLabel(stream);
           var start = startPosition(stream.info, opts, from);
+          // Where the lead decided the start (not a requested moment, a live point or the stream's own edge).
+          var leadPlaced = !!from && !from.paused && !atLive && opts.startAt == null && !opts.liveAt && start != null;
           // Live (dynamic) streams on AVPlay can't seek at start-up; instead the local service
           // time-shifts the manifest so the player's own live edge lies at the chosen moment
           // (it starts `delay` before its edge, hence the extra info.delay). Shaka cenc keeps the
@@ -2188,18 +2214,20 @@
           var info = stream.info;
           if (start != null && info && info.dynamic && info.epochAtZero > 1e9 && stream.licenseUrl && (!stream.cenc || stream.cencAvplay)) {
             var shift = Date.now() / 1000 - (info.epochAtZero + start) - info.delay;
-            if (shift > 5) stream.startDelay = shift;
+            // A viewer at LIVE stays there: AVPlay's own live point (~33 s behind real time, ~8 s behind the edge) is
+            // where the old feed was. Shifting by the lead instead started each switch a segment-rounded 2-9 s later,
+            // and live drifted ~1 s further per switch (Las Vegas FP2, 2026-11-20).
+            if (shift > 5 && !atLive) stream.startDelay = shift;
+            else leadPlaced = false;   // AVPlay's own live point: nothing to learn from it
             start = null;
           }
           // H.264 multiview: AVPlay shows the big feed in its place from the start.
           if (stream.grid && stream.grid.engine === 'h264') Player.setGridRect(mvBigRect(stream.grid.layout));
           dplay('loading', trial, stream);
           if (!from) return Player.load(stream, start).then(function () { feedsCtx.playing = i; });
-          var t0 = Date.now();
           return Player.switchTo(stream, start).then(function () {
             feedsCtx.playing = i;
-            // Learn how long a switch takes so the next one lands on the same moment.
-            if (!from.paused) switchLead = Math.max(0.5, Math.min(8, (switchLead + (Date.now() - t0) / 1000) / 2));
+            if (leadPlaced) learnSwitchLead(stream, from);
             // Paused or playing as the viewer last chose, also with a key pressed during the switch
             // (AVPlay reopens playing; Shaka carries the pause over).
             var want = switchPause;
@@ -2286,7 +2314,8 @@
             if (from) recovery.switchPaused = switchPause != null ? switchPause : from.paused;
             // Native preparation replaces the outgoing player. Its failed stream reports zero,
             // so retain the outgoing moment rather than deriving a new target from that zero.
-            if (from && recovery.startAt == null && recovery.liveAt == null) {
+            if (atLive) recovery.atLive = true;
+            else if (from && recovery.startAt == null && recovery.liveAt == null) {
               var ahead = from.paused ? 0 : (Date.now() - from.at) / 1000 + switchLead;
               if (from.wall) recovery.liveAt = from.wall + ahead;
               else recovery.startAt = from.pos + ahead;
@@ -2382,13 +2411,17 @@
 
   function sameMoment(from, opts) {
     var o = {};
-    if (from) {
+    if (from && from.atLive) {
+      o.atLive = true;   // the live point again, not a moment taken from the old feed
+      o.switching = true;
+      o.switchPaused = false;
+    } else if (from) {
       var late = from.paused ? 0 : (Date.now() - from.at) / 1000;
       if (from.wall) o.liveAt = from.wall + late; else o.startAt = from.pos + late;
       o.switching = true;
       o.switchPaused = from.paused;
     } else {
-      ['startAt', 'liveAt', 'fromStart'].forEach(function (k) { if (opts[k] != null) o[k] = opts[k]; });
+      ['startAt', 'liveAt', 'fromStart', 'atLive'].forEach(function (k) { if (opts[k] != null) o[k] = opts[k]; });
     }
     return o;
   }
@@ -2442,8 +2475,38 @@
   // Seconds a feed switch takes; the new feed starts this far ahead so it lines up. Learned per switch.
   var switchLead = 3;
 
+  /**
+   * A few seconds into a switched feed, compares the moment it shows with the moment the old feed would show now,
+   * and corrects the lead by that. The time switchTo takes is not it: Shaka's picture starts moving ~1-2 s after
+   * the load resolves, and from a keyframe ~0.7 s before the target, so live viewers drifted 1-3 s further from
+   * the edge with every switch (Las Vegas FP1, 2026-11-20).
+   */
+  function learnSwitchLead(stream, from) {
+    var loaded = Player.position();
+    setTimeout(function () {
+      // Not after the viewer's own keys since the switch began (a pause, a seek): that is no switch error.
+      if (Player.stream() !== stream || lastKeyAt !== from.keyAt || Player.isPaused() || scrub || switchPause != null) return;
+      var elapsed = (Date.now() - from.at) / 1000, now = Player.position(), err;
+      // Not a picture that hasn't moved since the load (a frozen start the start watch will retry).
+      if (!(now > loaded + 0.2) || Player.decodedFrames() === 0) return;
+      if (from.wall) {
+        var wall = Player.wallClock(now);
+        if (wall == null) return;
+        err = from.wall + elapsed - wall;
+      } else if (!(stream.info && stream.info.dynamic) && from.pos > 0) {
+        err = from.pos + elapsed - now;   // replays without a clock share one timeline
+      } else return;
+      var was = switchLead;
+      // Further off than a switch can be: the viewer seeked or it stalled meanwhile.
+      if (Math.abs(err) <= 6) switchLead = Math.max(0.5, Math.min(12, switchLead + 0.75 * err));
+      diag('play.switch_lead', { engine: Player.engineName(), feed: stream.feed, err: +err.toFixed(2),
+        was: +was.toFixed(2), lead: +switchLead.toFixed(2), skipped: Math.abs(err) > 6 });
+    }, 6000);
+  }
+
   function startPosition(info, opts, from) {
     if (opts.startAt != null) return opts.startAt;
+    if (opts.atLive && !opts.liveAt) return null;   // a retry of a switch made at LIVE
     if (opts.liveAt) {
       var at = Player.positionAt(opts.liveAt, info);
       // A moment from before this stream began (a next part that starts later) plays from its start;
