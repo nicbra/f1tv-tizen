@@ -13,9 +13,11 @@ h1, h2, .osd-title, .rail-title, .driver-number, .brand-tv, .upnext-title {
   font-family: 'F1 Display', 'Titillium Web', sans-serif;
 }
 
-/* The timing tower in F1's broadcast font, a little smaller since it runs wider. */
-.tower { font-family: 'F1 Display', 'Titillium Web', sans-serif; }
+/* The timing tower, and the timing data beside a multiview, in F1's broadcast font, a little smaller since it runs
+   wider. */
+.tower, .mv-data { font-family: 'F1 Display', 'Titillium Web', sans-serif; }
 .tower .tower-value { font-size: 26px; }
 .tower .tw-pos { width: 28px; font-size: 16px; }
-.tower .tw-tla { width: 54px; font-size: 18px; }
-.tower .tw-val { font-size: 16px; }
+.mv-data .tw-pos { font-size: 16px; }
+.tower .tw-tla, .mv-data .tw-tla { width: 54px; font-size: 18px; }
+.tower .tw-val, .mv-data .tw-val, .mv-data .tw-sec { font-size: 16px; }
