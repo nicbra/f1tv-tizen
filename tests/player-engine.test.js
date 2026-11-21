@@ -47,7 +47,7 @@ function fakeAvPlay({ liveWindow = '', duration = 0 } = {}) {
 /** Loads the real settings, service launcher and player with a fake AVPlay and Shaka. shakaLoad: Shaka's load(). */
 async function player(av, storage, shakaLoad, globals, manifest) {
   const store = Object.assign({}, storage);
-  const configs = [], languages = [], manifests = [];
+  const configs = [], languages = [], manifests = [], channels = [];
   // Shaka's SimpleTextDisplayer as far as it matters here: append() adds the cues to the video's track.
   class SimpleTextDisplayer {
     constructor(video) { this.track = video.textTracks[0]; }
@@ -57,7 +57,7 @@ async function player(av, storage, shakaLoad, globals, manifest) {
     }
   }
   class ShakaPlayer {
-    constructor() { this.responseFilters = []; }
+    constructor() { this.responseFilters = []; (context.shakaPlayers = context.shakaPlayers || []).push(this); }
     attach() { return Promise.resolve(); }
     resetConfiguration() {}
     configure(config) { configs.push(config); }
@@ -69,19 +69,21 @@ async function player(av, storage, shakaLoad, globals, manifest) {
       }
       return shakaLoad ? shakaLoad(url, start) : Promise.reject(new Error('no stream'));
     }
-    getNetworkingEngine() { return { registerRequestFilter() {}, registerResponseFilter: (fn) => this.responseFilters.push(fn) }; }
+    getNetworkingEngine() { return { registerRequestFilter: (fn) => { (this.requestFilters = this.requestFilters || []).push(fn); }, registerResponseFilter: (fn) => this.responseFilters.push(fn) }; }
     getBufferedInfo() { return { video: [{ start: 0, end: 10 }] }; }
-    selectAudioLanguage(l) { languages.push(['audio', l]); }
+    selectAudioLanguage(l, role, count) { languages.push(['audio', l]); channels.push(count); }
     getAudioLanguages() { return context.audioLanguages || []; }
+    getVariantTracks() { return context.variants || []; }
+    getStats() { return { estimatedBandwidth: context.bandwidth || NaN }; }
     selectTextLanguage(l) { languages.push(['text', l]); }
     setTextTrackVisibility(on) { languages.push(['subtitles', on]); }
-    addEventListener() {}
+    addEventListener(type, fn) { (this.listeners = this.listeners || {})[type] = fn; }
     unload() { return Promise.resolve(); }
   }
   const context = vm.createContext(Object.assign({
     webapis: { avplay: av },
     shaka: { polyfill: { installAll() {} }, Player: ShakaPlayer, text: { SimpleTextDisplayer },
-      net: { NetworkingEngine: { RequestType: { MANIFEST: 0, LICENSE: 2 } } },
+      net: { NetworkingEngine: { RequestType: { MANIFEST: 0, LICENSE: 2, KEY: 6 } } },
       util: { Error: { Category: {} }, StringUtils: { fromUTF8: (b) => Buffer.from(b).toString('utf8'), toUTF8: (s) => Buffer.from(s) } } },
     document: { body: el() },
     localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } },
@@ -96,6 +98,7 @@ async function player(av, storage, shakaLoad, globals, manifest) {
   context.Player.configs = configs;
   context.Player.SimpleTextDisplayer = SimpleTextDisplayer;
   context.Player.languages = languages;
+  context.Player.channels = channels;
   context.Player.manifests = manifests;
   context.Player.context = context;
   return context.Player;
@@ -205,6 +208,105 @@ test("Shaka ignores the MPD's minBufferTime (F1's PT30S held live starts at play
   assert.equal(P.engineName(), 'shaka');
   assert.equal(P.configs.at(-1).manifest.dash.ignoreMinBufferTime, true);
   assert.ok(P.configs.at(-1).streaming.rebufferingGoal <= 2);
+});
+
+test('Shaka prefers 5.1 audio where the offer has it (F1 shows: AC-3 beside AAC) and tells what plays', async () => {
+  const P = await player(fakeAvPlay(), undefined, () => Promise.resolve());
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); v.paused = false; });
+  const stream = { url: 'https://cdn/show/index.m3u8', hdr: true, multiFeed: false, info: { dynamic: false } };
+  await P.load(stream, null);
+  assert.equal(P.configs.at(-1).preferredAudioChannelCount, 6);
+  assert.deepEqual(P.channels, [6]);     // the language from the settings, with the channels
+  P.setAudio('deu');
+  assert.deepEqual(P.channels, [6, 6]);  // a language chosen in the menu keeps them
+  assert.equal(P.audioChannels(), null); // nothing chosen yet
+  P.context.variants = [{ active: false, channelsCount: 2 }, { active: true, channelsCount: 6 }];
+  assert.equal(P.audioChannels(), null); // the player bar asks every 500 ms: the answer is kept 2 s
+  P.setAudio('eng');                     // ...unless the audio changes (or a new load)
+  assert.equal(P.audioChannels(), 6);
+  P.forceEngine = 'avplay';
+  await P.load(stream, null);
+  assert.equal(P.audioChannels(), null); // AVPlay says nothing before it plays
+});
+
+test('AVPlay takes the 5.1 commentary of a language where it also has stereo (encrypted 4K HDR on F1 LIVE)', async () => {
+  const av = fakeAvPlay(), selected = [];
+  const info = (lang, channels, rate) => JSON.stringify({ language: lang, channels: String(channels), sample_rate: channels ? '48000' : '0', bit_rate: String(rate), fourCC: '' });
+  // As the TV reports them: the playing track has its channels and no bitrate, the others only their manifest bitrate.
+  av.getTotalTrackInfo = () => [
+    { type: 'AUDIO', index: 1, extra_info: info('eng', 2, 0) },
+    { type: 'AUDIO', index: 2, extra_info: info('spa', 0, 192000) },
+    { type: 'AUDIO', index: 3, extra_info: info('eng', 0, 384000) },
+    { type: 'AUDIO', index: 4, extra_info: info('spa', 0, 384000) }
+  ];
+  av.setSelectTrack = (kind, i) => selected.push([kind, i]);
+  const P = await player(av);
+  P.forceEngine = 'avplay';
+  await P.load({ url: 'https://cdn/live.mpd', info: { dynamic: false } }, null);
+  P.setAudio('spa');
+  P.setAudio('eng');
+  assert.deepEqual(selected.slice(-2), [['AUDIO', 4], ['AUDIO', 3]]);
+  assert.deepEqual([...P.tracks().audio].map((a) => a.lang), ['eng', 'spa']); // one choice per language
+  av.getCurrentStreamInfo = () => [{ type: 'AUDIO', extra_info: JSON.stringify({ language: 'eng', channels: '6', fourCC: 'audio/x-ac3_tz' }) }];
+  assert.equal(P.audioChannels(), 6);
+});
+
+test('4K HDR on Shaka buffers 15 s ahead and keeps 10 s behind (the TV\'s video buffer); SDR keeps 30 and 90', async () => {
+  const P = await player(fakeAvPlay(), undefined, () => Promise.resolve());
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); v.paused = false; });
+  await P.load({ url: 'https://cdn/hdr/master.m3u8', hdr: true, multiFeed: false, info: { dynamic: false } }, null);
+  assert.deepEqual([P.configs.at(-1).streaming.bufferingGoal, P.configs.at(-1).streaming.bufferBehind], [15, 10]);
+  await P.load({ url: 'https://cdn/sdr/master.m3u8', multiFeed: true, info: { dynamic: false } }, null);
+  assert.deepEqual([P.configs.at(-1).streaming.bufferingGoal, P.configs.at(-1).streaming.bufferBehind], [30, 90]);
+});
+
+test('4K HDR starts at 70 % of the bandwidth this TV last measured (10-30 Mbit/s); SDR at 10 Mbit/s', async () => {
+  const P = await player(fakeAvPlay(), { 'f1tv.bandwidth': '40000000' }, () => Promise.resolve());
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); v.paused = false; });
+  const hdr = { url: 'https://cdn/hdr/master.m3u8', hdr: true, multiFeed: false, info: { dynamic: false } };
+  await P.load(hdr, null);
+  assert.equal(P.configs.at(-1).abr.defaultBandwidthEstimate, 28000000);
+  await P.load({ url: 'https://cdn/sdr/master.m3u8', multiFeed: true, info: { dynamic: false } }, null);
+  assert.equal(P.configs.at(-1).abr.defaultBandwidthEstimate, 10000000);
+  P.context.bandwidth = 60000000;                // measured while playing: kept when the video ends
+  await P.unload();
+  await P.load(hdr, null);
+  assert.equal(P.configs.at(-1).abr.defaultBandwidthEstimate, 30000000);   // capped
+  P.context.bandwidth = 900000;                  // a slow network is remembered too
+  await P.unload();
+  await P.load(hdr, null);
+  assert.equal(P.configs.at(-1).abr.defaultBandwidthEstimate, 10000000);
+  P.context.bandwidth = 10000000;                // Shaka's untouched start estimate is no measurement
+  await P.unload();
+  assert.equal(P.context.localStorage.getItem('f1tv.bandwidth'), '900000');
+});
+
+test('a recoverable Shaka error is no playback error for the app; a critical one is', async () => {
+  const P = await player(fakeAvPlay(), undefined, () => Promise.resolve());
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); v.paused = false; });
+  await P.load({ url: 'https://cdn/hdr/master.m3u8', hdr: true, multiFeed: false, info: { dynamic: false } }, null);
+  const errors = [];
+  P.on('error', (msg) => errors.push(msg));
+  P.context.shakaPlayers.forEach((p) => p.listeners && p.listeners.error && p.listeners.error({ detail: { severity: 1, category: 1, code: 1001, data: [] } }));
+  assert.equal(errors.length, 0);
+  P.context.shakaPlayers.forEach((p) => p.listeners && p.listeners.error && p.listeners.error({ detail: { severity: 2, category: 3, code: 3016, data: [3] } }));
+  assert.equal(errors.length, 1);
+});
+
+test('AES-128 HLS key requests carry the account tokens to F1\'s key server only, from the slot that plays it', async () => {
+  const P = await player(fakeAvPlay(), undefined, () => Promise.resolve());
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); v.paused = false; });
+  await P.load({ url: 'https://cdn/tm/1033/master.m3u8', hdr: true, hlsAes: true, multiFeed: false, info: { dynamic: false },
+    keyHeaders: { ascendontoken: 'ASC', entitlementtoken: 'ENT' } }, null);
+  const keyRequest = (uri) => P.context.shakaPlayers.map((p) => {
+    const request = { uris: [uri], headers: {} };
+    (p.requestFilters || []).forEach((f) => f(6, request));
+    return request.headers;
+  });
+  const f1 = keyRequest('https://f1tv.formula1.com/2.0/R/ENG/BIGSCREEN_HLS/ALL/CONTENT/LA/ck?c=x');
+  assert.equal(f1.filter((h) => h.ascendontoken === 'ASC' && h.entitlementtoken === 'ENT').length, 1);   // the playing slot only
+  assert.ok(keyRequest('https://elsewhere.example/key').every((h) => Object.keys(h).length === 0));
+  assert.ok(keyRequest('http://f1tv.formula1.com/key').every((h) => Object.keys(h).length === 0));
 });
 
 const MIXED_HDR = `#EXTM3U

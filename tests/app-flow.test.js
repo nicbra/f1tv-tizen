@@ -304,6 +304,8 @@ async function boot(options = {}) {
     kind: 'shaka',   // or 'avplay': which engine the stub plays as
     load(s, start) {
       player.current = s;
+      // As player.js: encrypted HDR reports the 5.1 commentaries it added (player.surround), unless asked for none.
+      if (s.hdrEncrypted) s.surround = s.noSurround ? 0 : (player.surround || 0);
       player.engine = options.capsRouting ? (s.cenc && !s.cencAvplay ? 'shaka' : 'avplay') : player.kind;
       player.pos = start || 0;
       player.paused = false;
@@ -328,6 +330,7 @@ async function boot(options = {}) {
     setGridRect(r) { player.gridRect = r; },
     stream: () => player.current,
     engineName: () => player.engine,
+    audioChannels: () => (player.engine && player.channels) || null,
     exactPosition: () => player.pos,
     position: () => (player.engine ? player.pos : 0),
     decodedFrames: () => (player.engine ? player.frames : null),
@@ -1143,6 +1146,166 @@ const premiumHdr = (options) => boot(Object.assign({ multiview: true, hdrCapable
 
 const premiumOffer = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '/hdr.m3u8', hdr: true, hdrEncrypted: true, licenseUrl: 'https://lic' });
 
+test('the player bar says 5.1 while surround audio plays (F1 shows in 4K HDR), and nothing more for stereo', async () => {
+  const app = await premiumHdr({ play: premiumOffer });
+  await play(app, 'Race');
+  await app.advance(1000);
+  assert.match(app.$('osd-feed').textContent, /HDR/);
+  assert.doesNotMatch(app.$('osd-feed').textContent, /5\.1/);
+  app.player.channels = 6;
+  await app.press('UP');
+  await app.advance(1000);
+  assert.match(app.$('osd-feed').textContent, /HDR · 5\.1/);
+});
+
+// Encrypted 4K HDR with the 5.1 commentary (hdr.js): a TV whose native player can't play it must keep 4K HDR in stereo.
+const caps51 = (app) => app.context.Caps.report().paths;
+test('an encrypted HDR start with 5.1 that never plays retries the same HDR in stereo, held against the 5.1, not HDR', async () => {
+  const app = await premiumHdr({ play: premiumOffer });
+  app.player.surround = 2;
+  await play(app, 'Race');
+  await app.advance(1000);
+  assert.equal(app.player.current.surround, 2);
+  await app.advance(26000);                      // the start watch: no progress
+  const last = app.player.current;
+  assert.ok(last.hdrEncrypted && last.noSurround && last.surround === 0);   // the same HDR, without the 5.1
+  assert.match(app.player.loads.at(-1).url, /hdr\.m3u8/);
+  assert.equal(caps51(app)['avplay:ac3'].failed, 1);
+  assert.equal(caps51(app)['avplay:hdr'], undefined);
+  app.player.progress = true;                   // stereo HDR plays
+  await app.advance(3000);
+  assert.equal(caps51(app)['avplay:hdr'].ok, 1);
+  assert.equal(caps51(app)['avplay:ac3'].ok, 0);
+});
+
+test('an encrypted HDR load with 5.1 that fails retries the same HDR in stereo; a good 5.1 start is learned', async () => {
+  const app = await premiumHdr({ play: premiumOffer });
+  app.player.surround = 1;
+  app.player.hold = deferred();
+  await play(app, 'Race');
+  app.player.hold.reject(new Error('Could not open stream: PLAYER_ERROR_INVALID_PARAMETER'));
+  app.player.hold = null;
+  await app.advance(1000);
+  assert.ok(app.player.current.noSurround);
+  assert.ok(app.player.current.hdrEncrypted);
+  assert.equal(caps51(app)['avplay:ac3'].failed, 1);
+  assert.equal((caps51(app)['avplay:hdr'] || { failed: 0 }).failed, 0);
+  // Another video on this TV still tries the 5.1 (one failure is no verdict); its good start clears it.
+  const again = await premiumHdr({ store: app.store, play: premiumOffer });
+  again.player.surround = 1;
+  again.player.channels = 6;                     // the 5.1 is what plays
+  await play(again, 'Race');
+  await again.advance(1000);
+  assert.ok(!again.player.current.noSurround);
+  again.player.progress = true;
+  await again.advance(3000);
+  assert.equal(caps51(again)['avplay:ac3'].ok, 1);
+});
+
+test('a good start with the 5.1 in the stream but stereo playing teaches nothing about the 5.1', async () => {
+  const app = await premiumHdr({ play: premiumOffer });
+  app.player.surround = 2;
+  app.player.channels = 2;                       // German chosen: the official stereo plays
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(3000);
+  assert.equal(caps51(app)['avplay:hdr'].ok, 1);
+  assert.equal(caps51(app)['avplay:ac3'], undefined);
+});
+
+test('a feed switch with 5.1 that fails retries at the moment switched to, still paused if paused meanwhile', async () => {
+  for (const pauseDuring of [false, true]) {
+    const app = await premiumHdr({ play: premiumOffer });
+    app.player.kind = 'avplay';
+    await play(app, 'Race');
+    app.player.pos = 1800;
+    app.player.surround = 2;
+    app.player.hold = deferred();
+    await app.press('CH_DOWN');
+    if (pauseDuring) await app.press('PAUSE');
+    app.player.hold.reject(new Error('Could not open stream: PLAYER_ERROR_INVALID_PARAMETER'));
+    app.player.hold = null;
+    await app.advance(1000);
+    const load = app.player.loads.at(-1);
+    assert.ok(app.player.current.noSurround && app.player.current.hdrEncrypted);
+    assert.ok(load.start >= 1800 && load.start < 1810, 'retried at ' + load.start);
+    assert.equal(app.player.paused, pauseDuring);
+  }
+});
+
+test('a start with 5.1 that never plays retries at the position it asked for, though AVPlay reported 0', async () => {
+  const app = await premiumHdr({ play: premiumOffer });
+  app.player.kind = 'avplay';
+  await play(app, 'Race');
+  app.player.pos = 1800;
+  app.player.surround = 2;
+  const load = app.player.load;
+  app.player.load = (s, start) => { const r = load(s, start); app.player.pos = 0; return r; };   // AVPlay: 0 until it plays
+  await app.press('CH_DOWN');
+  await app.advance(500);
+  const asked = app.player.loads.at(-1).start;
+  assert.ok(asked >= 1800);
+  await app.advance(26000);
+  assert.ok(app.player.current.noSurround);
+  assert.equal(Math.round(app.player.loads.at(-1).start), Math.round(asked));
+});
+
+test('a TV that has learned the 5.1 fails asks for encrypted HDR without it', async () => {
+  const record = { version: 1, firmware: 'unknown', browser: { cenc: true, cbcs: false }, paths: { 'avplay:ac3': { ok: 0, failed: 2, crashed: 0, last: NOW, streak: 2 } } };
+  const app = await premiumHdr({ play: premiumOffer, store: { 'f1tv.caps': JSON.stringify(record) } });
+  app.player.surround = 2;
+  await play(app, 'Race');
+  await app.advance(1000);
+  assert.ok(app.player.current.hdrEncrypted && app.player.current.noSurround);
+});
+
+// F1's Tiledmedia offer (api.js playTm): AES-128 HLS in 4K HDR on Shaka, asked first for replays of one feed.
+const tmOffers = (asked) => (id, channel, opts) => {
+  asked.push(Object.assign({}, opts));
+  if (opts && opts.tm) return Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '/tm.m3u8', streamType: 'HDR_UHD_HLSCK', hdr: true, hlsAes: true });
+  return premiumOffer(id, channel);
+};
+test('a replay asks F1\'s Tiledmedia offer first; if it never plays, today\'s 4K HDR route follows, held against that offer only', async () => {
+  const asked = [];
+  const app = await premiumHdr({ play: tmOffers(asked) });
+  await play(app, 'Race');
+  await app.advance(1000);
+  assert.equal(asked[0].tm, true);
+  assert.ok(app.player.current.hlsAes);
+  await app.advance(26000);                      // the start watch: no progress
+  assert.equal(asked.at(-1).tm, false);
+  assert.equal(asked.at(-1).hdr, true);          // still 4K HDR, the usual way
+  assert.ok(app.player.current.hdrEncrypted);
+  assert.equal(caps51(app)['shaka:hlsaes'].failed, 1);
+  assert.equal(caps51(app)['avplay:hdr'], undefined);
+  app.player.progress = true;
+  await app.advance(3000);
+  assert.equal(caps51(app)['avplay:hdr'].ok, 1);
+  await app.stop();
+  // The next video tries it again (one failure is no verdict); a good start is learned.
+  const again = await premiumHdr({ store: app.store, play: tmOffers(asked) });
+  await play(again, 'Race');
+  await again.advance(1000);
+  assert.equal(asked.at(-1).tm, true);
+  again.player.progress = true;
+  await again.advance(3000);
+  assert.equal(caps51(again)['shaka:hlsaes'].ok, 1);
+});
+
+test('F1\'s Tiledmedia offer is not asked for live, nor where this TV learned it fails', async () => {
+  const asked = [];
+  const record = { version: 1, firmware: 'unknown', browser: { cenc: true, cbcs: false }, paths: { 'shaka:hlsaes': { ok: 0, failed: 2, crashed: 0, last: NOW, streak: 2 } } };
+  const app = await premiumHdr({ play: tmOffers(asked), store: { 'f1tv.caps': JSON.stringify(record) } });
+  await play(app, 'Race');
+  await app.advance(1000);
+  assert.equal(asked.at(-1).tm, false);
+  assert.equal(asked.at(-1).hdr, true);
+  const live = await premiumHdr({ play: tmOffers(asked) });
+  live.player.live = true;
+  await playLive(live);
+  assert.equal(asked.at(-1).tm, false);
+});
+
 test('watch options open a multiview page: layouts as pictures, then a feed for each place', async () => {
   const app = await premiumHdr();
   await play(app, 'Race');
@@ -1662,8 +1825,9 @@ test('in a multiview, Sound from picks the feed the commentary comes from, once 
   // An onboard's sound is its team radio, not the commentary F1 also puts on it.
   assert.equal(app.player.current.onboardSound, false, 'F1 LIVE: its commentary');
   assert.doesNotMatch(shown, /INTERNATIONAL/, 'the next feed shown while browsing');
-  // The sound's feed gets the full offer (licence, commentary); the others their HDR video alone.
-  assert.deepEqual(offers.filter((o) => !o[1]).length, 1);
+  // The feeds keep their offers: only the new sound's feed is asked again, for its full offer (licence, commentary).
+  assert.equal(offers.length, 1);
+  assert.equal(offers[0][1], false);
   // The choice is saved for a restart.
   await app.advance(3100);
   assert.equal(JSON.parse(app.store['f1tv.watching']).multiview.audio, grid.slots[1]);
