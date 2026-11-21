@@ -16,6 +16,16 @@ var HdrStream = (function () {
     if (!m) return fail('missing encryption identifier');
     return m[1].toLowerCase().replace(/^(........)(....)(....)(....)(............)$/, '$1-$2-$3-$4-$5');
   }
+  function b64url(s) { return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+  /** A media URL through the helper's audio route, which corrects F1's CBCS audio sample counts. */
+  function viaHelper(url) {
+    var q = url.search(/[?#]/), path = q < 0 ? url : url.slice(0, q), slash = path.lastIndexOf('/');
+    return LOCAL + '/s/' + b64url(url.slice(0, slash + 1)) + '/' + url.slice(slash + 1);
+  }
+  function note(kind, data) { if (typeof Diag !== 'undefined') Diag.note(kind, data); }
+  var LANG3 = { en: 'eng', de: 'deu', fr: 'fra', nl: 'nld', pt: 'por', ja: 'jpn', es: 'spa', it: 'ita' };
+  function lang3(l) { l = String(l || '').toLowerCase(); return LANG3[l] || l; }
+  function total(segments) { return segments.reduce(function (n, s) { return n + s.duration; }, 0); }
   function binary(kid) { return kid.replace(/-/g, '').match(/../g).map(function (x) { return String.fromCharCode(parseInt(x, 16)); }).join(''); }
   function psshFor(source, kid) {
     var raw = atob(source.pssh), before = binary(source.kid);
@@ -103,7 +113,7 @@ var HdrStream = (function () {
     var timescale = +attr(template[1], 'timescale') || 1, offset = +attr(template[1], 'presentationTimeOffset');
     if (!(offset > 0)) return fail('missing source presentation clock');
     var base = new URL('.', url).toString();
-    var encoded = btoa(base).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    var encoded = b64url(base);
     var audio = sets.filter(function (s) { return kind(s) === 'audio'; });
     if (!audio.length) return fail('missing commentary');
     // Preserve complete official adaptations, including their distinct DRM metadata and clocks.
@@ -111,11 +121,12 @@ var HdrStream = (function () {
       return s.replace(/^(<AdaptationSet\b[^>]*>)/, '$1<BaseURL>' + xml(LOCAL + '/s/' + encoded + '/') + '</BaseURL>');
     });
     // AVPlay starts on the first commentary.
-    var pick = audio.filter(function (s) { return attr(s.slice(0, s.indexOf('>')), 'lang') === langs.audio; })[0];
+    var pick = audio.filter(function (s) { return lang3(attr(s.slice(0, s.indexOf('>')), 'lang')) === lang3(langs.audio); })[0];
     if (pick) audio = [pick].concat(audio.filter(function (s) { return s !== pick; }));
     // Subtitles stay out of AVPlay's manifest: the app shows them (ttml.js).
     var subtitles = sets.filter(function (s) { return kind(s) === 'text'; }).map(function (s) { return subtitle(s, base); }).filter(Boolean);
     return { kid: protection.kid, pssh: protection.pssh, epoch: offset / timescale, others: audio.join(''), subtitles: subtitles,
+      langs: audio.map(function (s) { return attr(s.slice(0, s.indexOf('>')), 'lang'); }),
       namespaces: Object.keys(bindings).filter(function (p) { return p !== 'cenc'; }).map(function (p) { return ' xmlns:' + p + '="' + bindings[p] + '"'; }).join('') };
   }
   /** An stpp subtitle set's segment addressing (for ttml.js), or null for other formats. */
@@ -147,11 +158,78 @@ var HdrStream = (function () {
       seen[v.height] = true; return true;
     });
   }
+  /**
+   * The HLS master's multichannel commentary as DASH audio tracks: F1's shows and the F1 LIVE feed carry AC-3 5.1
+   * beside the stereo AAC in the 4K HDR offers (the official Widevine offer is stereo only). On the video's key
+   * and clock, through the helper (the segments' sample counts need the same correction as the official audio).
+   * Optional: its own requests, which must be done by `until` (ms, so the preparation's own deadline is never
+   * reached because of it). Resolves [] when there is none, it doesn't fit or fails, or time is up: stereo plays then.
+   * Tracks carry their own key id (`kid`); the caller keeps them only on the video's key.
+   */
+  function surround(master, masterUrl, epoch, until) {
+    var lines = master.split(/\r?\n/), codecs = {};
+    lines.forEach(function (line) {
+      if (!/^#EXT-X-STREAM-INF:/.test(line)) return;
+      var a = attrs(line.slice(18)), codec = (a.CODECS || '').split(',').map(function (c) { return c.trim(); })
+        .filter(function (c) { return c === 'ac-3' || c === 'ec-3'; })[0];
+      if (a.AUDIO && codec) codecs[a.AUDIO] = codec;
+    });
+    var list = lines.filter(function (l) { return /^#EXT-X-MEDIA:/.test(l); }).map(function (l) { return attrs(l.slice(13)); })
+      .filter(function (a) { return a.TYPE === 'AUDIO' && a.URI && codecs[a['GROUP-ID']] && parseInt(a.CHANNELS, 10) > 2; });
+    if (!list.length) return Promise.resolve([]);
+    var left = Math.min(until - Date.now(), 6000);   // never more than 6 s of waiting for it
+    if (left < 1000) { note('hdr.surround_skipped', { why: 'no time left' }); return Promise.resolve([]); }
+    var io = fetcher(left);
+    return io.deadline(Promise.all(list.map(function (a, i) {
+      return Promise.resolve().then(function () { return io.get(new URL(a.URI, masterUrl).toString()); }).then(function (response) {
+        var parsed = CmafDash.playlist(response.body);
+        var init = new URL(parsed.init, response.url).toString();
+        var segments = parsed.segments.map(function (s) { return { url: new URL(s.uri, response.url).toString(), duration: s.duration }; });
+        return Promise.all([io.get(init, true), io.get(segments[0].url, true, true)]).then(function (data) {
+          var timing = CmafDash.timing(data[0], data[1]), own = CmafDash.encryption(data[0]);
+          if (!own || own.scheme !== 'cbcs') return fail('surround not CBCS');
+          checkKeys(parsed.keys, own.kid);
+          if (Math.abs(timing.baseTime / timing.timescale - epoch) > 0.1) return fail('surround clock differs');
+          return { type: 'audio', id: 'mc' + i, language: lang3(a.LANGUAGE) || 'und', codecs: codecs[a['GROUP-ID']],
+            bandwidth: 384000, timing: timing, init: viaHelper(init), kid: own.kid,
+            segments: segments.map(function (s) { return { url: viaHelper(s.url), duration: s.duration }; }) };
+        });
+      });
+    }))).catch(function (e) { note('hdr.surround_skipped', { why: String(e && e.message || e).slice(0, 80) }); return []; });
+  }
+  /**
+   * The manifest of `tracks` with the commentary: the 5.1 tracks on the video's key (`key`) and of the video's length,
+   * and the official (stereo) ones from `source`. AVPlay starts on the first: 5.1 in the chosen language, else the
+   * official one in it, else 5.1. Without the 5.1 when it can't be written. Returns { mpd, surround (count) }.
+   */
+  function withCommentary(tracks, multi, key, source, langs) {
+    var length = total(tracks[0].segments);
+    // The video sets the length: the 5.1 may end up to 0.5 s sooner (audio frames), but not later (it would lengthen it).
+    var usable = multi.filter(function (t) { var d = total(t.segments) - length; return t.kid === key.kid && d <= 0.05 && d >= -0.5; }).map(function (t) {
+      return { type: t.type, id: t.id, language: t.language, codecs: t.codecs, bandwidth: t.bandwidth, timing: t.timing,
+        init: t.init, segments: t.segments, protection: key };
+    });
+    if (usable.length < multi.length) note('hdr.surround_skipped', { why: 'another key or length' });
+    var lang = lang3((langs || {}).audio), official = source.langs.map(lang3);
+    usable.sort(function (x, y) { return (y.language === lang) - (x.language === lang); });
+    var first = usable.length > 0 && (!lang || usable[0].language === lang || official.indexOf(lang) < 0);
+    var mpd;
+    try { mpd = CmafDash.manifest(tracks.concat(usable)); } catch (e) {
+      if (!usable.length) throw e;
+      note('hdr.surround_skipped', { why: 'manifest: ' + String(e && e.message || e).slice(0, 60) });
+      usable = []; first = false;
+      mpd = CmafDash.manifest(tracks);
+    }
+    mpd = mpd.replace('<MPD ', '<MPD' + source.namespaces + ' ');
+    var at = first ? mpd.indexOf('</Period>') : mpd.indexOf('<AdaptationSet contentType="audio"');
+    if (at < 0) at = mpd.indexOf('</Period>');
+    return { mpd: mpd.slice(0, at) + source.others + mpd.slice(at), surround: usable.length };
+  }
   function build(stream, langs) {
-    var io = fetcher(), get = io.get;
+    var io = fetcher(), get = io.get, until = Date.now() + 9000, want51 = (langs || {}).surround !== false;
     return io.deadline(Promise.all([get(stream.url), get(stream.widevineManifestUrl)]).then(function (sources) {
       var source = official(sources[1].body, sources[1].url, langs || {});
-      return Promise.all(variants(sources[0].body).map(function (v, i) {
+      var video$ = Promise.all(variants(sources[0].body).map(function (v, i) {
         var playlistUrl = new URL(v.uri, sources[0].url).toString();
         return get(playlistUrl).then(function (response) {
           playlistUrl = response.url;
@@ -168,10 +246,10 @@ var HdrStream = (function () {
               protection: { kid: protection.kid, pssh: psshFor(source, protection.kid) } };
           });
         });
-      })).then(function (tracks) {
-        var mpd = CmafDash.manifest(tracks);
-        return { mpd: mpd.replace('<MPD ', '<MPD' + source.namespaces + ' ').replace('</Period>', source.others + '</Period>'),
-          subtitles: source.subtitles };
+      }));
+      return Promise.all([video$, want51 ? surround(sources[0].body, sources[0].url, source.epoch, until) : []]).then(function (ready) {
+        var made = withCommentary(ready[0], ready[1], ready[0][0].protection, source, langs);
+        return { mpd: made.mpd, subtitles: source.subtitles, surround: made.surround };
       });
     }));
   }
@@ -255,7 +333,8 @@ var HdrStream = (function () {
     opts = opts || {};
     var known = typeof MultiviewLayouts !== 'undefined' && MultiviewLayouts.layouts[layout], heights = known && known.feeds;
     if (!heights || heights.length !== streams.length) return Promise.reject(new Error('HDR: layout ' + layout + ' needs ' + (heights ? heights.length : '?') + ' feeds'));
-    var io = fetcher(20000), get = io.get, range = opts.range || gridRange(streams), id = opts.id;
+    var io = fetcher(20000), get = io.get, range = opts.range || gridRange(streams), id = opts.id, until = Date.now() + 16000;
+    var want51 = (opts.langs || {}).surround !== false;
     // Encrypted HDR takes its commentary and Widevine metadata from the normal offer; clear HDR (some replays)
     // has its own audio in the HLS master.
     // opts.audio: the place of the feed whose commentary and subtitles play.
@@ -298,7 +377,7 @@ var HdrStream = (function () {
             return tpl ? { init: f.init, media: tpl.media, startNumber: tpl.startNumber, count: f.urls.length } : { init: f.init, urls: f.urls };
           }) };
           var base = timing.baseTime / timing.timescale;
-          return Promise.all([encrypted ? [] : audioTracks(io, feeds[lead], opts.langs || {}),
+          return Promise.all([encrypted ? (want51 ? surround(feeds[lead].master, feeds[lead].masterUrl, source.epoch, until) : []) : audioTracks(io, feeds[lead], opts.langs || {}),
             encrypted ? source.subtitles : subtitleTracks(io, feeds[lead], base),
             fetch(LOCAL + '/stitch/' + id, { method: 'POST', body: JSON.stringify(body) }).then(function (r) {
               return r.text().then(function (text) { if (!r.ok) return fail('grid helper: ' + text); return JSON.parse(text); });
@@ -309,9 +388,9 @@ var HdrStream = (function () {
               init: LOCAL + '/stitch/' + id + '/init.mp4',
               segments: feeds[0].durations.map(function (d, n) { return { url: LOCAL + '/stitch/' + id + '/' + n + '.m4s', duration: d }; }),
               protection: encrypted ? { kid: protection.kid, pssh: psshFor(source, protection.kid) } : null };
-            var mpd = CmafDash.manifest([track].concat(audio));
-            if (encrypted) mpd = mpd.replace('<MPD ', '<MPD' + source.namespaces + ' ').replace('</Period>', source.others + '</Period>');
-            return { mpd: mpd, subtitles: subtitles, width: info.width, height: info.height };
+            // Encrypted: the official commentary, and the sound feed's 5.1 (F1 LIVE) where it has one.
+            var made = encrypted ? withCommentary([track], audio, track.protection, source, opts.langs) : { mpd: CmafDash.manifest([track].concat(audio)), surround: 0 };
+            return { mpd: made.mpd, subtitles: subtitles, width: info.width, height: info.height, surround: made.surround };
           });
         });
       });

@@ -11,10 +11,11 @@ function api(route, globals) {
   const calls = [];
   const fetch = async (url, init) => {
     calls.push({ url, init: init || {} });
-    const r = (route && route(url, init || {})) || { status: 404, body: { message: 'not found' } };
+    const r = (route && await route(url, init || {})) || { status: 404, body: { message: 'not found' } };
     if (r === HANG) return new Promise(() => {});
     const text = typeof r.body === 'string' ? r.body : JSON.stringify(r.body);
-    return { ok: (r.status || 200) < 400, status: r.status || 200, text: async () => text };
+    return { ok: (r.status || 200) < 400, status: r.status || 200, text: async () => text, url: r.url || url,
+      headers: { get: (k) => (r.headers || {})[k] || null } };
   };
   const context = vm.createContext({ fetch, URL, encodeURIComponent, Date, setTimeout, clearTimeout, ...globals });
   vm.runInContext(readFileSync('app/js/api.js', 'utf8'), context);
@@ -253,7 +254,7 @@ test('feedsFrom plays INTERNATIONAL as the main stream instead of by its channel
   assert.deepEqual(plain(feeds.map((f) => [f.title, f.type, f.channelId])), [
     ['INTERNATIONAL', 'Broadcast', null], ['F1 LIVE', '', '1033'], ['TRACKER', '', '1003'], ['VER', 'Red Bull Racing', '1009']]);
   assert.deepEqual(plain(feeds[3]), { title: 'VER', type: 'Red Bull Racing', channelId: '1009', hex: '#3671C6',
-    full: 'Max Verstappen', num: '1' });
+    langs: [], full: 'Max Verstappen', num: '1' });
 });
 
 test('feedsFrom keeps an onboard whose playbackUrl names no channel, by its channelId', () => {
@@ -265,7 +266,7 @@ test('feedsFrom keeps an onboard whose playbackUrl names no channel, by its chan
 
 test('feedsFrom keeps the main feed alone for single-feed videos, and falls back to channelId without a playbackUrl', () => {
   const { F1Api } = api();
-  assert.deepEqual(plain(F1Api.feedsFrom({})), [{ title: 'Main feed', type: 'Broadcast', channelId: null }]);
+  assert.deepEqual(plain(F1Api.feedsFrom({})), [{ title: 'Main feed', type: 'Broadcast', channelId: null, langs: [] }]);
   const feeds = F1Api.feedsFrom({ additionalStreams: [{ title: 'MAIN', channelId: null }, { title: 'PIT LANE', channelId: 1002 }] });
   assert.deepEqual(plain(feeds.map((f) => [f.title, f.channelId])), [['Main feed', null], ['PIT LANE', 1002]]);
 });
@@ -617,3 +618,311 @@ test('without the diagnostics log recording, streamInfo parses no offer', async 
   assert.equal((await api(() => ({ body: mpd }), off).F1Api.streamInfo('https://cdn/a.mpd')).offer, undefined);
   assert.equal((await api(() => ({ body: mpd })).F1Api.streamInfo('https://cdn/a.mpd')).offer, undefined);
 });
+
+// F1's Tiledmedia offer (player=player_tm, as F1's own Apple TV and Android TV players ask): every feed in one answer,
+// 4K HLG as AES-128 HLS whose key address the playlist names.
+const TM_KEY = '#EXT-X-SESSION-KEY:METHOD=AES-128,URI="https://f1tv.formula1.com/2.0/R/ENG/BIGSCREEN_HLS/ALL/CONTENT/LA/ck?c=x",KEYFORMAT="identity"\n';
+const TM_MASTER = '#EXTM3U\n' + TM_KEY + '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",LANGUAGE="eng",NAME="eng",URI="eng.m3u8"\n' +
+  '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",LANGUAGE="spa",NAME="spa",URI="spa.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE=HLG,AUDIO="a"\n2160p.m3u8\n';
+const tmAnswer = (type) => ({ resultObj: { streamType: type, channelId: 1025, entitlementToken: 'TM_ENT',
+  tme: { channel: 'MULTI', feeds: [1033, 1025, 1003].map((c) => ({ metadata: { channel_id: c }, url: 'https://cdn/tm/' + c + '/master.m3u8' })) } } });
+function tmRoute({ type = 'HDR_UHD_HLSCK', master = TM_MASTER, answer, bm = HDR } = {}) {
+  return (url, init) => {
+    if (/player=player_tm/.test(url)) return { body: answer || tmAnswer(type) };
+    if (url.startsWith('https://cdn/tm/')) return { body: master };
+    if (url === HDR.url) return { body: MASTER };
+    if ((init.headers || {})['x-f1-device-info'] === 'device=tvos;') return { body: { resultObj: bm } };
+    return { body: { resultObj: SDR } };
+  };
+}
+const plays = (calls) => calls.filter((c) => /CONTENT\/PLAY/.test(c.url));
+
+test('play with tm takes F1\'s Tiledmedia offer for the feed asked: AES-128 HLS, its key fetched with the account\'s tokens', async () => {
+  const { F1Api, calls } = signedIn(tmRoute());
+  const stream = await F1Api.play('42', '1033', { hdr: true, tm: true });
+  assert.equal(stream.url, 'https://cdn/tm/1033/master.m3u8');
+  assert.equal(stream.hdr, true);
+  assert.equal(stream.hlsAes, true);
+  assert.equal(stream.streamType, 'HDR_UHD_HLSCK');
+  assert.equal(stream.licenseUrl, '');
+  assert.deepEqual(plain(stream.keyHeaders), { ascendontoken: 'ASC', entitlementtoken: 'TM_ENT' });
+  assert.equal(plays(calls).length, 1);
+  assert.equal(plays(calls)[0].url, 'https://f1tv.formula1.com/3.0/R/ENG/BIG_SCREEN_HLS/ALL/CONTENT/PLAY?contentId=42&player=player_tm&channelId=1033');
+  assert.equal(plays(calls)[0].init.headers['x-f1-device-info'], 'device=tvos;');
+});
+
+test('one Tiledmedia answer serves the video\'s other feeds for 30 min; the main feed is the one it names', async () => {
+  let now = 1e12;
+  class Clock extends Date { static now() { return now; } }
+  const { F1Api, calls } = api(tmRoute(), { Date: Clock });
+  Object.assign(F1Api.state, { ascendon: 'ASC', entitlement: 'ENT' });
+  assert.equal((await F1Api.play('42', null, { hdr: true, tm: true })).url, 'https://cdn/tm/1025/master.m3u8');
+  assert.equal((await F1Api.play('42', '1003', { hdr: true, tm: true })).url, 'https://cdn/tm/1003/master.m3u8');
+  assert.equal((await F1Api.play('42', '1033', { hdr: true, tm: true })).url, 'https://cdn/tm/1033/master.m3u8');
+  assert.equal(plays(calls).length, 1);
+  now += 31 * 60 * 1000;
+  await F1Api.play('42', '1033', { hdr: true, tm: true });
+  assert.equal(plays(calls).length, 2);
+  await F1Api.play('43', '1033', { hdr: true, tm: true });   // another video
+  assert.equal(plays(calls).length, 3);
+});
+
+for (const [name, opts] of [
+  ['an SDR answer (as Pro may get)', { type: 'SDR_HD_HLSCK' }],
+  ['FairPlay keys', { master: TM_MASTER.replace(TM_KEY, '#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,URI="skd://abc",KEYFORMAT="com.apple.streamingkeydelivery"\n') }],
+  ['a key without an address', { master: TM_MASTER.replace(/URI="[^"]*",/, '') }],
+  ['no HLG', { master: TM_MASTER.replace('VIDEO-RANGE=HLG', 'VIDEO-RANGE=SDR') }],
+  ['an answer without feeds', { answer: { resultObj: { streamType: 'HDR_UHD_HLSCK', channelId: 1025 } } }],
+  ['a feed without its own sound (TRACKER, DATA)', { master: TM_MASTER.replace(/#EXT-X-MEDIA:[^\n]*\n/g, '') }],
+  ['a refused request', { answer: { resultCode: 'OK', message: 'Failed to evaluate stream rule' } }]
+]) {
+  test('play with tm asks the usual way after ' + name, async () => {
+    const { F1Api, calls } = signedIn(tmRoute(opts));
+    const stream = await F1Api.play('42', '1033', { hdr: true, tm: true });
+    assert.equal(stream.url, HDR.url);
+    assert.equal(stream.hlsAes, undefined);
+    assert.ok(plays(calls).some((c) => /player=player_bm/.test(c.url) && c.init.headers['x-f1-device-info'] === 'device=tvos;'));
+  });
+}
+
+test('a Pro-like account (SDR from both 4K HDR requests) gets exactly the normal stream with tm asked', async () => {
+  const route = tmRoute({ type: 'SDR_HD_HLSCK', bm: { url: 'https://cdn/sdr-cmaf.m3u8', streamType: 'SDR_HD_CMAF' } });
+  const withTm = signedIn(route), normal = signedIn(route);
+  const a = await withTm.F1Api.play('42', '1033', { hdr: true, tm: true });
+  const b = await normal.F1Api.play('42', '1033');
+  assert.deepEqual(plain(a), plain(b));
+  assert.equal(a.url, SDR.url);
+});
+
+test('play with tm keeps the usual offer where the Tiledmedia feed lacks a commentary F1 names for it (onboards)', async () => {
+  const teamRadioOnly = TM_MASTER.replace(/#EXT-X-MEDIA:[^\n]*\n/g, '').replace('#EXT-X-STREAM-INF', '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",LANGUAGE="tea",NAME="tea",URI="t.m3u8"\n#EXT-X-STREAM-INF');
+  const onboard = signedIn(tmRoute({ master: teamRadioOnly }));
+  assert.equal((await onboard.F1Api.play('42', '1033', { hdr: true, tm: true, langs: ['tea', 'eng', 'deu'] })).url, HDR.url);
+  const main = signedIn(tmRoute());
+  assert.equal((await main.F1Api.play('42', '1033', { hdr: true, tm: true, langs: ['eng', 'spa'] })).hlsAes, true);
+});
+
+test('feedsFrom names each feed\'s audio languages, the main feed\'s too', () => {
+  const { F1Api } = api();
+  const feeds = plain(F1Api.feedsFrom({ additionalStreams: [
+    { title: 'F1 LIVE', channelId: 1033, type: 'additional', playbackUrl: 'CONTENT/PLAY?channelId=1033&contentId=1', audioTrackNames: { eng: 'English F1 Live', spa: 'Espanol' } },
+    { title: 'INTERNATIONAL', channelId: 1025, type: 'additional', playbackUrl: 'CONTENT/PLAY?contentId=1', audioTrackNames: { eng: 'English', fx: 'Track FX' } },
+    { title: 'TRACKER', channelId: 1003, type: 'additional', playbackUrl: 'CONTENT/PLAY?channelId=1003&contentId=1' }
+  ] }));
+  assert.deepEqual(feeds.map((f) => [f.title, f.langs]), [['INTERNATIONAL', ['eng', 'fx']], ['F1 LIVE', ['eng', 'spa']], ['TRACKER', []]]);
+  assert.equal(feeds[0].tmChannel, '1025');
+});
+
+test('switching to the main feed needs no PLAY request when F1\'s video information names its channel', async () => {
+  const { F1Api, calls } = signedIn(tmRoute());
+  await F1Api.play('42', '1033', { hdr: true, tm: true });
+  const main = await F1Api.play('42', null, { hdr: true, tm: true, mainChannel: '1025' });
+  assert.equal(main.url, 'https://cdn/tm/1025/master.m3u8');
+  assert.equal(plays(calls).length, 1);
+  await F1Api.play('42', null, { hdr: true, tm: true, mainChannel: '9999' });   // a channel the answer lacks: ask
+  assert.equal(plays(calls).length, 2);
+});
+
+test('a Tiledmedia answer is kept for one sign-in only', async () => {
+  const { F1Api, calls } = signedIn(tmRoute());
+  await F1Api.play('42', '1033', { hdr: true, tm: true });
+  F1Api.state.ascendon = 'OTHER';   // signed in as someone else
+  await F1Api.play('42', '1033', { hdr: true, tm: true });
+  assert.equal(plays(calls).filter((c) => /player_tm/.test(c.url)).length, 2);
+});
+
+test('a refused Tiledmedia request, or a feed its answer lacks, asks no further Tiledmedia PLAY for that video', async () => {
+  const refused = signedIn((url, init) => /player_tm/.test(url) ? { status: 500, body: { message: 'Failed to evaluate stream rule' } } : tmRoute()(url, init));
+  for (const ch of ['1033', '1003', null]) await refused.F1Api.play('42', ch, { hdr: true, tm: true });
+  assert.equal(plays(refused.calls).filter((c) => /player_tm/.test(c.url)).length, 1);
+  const lacking = signedIn(tmRoute());
+  await lacking.F1Api.play('42', '1033', { hdr: true, tm: true });
+  assert.equal((await lacking.F1Api.play('42', '2001', { hdr: true, tm: true })).url, HDR.url);   // not in the answer: usual offer
+  assert.equal(plays(lacking.calls).filter((c) => /player_tm/.test(c.url)).length, 1);
+});
+
+test('no HDR request goes out after the 8 s wait', async () => {
+  let release;
+  const tmHeld = new Promise((r) => { release = r; });
+  const route = (url, init) => /player_tm/.test(url) ? tmHeld : tmRoute()(url, init);
+  const timers = [];
+  const { F1Api, calls } = api(route, { setTimeout: (fn, ms) => { if (ms === 8000) { timers.push(fn); return 1; } return setTimeout(fn, ms); } });
+  Object.assign(F1Api.state, { ascendon: 'ASC', entitlement: 'ENT' });
+  const started = F1Api.play('42', '1033', { hdr: true, tm: true });
+  await new Promise((r) => setImmediate(r));
+  timers.forEach((fn) => fn());                  // HDR_WAIT is over: SDR plays
+  const stream = await started;
+  assert.equal(stream.url, SDR.url);
+  release({ status: 500, body: { message: 'Failed to evaluate stream rule' } });   // the Tiledmedia answer comes late
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(!plays(calls).some((c) => /player_bm/.test(c.url) && c.init.headers['x-f1-device-info'] === 'device=tvos;'));
+});
+
+for (const [name, master] of [
+  ['names no key', TM_MASTER.replace(TM_KEY, '')],
+  ['has the commentaries only in a group no HLG variant uses', TM_MASTER.replace('AUDIO="a"', 'AUDIO="other"')]
+]) {
+  test('play with tm asks the usual way when the Tiledmedia master ' + name, async () => {
+    const { F1Api } = signedIn(tmRoute({ master }));
+    const stream = await F1Api.play('42', '1033', { hdr: true, tm: true });
+    assert.equal(stream.url, HDR.url);
+  });
+}
+
+test('play with tm asks the usual way when the Tiledmedia master lacks a subtitle F1\'s player offers on the feed', async () => {
+  const answer = tmAnswer('HDR_UHD_HLSCK');
+  answer.resultObj.tme.feeds.forEach((f) => { f.subtitle_track_names = { eng_subtitle: 'English', spa_subtitle: 'Espanol' }; });
+  const withSubs = TM_MASTER.replace('#EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE=HLG,AUDIO="a"',
+    '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="s",LANGUAGE="eng",NAME="eng_subtitle",URI="e.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE=HLG,AUDIO="a",SUBTITLES="s"');
+  const lacking = signedIn(tmRoute({ answer, master: withSubs }));
+  assert.equal((await lacking.F1Api.play('42', '1033', { hdr: true, tm: true })).url, HDR.url);   // no Spanish subtitles
+  const full = signedIn(tmRoute({ answer, master: withSubs.replace('#EXT-X-STREAM-INF', '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="s",LANGUAGE="spa",NAME="spa_subtitle",URI="s.m3u8"\n#EXT-X-STREAM-INF') }));
+  assert.equal((await full.F1Api.play('42', '1033', { hdr: true, tm: true })).hlsAes, true);
+});
+
+test('prefetchTm asks the Tiledmedia answer ahead, so the start and feed switches need no PLAY', async () => {
+  const { F1Api, calls } = signedIn(tmRoute());
+  await F1Api.prefetchTm('42', '1025');
+  assert.equal(plays(calls).length, 1);
+  assert.equal((await F1Api.play('42', null, { hdr: true, tm: true })).hlsAes, true);
+  assert.equal((await F1Api.play('42', '1033', { hdr: true, tm: true })).hlsAes, true);
+  assert.equal(plays(calls).length, 1);
+});
+
+test('a 4K HDR start reads its HLS master once: the HDR check\'s copy serves streamInfo', async () => {
+  const { F1Api, calls } = signedIn(tmRoute());
+  const stream = await F1Api.play('42', '1033', { hdr: true, tm: true });
+  await F1Api.streamInfo(stream.url);
+  assert.equal(calls.filter((c) => c.url === stream.url).length, 1);
+});
+
+test('after CloudFront blocks PLAY ("Request blocked"), no PLAY request goes out for 10 min; other requests still do', async () => {
+  let now = 1e12, blocked = true;
+  class Clock extends Date { static now() { return now; } }
+  const route = (url) => /CONTENT\/PLAY/.test(url)
+    ? (blocked ? { status: 403, body: '<html><h1>Request blocked.</h1></html>' } : { body: { resultObj: SDR } })
+    : { body: { resultObj: { containers: [] } } };
+  const { F1Api, calls } = api(route, { Date: Clock });
+  Object.assign(F1Api.state, { ascendon: 'ASC', entitlement: 'ENT' });
+  await assert.rejects(F1Api.play('42', '1033'));
+  const first = plays(calls).length;
+  await assert.rejects(F1Api.play('42', '1033', { hdr: true, tm: true }), (e) => e.blocked === true);
+  assert.equal(plays(calls).length, first);            // nothing more asked while blocked
+  await F1Api.http('https://f1tv.formula1.com/2.0/R/ENG/WEB_DASH/ALL/PAGE/395');
+  assert.equal(calls.at(-1).url, 'https://f1tv.formula1.com/2.0/R/ENG/WEB_DASH/ALL/PAGE/395');
+  blocked = false;
+  now += 11 * 60 * 1000;
+  assert.equal((await F1Api.play('42', '1033')).url, SDR.url);
+});
+
+test('an F1 answer such as "Not entitled" (JSON 403) starts no PLAY block', async () => {
+  const { F1Api, calls } = signedIn((url) => ({ status: 403, body: { message: 'Not entitled' } }));
+  await assert.rejects(F1Api.play('42', '1033'));
+  const n = plays(calls).length;
+  await assert.rejects(F1Api.play('42', '1033'));
+  assert.ok(plays(calls).length > n);
+});
+
+test('a PLAY block honours Retry-After in seconds or as a date, keeps the longest, and a JSON 429 starts none', async () => {
+  let now = 1e12;
+  class Clock extends Date { static now() { return now; } }
+  const answers = [];
+  const { F1Api, calls } = api((url) => answers.shift() || { body: { resultObj: SDR } }, { Date: Clock });
+  Object.assign(F1Api.state, { ascendon: 'ASC', entitlement: 'ENT' });
+  answers.push({ status: 429, body: 'null' });   // F1's own JSON: no block (the next platform answers)
+  assert.equal((await F1Api.play('42', '1')).url, SDR.url);
+  answers.push({ status: 429, body: '<html>slow down</html>', headers: { 'Retry-After': '1200' } });
+  await assert.rejects(F1Api.play('42', '1'), (e) => e.blocked);
+  now += 11 * 60 * 1000;                         // past a 10 min default, not past the 20 min asked
+  const n = plays(calls).length;
+  await assert.rejects(F1Api.play('42', '1'), (e) => e.blocked);
+  assert.equal(plays(calls).length, n);
+  now += 10 * 60 * 1000;
+  assert.equal((await F1Api.play('42', '1')).url, SDR.url);
+  // As an HTTP date: 15 min from now.
+  answers.push({ status: 403, body: '<html>Request blocked</html>', headers: { 'Retry-After': new Date(now + 15 * 60000).toUTCString() } });
+  await assert.rejects(F1Api.play('42', '1'), (e) => e.blocked);
+  now += 12 * 60 * 1000;
+  await assert.rejects(F1Api.play('42', '1'), (e) => e.blocked);
+  now += 4 * 60 * 1000;
+  assert.equal((await F1Api.play('42', '1')).url, SDR.url);
+});
+
+test('a sign-in change while the Tiledmedia master is read gives no stream with mixed tokens', async () => {
+  let release;
+  const held = new Promise((r) => { release = r; });
+  const route = tmRoute();
+  const { F1Api } = signedIn((url, init) => url.startsWith('https://cdn/tm/') ? held : route(url, init));
+  const asked = F1Api.play('42', '1033', { hdr: true, tm: true });
+  await new Promise((r) => setTimeout(r, 10));
+  F1Api.state.ascendon = 'SOMEONE_ELSE';
+  release({ body: TM_MASTER });
+  const stream = await asked.catch((e) => e);
+  assert.ok(!(stream && stream.hlsAes && stream.keyHeaders && stream.keyHeaders.ascendontoken === 'SOMEONE_ELSE'));
+  assert.ok(!(stream && stream.hlsAes));
+});
+
+test('a prefetch and a start at the same time share one Tiledmedia PLAY; signed out, nothing is asked', async () => {
+  const { F1Api, calls } = signedIn(tmRoute());
+  const pre = F1Api.prefetchTm('42', '1025');
+  const started = F1Api.play('42', null, { hdr: true, tm: true, mainChannel: '1025' });
+  await pre;
+  assert.equal((await started).hlsAes, true);
+  assert.equal(plays(calls).filter((c) => /player_tm/.test(c.url)).length, 1);
+  const out = api(tmRoute());
+  await out.F1Api.prefetchTm('42', '1025');
+  assert.equal(out.calls.length, 0);
+});
+
+test('a short block of the Tiledmedia request turns it off for a minute, not 30', async () => {
+  let now = 1e12;
+  class Clock extends Date { static now() { return now; } }
+  let block = true;
+  const route = tmRoute();
+  const { F1Api, calls } = api((url, init) => /player_tm/.test(url) && block ? { status: 429, body: '<html>wait</html>', headers: { 'Retry-After': '1' } } : route(url, init), { Date: Clock });
+  Object.assign(F1Api.state, { ascendon: 'ASC', entitlement: 'ENT' });
+  await F1Api.prefetchTm('42', '1025');
+  block = false;
+  now += 2 * 60 * 1000;
+  assert.equal((await F1Api.play('42', '1033', { hdr: true, tm: true })).hlsAes, true);
+  assert.equal(plays(calls).filter((c) => /player_tm/.test(c.url)).length, 2);
+});
+
+test('subtitle and audio languages are read exactly: ASSOC-LANGUAGE is no LANGUAGE, and en is eng', async () => {
+  const answer = tmAnswer('HDR_UHD_HLSCK');
+  answer.resultObj.tme.feeds.forEach((f) => { f.subtitle_track_names = { eng_subtitle: 'English' }; });
+  const sub = (attrs) => TM_MASTER.replace('#EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE=HLG,AUDIO="a"',
+    '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="s",' + attrs + ',NAME="x",URI="x.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE=HLG,AUDIO="a",SUBTITLES="s"');
+  const assoc = signedIn(tmRoute({ answer, master: sub('ASSOC-LANGUAGE="eng",LANGUAGE="spa"') }));
+  assert.equal((await assoc.F1Api.play('42', '1033', { hdr: true, tm: true })).url, HDR.url);
+  const twoLetter = signedIn(tmRoute({ answer, master: sub('LANGUAGE="en"') }));
+  assert.equal((await twoLetter.F1Api.play('42', '1033', { hdr: true, tm: true, langs: ['eng', 'spa'] })).hlsAes, true);
+});
+
+test('the HDR check\'s master copy serves streamInfo only for the same sign-in, from where it was answered', async () => {
+  const route = tmRoute();
+  const { F1Api, calls } = signedIn((url, init) => url === 'https://cdn/tm/1033/master.m3u8' ? { body: TM_MASTER, url: 'https://cdn2/moved/master.m3u8' } : route(url, init));
+  const stream = await F1Api.play('42', '1033', { hdr: true, tm: true });
+  await F1Api.streamInfo(stream.url).catch(() => null);
+  assert.ok(calls.some((c) => c.url === 'https://cdn2/moved/2160p.m3u8'));   // variants from the answering address
+  F1Api.state.ascendon = 'OTHER';
+  await F1Api.streamInfo(stream.url).catch(() => null);
+  assert.equal(calls.filter((c) => c.url === stream.url).length, 2);         // another sign-in reads it again
+});
+
+test('a Tiledmedia request that never answers stops holding starts after 6 s: the usual HDR offer is asked', async () => {
+  const timers = [];
+  const route = tmRoute();
+  const { F1Api, calls } = api((url, init) => /player_tm/.test(url) ? HANG : route(url, init),
+    { setTimeout: (fn, ms) => { if (ms === 6000) { timers.push(fn); return 1; } return setTimeout(fn, ms); } });
+  Object.assign(F1Api.state, { ascendon: 'ASC', entitlement: 'ENT' });
+  F1Api.prefetchTm('42', '1025');                 // hangs
+  const started = F1Api.play('42', '1033', { hdr: true, tm: true });
+  await new Promise((r) => setImmediate(r));
+  timers.forEach((fn) => fn());                  // its 6 s are up
+  assert.equal((await started).url, HDR.url);    // the usual HDR offer, not SDR after 8 s
+  const again = await F1Api.play('42', '1033', { hdr: true, tm: true });
+  assert.equal(again.url, HDR.url);
+  assert.equal(plays(calls).filter((c) => /player_tm/.test(c.url)).length, 1);   // the hung one is not joined again
+});
+

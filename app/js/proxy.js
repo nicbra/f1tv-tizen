@@ -70,13 +70,16 @@ var StreamProxy = (function () {
       (langs.text ? '&text=' + encodeURIComponent(langs.text) : '');
   }
 
-  /** Resolves { url, subtitles }: the local manifest for AVPlay, and the subtitles the app shows itself. */
+  /**
+   * Resolves { url, subtitles, surround }: the local manifest for AVPlay, the subtitles the app shows itself, and how
+   * many 5.1 commentaries it has (langs.surround false: none).
+   */
   function hdrManifest(stream, langs) {
     return ensure().then(function () { return HdrStream.build(stream, langs); }).then(function (built) {
       var target = BASE + '/vod/' + Date.now().toString(36) + '-' + (++vodSequence) + '.mpd';
       return fetch(target, { method: 'POST', body: built.mpd }).then(function (r) {
         if (!r.ok) throw new Error('Could not prepare HDR manifest');
-        return { url: target, subtitles: built.subtitles };
+        return { url: target, subtitles: built.subtitles, surround: built.surround || 0 };
       });
     });
   }
@@ -114,7 +117,7 @@ var StreamProxy = (function () {
       var target = BASE + '/vod/' + id + '.mpd';
       return fetch(target, { method: 'POST', body: built.mpd }).then(function (r) {
         if (!r.ok) throw new Error('Could not prepare multiview');
-        return { url: target, subtitles: built.subtitles, id: id };
+        return { url: target, subtitles: built.subtitles, id: id, surround: built.surround || 0 };
       });
     });
   }

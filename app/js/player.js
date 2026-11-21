@@ -74,6 +74,24 @@ var Player = (function () {
     var swapping = false;   // a feed switch is under way; the outgoing feed stays current until it is done
     var generation = 0;     // bumped by every load, swap and unload, so late callbacks can tell they are stale
 
+    /**
+     * 4K HDR starts at the bandwidth this TV last measured on Shaka (70 %, 10-30 Mbit/s), so it can open at 2160p
+     * rather than climbing from 1080p (the default 10 Mbit/s); SDR keeps the default.
+     */
+    var BW_KEY = 'f1tv.bandwidth';
+    function startEstimate(slot, hdr) {
+      var seen = 0;
+      try { seen = +localStorage.getItem(BW_KEY) || 0; } catch (e) { /* no storage */ }
+      slot.startedAt = hdr ? Math.max(10000000, Math.min(30000000, Math.round(seen * 0.7))) : 10000000;
+      return slot.startedAt;
+    }
+    /** A slot's last measurement, slow ones too (the clamp applies when read); not Shaka's untouched start estimate. */
+    function rememberBandwidth(slot) {
+      try {
+        var bw = slot && slot.p.getStats().estimatedBandwidth;
+        if (bw > 0 && isFinite(bw) && Math.round(bw) !== slot.startedAt) localStorage.setItem(BW_KEY, String(Math.round(bw)));
+      } catch (e) { /* no stats or storage */ }
+    }
     function P() { return slots[cur].p; }
     function V() { return slots[cur].v; }
 
@@ -111,18 +129,25 @@ var Player = (function () {
       var slot = { p: player, v: video, hdr: false };
       return player.attach(video).then(function () {
         player.getNetworkingEngine().registerRequestFilter(function (type, request) {
-          if (type === shaka.net.NetworkingEngine.RequestType.LICENSE) {
-            Object.keys(licenseHeaders).forEach(function (k) {
-              if (licenseHeaders[k]) request.headers[k] = licenseHeaders[k];
-            });
-          }
+          var types = shaka.net.NetworkingEngine.RequestType;
+          // Key requests get the tokens only from F1's own server, whatever address a playlist names.
+          var add = type === types.LICENSE ? licenseHeaders :
+            type === types.KEY && /^https:\/\/f1tv\.formula1\.com\//.test(request.uris[0] || '') ? slot.keyHeaders : null;
+          if (add) Object.keys(add).forEach(function (k) { if (add[k]) request.headers[k] = add[k]; });
         });
         player.getNetworkingEngine().registerResponseFilter(function (type, response) {
           if (!slot.hdr || type !== shaka.net.NetworkingEngine.RequestType.MANIFEST) return;
           var text = shaka.util.StringUtils.fromUTF8(response.data);
           response.data = shaka.util.StringUtils.toUTF8(hlgMaster(text));
         });
-        player.addEventListener('error', function (ev) { if (slots[cur] === slot) emit('error', describe(ev.detail), errorInfo(ev.detail)); });
+        // Only what stops playback is an error for the app: a recoverable one (Shaka switches variant or retries) is
+        // noted, or a working stream would be given up and counted as failed.
+        player.addEventListener('error', function (ev) {
+          if (slots[cur] !== slot) return;
+          var d = ev.detail || {};
+          if (d.severity === 1) return diag('player.recoverable', { code: d.code, category: d.category }, 'info');
+          emit('error', describe(d), errorInfo(d));
+        });
         player.addEventListener('buffering', function (ev) { if (slots[cur] === slot) emit('buffering', ev.buffering); });
         video.addEventListener('ended', function () { if (slots[cur] === slot && !swapping) emit('ended'); });
         return slot;
@@ -179,19 +204,31 @@ var Player = (function () {
       return 'Playback error ' + err.code + (err.data && err.data[0] ? ': ' + String(err.data[0]).slice(0, 120) : '');
     }
 
+    var SURROUND = 6;
+
     function configure(slot, stream) {
       var player = slot.p;
       slot.hdr = stream.hdr === true;
       licenseHeaders = stream.licenseHeaders || {};
+      // AES-128 HLS key requests (F1's Tiledmedia offer): the account's tokens, per slot (a feed switch configures the
+      // incoming slot while the outgoing one may still fetch a key).
+      slot.keyHeaders = (stream.hlsAes && stream.keyHeaders) || {};
       var drm = stream.licenseUrl ? { servers: { 'com.widevine.alpha': stream.licenseUrl } } : {};
       player.resetConfiguration();
       player.configure({
         drm: drm,
         preferredVideoHdrLevel: stream.hdr ? 'HLG' : 'AUTO',
+        // 5.1 where the offer has it: F1's own shows and the F1 LIVE feed of sessions carry AC-3 5.1 (English, F1 LIVE
+        // also Spanish) beside the stereo AAC in the Apple TV HDR offer; other feeds and offers are stereo (2026-11-21).
+        // Shaka takes the most channels up to this, and stereo where nothing else exists; codecs the TV can't decode
+        // are left out by Shaka itself.
+        preferredAudioChannelCount: SURROUND,
         // Keep recent video for backward seeks. A 10 Mbit/s estimate starts F1 streams at 1080p.
-        streaming: { bufferingGoal: 30, rebufferingGoal: 1, bufferBehind: 90,
+        // 4K HDR keeps less: 30 s ahead at 2160p (~17 Mbit/s) filled the TV's video buffer, and Shaka then dropped 2160p
+        // for 30 s at a time (LV Qualifying, 2026-11-21: 2160p ~27 s, 1620p ~30 s, over and over); 15 + 10 s held 2160p.
+        streaming: { bufferingGoal: stream.hdr ? 15 : 30, rebufferingGoal: 1, bufferBehind: stream.hdr ? 10 : 90,
           retryParameters: { maxAttempts: 4, baseDelay: 1000, backoffFactor: 2 } },
-        abr: { enabled: true, defaultBandwidthEstimate: 10000000, useNetworkInformation: false, switchInterval: 4 },
+        abr: { enabled: true, defaultBandwidthEstimate: startEstimate(slot, stream.hdr), useNetworkInformation: false, switchInterval: 4 },
         // F1's DASH says minBufferTime PT30S, and Shaka waits for max(that, rebufferingGoal) at playbackRate 0 before
         // playing: a live start ~25 s from the edge can't buffer 30 s, so it sat frozen ~10 s (Las Vegas FP1, 2026-11-20).
         manifest: { hls: { ignoreManifestProgramDateTime: false }, dash: { ignoreMinBufferTime: true } }
@@ -199,7 +236,7 @@ var Player = (function () {
     }
 
     function applyPrefs(player) {
-      try { player.selectAudioLanguage(langOf(Settings.get('audio'))); } catch (e) { /* single track */ }
+      try { player.selectAudioLanguage(langOf(Settings.get('audio')), '', SURROUND); } catch (e) { /* single track */ }
       textTrack(player, Settings.get('subtitles'));
     }
 
@@ -313,6 +350,7 @@ var Player = (function () {
     function swap(stream, startTime) {
       var old = slots[cur], next = slots[1 - cur];
       generation++;
+      rememberBandwidth(old);   // before the incoming slot reads it for its start
       configure(next, stream);
       next.v.muted = true;
       swapping = true;
@@ -365,6 +403,7 @@ var Player = (function () {
     var stuckSlots = [];
 
     function unload() {
+      rememberBandwidth(slots[cur]);
       licenseHeaders = {};
       generation++;
       slots.forEach(function (s) { s.v.classList.add('hidden'); s.v.style.zIndex = ''; });
@@ -398,7 +437,12 @@ var Player = (function () {
       load: load,
       swap: swap,
       tracks: tracks,
-      setAudio: function (l) { try { P().selectAudioLanguage(langOf(l)); } catch (e) { /* single track */ } },
+      setAudio: function (l) { try { P().selectAudioLanguage(langOf(l), '', SURROUND); } catch (e) { /* single track */ } },
+      /** Channels of the audio playing (2, or 6 for F1's 5.1 AC-3), or null before a variant is chosen. */
+      audioChannels: function () {
+        var a = P().getVariantTracks().filter(function (t) { return t.active; })[0];
+        return a && a.channelsCount ? a.channelsCount : null;
+      },
       setSubtitles: function (l) { textTrack(P(), l); },
       unload: unload,
       isLive: function () { return P().isLive(); },
@@ -530,7 +574,7 @@ var Player = (function () {
         av.getTotalTrackInfo().forEach(function (t) {
           var info = {};
           try { info = JSON.parse(t.extra_info || '{}'); } catch (e) { /* keep empty */ }
-          if (t.type === 'AUDIO') out.audio.push({ index: t.index, lang: info.language || '' });
+          if (t.type === 'AUDIO') out.audio.push({ index: t.index, lang: info.language || '', channels: +info.channels || 0, bitrate: +info.bit_rate || 0 });
           if (t.type === 'TEXT') out.text.push({ index: t.index, lang: info.track_lang || '' });
         });
       } catch (e) { /* not prepared yet */ }
@@ -538,8 +582,16 @@ var Player = (function () {
       return out;
     }
 
+    /**
+     * 5.1 before stereo where a language has both (encrypted 4K HDR on F1 LIVE and the shows, hdr.js). AVPlay names
+     * the channels of the playing track only; the others show their manifest bitrate: 384k for the 5.1 AC-3 tracks,
+     * 192k for F1's stereo commentary.
+     */
+    function surroundish(a) { return a.channels > 2 || (!a.channels && a.bitrate >= 384000); }
+
     function selectAudio(lang) {
-      var t = trackList().audio.filter(function (a) { return sameLang(a.lang, lang); })[0];
+      var t = trackList().audio.filter(function (a) { return sameLang(a.lang, lang); })
+        .sort(function (x, y) { return surroundish(y) - surroundish(x) || x.index - y.index; })[0];
       if (t) try { av.setSelectTrack('AUDIO', t.index); } catch (e) { /* keep current */ }
     }
 
@@ -563,19 +615,23 @@ var Player = (function () {
       if (s.grid && s.grid.engine !== 'h264') {
         var gridPrefs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
         var gridReady = s.info && s.info.dynamic ? StreamProxy.gridLive(s, s.startDelay, gridPrefs) :
-          StreamProxy.gridManifest(s.grid.streams, s.grid.layout, gridPrefs, startTime, s.grid.audioPos || 0);
+          StreamProxy.gridManifest(s.grid.streams, s.grid.layout, { audio: gridPrefs.audio, text: gridPrefs.text, surround: !s.noSurround },
+            startTime, s.grid.audioPos || 0);
         return gridReady.then(function (prepared) {
           if (stream !== s) throw new Error('cancelled');
           s.grid.id = prepared.id;   // for rearranging it later without reloading
+          s.surround = prepared.surround || 0;   // 5.1 commentaries in it (the app learns per TV whether they play)
           captions = subtitleReader(prepared.subtitles);
           return open(s, prepared.url);
         });
       }
       if (s.hdrEncrypted) {
         var prefs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
-        var prepare = s.info && s.info.dynamic ? StreamProxy.hdrLive(s, s.startDelay, prefs) : StreamProxy.hdrManifest(s, prefs);
+        var prepare = s.info && s.info.dynamic ? StreamProxy.hdrLive(s, s.startDelay, prefs) :
+          StreamProxy.hdrManifest(s, { audio: prefs.audio, text: prefs.text, surround: !s.noSurround });
         return prepare.then(function (prepared) {
           if (stream !== s) throw new Error('cancelled');
+          s.surround = prepared.surround || 0;
           captions = subtitleReader(prepared.subtitles);
           return open(s, prepared.url);
         });
@@ -936,9 +992,22 @@ var Player = (function () {
       paused: function () { return isPaused; },
       play: function () { try { av.play(); } catch (e) { /* not ready: ensurePlaying retries */ } isPaused = false; },
       pause: function () { try { av.pause(); } catch (e) { /* not ready yet */ } isPaused = true; },
-      tracks: trackList,
+      // One entry per language (a 5.1 and a stereo commentary in one language are one choice, as on Shaka).
+      tracks: function () {
+        var list = trackList(), seen = {};
+        list.audio = list.audio.filter(function (a) { var k = lang3(a.lang); if (seen[k]) return false; seen[k] = true; return true; });
+        return list;
+      },
       setGridRect: setGridRect,
       setAudio: selectAudio,
+      /** Channels of the audio playing (6 for F1's 5.1 AC-3), or null where AVPlay doesn't say. */
+      audioChannels: function () {
+        var a = null;
+        try { a = av.getCurrentStreamInfo().filter(function (t) { return t.type === 'AUDIO'; })[0]; } catch (e) { return null; }
+        var n = 0;
+        try { n = +JSON.parse((a && a.extra_info) || '{}').channels || 0; } catch (e) { /* unknown */ }
+        return n > 0 ? n : null;
+      },
       setSubtitles: selectText,
       grid: function () {
         var i = stream && stream.info;
@@ -1030,9 +1099,11 @@ var Player = (function () {
   }
 
   var current = null;
+  var channelsSeen = { stream: null, at: 0, n: null };   // Player.audioChannels(), kept 2 s
 
   function load(stream, startTime) {
     current = stream;
+    channelsSeen = { stream: null, at: 0, n: null };
     return unload().then(function () {
       engine = choose(stream);
       engineName = engine === AvEngine ? 'avplay' : 'shaka';
@@ -1173,7 +1244,16 @@ var Player = (function () {
      */
     seekGrid: function () { return engine === AvEngine ? AvEngine.grid() : null; },
     tracks: function () { return engine ? engine.tracks() : { audio: [], text: [] }; },
-    setAudio: traced('player.setAudio', function (l) { if (engine) engine.setAudio(l); }, function (l) { return { lang: l }; }),
+    /** Audio channels playing, where the engine tells: 2, 6, ...; null otherwise. Asked every 500 ms by the player bar: kept 2 s. */
+    audioChannels: function () {
+      var now = Date.now();
+      if (channelsSeen.stream === current && now - channelsSeen.at < 2000) return channelsSeen.n;
+      var n = null;
+      try { n = engine && engine.audioChannels ? engine.audioChannels() : null; } catch (e) { n = null; }
+      channelsSeen = { stream: current, at: now, n: n };
+      return n;
+    },
+    setAudio: traced('player.setAudio', function (l) { channelsSeen.at = 0; if (engine) engine.setAudio(l); }, function (l) { return { lang: l }; }),
     setSubtitles: traced('player.setSubtitles', function (l) { if (engine) engine.setSubtitles(l); }, function (l) { return { lang: l }; }),
     forceEngine: null,
     /** Multiview: where AVPlay draws the grid's picture ([x, y, w, h] on the 1920x1080 screen, null: all of it). */

@@ -1208,11 +1208,12 @@
 
   // What the app has learned about playing copy-protected video on this TV (js/caps.js), in words.
   var CAPS_NAMES = { 'shaka:cenc': 'Shaka, CENC', 'avplay:cbcs': 'AVPlay, CBCS', 'avplay:cenc': 'AVPlay, CENC',
-    'avplay:hdr': 'AVPlay, 4K HDR' };
+    'avplay:hdr': 'AVPlay, 4K HDR', 'avplay:ac3': 'AVPlay, 5.1 sound in 4K HDR', 'shaka:hlsaes': 'Shaka, 4K HDR (AES-128 HLS)' };
 
   function capsSummary() {
     var paths = Caps.report().paths, n = 0;
-    Object.keys(paths).forEach(function (k) { n += paths[k].ok + paths[k].failed + paths[k].crashed; });
+    // The 5.1 sound is part of a 4K HDR start, not a start of its own.
+    Object.keys(paths).forEach(function (k) { if (k !== 'avplay:ac3') n += paths[k].ok + paths[k].failed + paths[k].crashed; });
     return n ? 'Learned from ' + n + ' video start' + (n === 1 ? '' : 's') : 'Nothing learned yet';
   }
 
@@ -1465,6 +1466,8 @@
         live: live, start: ev ? ev.start : null,
         // Not on air yet: played as live once its start has come (the play API says if it is too early).
         upcoming: !live && m.contentSubtype !== 'REPLAY' && !!ev && status(ev) === 'upcoming' };
+      // The Tiledmedia answer covers every feed: asked now, a replay starts without waiting for F1's play API.
+      if (F1Api.prefetchTm && !feedsCtx.upcoming && tmWanted()) F1Api.prefetchTm(contentId, feeds[0].tmChannel);
       var emf = m.emfAttributes || {};
       feedsCtx.timingMeta = {
         title: Timing.sessionName(m.titleBrief || tile.title), series: emf.Series || (ev && ev.series) || '',
@@ -1639,6 +1642,14 @@
 
   function nativeHdrUsable() { return pathUsable('avplay:hdr') && pathUsable('avplay:cbcs'); }
 
+  /**
+   * F1's Tiledmedia offer first (api.js playTm: every feed's 4K HDR in one answer, AES-128 HLS on Shaka): replays of
+   * one feed only for now (live and multiview keep today's routes), until it failed for this video or on this TV.
+   */
+  function tmWanted() {
+    return hdrWanted() && !feedsCtx.live && !feedsCtx.tmFailed && pathUsable('shaka:hlsaes');
+  }
+
   function hdrWanted() {
     // Live needs native cbcs HDR. Replays can still accept a clear Apple TV HLS offer (api.js).
     return Settings.get('hdr') && !feedsCtx.hdrFailed && Player.hdrCapable() && (!feedsCtx.live || nativeHdrUsable());
@@ -1653,6 +1664,23 @@
   function playbackFailed(stream) {
     if (!stream || !stream.capsPath || stream.capsFailed) return;
     stream.capsFailed = true;
+    // A start with the 5.1 commentary (encrypted 4K HDR) that fails counts against the 5.1, not against HDR: the retry
+    // plays the same HDR in stereo (feedsCtx.noSurround), and only if that fails too does HDR take the blame.
+    if (stream.surround) {
+      feedsCtx.noSurround = true;
+      if (typeof Caps !== 'undefined') {
+        Caps.failed('avplay:ac3');
+        if (Player.stream() === stream) Caps.crashEnd();
+      }
+      return;
+    }
+    // F1's Tiledmedia offer (AES-128 HLS on Shaka) that fails: today's 4K HDR route next (feedsCtx.tmFailed), and only
+    // a failure of that one counts against HDR.
+    if (stream.hlsAes) {
+      feedsCtx.tmFailed = true;
+      if (typeof Caps !== 'undefined') Caps.failed('shaka:hlsaes');
+      return;
+    }
     if (typeof Caps !== 'undefined') {
       Caps.failed(stream.capsPath);
       if (Player.stream() === stream) Caps.crashEnd();
@@ -1671,8 +1699,12 @@
       Player.decodedFrames() !== 0) {
       s.capsOk = true;
       Caps.ok(s.capsPath);
+      if (s.surround && Player.audioChannels() > 2) Caps.ok('avplay:ac3');   // only when the 5.1 is what plays
     }
-    if (s.capsOk && !s.capsFailed && !s.capsEnded && Player.engineName() === 'avplay' && !Player.isPaused()) Caps.crashStart(s.capsPath);
+    // A crash while the 5.1 plays counts against the 5.1 first (as a failed start does): the next start leaves it out.
+    if (s.capsOk && !s.capsFailed && !s.capsEnded && Player.engineName() === 'avplay' && !Player.isPaused()) {
+      Caps.crashStart(s.surround && Player.audioChannels() > 2 ? 'avplay:ac3' : s.capsPath);
+    }
     else Caps.crashEnd();
   }
 
@@ -1801,20 +1833,42 @@
 
   function mvStreams(mv) {
     var prev = Player.stream() && Player.stream().grid;
-    if (prev && prev.layout === mv.layout && prev.slots.join() === mv.slots.join() && prev.audio === mvSound(mv)) return Promise.resolve(prev.streams);
-    var list = [], sound = mvSound(mv);
-    return mv.slots.reduce(function (chain, idx, k) {
+    if (prev && prev.layout === mv.layout && prev.slots.join() === mv.slots.join() && prev.audio === mvSound(mv) &&
+        prev.streams.every(function (o) { return o.offeredWho === F1Api.state.ascendon; })) return Promise.resolve(prev.streams);
+    var list = [], sound = mvSound(mv), asked = 0;
+    // The feeds of the multiview playing keep their offers (another sound, say): only what's missing is asked for, and
+    // the new sound's feed if encrypted HDR needs its full offer (licence, commentary, the clock), not the video alone.
+    // Only for the same video and arrangement (just another sound), and offers under 30 min old (signed addresses).
+    var have = {}, playing = Player.stream();
+    if (prev && !mv.fresh && mv.engine !== 'h264' && prev.engine !== 'h264' && playing.contentId === feedsCtx.contentId &&
+        prev.layout === mv.layout && prev.slots.join() === mv.slots.join()) {
+      prev.slots.forEach(function (idx, k) { have[idx] = prev.streams[k]; });
+    }
+    // Offers carry the sign-in they were asked with (licence headers): a renewed sign-in asks again.
+    var reusable = function (idx) {
+      var o = have[idx];
+      return !!o && Date.now() - (o.offeredAt || 0) < 30 * 60 * 1000 && o.offeredWho === F1Api.state.ascendon &&
+        (idx !== sound || !o.hdrEncrypted || !!o.widevineManifestUrl);
+    };
+    var reused = 0;
+    return mv.slots.reduce(function (chain, idx) {
       return chain.then(function () {
-        return (k ? new Promise(function (r) { setTimeout(r, 800); }) : Promise.resolve()).then(function () {
+        if (reusable(idx)) { reused++; return have[idx]; }
+        return (asked++ ? new Promise(function (r) { setTimeout(r, 800); }) : Promise.resolve()).then(function () {
           // The sound's feed gets the full offer (licence, commentary, the clock); the others their HDR video alone.
           // H.264: the usual offers (there is no HDR or HEVC to ask for).
-          return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, mv.engine === 'h264' ? {} : { hdr: hdrWanted(), hdrOnly: idx !== sound, cbcs: nativeHdrUsable() });
-        }).then(function (s) {
-          mvCheck(s, list[0], idx);
-          list.push(s);
+          return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, mv.engine === 'h264' ? {} : { hdr: hdrWanted(), hdrOnly: idx !== sound, cbcs: nativeHdrUsable() })
+            .then(function (s) { s.offeredAt = Date.now(); s.offeredWho = F1Api.state.ascendon; return s; });
         });
+      }).then(function (s) {
+        mvCheck(s, list[0], idx);
+        list.push(s);
       });
-    }, Promise.resolve()).then(function () { return list; });
+    }, Promise.resolve()).then(function () { return list; }, function (e) {
+      // A kept offer that no longer fits (F1 republished the replay as clear HDR, say): every feed asked anew, once.
+      if (!reused || mv.fresh) throw e;
+      return mvStreams(Object.assign({}, mv, { fresh: true }));
+    });
   }
 
   var mvStall = null, mvDrawn = '';
@@ -2107,9 +2161,12 @@
 
   function feedLabel(stream) {
     var grid = stream ? stream.grid : feedsCtx.multiview;
-    if (grid) return 'Multiview · ' + (mvHeights(grid.layout) || []).length + ' feeds' + (stream && stream.hdr ? ' · HDR' : '');
+    // What plays: HDR, and 5.1 when the playing stream's audio has more than two channels.
+    var ch = stream && Player.stream() === stream && Player.audioChannels ? Player.audioChannels() : null;
+    var tags = [stream && stream.hdr ? 'HDR' : '', ch > 2 ? (ch === 6 ? '5.1' : ch === 8 ? '7.1' : 'Surround') : ''].filter(Boolean);
+    if (grid) return ['Multiview · ' + (mvHeights(grid.layout) || []).length + ' feeds'].concat(tags).join(' · ');
     var title = feedsCtx.feeds.length > 1 ? feedsCtx.feeds[feedsCtx.index].title : '';
-    return title + (stream && stream.hdr ? (title ? ' · HDR' : 'HDR') : '');
+    return [title].concat(tags).filter(Boolean).join(' · ');
   }
 
   function loadFeed(i, opts) {
@@ -2163,7 +2220,7 @@
       var stream, route = sdrPath();
       return (from || playing ? Promise.resolve() : Player.unload())
         .then(function () {
-          if (!mv) return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(), cenc: route !== 'avplay:cbcs', cbcs: nativeHdrUsable() });
+          if (!mv) return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(), tm: tmWanted(), langs: f.langs, mainChannel: f.tmChannel, cenc: route !== 'avplay:cbcs', cbcs: nativeHdrUsable() });
           // Multiview: the first feed's offer gives the clock, licence and commentary; the player builds the grid.
           // How it plays (mvEngine) needs the playing offer's HEVC heights: a resumed multiview hasn't read them yet.
           return (mv.engine ? Promise.resolve() : mvReadSource()).then(function () {
@@ -2189,6 +2246,10 @@
           stream.cencAvplay = !!stream.cenc && route === 'avplay:cenc';
           if (stream.licenseUrl) stream.capsPath = stream.hdrEncrypted ? 'avplay:hdr' :
             (stream.cenc ? (stream.cencAvplay || stream.grid ? 'avplay:cenc' : 'shaka:cenc') : 'avplay:cbcs');
+          // Encrypted HDR adds the 5.1 commentary where there is one (hdr.js), unless this video's start with it failed
+          // or this TV has learned that it doesn't play it ('avplay:ac3').
+          if (stream.hdrEncrypted) stream.noSurround = !!feedsCtx.noSurround || (typeof Caps !== 'undefined' && Caps.avoided('avplay:ac3'));
+          if (stream.hlsAes) stream.capsPath = 'shaka:hlsaes';   // learned per TV like the DRM paths
           // Live HDR plays on the official live DASH timeline (the helper swaps in the HLG video).
           var timeline = stream.hdrEncrypted && stream.live ? stream.widevineManifestUrl : stream.url;
           return F1Api.streamInfo(timeline).then(function (info) { stream.info = info; }, function () {}).then(function () {
@@ -2200,11 +2261,12 @@
           // Superseded by a newer request, or the viewer left the player while it loaded.
           if (feedsCtx.index !== i || queuedFeed || screen !== 'player') return;
           // Keys in the variant playlist: not playable here; the catch below falls back to SDR.
-          if (stream.hdr && stream.info && stream.info.encrypted && !stream.hdrEncrypted) throw new Error('encrypted HDR stream');
+          if (stream.hdr && stream.info && stream.info.encrypted && !stream.hdrEncrypted && !stream.hlsAes) throw new Error('encrypted HDR stream');
           // Live HDR plays only natively, on the official live timeline (HdrStream.live).
           if (stream.hdr && stream.live && !stream.hdrEncrypted) throw new Error('HDR: live needs the native path');
           $('osd-feed').textContent = feedLabel(stream);
           var start = startPosition(stream.info, opts, from);
+          stream.askedStart = start;   // a retry of a start that never played (AVPlay reports 0) asks for it again
           // Where the lead decided the start (not a requested moment, a live point or the stream's own edge).
           var leadPlaced = !!from && !from.paused && !atLive && opts.startAt == null && !opts.liveAt && start != null;
           // Live (dynamic) streams on AVPlay can't seek at start-up; instead the local service
@@ -2287,6 +2349,28 @@
             if (!queuedFeed && screen === 'player') playFeed(i, again);
             return;
           }
+          // The retry of this load: the moment it asked for, or for a switch the outgoing feed's moment carried on, and
+          // a pause pressed while it loaded.
+          var retryOpts = function (extra) {
+            var recovery = Object.assign({}, opts, extra, { recover: true });
+            if (from) recovery.switchPaused = switchPause != null ? switchPause : from.paused;
+            // Native preparation replaces the outgoing player. Its failed stream reports zero,
+            // so retain the outgoing moment rather than deriving a new target from that zero.
+            if (atLive) recovery.atLive = true;
+            else if (from && recovery.startAt == null && recovery.liveAt == null) {
+              var ahead = from.paused ? 0 : (Date.now() - from.at) / 1000 + switchLead;
+              if (from.wall) recovery.liveAt = from.wall + ahead;
+              else recovery.startAt = from.pos + ahead;
+            }
+            return recovery;
+          };
+          // A start with the 5.1 commentary failed (held against the 5.1 above): the same HDR, multiview included, in stereo.
+          // F1's Tiledmedia offer failed: today's 4K HDR route.
+          if (stream && (stream.surround || stream.hlsAes)) {
+            diag('play.fallback', { to: stream.hlsAes ? 'hdr-usual' : 'hdr-stereo' });
+            if (!queuedFeed && screen === 'player') playFeed(i, retryOpts({}));
+            return;
+          }
           // Multiview failed: the big feed alone (a failed switch leaves the previous video playing).
           if (mv && feedsCtx.multiview === mv) {
             feedsCtx.multiview = null;
@@ -2310,17 +2394,7 @@
             diag('play.fallback', { to: hdrFailure ? (feedsCtx.hdrFailed ? 'sdr' : 'hdr-again') : 'cbcs',
               hdrFailures: feedsCtx.hdrFailures || 0 });
             // Queue the retry behind this load; a newer feed request still wins.
-            var recovery = Object.assign({}, opts, hdrFailure ? { hdrRetry: true } : {}, { recover: true });
-            if (from) recovery.switchPaused = switchPause != null ? switchPause : from.paused;
-            // Native preparation replaces the outgoing player. Its failed stream reports zero,
-            // so retain the outgoing moment rather than deriving a new target from that zero.
-            if (atLive) recovery.atLive = true;
-            else if (from && recovery.startAt == null && recovery.liveAt == null) {
-              var ahead = from.paused ? 0 : (Date.now() - from.at) / 1000 + switchLead;
-              if (from.wall) recovery.liveAt = from.wall + ahead;
-              else recovery.startAt = from.pos + ahead;
-            }
-            if (!queuedFeed && screen === 'player') playFeed(i, recovery);
+            if (!queuedFeed && screen === 'player') playFeed(i, retryOpts(hdrFailure ? { hdrRetry: true } : {}));
             return;
           }
           if (F1Api.isNotStarted(e) && feedsCtx.playing == null) {
@@ -2421,7 +2495,7 @@
       o.switching = true;
       o.switchPaused = from.paused;
     } else {
-      ['startAt', 'liveAt', 'fromStart', 'atLive'].forEach(function (k) { if (opts[k] != null) o[k] = opts[k]; });
+      ['startAt', 'liveAt', 'fallbackAt', 'fromStart', 'atLive'].forEach(function (k) { if (opts[k] != null) o[k] = opts[k]; });
     }
     return o;
   }
@@ -2449,14 +2523,19 @@
       toast('The video didn\'t start, trying again…', 3000);
       // Through playFeed so it queues behind any other load instead of racing it.
       // AVPlay reports no position until it plays: 0 is no moment of the stream, so the retry repeats the request.
+      // A start that never played (AVPlay reports 0) retries at the position it asked for.
+      if (!(from > 0) && (stream.surround || stream.hlsAes) && stream.askedStart > 0) from = stream.askedStart;
       var wall = from > 0 ? Player.wallClock(from) : null;
-      if (stream.grid) feedsCtx.multiview = null;   // the retry plays the big feed alone
+      if (stream.surround || stream.hlsAes) { /* playbackFailed turned the 5.1 or the Tiledmedia offer off: HDR again */ }
+      else if (stream.grid) feedsCtx.multiview = null;   // the retry plays the big feed alone
       else if (stream.hdr) { feedsCtx.hdrFailed = true; feedsCtx.hdrFailures = (feedsCtx.hdrFailures || 0) + 1; }
       else if (stream.cenc) feedsCtx.cencFailed = true;
       var again = {};
       Object.keys(opts || {}).forEach(function (k) { if (k !== 'switching') again[k] = opts[k]; });   // a fresh load
       again.retry = true;
       if (Player.isLive() && wall) again = { liveAt: wall, retry: true };
+      // The usual HDR offer after the Tiledmedia one is another package: the same moment by its clock, else position.
+      else if (!Player.isLive() && from && stream.hlsAes && wall) again = { liveAt: wall, fallbackAt: from, retry: true };
       else if (!Player.isLive() && from) again = { startAt: from, retry: true };
       playFeed(feedsCtx.index, again);
     }, stream.hdr ? 25000 : 15000);
@@ -2513,6 +2592,8 @@
       // one at or past its end, at live.
       if (at != null && info) at = Math.max(at, info.windowStart + (info.dynamic ? 15 : 0));
       if (at != null && (!info || at < info.windowEnd)) return at;
+      // A replay whose clock can't place the moment: the position it had (replays share a timeline).
+      if (opts.fallbackAt > 0 && !(info && info.dynamic)) return opts.fallbackAt;
     }
     if (from) {
       var ahead = from.paused ? 0 : (Date.now() - from.at) / 1000 + switchLead;
@@ -3772,13 +3853,18 @@
       if (screen !== 'player' || loadingFeed) return;
       var s = Player.stream();
       playbackFailed(s);
-      var fallback = !!(s && !s.grid && s.capsPath && (s.hdr || sdrPath() !== s.capsRoute));
+      var fallback = !!(s && s.capsPath && (s.surround || s.hlsAes || (!s.grid && (s.hdr || sdrPath() !== s.capsRoute))));
       // A failure while playing (the load's own catch or start watch records the others); final when nothing follows.
       dplay('failed', null, info ? { diag: info } : null, { runtime: true, final: !fallback });
       if (fallback) {
-        if (s.hdr) feedsCtx.hdrFailed = true;
-        var wall = Player.wallClock(Player.position());
-        playFeed(feedsCtx.index, recovering(wall ? { liveAt: wall } : { startAt: Player.position() }));
+        // With the 5.1 or the Tiledmedia offer: HDR again first, without them.
+        if (s.hdr && !s.surround && !s.hlsAes) feedsCtx.hdrFailed = true;
+        // The position, or before it played the one it was asked to start at.
+        var pos = Player.position() > 0 ? Player.position() : (s.askedStart > 0 ? s.askedStart : 0);
+        var wall = pos > 0 ? Player.wallClock(pos) : null;
+        // The same HDR stream without the 5.1 shares this timeline: its position needs no clock lookup. Another
+        // package (after the Tiledmedia offer) by the clock, its position if that can't be placed.
+        playFeed(feedsCtx.index, recovering(wall && !s.surround ? { liveAt: wall, fallbackAt: pos || null } : { startAt: pos }));
       }
     });
     // During a jump the pending-seek logic owns the spinner (it waits a moment before showing it).

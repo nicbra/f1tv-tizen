@@ -42,8 +42,34 @@ var F1Api = (function () {
     return (typeof Diag !== 'undefined' && Diag.recording()) || (typeof DiagUpload !== 'undefined' && DiagUpload.enabled());
   }
 
+  /**
+   * F1's PLAY endpoint is rate-limited per IP by CloudFront: ~250 PLAY requests in 3-4 min blocked playback for the
+   * whole household for 30-45 min (2026-10-28), with an HTML 403 "Request blocked" (or a 429). Every further request
+   * then only lengthens the block, so after one, PLAY requests wait: Retry-After where given, else 10 min. The block
+   * is CloudFront's, not F1's: an F1 answer (JSON, such as "Not entitled") never starts it.
+   */
+  var playBlockedUntil = 0;   // on monotonic() time, so a TV clock change neither ends nor stretches it
+  var PLAY_BLOCK_MS = 10 * 60 * 1000;
+  function isPlay(url) { return /\/CONTENT\/PLAY\?/.test(url); }
+  function monotonic() { return typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now(); }
+  /** How long a block lasts: Retry-After in seconds or as an HTTP date (0 included), else 10 min; at most 1 h. */
+  function blockMs(retryAfter) {
+    var v = String(retryAfter || '').trim(), ms = PLAY_BLOCK_MS;
+    if (/^\d+$/.test(v)) ms = +v * 1000;
+    else if (v && !isNaN(Date.parse(v))) ms = Date.parse(v) - Date.now();
+    return Math.max(0, Math.min(ms, 60 * 60 * 1000));
+  }
+
   function http(url, opts) {
     opts = opts || {};
+    if (isPlay(url) && monotonic() < playBlockedUntil) {
+      var waiting = new Error('F1 TV is limiting video requests from this network for a few minutes. Try again in ' +
+        Math.max(1, Math.ceil((playBlockedUntil - monotonic()) / 60000)) + ' min.');
+      waiting.status = 429;
+      waiting.blocked = true;
+      waiting.local = true;   // nothing was asked: no HTTP result for the diagnostics
+      return Promise.reject(waiting);
+    }
     return fetch(url, {
       method: opts.method || 'GET',
       headers: opts.headers || {},
@@ -54,15 +80,21 @@ var F1Api = (function () {
       throw e;
     }).then(function (res) {
       return res.text().then(function (text) {
-        var data = null;
-        try { data = text ? JSON.parse(text) : null; } catch (e) { /* not JSON */ }
+        var data = null, json = false;
+        try { data = text ? JSON.parse(text) : null; json = !!text; } catch (e) { /* not JSON */ }
         if (!res.ok) {
           var msg = (data && (data.message || (data.resultObj && data.resultObj.message))) || ('HTTP ' + res.status);
           var err = new Error(msg);
           err.status = res.status;
           err.data = data;
           // An HTML 403 is CloudFront's per-IP block ("Request blocked"), not an F1 TV answer.
-          diag('api.http', { url: url, status: res.status, message: msg, blocked: !data && /Request blocked/i.test(text) });
+          var blocked = !json && (res.status === 429 || (res.status === 403 && /Request blocked/i.test(text)));
+          diag('api.http', { url: url, status: res.status, message: msg, blocked: blocked });
+          if (blocked && isPlay(url)) {
+            var ms = blockMs(res.headers && res.headers.get ? res.headers.get('Retry-After') : '');
+            playBlockedUntil = Math.max(playBlockedUntil, monotonic() + ms);
+            err.blocked = true;
+          }
           failed(opts.op, res.status, 0);
           throw err;
         }
@@ -202,11 +234,142 @@ var F1Api = (function () {
   }
 
   /**
-   * The tvOS request's HLG offer. Clear HLS stays on Shaka; supported CBCS uses the normal Widevine offer.
-   * Null unless F1 answers with that (it gives SDR to Pro and for old replays), so the caller can fall back.
+   * The last HLS master an HDR check read ({ url, base (where it was answered from), who, text, at }): hlsInfo reads it
+   * again within a minute, for the same sign-in, instead of the CDN.
    */
-  function playHdr(contentId, channelId, offers) {
-    var ask = probe(offers, 'hdr', playOn(PLAY_PLATFORMS[0], contentId, channelId, 'device=tvos;')).then(function (r) {
+  var lastMaster = null;
+  function keepMaster(url, text, base) { lastMaster = { url: url, base: base || url, who: state.ascendon, text: text, at: Date.now() }; return text; }
+
+  var LANG3 = { en: 'eng', de: 'deu', fr: 'fra', nl: 'nld', pt: 'por', ja: 'jpn', es: 'spa', it: 'ita' };
+  function lang3(l) { l = String(l || '').toLowerCase(); return LANG3[l] || l; }
+  /** One attribute of an HLS tag line, exactly (LANGUAGE is not ASSOC-LANGUAGE). */
+  function hlsAttr(line, name) {
+    var m = new RegExp('[:,]' + name + '=(?:"([^"]*)"|([^,]*))').exec(line);
+    return m ? (m[1] != null ? m[1] : m[2]) : '';
+  }
+
+  /** F1's Tiledmedia answers (playTm), per sign-in and video, the last few: every feed of the video, kept TM_KEEP ms. */
+  var tmAnswers = [];
+  var TM_KEEP = 30 * 60 * 1000;
+  var tmAsking = {};   // requests under way, per sign-in and video (a prefetch and a start share one)
+
+  /**
+   * F1's Tiledmedia answer for a video (cached, shared while asked, else one PLAY): { feeds: { channel: url },
+   * subs: { channel: [lang] }, main, streamType, entitlementToken, refused }, or null after a sign-in change.
+   */
+  function tmAnswerFor(contentId, want, mainChannel) {
+    var id = String(contentId), who = state.ascendon, key = who + '|' + id;
+    var mainOf = function (t) { return t.main || (mainChannel && t.feeds[mainChannel] ? String(mainChannel) : null); };
+    var a = tmAnswers.filter(function (x) { return x.key === key && Date.now() < x.until; })[0];
+    if (a && (a.refused || (want ? Object.keys(a.feeds).length > 0 : !!mainOf(a)))) return Promise.resolve(a);
+    var asking = tmAsking[key];
+    if (asking && (want || !asking.want)) return asking.promise;
+    var url = [BASE, state.playApi, 'R', LANG, 'BIG_SCREEN_HLS', 'ALL/CONTENT/PLAY'].join('/') +
+      '?contentId=' + encodeURIComponent(contentId) + '&player=player_tm' + (want ? '&channelId=' + encodeURIComponent(want) : '');
+    var headers = authHeaders();
+    headers['x-f1-device-info'] = 'device=tvos;';
+    var promise = http(url, { headers: headers }).then(function (data) {
+      var r = (data && data.resultObj) || {}, feeds = {}, subs = {};
+      ((r.tme && r.tme.feeds) || []).forEach(function (f) {
+        var ch = f && f.metadata && f.metadata.channel_id;
+        if (ch == null || typeof f.url !== 'string') return;
+        feeds[String(ch)] = f.url;
+        // The subtitles F1's player offers on it (eng_subtitle, ...): the playlist must have them all.
+        subs[String(ch)] = Object.keys(f.subtitle_track_names || {}).map(function (k) { return lang3(k.replace(/_subtitle$/, '')); });
+      });
+      var same = a && !a.refused && a.streamType === (r.streamType || '') ? a : null;
+      return { key: key, until: Date.now() + TM_KEEP, streamType: r.streamType || '', entitlementToken: r.entitlementToken,
+        feeds: feeds, subs: subs, refused: !Object.keys(feeds).length,
+        main: want ? (same && same.main) : (r.channelId != null ? String(r.channelId) : null) };
+    }, function (e) {
+      // F1 answering no (Pro, or a rule this request doesn't meet) is kept 30 min; a block or a failure only briefly.
+      var answered = e && !e.blocked && e.data != null && e.status >= 400;
+      return { key: key, until: Date.now() + (answered ? TM_KEEP : 60 * 1000), streamType: '', feeds: {}, subs: {}, refused: true, main: null };
+    }).then(function (t) {
+      if (tmAsking[key] && tmAsking[key].promise === promise) delete tmAsking[key];
+      if (state.ascendon !== who) return null;   // signed out or in as someone else meanwhile: neither kept nor used
+      tmAnswers = [t].concat(tmAnswers.filter(function (x) { return x.key !== key; })).slice(0, 4);
+      return t;
+    });
+    // Its own deadline: a request that never answers must not hold every later start of the video (6 s, then 1 min off).
+    var timer = null;
+    promise = Promise.race([promise, new Promise(function (resolve) {
+      timer = setTimeout(function () {
+        if (tmAsking[key] && tmAsking[key].promise === shared) delete tmAsking[key];
+        if (state.ascendon !== who) return resolve(null);
+        var off = { key: key, until: Date.now() + 60 * 1000, streamType: '', feeds: {}, subs: {}, refused: true, main: null };
+        tmAnswers = [off].concat(tmAnswers.filter(function (x) { return x.key !== key; })).slice(0, 4);
+        resolve(off);
+      }, 6000);
+    })]).then(function (t) { clearTimeout(timer); return t; });
+    var shared = promise;
+    tmAsking[key] = { want: want, promise: promise };
+    return promise;
+  }
+
+  /**
+   * F1's Tiledmedia offer, as F1's own Apple TV and Android TV players ask (player=player_tm), with device=tvos;.
+   * One answer has every feed of the video (tme.feeds: channel_id and HLS url; with no channelId asked, its channelId
+   * is the main feed's). For Premium it is HDR_UHD_HLSCK: 4K/1080p HLG, the AC-3 5.1 on F1 LIVE, and AES-128 with the
+   * key address in the playlist, which Shaka decrypts itself (no DRM). The answer is kept 30 min for the video's other
+   * feeds (its addresses last hours), so feed switches need no PLAY request. Resolves an offer for the feed, or null
+   * unless it is such HDR (SDR for Pro, untested; old replays): the caller asks the usual way then.
+   */
+  function playTm(contentId, channelId, langs, mainChannel) {
+    var want = channelId ? String(channelId) : null, who = state.ascendon;
+    return tmAnswerFor(contentId, want, mainChannel).then(function (t) {
+      var ch = t && !t.refused ? want || t.main || (mainChannel && t.feeds[mainChannel] ? String(mainChannel) : null) : null;
+      var url = ch && t.feeds[ch];
+      if (!url || !/^HDR_/.test(t.streamType) || !/\.m3u8(\?|$)/.test(url)) return null;
+      return fetch(url).then(function (res) {
+        return res.ok ? res.text().then(function (text) { return { text: text, base: res.url || url }; }) : { text: '' };
+      }).then(function (got) {
+        var master = got.text;
+        if (state.ascendon !== who || !/^#EXTM3U\s/.test(master)) return null;
+        // Whole-segment AES-128, with its key at an address the playlist names: never FairPlay or Widevine, nor a master
+        // that names no key (its variants could still use another kind).
+        var keys = master.match(/^#EXT-X-(?:SESSION-)?KEY:.*$/gm) || [];
+        if (!keys.length || !keys.every(function (k) {
+          return hlsAttr(k, 'METHOD') === 'AES-128' && /^https:\/\//.test(hlsAttr(k, 'URI')) && /^(identity)?$/.test(hlsAttr(k, 'KEYFORMAT'));
+        })) return null;
+        // The HLG variants, and their own sound and subtitles with every language F1 names for the feed: TRACKER and DATA
+        // have no sound here (F1's player takes another feed's), onboards only team radio. Those play the usual offer.
+        var groups = {}, textGroups = {};
+        (master.match(/^#EXT-X-STREAM-INF:.*$/gm) || []).forEach(function (l) {
+          if (hlsAttr(l, 'VIDEO-RANGE') !== 'HLG') return;
+          groups[hlsAttr(l, 'AUDIO')] = true;
+          textGroups[hlsAttr(l, 'SUBTITLES')] = true;
+        });
+        if (!Object.keys(groups).length) return null;
+        var langsOf = function (type, use) {
+          return (master.match(/^#EXT-X-MEDIA:.*$/gm) || []).filter(function (l) {
+            return hlsAttr(l, 'TYPE') === type && use[hlsAttr(l, 'GROUP-ID')];
+          }).map(function (l) { return lang3(hlsAttr(l, 'LANGUAGE')); });
+        };
+        var have = langsOf('AUDIO', groups), texts = langsOf('SUBTITLES', textGroups);
+        if (!have.length || (langs || []).some(function (l) { return have.indexOf(lang3(l)) < 0; })) return null;
+        if (((t.subs || {})[ch] || []).some(function (l) { return texts.indexOf(l) < 0; })) return null;
+        keepMaster(url, master, got.base);
+        return { url: url, streamType: t.streamType, platform: 'BIG_SCREEN_HLS', entitlementToken: t.entitlementToken, hdr: true,
+          hlsAes: true, who: who };
+      });
+    }).catch(function () { return null; });
+  }
+
+  /**
+   * The tvOS request's HLG offer. Clear HLS stays on Shaka; supported CBCS uses the normal Widevine offer.
+   * With `tm`, F1's Tiledmedia offer is asked first (playTm). Null unless F1 answers with HDR (it gives SDR to Pro
+   * and for old replays), so the caller can fall back.
+   */
+  function playHdr(contentId, channelId, offers, tm, langs, mainChannel) {
+    var late = false;   // past HDR_WAIT: the caller plays SDR, and no further HDR request goes out
+    if (tm && offers) offers.hdr = 'no_answer';
+    var first = tm ? playTm(contentId, channelId, langs, mainChannel) : Promise.resolve(null);
+    var ask = first.then(function (t) {
+      if (t) { if (offers && !late) offers.hdr = offerFamily(t); return t; }
+      return late ? null : usual();
+    });
+    function usual() { return probe(offers, 'hdr', playOn(PLAY_PLATFORMS[0], contentId, channelId, 'device=tvos;')).then(function (r) {
       if (!/^HDR_/.test(r.streamType || '') || typeof r.url !== 'string' ||
           !/\.m3u8(\?|$)/.test(r.url) || ((r.laURL || r.laUrl) && !/CMAFFP/.test(r.streamType))) return null;
       // tvOS may receive FairPlay streams, which this player cannot decrypt.
@@ -214,6 +377,7 @@ var F1Api = (function () {
         if (!res.ok) return null;
         return res.text().then(function (master) {
           if (!/^#EXTM3U\s/.test(master)) return null;
+          keepMaster(r.url, master, res.url);
           if (hasKeys(master)) {
             var keys = master.match(/^#EXT-X-(?:SESSION-)?KEY:.*$/gm) || [];
             if (!/CMAFFP/.test(r.streamType) || !keys.length || !keys.every(function (k) {
@@ -225,10 +389,10 @@ var F1Api = (function () {
           return r;
         });
       });
-    }).catch(function () { return null; });
+    }).catch(function () { return null; }); }
     // Never let the extra request hold up playback.
     return new Promise(function (resolve) {
-      var timer = setTimeout(function () { resolve(null); }, HDR_WAIT);
+      var timer = setTimeout(function () { late = true; resolve(null); }, HDR_WAIT);
       ask.then(function (r) { clearTimeout(timer); resolve(r); });
     });
   }
@@ -270,6 +434,11 @@ var F1Api = (function () {
       var ask = playOn(platform, contentId, channelId);
       if (offers) probe(offers, 'web', ask);   // a later platform only after the first failed
       return ask.catch(function (e) {
+        // A block applies to every platform: stop here (and an answer this app didn't ask for is no HTTP result).
+        if (e && e.blocked) {
+          if (!e.local) failed('playback_offer', e.status, i - 1);
+          throw e;
+        }
         if (!firstErr) firstErr = e;
         lastErr = e;
         return next();
@@ -278,7 +447,7 @@ var F1Api = (function () {
     // F1 decides what an account gets: the HDR request is asked for every account, and its answer is used
     // only when it is HDR (playHdr). Otherwise (Pro gets SDR from it) the normal request, as before.
     var request = opts && opts.hdr
-      ? playHdr(contentId, channelId, offers).then(function (hdr) {
+      ? playHdr(contentId, channelId, offers, !!opts.tm, opts.langs, opts.mainChannel).then(function (hdr) {
         // Apple TV is the only 4K HDR offer: clear HLS on some replays, cbcs on others and live.
         // There is no cenc HDR. Keep clear HDR when the TV has learned to avoid native cbcs.
         if (!hdr || (hdr.hdrEncrypted && opts.cbcs === false)) return next();
@@ -316,6 +485,12 @@ var F1Api = (function () {
       };
       if (r.hdr) stream.hdr = true;
       if (r.cenc) stream.cenc = true;
+      // AES-128 HLS (playTm): Shaka fetches the key from the playlist's address, with the account's tokens.
+      if (r.hlsAes) {
+        if (r.who !== state.ascendon) throw new Error('Signed in again while the video was asked for');
+        stream.hlsAes = true;
+        stream.keyHeaders = { ascendontoken: r.who, entitlementtoken: r.entitlementToken || state.entitlement };
+      }
       if (r.hdrEncrypted) { stream.hdrEncrypted = true; stream.widevineManifestUrl = r.widevineManifestUrl; }
       if (offers) {
         (offers.close || []).forEach(function (close) { close(); });
@@ -351,21 +526,28 @@ var F1Api = (function () {
   }
 
   /**
-   * A video's feeds, its main stream first: [{ title, type, channelId, hex, full, num }].
+   * A video's feeds, its main stream first: [{ title, type, channelId, hex, full, num, langs }]. `langs`: the audio
+   * languages F1's video information names for the feed (its commentaries, `tea` for team radio), where it names any.
    * INTERNATIONAL's playbackUrl names no channel: it is the main stream, and F1 rejects its channelId
    * (1025) for most replays, so it names the first entry instead of being listed twice.
    */
   function feedsFrom(m) {
-    var main = { title: 'Main feed', type: 'Broadcast', channelId: null };
+    var main = { title: 'Main feed', type: 'Broadcast', channelId: null, langs: [] }, mainSeen = false;
     var feeds = [main];
     ((m && m.additionalStreams) || []).forEach(function (s) {
       var name = s.title || s.reportingName || (s.driverFirstName && (s.driverFirstName + ' ' + s.driverLastName)) || 'Feed';
-      var channelId = feedChannel(s);
+      var channelId = feedChannel(s), langs = Object.keys(s.audioTrackNames || {});
       if (!channelId) {
-        if (s.type !== 'obc' && main.title === 'Main feed' && !/^main/i.test(name)) main.title = name;
+        if (s.type !== 'obc' && !mainSeen) {
+          mainSeen = true;
+          if (!/^main/i.test(name)) main.title = name;
+          main.langs = langs;
+          // Its channel, never asked for (F1 rejects it for most replays) but named in a Tiledmedia answer (playTm).
+          if (s.channelId != null) main.tmChannel = String(s.channelId);
+        }
         return;
       }
-      feeds.push({ title: name, type: s.type === 'obc' ? (s.teamName || 'Onboard') : '', channelId: channelId, hex: s.hex || '',
+      feeds.push({ title: name, type: s.type === 'obc' ? (s.teamName || 'Onboard') : '', channelId: channelId, hex: s.hex || '', langs: langs,
         full: s.driverFirstName ? s.driverFirstName + ' ' + s.driverLastName : '',
         num: s.type === 'obc' && s.racingNumber != null ? String(s.racingNumber) : '' });
     });
@@ -559,13 +741,14 @@ var F1Api = (function () {
    * which give the real clock time of segments; marks maps player positions to Unix seconds.
    */
   function hlsInfo(url) {
-    var offer = null;
-    return manifest(url, /^\s*#EXTM3U/).then(function (master) {
+    var m = lastMaster, kept = m && m.url === url && m.who === state.ascendon && Date.now() - m.at < 60000 ? m : null;
+    var offer = null, base = kept ? kept.base : url;
+    return (kept ? Promise.resolve(kept.text) : manifest(url, /^\s*#EXTM3U/)).then(function (master) {
       offer = withOffer({}, hlsOffer, master).offer || null;
       var lines = master.split('\n');
       for (var i = 0; i < lines.length - 1; i++) {
         if (lines[i].indexOf('#EXT-X-STREAM-INF') === 0) {
-          return manifest(new URL(lines[i + 1].trim(), url).toString(), /^\s*#EXTM3U/);
+          return manifest(new URL(lines[i + 1].trim(), base).toString(), /^\s*#EXTM3U/);
         }
       }
       return master;
@@ -649,6 +832,10 @@ var F1Api = (function () {
     play: play,
     menu: menu,
     feedsFrom: feedsFrom,
+    /** Asks F1's Tiledmedia offer for a video ahead of playing it (the feed list opened), so a start needs no PLAY. */
+    prefetchTm: function (contentId, mainChannel) {
+      return state.ascendon ? tmAnswerFor(contentId, null, mainChannel).then(function () { return null; }, function () { return null; }) : Promise.resolve(null);
+    },
     scheduleFrom: scheduleFrom,
     seasonFrom: seasonFrom,
     streamInfo: streamInfo,

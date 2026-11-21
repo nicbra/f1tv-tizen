@@ -27,12 +27,12 @@ v/hd.m3u8
 sdr.m3u8
 `;
 const playlist=`#EXTM3U\n#EXT-X-MAP:URI="init.mp4?sig=one&n=2"\n#EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.apple.streamingkeydelivery",URI="skd://${hdrKid}"\n#EXTINF:5.76,\nv_100.m4s?sig=keep&n=2\n#EXTINF:5.76,\nv_101.m4s?sig=keep&n=2\n#EXT-X-ENDLIST\n`;
-function harness(overrides={}, redirects={}){
- const calls=[];
- const ctx=vm.createContext({CmafDash,URL,Uint8Array,AbortController,setTimeout,clearTimeout,btoa:s=>Buffer.from(s,'binary').toString('base64'),atob:s=>Buffer.from(s,'base64').toString('binary'),fetch:async (url,opts={})=>{calls.push({url,opts});let body=url.endsWith('master.m3u8')?master:url.endsWith('.mpd')?mpd:url.includes('.m3u8')?playlist:url.includes('init.mp4')?init:frag;body=overrides[url]??body;return {ok:true,url:redirects[url]||url,text:async()=>body,arrayBuffer:async()=>Uint8Array.from(body).buffer};}});
+function harness(overrides={}, redirects={}, langs={audio:'deu',text:'eng'}, late={}){
+ const calls=[];let offset=0;
+ const ctx=vm.createContext({CmafDash,URL,Uint8Array,AbortController,setTimeout,clearTimeout,Date:{now:()=>Date.now()+offset},btoa:s=>Buffer.from(s,'binary').toString('base64'),atob:s=>Buffer.from(s,'base64').toString('binary'),fetch:async (url,opts={})=>{calls.push({url,opts});offset+=late[url]||0;let body=url.endsWith('master.m3u8')?master:url.endsWith('.mpd')?mpd:url.includes('.m3u8')?playlist:url.includes('init.mp4')?init:frag;body=overrides[url]??body;return {ok:true,url:redirects[url]||url,text:async()=>body,arrayBuffer:async()=>Uint8Array.from(body).buffer};}});
  vm.runInContext(fs.readFileSync('app/js/hdr.js','utf8'),ctx);
- const built=()=>ctx.HdrStream.build({url:'https://video.formula1.com/vod/master.m3u8',widevineManifestUrl:'https://video.formula1.com/sdr/index.mpd'},{audio:'deu',text:'eng'});
- return {calls,built,build:()=>built().then(r=>r.mpd)};
+ const built=()=>ctx.HdrStream.build({url:'https://video.formula1.com/vod/master.m3u8',widevineManifestUrl:'https://video.formula1.com/sdr/index.mpd'},langs);
+ return {calls,built,build:()=>built().then(r=>r.mpd),ctx};
 }
 test('encrypted HDR keeps only HLG qualities and preserves every official commentary',async()=>{
  const h=harness(),xml=await h.build();
@@ -56,6 +56,84 @@ for(const [name,url,body] of [
  ['no HLG','https://video.formula1.com/vod/master.m3u8',master.replaceAll('VIDEO-RANGE=HLG','VIDEO-RANGE=SDR')]
 ])test('encrypted HDR rejects '+name+' for safe SDR recovery',async()=>{await assert.rejects(harness({[url]:body}).build());});
 
+
+// F1 LIVE and the shows: a second audio group with AC-3 5.1 (English, Spanish) beside the stereo AAC, on the video's key.
+const master51=master.replace('#EXT-X-STREAM-INF:BANDWIDTH=18000000,','#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="ac3",CHANNELS="6",NAME="eng",LANGUAGE="eng",URI="a/eng51.m3u8"\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="ac3",CHANNELS="6",NAME="spa",LANGUAGE="spa",URI="a/spa51.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=18384000,RESOLUTION=3840x2160,CODECS="hev1.2.4.L153.B0,ac-3",VIDEO-RANGE=HLG,AUDIO="ac3"\nv/uhd.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=18000000,');
+const surroundSets=xml=>(xml.match(/<AdaptationSet[^>]*>(?:(?!<\/AdaptationSet>)[\s\S])*codecs="ac-3"[\s\S]*?<\/AdaptationSet>/g)||[]);
+test('encrypted HDR adds the HLS 5.1 commentary on the video key and clock, through the helper, after the chosen stereo language',async()=>{
+ const xml=await harness({'https://video.formula1.com/vod/master.m3u8':master51}).build();
+ const sets=surroundSets(xml);
+ assert.equal(sets.length,2);
+ assert.ok(sets[0].includes('lang="eng"')&&sets[1].includes('lang="spa"'));
+ assert.ok(sets.every(x=>x.includes('cenc:default_KID="'+hdrKid+'"')&&x.includes('urn:uuid:edef8ba9')));
+ assert.ok(sets[0].includes('/s/'+Buffer.from('https://video.formula1.com/vod/a/').toString('base64url')+'/v_$Number$.m4s?sig=keep&amp;n=2'));
+ assert.ok(sets[0].includes('presentationTimeOffset="89669822112000"'));
+ // The viewer chose German, which only the stereo commentary has: AVPlay starts on it.
+ assert.ok(xml.indexOf('<AdaptationSet contentType="audio" lang="deu"')<xml.indexOf('codecs="ac-3"'));
+});
+test('encrypted HDR starts on the 5.1 commentary in the chosen language',async()=>{
+ const xml=await harness({'https://video.formula1.com/vod/master.m3u8':master51},{},{audio:'spa',text:''}).build();
+ const first=xml.indexOf('<AdaptationSet contentType="audio"');
+ assert.ok(xml.slice(first,xml.indexOf('</AdaptationSet>',first)).includes('codecs="ac-3"'));
+ assert.ok(xml.slice(first,xml.indexOf('</AdaptationSet>',first)).includes('lang="spa"'));
+ assert.ok(xml.indexOf('codecs="ac-3"')<xml.indexOf('<AdaptationSet contentType="audio" lang="eng"'));
+});
+test('encrypted HDR multiview adds the 5.1 commentary of the feed whose sound plays',async()=>{
+ const h=harness({'https://video.formula1.com/vod/master.m3u8':master51,'http://127.0.0.1:18765/stitch/g1':JSON.stringify({width:3840,height:3264,codecs:'hev1.2.4.L153.B0'})});
+ h.ctx.MultiviewLayouts={layouts:{duo:{feeds:[2160,1080]}}};h.ctx.navigator={userAgent:'test'};
+ const lead={url:'https://video.formula1.com/vod/master.m3u8',widevineManifestUrl:'https://video.formula1.com/sdr/index.mpd',hdr:true,hdrEncrypted:true};
+ const {mpd}=await h.ctx.HdrStream.grid([lead,{url:'https://video.formula1.com/vod/master.m3u8',hdr:true}],'duo',{id:'g1',langs:{audio:'eng',text:''},audio:0});
+ const first=mpd.indexOf('<AdaptationSet contentType="audio"');
+ assert.ok(mpd.slice(first,mpd.indexOf('</AdaptationSet>',first)).includes('codecs="ac-3"'));
+ assert.equal(surroundSets(mpd).length,2);
+ assert.ok(mpd.includes('<AdaptationSet contentType="audio" lang="deu"')); // the official commentary stays
+});
+test('encrypted HDR multiview takes the 5.1 of the feed whose sound plays, not of the first feed',async()=>{
+ for(const [sound,expect] of [[1,2],[0,0]]){
+  const h=harness({'https://video.formula1.com/vod2/master.m3u8':master51,'http://127.0.0.1:18765/stitch/g2':JSON.stringify({width:3840,height:3264,codecs:'hev1.2.4.L153.B0'})});
+  h.ctx.MultiviewLayouts={layouts:{duo:{feeds:[2160,1080]}}};h.ctx.navigator={userAgent:'test'};
+  const sdr='https://video.formula1.com/sdr/index.mpd';
+  const feeds=[{url:'https://video.formula1.com/vod/master.m3u8',widevineManifestUrl:sdr,hdr:true,hdrEncrypted:true},
+   {url:'https://video.formula1.com/vod2/master.m3u8',widevineManifestUrl:sdr,hdr:true,hdrEncrypted:true}];
+  const built=await h.ctx.HdrStream.grid(feeds,'duo',{id:'g2',langs:{audio:'eng',text:''},audio:sound});
+  assert.equal(surroundSets(built.mpd).length,expect);
+  assert.equal(built.surround,expect);
+ }
+});
+test('encrypted HDR adds no 5.1 when the app asks for none (a start with it failed, or the TV learned it fails)',async()=>{
+ const r=await harness({'https://video.formula1.com/vod/master.m3u8':master51},{},{audio:'eng',text:'',surround:false}).built();
+ assert.equal(surroundSets(r.mpd).length,0);assert.equal(r.surround,0);
+});
+test('the 5.1 never makes encrypted HDR miss its deadline: none when the preparation is already late',async()=>{
+ // The master arrives 8.5 s into the preparation (of 12): no time is left for the optional 5.1, stereo HDR plays.
+ const r=await harness({'https://video.formula1.com/vod/master.m3u8':master51},{},{audio:'eng',text:''},{'https://video.formula1.com/vod/master.m3u8':8500}).built();
+ assert.equal(surroundSets(r.mpd).length,0);
+ assert.ok(r.mpd.includes('width="3840" height="2160"'));
+});
+test('Spanish chosen as "spa" starts on the 5.1 that the HLS master calls "es"',async()=>{
+ const m=master51.replace('LANGUAGE="spa"','LANGUAGE="es"');
+ const official=mpd.replace('lang="deu"','lang="spa"');
+ const xml=await harness({'https://video.formula1.com/vod/master.m3u8':m,'https://video.formula1.com/sdr/index.mpd':official},{},{audio:'spa',text:''}).build();
+ const first=xml.indexOf('<AdaptationSet contentType="audio"');
+ const set=xml.slice(first,xml.indexOf('</AdaptationSet>',first));
+ assert.ok(set.includes('codecs="ac-3"')&&set.includes('lang="spa"'));
+});
+const otherKidInit=Buffer.from(init.toString('binary').replace(Buffer.from(hdrKid.replaceAll('-',''),'hex').toString('binary'),Buffer.from(kid.replaceAll('-',''),'hex').toString('binary')),'binary');
+const otherClock=box('moof',box('traf',box('tfdt',Buffer.concat([Buffer.from([1,0,0,0]),(()=>{const b=Buffer.alloc(8);b.writeBigUInt64BE(89669832112000n);return b;})()]))));
+for(const [name,more] of [
+ ['declared on another key',{'https://video.formula1.com/vod/a/eng51.m3u8':playlist.replace(hdrKid,kid)}],
+ ['on another key',{'https://video.formula1.com/vod/a/eng51.m3u8':playlist.replace(hdrKid,kid),'https://video.formula1.com/vod/a/init.mp4?sig=one&n=2':otherKidInit}],
+ ['longer than the video',Object.fromEntries(['eng51','spa51'].map(n=>['https://video.formula1.com/vod/a/'+n+'.m3u8',playlist.replace('#EXT-X-ENDLIST','#EXTINF:5.76,\nv_102.m4s?sig=keep&n=2\n#EXT-X-ENDLIST')]))],
+ ['a segment too short to write',{'https://video.formula1.com/vod/a/eng51.m3u8':playlist.replace('#EXTINF:5.76,\nv_101','#EXTINF:5.759999,\nv_101').replace('#EXT-X-ENDLIST','#EXTINF:0.000001,\nv_102.m4s?sig=keep&n=2\n#EXT-X-ENDLIST')}],
+ ['at an invalid address',{'https://video.formula1.com/vod/master.m3u8':master51.replace('URI="a/spa51.m3u8"','URI="http://[bad"')}],
+ ['on another clock',{'https://video.formula1.com/vod/a/v_100.m4s?sig=keep&n=2':otherClock}],
+ ['unreachable',{'https://video.formula1.com/vod/a/spa51.m3u8':'not a playlist'}]
+])test('encrypted HDR keeps the stereo commentary when the 5.1 is '+name,async()=>{
+ const xml=await harness(Object.assign({'https://video.formula1.com/vod/master.m3u8':master51},more)).build();
+ assert.equal(surroundSets(xml).length,0);
+ assert.ok(!/PT(?!11\.52S)[\d.]+S"/.test(xml.match(/mediaPresentationDuration="[^"]*"/)[0]));   // the video's length
+ assert.ok(xml.includes('<AdaptationSet contentType="audio" lang="eng"')&&xml.includes('width="3840" height="2160"'));
+});
 
 test('CDN redirects determine every relative manifest and media base',async()=>{
  const h=harness({}, {
