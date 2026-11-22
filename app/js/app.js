@@ -1642,17 +1642,25 @@
 
   function nativeHdrUsable() { return pathUsable('avplay:hdr') && pathUsable('avplay:cbcs'); }
 
+  function hdrAllowed() { return Settings.get('hdr') && !feedsCtx.hdrFailed && Player.hdrCapable(); }
+
   /**
-   * F1's Tiledmedia offer first (api.js playTm: every feed's 4K HDR in one answer, AES-128 HLS on Shaka): replays of
-   * one feed only for now (live and multiview keep today's routes), until it failed for this video or on this TV.
+   * F1's Tiledmedia offer first (api.js playTm: every feed's 4K HDR in one answer, AES-128 HLS on Shaka) for one feed,
+   * replays and live alike (multiview keeps its routes), until it failed for this video or on this TV. It needs no DRM,
+   * so it plays where AVPlay's Widevine doesn't (Tizen 5 can't decrypt cbcs, Tizen 9's AVPlay + Widevine crashed), and
+   * the TS work runs in a worker (ts-offload.js). Live on Shaka sits further behind real time than AVPlay (~46 s against
+   * ~30 s, F1 Academy 2026-11-22): compatibility first (user's choice, 2026-11-22).
    */
   function tmWanted() {
-    return hdrWanted() && !feedsCtx.live && !feedsCtx.tmFailed && pathUsable('shaka:hlsaes');
+    return hdrAllowed() && !feedsCtx.tmFailed && pathUsable('shaka:hlsaes');
   }
 
-  function hdrWanted() {
-    // Live needs native cbcs HDR. Replays can still accept a clear Apple TV HLS offer (api.js).
-    return Settings.get('hdr') && !feedsCtx.hdrFailed && Player.hdrCapable() && (!feedsCtx.live || nativeHdrUsable());
+  /**
+   * 4K HDR asked for. Live HDR otherwise needs native cbcs (AVPlay); `oneFeed` (not multiview) also takes F1's
+   * Tiledmedia offer. Replays can also take a clear Apple TV HLS offer (api.js).
+   */
+  function hdrWanted(oneFeed) {
+    return hdrAllowed() && (!feedsCtx.live || nativeHdrUsable() || (!!oneFeed && tmWanted()));
   }
 
   function failPath(path) {
@@ -1669,6 +1677,8 @@
    */
   function unclearFailure(info, message) {
     if (typeof navigator !== 'undefined' && navigator.onLine === false) return true;
+    // The TS worker stopped under a segment (ts-offload.js): the app's own fault; later loads transmux on the page.
+    if (/TS worker stopped/.test(String(message || ''))) return true;
     if (!info) return false;
     if (info.code === 'NETWORK_ERROR') return info.platform !== 'PLAYER_ERROR_CONNECTION_FAILED';
     // AVPlay's licence download ('License: '), except a refusal (4xx: this TV or account may never get one).
@@ -2235,7 +2245,7 @@
       var stream, route = sdrPath();
       return (from || playing ? Promise.resolve() : Player.unload())
         .then(function () {
-          if (!mv) return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(), tm: tmWanted(), langs: f.langs, mainChannel: f.tmChannel, cenc: route !== 'avplay:cbcs', cbcs: nativeHdrUsable() });
+          if (!mv) return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(true), tm: tmWanted(), langs: f.langs, mainChannel: f.tmChannel, cenc: route !== 'avplay:cbcs', cbcs: nativeHdrUsable() });
           // Multiview: the first feed's offer gives the clock, licence and commentary; the player builds the grid.
           // How it plays (mvEngine) needs the playing offer's HEVC heights: a resumed multiview hasn't read them yet.
           return (mv.engine ? Promise.resolve() : mvReadSource()).then(function () {
@@ -2280,8 +2290,8 @@
           if (feedsCtx.index !== i || queuedFeed || screen !== 'player') return;
           // Keys in the variant playlist: not playable here; the catch below falls back to SDR.
           if (stream.hdr && stream.info && stream.info.encrypted && !stream.hdrEncrypted && !stream.hlsAes) throw new Error('encrypted HDR stream');
-          // Live HDR plays only natively, on the official live timeline (HdrStream.live).
-          if (stream.hdr && stream.live && !stream.hdrEncrypted) throw new Error('HDR: live needs the native path');
+          // Live HDR plays natively on the official live timeline (HdrStream.live), or as F1's Tiledmedia HLS on Shaka.
+          if (stream.hdr && stream.live && !stream.hdrEncrypted && !stream.hlsAes) throw new Error('HDR: live needs the native path');
           $('osd-feed').textContent = feedLabel(stream);
           var start = startPosition(stream.info, opts, from);
           stream.askedStart = start;   // a retry of a start that never played (AVPlay reports 0) asks for it again

@@ -741,21 +741,37 @@ test('a refused Tiledmedia request, or a feed its answer lacks, asks no further 
   assert.equal(plays(lacking.calls).filter((c) => /player_tm/.test(c.url)).length, 1);
 });
 
-test('no HDR request goes out after the 8 s wait', async () => {
+test('no HDR request goes out after the whole wait (5 s for the Tiledmedia offer + 8 s)', async () => {
   let release;
   const tmHeld = new Promise((r) => { release = r; });
   const route = (url, init) => /player_tm/.test(url) ? tmHeld : tmRoute()(url, init);
-  const timers = [];
-  const { F1Api, calls } = api(route, { setTimeout: (fn, ms) => { if (ms === 8000) { timers.push(fn); return 1; } return setTimeout(fn, ms); } });
+  const timers = {};
+  const { F1Api, calls } = api(route, { setTimeout: (fn, ms) => { if (ms === 13000 || ms === 5000) { (timers[ms] = timers[ms] || []).push(fn); return 1; } return setTimeout(fn, ms); } });
   Object.assign(F1Api.state, { ascendon: 'ASC', entitlement: 'ENT' });
   const started = F1Api.play('42', '1033', { hdr: true, tm: true });
   await new Promise((r) => setImmediate(r));
-  timers.forEach((fn) => fn());                  // HDR_WAIT is over: SDR plays
+  timers[13000].forEach((fn) => fn());           // the whole wait is over: SDR plays
   const stream = await started;
   assert.equal(stream.url, SDR.url);
   release({ status: 500, body: { message: 'Failed to evaluate stream rule' } });   // the Tiledmedia answer comes late
+  (timers[5000] || []).forEach((fn) => fn());
   await new Promise((r) => setTimeout(r, 20));
   assert.ok(!plays(calls).some((c) => /player_bm/.test(c.url) && c.init.headers['x-f1-device-info'] === 'device=tvos;'));
+});
+
+test('a Tiledmedia offer that takes over 5 s gives way to the usual 4K HDR request, which still gets its 8 s', async () => {
+  const tmHeld = new Promise(() => {});
+  const route = (url, init) => /player_tm/.test(url) ? tmHeld : tmRoute()(url, init);
+  const timers = {};
+  const { F1Api, calls } = api(route, { setTimeout: (fn, ms) => { if (ms === 13000 || ms === 5000 || ms === 6000) { (timers[ms] = timers[ms] || []).push(fn); return 1; } return setTimeout(fn, ms); } });
+  Object.assign(F1Api.state, { ascendon: 'ASC', entitlement: 'ENT' });
+  const started = F1Api.play('42', '1033', { hdr: true, tm: true });
+  await new Promise((r) => setImmediate(r));
+  timers[5000].forEach((fn) => fn());            // TM_WAIT
+  const stream = await started;
+  assert.equal(stream.hdr, true);
+  assert.ok(!stream.hlsAes);
+  assert.ok(plays(calls).some((c) => /player_bm|PLAY\?contentId=42&channelId/.test(c.url) && c.init.headers['x-f1-device-info'] === 'device=tvos;'));
 });
 
 for (const [name, master] of [

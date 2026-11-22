@@ -1288,7 +1288,9 @@ test('a TV that has learned the 5.1 fails asks for encrypted HDR without it', as
 const tmOffers = (asked) => (id, channel, opts) => {
   asked.push(Object.assign({}, opts));
   if (opts && opts.tm) return Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '/tm.m3u8', streamType: 'HDR_UHD_HLSCK', hdr: true, hlsAes: true });
-  return premiumOffer(id, channel);
+  // As api.js: encrypted 4K HDR only where native cbcs is usable, else the normal (SDR) offer.
+  if (opts && opts.hdr && opts.cbcs !== false) return premiumOffer(id, channel).then((o) => Object.assign(o, { widevineManifestUrl: 'https://cdn/' + id + '/live.mpd' }));
+  return Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' });
 };
 test('a replay asks F1\'s Tiledmedia offer first; if it never plays, today\'s 4K HDR route follows, held against that offer only', async () => {
   const asked = [];
@@ -1317,7 +1319,7 @@ test('a replay asks F1\'s Tiledmedia offer first; if it never plays, today\'s 4K
   assert.equal(caps51(again)['shaka:hlsaes'].ok, 1);
 });
 
-test('F1\'s Tiledmedia offer is not asked for live, nor where this TV learned it fails', async () => {
+test('F1\'s Tiledmedia offer is not asked where this TV learned it fails, for replays or live', async () => {
   const asked = [];
   const record = { version: 1, firmware: 'unknown', browser: { cenc: true, cbcs: false }, paths: { 'shaka:hlsaes': { ok: 0, failed: 2, crashed: 0, last: NOW, streak: 2 } }, appVersion: '1.0.0' };
   const app = await premiumHdr({ play: tmOffers(asked), store: { 'f1tv.caps': JSON.stringify(record) } });
@@ -1325,10 +1327,56 @@ test('F1\'s Tiledmedia offer is not asked for live, nor where this TV learned it
   await app.advance(1000);
   assert.equal(asked.at(-1).tm, false);
   assert.equal(asked.at(-1).hdr, true);
-  const live = await premiumHdr({ play: tmOffers(asked) });
-  live.player.live = true;
+  const live = await premiumHdr({ play: tmOffers(asked), store: { 'f1tv.caps': JSON.stringify(record) } });
   await playLive(live);
   assert.equal(asked.at(-1).tm, false);
+  assert.equal(asked.at(-1).hdr, true);
+  assert.ok(live.player.current.hdrEncrypted, 'native live HDR, as before');
+});
+
+// Live (2026-11-22, user: compatibility before latency): F1's Tiledmedia offer first, on Shaka; then native HDR; then SDR.
+test('live asks F1\'s Tiledmedia offer first and plays it on Shaka; a start that never plays goes on to native HDR', async () => {
+  const asked = [];
+  const live = await premiumHdr({ play: tmOffers(asked) });
+  await playLive(live);
+  await live.advance(1000);
+  assert.equal(asked[0].tm, true);
+  assert.ok(live.player.current.hlsAes);
+  assert.equal(live.player.current.live, true);
+  assert.equal(live.player.engine, 'shaka');
+  await live.advance(26000);                     // the start watch: no progress
+  assert.equal(asked.at(-1).tm, false);
+  assert.equal(asked.at(-1).hdr, true);
+  assert.ok(live.player.current.hdrEncrypted, 'native live HDR next');
+  assert.equal(caps51(live)['shaka:hlsaes'].failed, 1);
+  assert.equal(caps51(live)['avplay:hdr'], undefined);
+});
+
+test('a TS worker that stopped under F1\'s Tiledmedia offer is not held against that offer', async () => {
+  const asked = [];
+  const app = await premiumHdr({ play: tmOffers(asked) });
+  await play(app, 'Race');
+  await app.advance(1000);
+  assert.ok(app.player.current.hlsAes);
+  app.player.listeners.error('Playback error 3018: TS worker stopped: segment timed out', { code: 'OTHER', platform: '3018' });
+  await app.advance(1000);
+  assert.ok(!caps51(app)['shaka:hlsaes'] || !caps51(app)['shaka:hlsaes'].failed, JSON.stringify(caps51(app)['shaka:hlsaes']));
+});
+
+test('a TV without native HDR (Tizen 5, 9) gets live 4K HDR from F1\'s Tiledmedia offer, and SDR if that fails', async () => {
+  const asked = [];
+  const live = await premiumHdr({ play: tmOffers(asked), store: learnedStore(['avplay:cbcs']) });
+  await playLive(live);
+  await live.advance(1000);
+  assert.equal(asked[0].tm, true);
+  assert.equal(asked[0].hdr, true);
+  assert.equal(asked[0].cbcs, false);
+  assert.ok(live.player.current.hlsAes && live.player.current.hdr);
+  assert.equal(live.player.engine, 'shaka');
+  await live.advance(26000);                     // never plays
+  assert.equal(asked.at(-1).tm, false);
+  assert.equal(asked.at(-1).hdr, false, 'no native HDR to try: SDR');
+  assert.ok(!live.player.current.hdr);
 });
 
 test('watch options open a multiview page: layouts as pictures, then a feed for each place', async () => {
@@ -3501,7 +3549,9 @@ test('remembered cbcs crashes skip native live HDR, request cenc for live and re
     assert.equal(app.player.engine, 'shaka');
     assert.equal(offers[0].cenc, true);
     assert.equal(offers[0].cbcs, false);
-    if (live) assert.equal(offers[0].hdr, false);
+    // Live HDR is still asked for, from F1's Tiledmedia offer only (no native cbcs here); none is offered in this test.
+    if (live) assert.equal(offers[0].tm, true);
+    assert.ok(!app.player.current.hdr);
     app.player.listeners.error('Shaka DRM error');
     await app.advance(1000);
     assert.equal(app.player.engine, 'avplay');

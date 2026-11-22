@@ -11,6 +11,9 @@ var F1Api = (function () {
   var PAGE_PLATFORM = 'WEB_DASH';
   // How long the extra HDR request may take before playback goes ahead without it.
   var HDR_WAIT = 8000;
+  // F1's Tiledmedia offer (PLAY, usually answered ahead by prefetchTm, plus its master) gets its own share first, so a
+  // slow one still leaves the usual HDR request its full HDR_WAIT (live: native HDR before SDR).
+  var TM_WAIT = 5000;
   // Playback requires this header in web-player format; 'device=tv' is rejected.
   var DEVICE_INFO = 'device=web;screen=browser;os=tizen;browser=chrome;browserVersion=76;' +
     'osVersion=6.0;appVersion=55.0.3;playerVersion=8.212.0;p=false;tms=1';
@@ -364,7 +367,11 @@ var F1Api = (function () {
   function playHdr(contentId, channelId, offers, tm, langs, mainChannel) {
     var late = false;   // past HDR_WAIT: the caller plays SDR, and no further HDR request goes out
     if (tm && offers) offers.hdr = 'no_answer';
-    var first = tm ? playTm(contentId, channelId, langs, mainChannel) : Promise.resolve(null);
+    var tmLate = false;
+    var first = !tm ? Promise.resolve(null) : new Promise(function (resolve) {
+      var timer = setTimeout(function () { tmLate = true; resolve(null); }, TM_WAIT);
+      playTm(contentId, channelId, langs, mainChannel).then(function (t) { clearTimeout(timer); resolve(tmLate ? null : t); });
+    });
     var ask = first.then(function (t) {
       if (t) { if (offers && !late) offers.hdr = offerFamily(t); return t; }
       return late ? null : usual();
@@ -390,9 +397,9 @@ var F1Api = (function () {
         });
       });
     }).catch(function () { return null; }); }
-    // Never let the extra request hold up playback.
+    // Never let the extra request hold up playback (with the Tiledmedia offer first: its own TM_WAIT more at most).
     return new Promise(function (resolve) {
-      var timer = setTimeout(function () { late = true; resolve(null); }, HDR_WAIT);
+      var timer = setTimeout(function () { late = true; resolve(null); }, HDR_WAIT + (tm ? TM_WAIT : 0));
       ask.then(function (r) { clearTimeout(timer); resolve(r); });
     });
   }

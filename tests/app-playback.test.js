@@ -24,7 +24,7 @@ function playback(load, capable = true, opts = {}) {
     F1Api: {
       state: {}, isNotStarted: () => false, savePosition: async () => {},
       play: async (id, channel, o) => {
-        requests.push({ id, channel, hdr: o.hdr, cenc: o.cenc });
+        requests.push({ id, channel, hdr: o.hdr, cenc: o.cenc, tm: o.tm });
         offers.push(o);
         const hdr = o.hdr && !(opts.authorizedHdr && o.cbcs === false);
         const drm = opts.protected ? { licenseUrl: 'https://lic/wv' } : {};
@@ -81,7 +81,7 @@ test('HDR load and switch failures retry the same feed in SDR with the same star
     for (let i = 0; i < 5; i++) await settle();
     assert.equal(ctx.hdrFailed, true);
     assert.deepEqual(h.requests.slice(-2), [
-      { id: '42', channel: 'car', hdr: true, cenc: false }, { id: '42', channel: 'car', hdr: false, cenc: false }
+      { id: '42', channel: 'car', hdr: true, cenc: false, tm: true }, { id: '42', channel: 'car', hdr: false, cenc: false, tm: false }
     ]);
     assert.deepEqual(h.loads.slice(-2).map((l) => [l.position, l.switching]), [[87, switching], [87, switching]]);
     assert.doesNotMatch(h.nodes.toast?.textContent || '', /Could not play/);
@@ -350,12 +350,13 @@ test('this TV keeps clear HDR on Shaka, encrypted HDR on AVPlay, and cenc replay
   }
 });
 
-test('clear HDR replays remain available when native HDR is avoided; live skips that offer', async () => {
+test('clear HDR replays remain available when native HDR is avoided; live asks only F1\'s Tiledmedia offer for HDR', async () => {
   for (const live of [false, true]) {
     const h = playback(null, true, { caps: ['avplay:hdr'], cencCapable: true, protected: true });
     h.app.set(video({ live })); h.app.play(0, {}); await settle();
-    assert.equal(h.requests[0].hdr, !live);
-    assert.equal(!!h.loads[0].stream.hdr, !live);
+    assert.equal(h.requests[0].hdr, true);
+    assert.equal(h.requests[0].tm, true);
+    assert.equal(!!h.loads[0].stream.hdr, !live);   // this harness offers clear HDR for replays and no Tiledmedia HLS
     assert.equal(h.offers[0].cbcs, false);
   }
 });

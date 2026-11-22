@@ -630,7 +630,7 @@ test('the freeze checks repeat until 15 s: a seek whose data comes after the 5 s
   at(7500); at(10000); at(12500);
   await new Promise(setImmediate);
   assert.equal(loads, 2);
-  assert.deepEqual(timers.map((t) => t.ms).filter((ms) => ms >= 2500 && ms <= 15000).sort((a, b) => a - b), [2500, 5000, 7500, 10000, 12500, 15000]);
+  assert.deepEqual(timers.map((t) => t.ms).filter((ms) => ms >= 2500 && ms <= 15000 && ms % 2500 === 0).sort((a, b) => a - b), [2500, 5000, 7500, 10000, 12500, 15000]);
 });
 
 test('the frozen-HDR reload stands down after a stop, starts from a seek, and does not undo a pause', async () => {
@@ -1100,4 +1100,21 @@ test('player uses saved browser EME evidence without issuing a launch probe, and
   const before = ended;
   await P.unload();
   assert.equal(ended, before + 1);
+});
+
+test('a Shaka start whose play() never resolves still finishes loading, so the app\'s start watch runs', async () => {
+  const timers = [];
+  const P = await player(fakeAvPlay(), undefined, () => Promise.resolve(),
+    { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return 0; } });
+  P.forceEngine = 'shaka';
+  Object.assign(P.videos[0], { readyState: 1, currentTime: 0, play: () => new Promise(() => {}),
+    buffered: { length: 0 }, getVideoPlaybackQuality: () => ({ totalVideoFrames: 0 }) });
+  let done = false;
+  const loading = P.load({ url: 'https://cdn/tm.m3u8', licenseUrl: '', multiFeed: true, hdr: true, hlsAes: true, info: { dynamic: true } }, null)
+    .then(() => { done = true; });
+  await new Promise(setImmediate);
+  assert.equal(done, false);
+  timers.filter((t) => t.ms === 3000).forEach((t) => t.fn());
+  await loading;
+  assert.equal(done, true);
 });

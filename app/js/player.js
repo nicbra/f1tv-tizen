@@ -214,6 +214,11 @@ var Player = (function () {
     }
 
     var SURROUND = 6;
+    // Live HLS (F1's Tiledmedia offer): Shaka starts this many segments (each rounded up: 6 s for F1's 5.76 s) behind
+    // the playlist's end, unless the playlist says HOLD-BACK. Shaka's default, 3, played ~46 s behind real time
+    // (F1 Academy, 2026-11-22; AVPlay's live DASH ~30 s). Fewer may stall when F1 publishes a segment late: to be
+    // measured at a live session (Player.setHlsLiveSegments in DevTools; the next load uses it).
+    var hlsLiveSegments = 3;
 
     function configure(slot, stream) {
       var player = slot.p;
@@ -240,7 +245,7 @@ var Player = (function () {
         abr: { enabled: true, defaultBandwidthEstimate: startEstimate(slot, stream.hdr), useNetworkInformation: false, switchInterval: 4 },
         // F1's DASH says minBufferTime PT30S, and Shaka waits for max(that, rebufferingGoal) at playbackRate 0 before
         // playing: a live start ~25 s from the edge can't buffer 30 s, so it sat frozen ~10 s (Las Vegas FP1, 2026-11-20).
-        manifest: { hls: { ignoreManifestProgramDateTime: false }, dash: { ignoreMinBufferTime: true } }
+        manifest: { hls: { ignoreManifestProgramDateTime: false, liveSegmentsDelay: hlsLiveSegments }, dash: { ignoreMinBufferTime: true } }
       });
     }
 
@@ -273,7 +278,9 @@ var Player = (function () {
         var started = slot.v.play();
         keepPlaying(slot.v, 5000);
         if (stream.hdr || stream.cenc) reloadIfFrozen(slot, stream, startTime, gen);
-        return started && started.catch(function () {});
+        // play() resolves only once the video plays: a start that never gets there (no decodable data) must still end
+        // the load, so the app's start watch runs and falls back (Codex review 2026-11-22).
+        return started && Promise.race([started.catch(function () {}), new Promise(function (r) { setTimeout(r, 3000); })]);
       });
     }
 
@@ -417,7 +424,9 @@ var Player = (function () {
         old.v.style.zIndex = '2';           // keep the old picture on top until the new one runs
         next.v.style.zIndex = '1';
         next.v.classList.remove('hidden');
-        return next.v.play().catch(function () { /* paused by the TV; whenPlaying retries below */ });
+        // Bounded like loadSlot's: whenPlaying below decides.
+        return Promise.race([next.v.play().catch(function () { /* paused by the TV; whenPlaying retries below */ }),
+          new Promise(function (r) { setTimeout(r, 3000); })]);
       }).then(function () {
         keepPlaying(next.v, 3000, true);
         return whenPlaying(next.v, 3000);
@@ -500,6 +509,7 @@ var Player = (function () {
         return a && a.channelsCount ? a.channelsCount : null;
       },
       setSubtitles: function (l) { textTrack(P(), l); },
+      setHlsLiveSegments: function (n) { hlsLiveSegments = Math.max(1, Math.min(6, Math.round(+n) || 3)); return hlsLiveSegments; },
       unload: unload,
       isLive: function () { return P().isLive(); },
       range: function () { return P().seekRange(); },
@@ -1286,6 +1296,8 @@ var Player = (function () {
     avTuning: AvEngine.tuning,
     wallClock: wallClock,
     positionAt: positionAt,
+    /** DevTools: how many segments behind a live HLS playlist's end Shaka starts (3 = Shaka's default). */
+    setHlsLiveSegments: function (n) { return ShakaEngine.setHlsLiveSegments(n); },
     stream: function () { return current; },
     togglePause: traced('player.togglePause', togglePause, function () { return { wasPaused: !!(engine && engine.paused()) }; }),
     isLive: proxy('isLive', false),
