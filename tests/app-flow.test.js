@@ -336,9 +336,17 @@ async function boot(options = {}) {
     decodedFrames: () => (player.engine ? player.frames : null),
     // player.live: a live stream with an hour of DVR window up to its live edge (window positions 1000-4600).
     range: () => (!player.engine ? { start: 0, end: 0 } : player.live ? { start: 1000, end: 4600 } : { start: 0, end: 7200 }),
-    bufferedEnd: () => player.pos,
+    // player.buffered: seconds buffered ahead (10 by default; 0: no data arrived).
+    bufferedEnd: () => player.pos + (player.buffered == null ? 10 : player.buffered),
+    // player.reloadedMs: when the engine loaded a frozen start again (player.js reloadIfFrozen).
+    reloadedSince: (t) => (player.reloadedMs || 0) >= t,
+    reloadedAt: () => player.reloadedMs || 0,
+    // As player.js for the errors tests make: an error's own `info` ({ code, platform }), else OTHER.
+    errorInfo: (e) => (e && e.info) || { code: 'OTHER', platform: null },
     isLive: () => !!player.engine && !!player.live,
     isPaused: () => !!player.engine && player.paused,
+    // player.viewerPaused: the viewer's own pause where it differs from the element's (Shaka, while reloading).
+    isViewerPaused: () => !!player.engine && (player.viewerPaused != null ? player.viewerPaused : player.paused),
     togglePause() { player.paused = !player.paused; },
     seekTo(p) { player.pos = p; },
     seekBy(d) { player.pos += d; },
@@ -1250,8 +1258,25 @@ test('a start with 5.1 that never plays retries at the position it asked for, th
   assert.equal(Math.round(app.player.loads.at(-1).start), Math.round(asked));
 });
 
+test('live 4K HDR with 5.1 that errors before its first position retries stereo at the live point, not position 0', async () => {
+  const app = await premiumHdr({ play: (id, channel) => premiumOffer(id, channel).then((o) => Object.assign(o, { widevineManifestUrl: 'https://cdn/' + id + '/live.mpd' })) });
+  app.player.surround = 1;
+  await playLive(app, 'avplay');
+  await app.advance(2000);
+  assert.ok(app.player.current.hdrEncrypted && app.player.current.surround === 1);
+  const first = app.player.loads.length;
+  app.player.pos = 0;   // AVPlay: no position yet
+  app.player.listeners.error('Player error: PLAYER_ERROR_GENEREIC', { code: 'OTHER', platform: null });
+  await app.advance(1000);
+  const load = app.player.loads.at(-1);
+  assert.ok(app.player.loads.length > first, 'it tried again');
+  assert.ok(app.player.current.noSurround && app.player.current.hdrEncrypted, 'the same HDR, in stereo');
+  // Position 0 of the window would be over an hour behind live (a shift the helper can't serve).
+  assert.ok(load.start == null && !(app.player.current.startDelay > 0), 'retried at the live point, not ' + app.player.current.startDelay + ' s behind');
+});
+
 test('a TV that has learned the 5.1 fails asks for encrypted HDR without it', async () => {
-  const record = { version: 1, firmware: 'unknown', browser: { cenc: true, cbcs: false }, paths: { 'avplay:ac3': { ok: 0, failed: 2, crashed: 0, last: NOW, streak: 2 } } };
+  const record = { version: 1, firmware: 'unknown', browser: { cenc: true, cbcs: false }, paths: { 'avplay:ac3': { ok: 0, failed: 2, crashed: 0, last: NOW, streak: 2 } }, appVersion: '1.0.0' };
   const app = await premiumHdr({ play: premiumOffer, store: { 'f1tv.caps': JSON.stringify(record) } });
   app.player.surround = 2;
   await play(app, 'Race');
@@ -1294,7 +1319,7 @@ test('a replay asks F1\'s Tiledmedia offer first; if it never plays, today\'s 4K
 
 test('F1\'s Tiledmedia offer is not asked for live, nor where this TV learned it fails', async () => {
   const asked = [];
-  const record = { version: 1, firmware: 'unknown', browser: { cenc: true, cbcs: false }, paths: { 'shaka:hlsaes': { ok: 0, failed: 2, crashed: 0, last: NOW, streak: 2 } } };
+  const record = { version: 1, firmware: 'unknown', browser: { cenc: true, cbcs: false }, paths: { 'shaka:hlsaes': { ok: 0, failed: 2, crashed: 0, last: NOW, streak: 2 } }, appVersion: '1.0.0' };
   const app = await premiumHdr({ play: tmOffers(asked), store: { 'f1tv.caps': JSON.stringify(record) } });
   await play(app, 'Race');
   await app.advance(1000);
@@ -3497,6 +3522,104 @@ test('native cbcs error learns a failure, clears the marker and falls back to ce
   assert.equal(app.context.Caps.report().paths['avplay:cbcs'].failed, 1);
   assert.equal(app.player.current.capsPath, 'avplay:cenc');
   assert.equal(app.player.current.cencAvplay, true);
+});
+
+test('network and licence-server failures fall back for the video but are not held against the path', async () => {
+  const offers = [];
+  const app = await boot({ capsRouting: true, settings: { hdr: false }, play: protectedOffers(offers) });
+  await playLive(app);
+  assert.equal(app.player.engine, 'shaka');
+  app.player.listeners.error('Playback error 1002', { code: 'NETWORK_ERROR', platform: '1002' });
+  await app.advance(1000);
+  assert.equal(app.player.current.capsPath, 'avplay:cbcs');
+  const paths = () => app.context.Caps.report().paths;
+  assert.equal(paths()['shaka:cenc'].failed, 0);
+  assert.equal(paths()['shaka:cenc'].unclear, 1);
+  // AVPlay's licence request (player.js 'License: ...') failing is the licence server's, not the path's.
+  app.player.progress = true; await app.advance(2000);
+  app.player.listeners.error('License: Failed to fetch', { code: 'DRM_ERROR', platform: null });
+  await app.advance(1000);
+  assert.equal(paths()['avplay:cbcs'].failed, 0);
+  assert.equal(paths()['avplay:cbcs'].unclear, 1);
+  assert.equal(app.context.Caps.report().playing, undefined);
+  // AVPlay's CONNECTION_FAILED also means segments it can't read: it counts.
+  assert.equal(app.player.current.capsPath, 'avplay:cenc');
+  app.player.listeners.error('Player error: PLAYER_ERROR_CONNECTION_FAILED', { code: 'NETWORK_ERROR', platform: 'PLAYER_ERROR_CONNECTION_FAILED' });
+  await app.advance(1000);
+  assert.equal(paths()['avplay:cenc'].failed, 1);
+});
+
+test('AVPlay licence errors: a download failure is unclear, a refusal (4xx) or a licence the TV will not install counts', async () => {
+  for (const [message, counted] of [['License: License server answered 503', false], ['License: Failed to fetch', false],
+    ['License: License server answered 403', true], ['Licence install: PLAYER_ERROR_INVALID_PARAMETER', true]]) {
+    const app = await boot({ capsRouting: true, settings: { hdr: false }, store: learnedStore(['shaka:cenc']), play: protectedOffers([]) });
+    await playLive(app);
+    assert.equal(app.player.current.capsPath, 'avplay:cbcs');
+    app.player.progress = true; await app.advance(2000);
+    app.player.listeners.error(message, { code: 'DRM_ERROR', platform: null });
+    await app.advance(1000);
+    const p = app.context.Caps.report().paths['avplay:cbcs'];
+    assert.equal(p.failed, counted ? 1 : 0, message);
+    assert.equal(p.unclear || 0, counted ? 0 : 1, message);
+  }
+});
+
+test('a licence download failure while AVPlay prepares is remembered when the preparation then times out', async () => {
+  const app = await boot({ capsRouting: true, settings: { hdr: false }, store: learnedStore(['shaka:cenc']), play: protectedOffers([]) });
+  app.player.hold = deferred();
+  await playLive(app);
+  assert.equal(app.player.current.capsPath, 'avplay:cbcs');
+  app.player.listeners.error('License: Failed to fetch', { code: 'DRM_ERROR', platform: null });
+  const held = app.player.hold;
+  app.player.hold = null;
+  held.reject(Object.assign(new Error('The video player did not start'), { code: 'PREPARE_TIMEOUT' }));
+  await app.advance(1000);
+  const p = app.context.Caps.report().paths['avplay:cbcs'];
+  assert.equal(p.failed, 0);
+  assert.equal(p.unclear, 1);
+});
+
+test('a start the player loaded again because it froze gets one more watch before it counts as failed', async () => {
+  for (const plays of [true, false]) {
+    const app = await boot({ capsRouting: true, settings: { hdr: false }, play: protectedOffers([]) });
+    await playLive(app);
+    assert.equal(app.player.engine, 'shaka');
+    await app.advance(5000);
+    app.player.reloadedMs = app.clock.now();   // frozen: reloaded
+    await app.advance(11000);                  // the 15 s watch: re-armed, no fallback
+    assert.equal(app.player.engine, 'shaka');
+    assert.equal(app.context.Caps.report().paths['shaka:cenc'], undefined);
+    if (plays) app.player.progress = true;
+    await app.advance(16000);
+    assert.equal(app.player.engine, plays ? 'shaka' : 'avplay');
+    assert.equal((app.context.Caps.report().paths['shaka:cenc'] || {}).failed || 0, plays ? 0 : 1);
+  }
+});
+
+test('a reloaded start whose element stays paused (the reload hung) is still watched, from the reload\'s start', async () => {
+  const app = await boot({ capsRouting: true, settings: { hdr: false }, play: protectedOffers([]) });
+  await playLive(app);
+  await app.advance(5000);
+  app.player.reloadedMs = app.clock.now();
+  Object.assign(app.player, { paused: true, viewerPaused: false });   // the element, not the viewer
+  await app.advance(11000);   // the first watch (15 s): one more round, until 15 s after the reload began
+  assert.equal(app.player.engine, 'shaka');
+  await app.advance(5500);    // 21.5 s: past it
+  assert.equal(app.player.engine, 'avplay');
+  assert.equal(app.context.Caps.report().paths['shaka:cenc'].failed, 1);
+});
+
+test('a Shaka start where no data arrived is not held against the path; data without a picture is', async () => {
+  for (const buffered of [0, 10]) {
+    const app = await boot({ capsRouting: true, settings: { hdr: false }, play: protectedOffers([]) });
+    app.player.buffered = buffered;
+    await playLive(app);
+    await app.advance(16000);
+    assert.equal(app.player.engine, 'avplay', 'the video falls back either way');
+    const p = app.context.Caps.report().paths['shaka:cenc'];
+    assert.equal(p.failed, buffered ? 1 : 0);
+    assert.equal(p.unclear || 0, buffered ? 0 : 1);
+  }
 });
 
 test('multiview offers also exclude encrypted HDR when native cbcs is avoided', async () => {

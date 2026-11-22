@@ -255,13 +255,68 @@ var HdrStream = (function () {
   }
 
   /**
+   * Live 5.1: the HLS master's multichannel commentary (see surround) as audio AdaptationSets for the helper, which
+   * gives them the official audio's SegmentTimeline on every manifest refresh. F1 numbers and times the HLS AC-3 and
+   * the DASH AAC segments alike (48 kHz, 5.76 s; Las Vegas 2026 Pre-Race Show), checked here on a recent segment, and
+   * they are on the video's key (`kid`). Optional like the replays' 5.1: resolves [] when anything doesn't fit.
+   */
+  function liveSurround(master, masterUrl, clock, kid, protection, until) {
+    var lines = master.split(/\r?\n/), codecs = {};
+    lines.forEach(function (line) {
+      if (!/^#EXT-X-STREAM-INF:/.test(line)) return;
+      var a = attrs(line.slice(18)), codec = (a.CODECS || '').split(',').map(function (c) { return c.trim(); })
+        .filter(function (c) { return c === 'ac-3' || c === 'ec-3'; })[0];
+      if (a.AUDIO && codec) codecs[a.AUDIO] = codec;
+    });
+    var list = lines.filter(function (l) { return /^#EXT-X-MEDIA:/.test(l); }).map(function (l) { return attrs(l.slice(13)); })
+      .filter(function (a) { return a.TYPE === 'AUDIO' && a.URI && codecs[a['GROUP-ID']] && parseInt(a.CHANNELS, 10) > 2; });
+    if (!list.length) return Promise.resolve([]);
+    var left = Math.min(until - Date.now(), 6000);
+    if (left < 1000) { note('hdr.surround_skipped', { why: 'no time left' }); return Promise.resolve([]); }
+    var io = fetcher(left);
+    return io.deadline(Promise.all(list.map(function (a, i) {
+      // Inside the promise: a bad address must leave stereo, not fail the video (new URL throws).
+      return Promise.resolve().then(function () { return io.get(new URL(a.URI, masterUrl).toString()); }).then(function (response) {
+        var text = response.body, map = /^#EXT-X-MAP:.*URI="([^"]+)"/m.exec(text);
+        var uris = text.split(/\r?\n/).filter(function (l) { return l.trim() && l.charAt(0) !== '#'; })
+          .map(function (l) { return new URL(l.trim(), response.url).toString(); });
+        if (!/^#EXTM3U\s/.test(text) || !map || uris.length < 4 || /^#EXT-X-(?:DISCONTINUITY\s*$|BYTERANGE:)/m.test(text)) return fail('unsupported live surround playlist');
+        var recent = uris.slice(-4, -1), pattern = CmafDash.template(recent);
+        if (!pattern) return fail('unsupported live surround segment names');
+        var init = new URL(map[1], response.url).toString();
+        return Promise.all([io.get(init, true), io.get(recent[0], true, true)]).then(function (data) {
+          var own = CmafDash.encryption(data[0]);
+          if (!own || own.scheme !== 'cbcs') return fail('surround not CBCS');
+          if (own.kid !== kid) return fail('surround on another key');
+          checkKeys(text.match(/^#EXT-X-KEY:.*$/gm) || [], own.kid);
+          var timing = CmafDash.timing(data[0], data[1]);
+          if (timing.timescale !== clock.timescale || timing.baseTime !== timeOf(clock, pattern.startNumber)) return fail('surround timeline differs');
+          // The same cadence too (the manifest gives the 5.1 the official audio's segment durations): the recent
+          // segments' lengths against the official timeline's, within an AC-3 frame (32 ms).
+          var lengths = (text.match(/^#EXTINF:\s*([\d.]+)/gm) || []).map(function (l) { return parseFloat(l.slice(8)); }).slice(-4, -1);
+          lengths.forEach(function (d, k) {
+            var t0 = timeOf(clock, pattern.startNumber + k), t1 = timeOf(clock, pattern.startNumber + k + 1);
+            if (t0 == null || t1 == null || Math.abs((t1 - t0) / clock.timescale - d) > 0.032) fail('surround segment lengths differ');
+          });
+          return '<AdaptationSet xmlns:cenc="urn:mpeg:cenc:2013" contentType="audio" mimeType="audio/mp4" lang="' + xml(lang3(a.LANGUAGE) || 'und') +
+            '" segmentAlignment="true" startWithSAP="1">' + protection +
+            '<Representation id="mc' + i + '" bandwidth="384000" codecs="' + xml(codecs[a['GROUP-ID']]) + '">' +
+            '<SegmentTemplate timescale="' + clock.timescale + '" presentationTimeOffset="' + clock.offset + '" startNumber="' + clock.startNumber +
+            '" initialization="' + xml(viaHelper(init)) + '" media="' + xml(viaHelper(pattern.media)) + '"><!--timeline--></SegmentTemplate></Representation></AdaptationSet>';
+        });
+      });
+    }))).catch(function (e) { note('hdr.surround_skipped', { why: 'live: ' + String(e && e.message || e).slice(0, 74) }); return []; });
+  }
+  /**
    * Live: the HLG ladder as a video AdaptationSet for the stream helper, which puts it in place of the
    * official SDR video on every manifest refresh, with that video's current SegmentTimeline where
    * <!--timeline--> stands. F1 numbers and times the HLS and DASH segments alike (FP3, Mexico 2026);
-   * that is checked here on a recent segment. Resolves { adaptation, subtitles }.
+   * that is checked here on a recent segment. With the 5.1 commentary where the HLS master has it (opts.surround not
+   * false): its sets follow the video after <!--audio-->, each on the official audio's timeline (<!--timeline-->).
+   * Resolves { adaptation, subtitles, surround (count) }.
    */
-  function live(stream) {
-    var io = fetcher();
+  function live(stream, opts) {
+    var io = fetcher(), until = Date.now() + 9000, want51 = (opts || {}).surround !== false;
     return io.deadline(Promise.all([io.get(stream.url), io.get(stream.widevineManifestUrl)]).then(function (sources) {
       var mpd = sources[1].body, period = /<Period\b([^>]*)>/.exec(mpd);
       if (!/<MPD\b[^>]*\btype="dynamic"/.test(mpd) || (mpd.match(/<Period\b/g) || []).length !== 1 || /<BaseURL\b/.test(mpd)) return fail('unsupported Widevine live layout');
@@ -274,6 +329,11 @@ var HdrStream = (function () {
       if (!template || !/\$Number\$/.test(attr(template[1], 'media')) || !/<SegmentTimeline>/.test(template[2])) return fail('unsupported live addressing');
       var clock = { timescale: +attr(template[1], 'timescale') || 1, offset: +attr(template[1], 'presentationTimeOffset') || 0,
         startNumber: attr(template[1], 'startNumber') === '' ? 1 : +attr(template[1], 'startNumber'), runs: runsOf(template[2]) };
+      var audio = sets.filter(function (s) { return kind(s) === 'audio'; })[0];
+      var audioTemplate = audio && /<SegmentTemplate\b([^>]*)>([\s\S]*?)<\/SegmentTemplate>/.exec(audio);
+      var audioClock = audioTemplate && /\$Number\$/.test(attr(audioTemplate[1], 'media')) && /<SegmentTimeline>/.test(audioTemplate[2]) ? {
+        timescale: +attr(audioTemplate[1], 'timescale') || 1, offset: +attr(audioTemplate[1], 'presentationTimeOffset') || 0,
+        startNumber: attr(audioTemplate[1], 'startNumber') === '' ? 1 : +attr(audioTemplate[1], 'startNumber'), runs: runsOf(audioTemplate[2]) } : null;
       var periodStart = isoSeconds(period ? attr(period[1], 'start') : '');
       var base = new URL('.', sources[1].url).toString();
       var subtitles = sets.filter(function (s) { return kind(s) === 'text'; }).map(function (s) { return subtitle(s, base); }).filter(Boolean).map(function (t) {
@@ -313,13 +373,15 @@ var HdrStream = (function () {
             '<SegmentTemplate timescale="' + clock.timescale + '" presentationTimeOffset="' + clock.offset + '" startNumber="' + clock.startNumber +
             '" initialization="' + xml(t.init) + '" media="' + xml(t.media) + '"><!--timeline--></SegmentTemplate></Representation>';
         });
-        return {
-          adaptation: '<AdaptationSet xmlns:cenc="urn:mpeg:cenc:2013" contentType="video" mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">' +
-            '<ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cbcs" cenc:default_KID="' + kid + '"/>' +
-            '<ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"><cenc:pssh>' + xml(psshFor(source, kid)) + '</cenc:pssh></ContentProtection>' +
-            '<EssentialProperty schemeIdUri="urn:mpeg:mpegB:cicp:TransferCharacteristics" value="18"/>' + reps.join('') + '</AdaptationSet>',
-          subtitles: subtitles
-        };
+        var protection = '<ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cbcs" cenc:default_KID="' + kid + '"/>' +
+          '<ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"><cenc:pssh>' + xml(psshFor(source, kid)) + '</cenc:pssh></ContentProtection>';
+        var adaptation = '<AdaptationSet xmlns:cenc="urn:mpeg:cenc:2013" contentType="video" mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">' +
+          protection + '<EssentialProperty schemeIdUri="urn:mpeg:mpegB:cicp:TransferCharacteristics" value="18"/>' + reps.join('') + '</AdaptationSet>';
+        if (!want51) return { adaptation: adaptation, subtitles: subtitles, surround: 0 };
+        if (!audioClock) { note('hdr.surround_skipped', { why: 'live audio addressing' }); return { adaptation: adaptation, subtitles: subtitles, surround: 0 }; }
+        return liveSurround(sources[0].body, sources[0].url, audioClock, kid, protection, until).then(function (more) {
+          return { adaptation: adaptation + (more.length ? '<!--audio-->' + more.join('') : ''), subtitles: subtitles, surround: more.length };
+        });
       });
     }));
   }

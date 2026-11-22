@@ -42,7 +42,7 @@ function playback(load, capable = true, opts = {}) {
       unload: async () => {}, stream: () => current,
       load: (s, p) => start(s, p, false), switchTo: (s, p) => start(s, p, true),
       position: () => opts.position ? opts.position(current) : 120, decodedFrames: () => null, wallClock: () => null, isLive: () => false, isPaused: () => paused, togglePause: () => { paused = !paused; },
-      range: () => ({ start: 0, end: 600 }), bufferedEnd: () => 150,
+      range: () => ({ start: 0, end: 600 }), bufferedEnd: () => 150, errorInfo: (e) => (e && e.info) || { code: 'OTHER', platform: null },
       tracks: () => ({ audio: [], text: [] })
     }
   });

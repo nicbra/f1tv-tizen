@@ -212,22 +212,40 @@ function timeShift(mpd, shift, nowMs) {
 /**
  * Live HDR: the official video AdaptationSet (the first one) becomes the stored HLG set, whose
  * templates take the official SegmentTimeline of this refresh. F1 numbers and times both alike.
+ * The stored 5.1 sets (after <!--audio-->) take the official audio's timeline the same way and go before
+ * the official audio (AVPlay starts on the first set; preferLanguages still puts the chosen language first).
+ * Without the official audio's timeline the 5.1 is left out (stereo plays); without the video's, null.
  */
-function useHdrVideo(mpd, adaptation) {
+function onTimeline(stored, official) {
+  var timeline = /<SegmentTimeline>[\s\S]*?<\/SegmentTimeline>/.exec(official);
+  if (!timeline) return null;
+  var out = stored.split('<!--timeline-->').join(timeline[0]);
+  // This refresh's addressing too, not only its timeline: should F1 move the window's start (startNumber,
+  // offset), the swapped-in set must number its segments as the official one does. A missing attribute is its
+  // DASH default (the stored one may be from an earlier refresh).
+  var template = /<SegmentTemplate\b([^>]*)>/.exec(official);
+  var defaults = { startNumber: '1', timescale: '1', presentationTimeOffset: '0' };
+  if (template) Object.keys(defaults).forEach(function (name) {
+    var v = attr(template[1], name);
+    if (v == null) v = defaults[name];
+    out = out.replace(new RegExp('(<SegmentTemplate\\b[^>]*\\s' + name + '=")[^"]*"', 'g'), function (all, head) { return head + v + '"'; });
+  });
+  return out;
+}
+function officialSets(mpd, type) {
   var sets = [], re = /<AdaptationSet\b[\s\S]*?<\/AdaptationSet>/g, m;
   while ((m = re.exec(mpd))) sets.push({ text: m[0], at: m.index });
-  var video = sets.filter(function (b) { return /\scontentType="video"/.test(b.text.slice(0, b.text.indexOf('>'))); })[0];
-  var timeline = video && /<SegmentTimeline>[\s\S]*?<\/SegmentTimeline>/.exec(video.text);
-  if (!timeline) return null;
-  var hdr = adaptation.split('<!--timeline-->').join(timeline[0]);
-  // This refresh's addressing too, not only its timeline: should F1 move the window's start (startNumber,
-  // offset), the swapped-in video must number its segments as the official one does.
-  var official = /<SegmentTemplate\b([^>]*)>/.exec(video.text);
-  if (official) ['startNumber', 'timescale', 'presentationTimeOffset'].forEach(function (name) {
-    var v = attr(official[1], name);
-    if (v != null) hdr = hdr.replace(new RegExp('(<SegmentTemplate\\b[^>]*\\s' + name + '=")[^"]*"', 'g'), function (all, head) { return head + v + '"'; });
-  });
-  return mpd.slice(0, video.at) + hdr + mpd.slice(video.at + video.text.length);
+  return sets.filter(function (b) { return new RegExp('\\scontentType="' + type + '"').test(b.text.slice(0, b.text.indexOf('>'))); });
+}
+function useHdrVideo(mpd, adaptation) {
+  var parts = adaptation.split('<!--audio-->');
+  var video = officialSets(mpd, 'video')[0];
+  var hdr = video && onTimeline(parts[0], video.text);
+  if (!hdr) return null;
+  mpd = mpd.slice(0, video.at) + hdr + mpd.slice(video.at + video.text.length);
+  var audio = parts.length > 1 && officialSets(mpd, 'audio')[0];
+  var surround = audio && onTimeline(parts.slice(1).join(''), audio.text);
+  return surround ? mpd.slice(0, audio.at) + surround + mpd.slice(audio.at) : mpd;
 }
 
 function setKind(block) {

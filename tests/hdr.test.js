@@ -193,6 +193,47 @@ test('live HDR refuses timelines that do not line up, and a static source',async
  await assert.rejects(liveHarness(liveMpd().replace('type="dynamic"','type="static"'))(),/live layout/);
 });
 
+// Live 5.1 (Las Vegas 2026 Pre-Race Show): AC-3 renditions numbered and timed like the official 48 kHz audio, on the video's key.
+const mdhd48=box('mdhd',Buffer.concat([Buffer.alloc(12),u32(48000),Buffer.alloc(8)]));
+const tenc51=box('tenc',Buffer.concat([Buffer.from([1,0,0,0,0,0x19,1,0]),Buffer.from(hdrKid.replaceAll('-',''),'hex'),Buffer.from([16]),Buffer.alloc(16)]));
+const enca=box('enca',Buffer.concat([Buffer.alloc(28),box('sinf',Buffer.concat([box('schm',Buffer.concat([Buffer.alloc(4),Buffer.from('cbcs'),u32(65536)])),box('schi',tenc51)]))]));
+const init51=box('moov',box('trak',box('mdia',Buffer.concat([mdhd48,box('minf',box('stbl',box('stsd',Buffer.concat([Buffer.alloc(4),u32(1),enca]))))]))));
+const astamp=Buffer.alloc(8);astamp.writeBigUInt64BE(86086398965760n+48n*276480n);
+const frag51=box('moof',box('traf',box('tfdt',Buffer.concat([Buffer.from([1,0,0,0]),astamp]))));
+const liveMaster51=master.replace('#EXT-X-STREAM-INF:BANDWIDTH=18000000,','#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio_1",CHANNELS="6",NAME="eng",LANGUAGE="eng",URI="a/eng51.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=18384000,RESOLUTION=3840x2160,CODECS="hev1.2.4.L153.B0,ac-3",VIDEO-RANGE=HLG,AUDIO="audio_1"\nv/uhd.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=18000000,');
+const liveAudioMpd=(t=86086398965760)=>liveMpd().replace('<SegmentTemplate timescale="48000" media="a_$Number$.mp4" startNumber="311353500"><SegmentTimeline><S t="1"','<SegmentTemplate timescale="48000" media="a_$Number$.mp4" startNumber="311353500"><SegmentTimeline><S t="'+t+'"');
+function live51(mpdText=liveAudioMpd(),{masterText=liveMaster51,a51=livePlaylist(311353547).replace('init.mp4','a51init.mp4').replaceAll('seg_','a51_')}={},opts){
+ const notes=[];
+ const ctx=vm.createContext({CmafDash,URL,Uint8Array,AbortController,setTimeout,clearTimeout,Diag:{note:(k,d)=>notes.push([k,d])},btoa:s=>Buffer.from(s,'binary').toString('base64'),atob:s=>Buffer.from(s,'base64').toString('binary'),fetch:async (url)=>{
+  const body=url.endsWith('master.m3u8')?masterText:url.endsWith('.mpd')?mpdText:url.includes('eng51.m3u8')?a51:url.includes('.m3u8')?livePlaylist(311353547):url.includes('a51init.mp4')?init51:url.includes('a51_')?frag51:url.includes('init.mp4')?init:frag;
+  return {ok:true,url,text:async()=>body,arrayBuffer:async()=>Uint8Array.from(body).buffer};}});
+ vm.runInContext(fs.readFileSync('app/js/hdr.js','utf8'),ctx);
+ return ctx.HdrStream.live({url:'https://video.formula1.com/live/master.m3u8',widevineManifestUrl:'https://video.formula1.com/livesdr/index.mpd'},opts).then(r=>Object.assign(r,{notes}));
+}
+test('live HDR 5.1: AC-3 sets after the video, on the audio clock, the HDR key and through the helper',async()=>{
+ const r=await live51();
+ assert.equal(r.surround,1);
+ const [video,audio]=r.adaptation.split('<!--audio-->');
+ assert.ok(video.includes('hlg0')&&!video.includes('ac-3'));
+ assert.ok(audio.startsWith('<AdaptationSet xmlns:cenc="urn:mpeg:cenc:2013" contentType="audio" mimeType="audio/mp4" lang="eng"'));
+ assert.ok(audio.includes('codecs="ac-3"')&&audio.includes(`cenc:default_KID="${hdrKid}"`));
+ assert.ok(audio.includes('timescale="48000" presentationTimeOffset="0" startNumber="311353500"'));
+ assert.ok(audio.includes('media="http://127.0.0.1:18765/s/'+Buffer.from('https://video.formula1.com/live/a/').toString('base64url')+'/a51_$Number$.m4s?sig=keep&amp;n=2"'));
+ assert.equal((audio.match(/<!--timeline-->/g)||[]).length,1);
+});
+test('live HDR 5.1 is optional: another clock, another key, none asked or none offered leave stereo',async()=>{
+ for(const r of [await live51(liveAudioMpd(86086398965760-276480)),await live51(undefined,{a51:livePlaylist(311353547).replace('init.mp4','a51init.mp4').replaceAll('seg_','a51_').replace(hdrKid,kid)}),
+  await live51(undefined,{},{surround:false}),await live51(undefined,{masterText:master})]){
+  assert.equal(r.surround,0);assert.ok(!r.adaptation.includes('<!--audio-->')&&r.adaptation.includes('hlg0'));
+ }
+ for(const r of [await live51(undefined,{masterText:liveMaster51.replace('URI="a/eng51.m3u8"','URI="https://["')}),
+  await live51(undefined,{a51:livePlaylist(311353547).replace('init.mp4','a51init.mp4').replaceAll('seg_','a51_').replaceAll('#EXTINF:5.76','#EXTINF:2.88')})]){
+  assert.equal(r.surround,0,'a bad address or another cadence: stereo, and the video still');assert.ok(r.adaptation.includes('hlg0'));
+ }
+ const differs=await live51(liveAudioMpd(86086398965760-276480));
+ assert.ok(differs.notes.some(([k,d])=>k==='hdr.surround_skipped'&&/timeline differs/.test(d.why)));
+});
+
 test('a clear HDR multiview gets the HLS master\'s WebVTT subtitles, on the video\'s timeline', async () => {
   const ctx = vm.createContext({ URL, CmafDash, setTimeout, clearTimeout, AbortController });
   vm.runInContext(fs.readFileSync('app/js/hdr.js', 'utf8'), ctx);

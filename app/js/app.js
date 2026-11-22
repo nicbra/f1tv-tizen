@@ -1661,7 +1661,22 @@
     else if (path === 'avplay:cenc') feedsCtx.avCencFailed = true;
   }
 
-  function playbackFailed(stream) {
+  /**
+   * A failure that says nothing about the way of playing, so Caps doesn't hold it against the path (this video still
+   * falls back): no network, the network or F1's servers (Shaka's network errors, this app's own requests), or the licence
+   * server (Shaka 6007, AVPlay's licence request in player.js). AVPlay's PLAYER_ERROR_CONNECTION_FAILED does count: it
+   * is also what AVPlay says about segments it can't read (F1's audio senc without the helper, Tizen 6).
+   */
+  function unclearFailure(info, message) {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return true;
+    if (!info) return false;
+    if (info.code === 'NETWORK_ERROR') return info.platform !== 'PLAYER_ERROR_CONNECTION_FAILED';
+    // AVPlay's licence download ('License: '), except a refusal (4xx: this TV or account may never get one).
+    var m = String(message || '');
+    return info.code === 'DRM_ERROR' && (info.platform === '6007' || (/^License: /.test(m) && !/answered 4\d\d/.test(m)));
+  }
+
+  function playbackFailed(stream, unclear) {
     if (!stream || !stream.capsPath || stream.capsFailed) return;
     stream.capsFailed = true;
     // A start with the 5.1 commentary (encrypted 4K HDR) that fails counts against the 5.1, not against HDR: the retry
@@ -1669,8 +1684,8 @@
     if (stream.surround) {
       feedsCtx.noSurround = true;
       if (typeof Caps !== 'undefined') {
-        Caps.failed('avplay:ac3');
-        if (Player.stream() === stream) Caps.crashEnd();
+        Caps.failed('avplay:ac3', unclear);
+        if (Player.stream() === stream) Caps.crashEnd(true);
       }
       return;
     }
@@ -1678,12 +1693,12 @@
     // a failure of that one counts against HDR.
     if (stream.hlsAes) {
       feedsCtx.tmFailed = true;
-      if (typeof Caps !== 'undefined') Caps.failed('shaka:hlsaes');
+      if (typeof Caps !== 'undefined') Caps.failed('shaka:hlsaes', unclear);
       return;
     }
     if (typeof Caps !== 'undefined') {
-      Caps.failed(stream.capsPath);
-      if (Player.stream() === stream) Caps.crashEnd();
+      Caps.failed(stream.capsPath, unclear);
+      if (Player.stream() === stream) Caps.crashEnd(true);
     }
     failPath(stream.capsPath);
     // The server may decline the cenc offer and return cbcs. Don't request that same dead end forever.
@@ -2329,7 +2344,7 @@
             feedsCtx.index = feedsCtx.playing != null ? feedsCtx.playing : from.index;
             $('osd-feed').textContent = feedLabel(from.stream);
           }
-          playbackFailed(stream);
+          playbackFailed(stream, unclearFailure(Player.errorInfo(e), e && e.message) || !!(stream && stream.unclearCause));
           // An SDR engine failed before starting. Try the next path at the requested moment;
           // native cenc still goes through the helper, as in PR #3.
           if (!mv && stream && !stream.hdr && stream.capsPath && sdrPath() !== stream.capsRoute &&
@@ -2510,16 +2525,28 @@
    * load of a 2024 TS replay after AVPlay jumped from 0 to 2.13 s and stayed there without a picture (0 frames, stuck
    * seeking; TV, 2026-11-19). AVPlay reports no position until it plays, so there the position is enough.
    */
-  function watchStart(stream, opts) {
-    var from = Player.position(), frames = Player.decodedFrames(), ctx = feedsCtx;
+  function watchStart(stream, opts, wait) {
+    var from = Player.position(), frames = Player.decodedFrames(), ctx = feedsCtx, armed = Date.now();
+    var budget = stream.hdr ? 25000 : 15000;
     setTimeout(function () {
       // A newer load or another video has taken over; it has its own watch.
       if (feedsCtx !== ctx || loadingFeed) return;
-      if (screen !== 'player' || Player.stream() !== stream || Player.isPaused() || stream.retried) return;
+      if (screen !== 'player' || Player.stream() !== stream || stream.retried) return;
+      // Paused by the viewer (not the element's own pause while a frozen start loads again, which must still be watched).
+      if (Player.isViewerPaused ? Player.isViewerPaused() : Player.isPaused()) return;
       // Moved either way (the viewer may have jumped back), with pictures decoded meanwhile: it plays.
       if (Math.abs(Player.position() - from) > 0.5 && decodedSince(frames) !== 0) return;
-      diag('play.no-start', { stream: diagStream(stream), waitedMs: stream.hdr ? 25000 : 15000, position: from, retry: !!opts.retry });
-      playbackFailed(stream);
+      // The player loaded a frozen start again meanwhile (player.js reloadIfFrozen): that load gets the usual time from
+      // when it began (at least 5 s more), once, before the start counts as failed.
+      if (!stream.reloadWatched && Player.reloadedSince && Player.reloadedSince(armed)) {
+        stream.reloadWatched = true;
+        return watchStart(stream, opts, Math.max(5000, Player.reloadedAt() + budget - Date.now()));
+      }
+      diag('play.no-start', { stream: diagStream(stream), waitedMs: wait || budget, position: from, retry: !!opts.retry });
+      // On Shaka, nothing buffered means no data arrived (the network or the CDN): that says nothing about the path.
+      // Data without a picture does (the first-HDR freeze, a decoder that refuses). AVPlay doesn't tell: it counts.
+      var noData = Player.engineName() === 'shaka' && Player.bufferedEnd() - Player.position() < 1;
+      playbackFailed(stream, noData || unclearFailure(null) || !!stream.unclearCause);
       var last = opts.retry && !stream.hdr && (!stream.capsPath || sdrPath() === stream.capsRoute);
       dplay('failed', null, null, { noProgress: true, final: last });
       if (last) return;
@@ -2541,7 +2568,7 @@
       else if (!Player.isLive() && from && stream.hlsAes && wall) again = { liveAt: wall, fallbackAt: from, retry: true };
       else if (!Player.isLive() && from) again = { startAt: from, retry: true };
       playFeed(feedsCtx.index, again);
-    }, stream.hdr ? 25000 : 15000);
+    }, wait || budget);
   }
 
   /**
@@ -3854,10 +3881,14 @@
       diag('player.error', { message: msg, code: info, stream: diagStream(Player.stream()) }, 'error');
       toast(msg, 8000);
       $('spinner').classList.add('hidden');
+      // A network or licence-server error while loading: remembered for the load catch/start watch, which count the
+      // failure once native preparation settles (its timeout or open error would otherwise take the blame).
+      var cur = Player.stream();
+      if (cur && unclearFailure(info, msg)) cur.unclearCause = true;
       // Loading errors are handled by the load catch/start watch, once native preparation settles.
       if (screen !== 'player' || loadingFeed) return;
       var s = Player.stream();
-      playbackFailed(s);
+      playbackFailed(s, unclearFailure(info, msg));
       var fallback = !!(s && s.capsPath && (s.surround || s.hlsAes || (!s.grid && (s.hdr || sdrPath() !== s.capsRoute))));
       // A failure while playing (the load's own catch or start watch records the others); final when nothing follows.
       dplay('failed', null, info ? { diag: info } : null, { runtime: true, final: !fallback });
@@ -3867,9 +3898,11 @@
         // The position, or before it played the one it was asked to start at.
         var pos = Player.position() > 0 ? Player.position() : (s.askedStart > 0 ? s.askedStart : 0);
         var wall = pos > 0 ? Player.wallClock(pos) : null;
-        // The same HDR stream without the 5.1 shares this timeline: its position needs no clock lookup. Another
-        // package (after the Tiledmedia offer) by the clock, its position if that can't be placed.
-        playFeed(feedsCtx.index, recovering(wall && !s.surround ? { liveAt: wall, fallbackAt: pos || null } : { startAt: pos }));
+        // The same HDR replay without the 5.1 shares this timeline: its position needs no clock lookup. Another
+        // package (after the Tiledmedia offer), and live (a new time shift), by the clock, its position if that can't be placed.
+        // Live with no known moment (it failed before its first position): the live point, never position 0.
+        playFeed(feedsCtx.index, recovering(wall && (!s.surround || s.live) ? { liveAt: wall, fallbackAt: pos || null } :
+          s.live && !(pos > 0) ? {} : { startAt: pos }));
       }
     });
     // During a jump the pending-seek logic owns the spinner (it waits a moment before showing it).

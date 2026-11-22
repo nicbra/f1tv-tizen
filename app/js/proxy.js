@@ -86,11 +86,11 @@ var StreamProxy = (function () {
 
   /**
    * Live HDR: the official live manifest through the helper as usual (time shift, audio fix, languages),
-   * with the HLG video in place of the SDR one and without subtitle sets (the app shows those).
-   * Resolves { url, subtitles }.
+   * with the HLG video in place of the SDR one, the 5.1 commentary where there is one (langs.surround false: none),
+   * and without subtitle sets (the app shows those). Resolves { url, subtitles, surround }.
    */
   function hdrLive(stream, shift, langs) {
-    return ensure().then(function () { return HdrStream.live(stream); }).then(function (built) {
+    return ensure().then(function () { return HdrStream.live(stream, { surround: !langs || langs.surround !== false }); }).then(function (built) {
       var id = Date.now().toString(36) + '-' + (++vodSequence);
       return fetch(BASE + '/hdr/' + id, { method: 'POST', body: built.adaptation }).then(function (r) {
         if (!r.ok) throw new Error('Could not prepare HDR manifest');
@@ -100,7 +100,13 @@ var StreamProxy = (function () {
         // the helper restarted). A failure here is a temporary one: the app tries HDR once more.
         return fetch(url, { cache: 'no-store' }).then(function (check) {
           if (!check.ok) throw new Error('HDR live manifest answered ' + check.status);
-          return { url: url, subtitles: built.subtitles };
+          // The 5.1 the helper served (it leaves it out when the official audio can't carry it): a start counted
+          // against the 5.1 must have had it.
+          return check.text().then(function (mpd) {
+            var served = (mpd.match(/<AdaptationSet\b[^>]*contentType="audio"[\s\S]*?<\/AdaptationSet>/g) || [])
+              .filter(function (set) { return /codecs="(?:ac-3|ec-3)"/.test(set); }).length;
+            return { url: url, subtitles: built.subtitles, surround: Math.min(built.surround || 0, served) };
+          });
         });
       });
     });
