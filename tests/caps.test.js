@@ -20,7 +20,9 @@ function boot(store = {}, options = {}) {
       return options.probe ? options.probe(configs[0]) : Promise.reject(Error('unsupported'));
     } }
   });
-  vm.runInContext(readFileSync('app/js/caps.js', 'utf8'), context);
+  if (options.version) context.Launcher = { version: options.version };
+  const source = readFileSync('app/js/caps.js', 'utf8');
+  vm.runInContext(options.source ? options.source(source) : source, context);
   return { caps: context.Caps, store, timers, events, calls, document, at: (time) => { now = time; } };
 }
 const plain = (value) => JSON.parse(JSON.stringify(value));
@@ -30,8 +32,8 @@ test('caps persists outcomes per path, last time, firmware and returns a detache
   const h = boot();
   h.caps.ok('shaka:cenc'); h.at(123456); h.caps.failed('avplay:cbcs');
   const report = h.caps.report();
-  assert.deepEqual(plain(report.paths['shaka:cenc']), { ok: 1, failed: 0, crashed: 0, last: 100000, streak: 0 });
-  assert.deepEqual(plain(report.paths['avplay:cbcs']), { ok: 0, failed: 1, crashed: 0, last: 123456, streak: 1 });
+  assert.deepEqual(plain(report.paths['shaka:cenc']), { ok: 1, failed: 0, crashed: 0, last: 100000, streak: 0, retries: 0 });
+  assert.deepEqual(plain(report.paths['avplay:cbcs']), { ok: 0, failed: 1, crashed: 0, last: 123456, streak: 1, badAt: 123456 });
   report.paths['avplay:cbcs'].failed = 99;
   assert.equal(boot(h.store).caps.report().paths['avplay:cbcs'].failed, 1);
   assert.equal(boot(h.store, { firmware: 'TV-2' }).caps.report().paths['avplay:cbcs'], undefined);
@@ -170,4 +172,144 @@ test('encrypted HDR stays avoided when native cbcs is the last SDR resort', () =
   h.caps.failed('shaka:cenc');
   assert.equal(h.caps.usable('avplay:cbcs'), true);
   assert.equal(h.caps.usable('avplay:hdr'), false);
+});
+
+const DAY = 86400000;
+// Two crashes on a path, found as heartbeats at the next starts (as the app does), then a third start after them.
+function crashedTwice(path, options = {}) {
+  let h = boot({}, options);
+  for (let i = 0; i < 2; i++) { h.caps.crashStart(path); h = boot(h.store, Object.assign({}, options, { now: 100000 + 60000 })); }
+  return h;
+}
+
+test('failures caused by the network or a server are kept apart and never rule a path out', () => {
+  const h = boot();
+  h.caps.failed('avplay:hdr', true); h.caps.failed('avplay:hdr', true); h.caps.failed('avplay:hdr', true);
+  const p = h.caps.report().paths['avplay:hdr'];
+  assert.equal(p.unclear, 3); assert.equal(p.failed, 0); assert.equal(p.streak, undefined);
+  assert.equal(h.caps.usable('avplay:hdr'), true);
+  h.caps.failed('avplay:hdr'); h.caps.failed('avplay:hdr', true);
+  assert.equal(h.caps.usable('avplay:hdr'), true, 'one real failure between unclear ones');
+});
+
+test('a path ruled out by failures gets a try after 3 days, then waits twice as long after each try that fails', () => {
+  const h = boot();
+  h.caps.failed('avplay:hdr'); h.caps.failed('avplay:hdr');
+  assert.equal(h.caps.avoided('avplay:hdr'), true);
+  h.at(100000 + 3 * DAY - 1); assert.equal(h.caps.usable('avplay:hdr'), false);
+  h.at(100000 + 3 * DAY); assert.equal(h.caps.usable('avplay:hdr'), true);
+  // The try fails: 6 days now, then 12.
+  const t1 = 100000 + 3 * DAY; h.caps.failed('avplay:hdr');
+  assert.equal(h.caps.report().paths['avplay:hdr'].retries, 1);
+  h.at(t1 + 6 * DAY - 1); assert.equal(h.caps.usable('avplay:hdr'), false);
+  h.at(t1 + 6 * DAY); assert.equal(h.caps.usable('avplay:hdr'), true);
+  const t2 = t1 + 6 * DAY; h.caps.failed('avplay:hdr');
+  h.at(t2 + 12 * DAY - 1); assert.equal(h.caps.usable('avplay:hdr'), false);
+  // Never longer than 60 days.
+  const r = JSON.parse(h.store['f1tv.caps']); r.paths['avplay:hdr'].retries = 10; h.store['f1tv.caps'] = JSON.stringify(r);
+  const later = boot(h.store, { now: t2 + 60 * DAY });
+  assert.equal(later.caps.usable('avplay:hdr'), true);
+  // A try that plays: the record is clean again, and the next ruling waits 3 days.
+  later.caps.ok('avplay:hdr');
+  assert.equal(later.caps.report().paths['avplay:hdr'].retries, 0);
+  later.caps.failed('avplay:hdr'); later.caps.failed('avplay:hdr');
+  later.at(t2 + 63 * DAY); assert.equal(later.caps.usable('avplay:hdr'), true);
+});
+
+test('a path ruled out by crashes waits 14 days for its try; older records count from their last outcome', () => {
+  const h = crashedTwice('avplay:hdr');
+  const at = 100000 + 60000;
+  assert.equal(h.caps.report().paths['avplay:hdr'].crashed, 2);
+  h.at(at + 14 * DAY - 1); assert.equal(h.caps.usable('avplay:hdr'), false);
+  h.at(at + 14 * DAY); assert.equal(h.caps.usable('avplay:hdr'), true);
+  const old = { version: 1, firmware: 'TV-1', browser: { cenc: null, cbcs: null }, paths: { 'avplay:cbcs': { ok: 0, failed: 2, crashed: 0, last: 5000 } } };
+  assert.equal(boot({ 'f1tv.caps': JSON.stringify(old) }, { now: 5000 + 3 * DAY - 1 }).caps.avoided('avplay:cbcs'), true);
+  assert.equal(boot({ 'f1tv.caps': JSON.stringify(old) }, { now: 5000 + 3 * DAY }).caps.avoided('avplay:cbcs'), false);
+});
+
+test('three clean runs of 10 minutes wear one crash off; short runs and runs that end in a failure do not', () => {
+  const h = crashedTwice('avplay:cbcs');
+  let t = 100000 + 60000;
+  const run = (minutes, end) => { h.caps.crashStart('avplay:cbcs'); t += minutes * 60000; h.at(t); end(); };
+  run(9, () => h.caps.crashEnd());
+  run(30, () => h.caps.crashEnd(true));
+  assert.equal(h.caps.report().paths['avplay:cbcs'].cleanRuns, undefined);
+  run(10, () => h.caps.crashEnd());
+  run(12, () => h.events.pagehide({ type: 'pagehide' }));   // an event object is no failure
+  assert.equal(h.caps.report().paths['avplay:cbcs'].cleanRuns, 2);
+  assert.equal(h.caps.avoided('avplay:cbcs'), true);
+  run(20, () => h.caps.crashEnd());
+  const p = h.caps.report().paths['avplay:cbcs'];
+  assert.equal(p.crashed, 2); assert.equal(p.forgiven, 1); assert.equal(p.cleanRuns, 0);
+  assert.equal(h.caps.avoided('avplay:cbcs'), false, 'one crash alone rules nothing out');
+  // A clean run without crashes held against the path just counts.
+  const fresh = boot(); fresh.caps.crashStart('avplay:hdr'); fresh.at(100000 + 10 * 60000); fresh.caps.crashEnd();
+  assert.equal(fresh.caps.report().paths['avplay:hdr'], undefined, 'no record made for a path never counted');
+});
+
+test('a new app version forgets failures but keeps crashes; the same version keeps both', () => {
+  let h = boot({}, { version: '1.2.0' });
+  h.caps.failed('avplay:hdr'); h.caps.failed('avplay:hdr');
+  h.caps.crashStart('avplay:cbcs');
+  h = boot(h.store, { version: '1.2.0', now: 160000 });
+  h.caps.crashStart('avplay:cbcs');
+  h = boot(h.store, { version: '1.2.0', now: 220000 });
+  assert.equal(h.caps.avoided('avplay:hdr'), true);
+  assert.equal(h.caps.avoided('avplay:cbcs'), true);
+  const next = boot(h.store, { version: '1.2.1', now: 230000 });
+  assert.equal(next.caps.avoided('avplay:hdr'), false);
+  assert.equal(next.caps.report().paths['avplay:hdr'].failed, 2, 'the counts stay for the About screen');
+  assert.equal(next.caps.avoided('avplay:cbcs'), true);
+  assert.equal(next.caps.report().appVersion, '1.2.1');
+  // A record from before versions were kept counts as another version: its failures go once.
+  const old = { version: 1, firmware: 'TV-1', browser: { cenc: null, cbcs: null }, paths: { 'avplay:hdr': { ok: 0, failed: 2, crashed: 0, last: 100000, streak: 2 } } };
+  assert.equal(boot({ 'f1tv.caps': JSON.stringify(old) }, { version: '1.2.0' }).caps.avoided('avplay:hdr'), false);
+  // No version known (desktop): nothing forgotten.
+  assert.equal(boot({ 'f1tv.caps': JSON.stringify(old) }).caps.avoided('avplay:hdr'), true);
+  // Forget keeps the version (it isn't a new one).
+  next.caps.reset(); assert.equal(next.caps.report().appVersion, '1.2.1');
+});
+
+test('a release that lists a path as fixed forgets its crashes once', () => {
+  const fixed = (src) => src.replace('var FIXED = {};', "var FIXED = { 'avplay:cbcs': '1.3.0' };");
+  const h = crashedTwice('avplay:cbcs', { version: '1.2.0' });
+  assert.equal(h.caps.avoided('avplay:cbcs'), true);
+  let next = boot(h.store, { version: '1.3.0', source: fixed, now: 200000 });
+  assert.equal(next.caps.avoided('avplay:cbcs'), false);
+  assert.equal(next.caps.report().paths['avplay:cbcs'].forgiven, 2);
+  // New crashes after the fix count again, and the next start of the same release forgives nothing.
+  next.caps.crashStart('avplay:cbcs'); next = boot(next.store, { version: '1.3.0', source: fixed, now: 230000 });
+  next.caps.crashStart('avplay:cbcs'); next = boot(next.store, { version: '1.3.0', source: fixed, now: 260000 });
+  assert.equal(next.caps.avoided('avplay:cbcs'), true);
+  // Neither does a later release that still lists the same fix.
+  assert.equal(boot(next.store, { version: '1.3.1', source: fixed, now: 290000 }).caps.avoided('avplay:cbcs'), true);
+});
+
+test("a good start keeps a crash's growing wait (the crash comes after it); a clean run without a crash held earns nothing", () => {
+  let h = crashedTwice('avplay:hdr');
+  let t = 100000 + 60000 + 14 * DAY;
+  h.at(t); assert.equal(h.caps.usable('avplay:hdr'), true);
+  h.caps.ok('avplay:hdr'); h.caps.crashStart('avplay:hdr');
+  h = boot(h.store, { now: t + 30000 });
+  assert.equal(h.caps.report().paths['avplay:hdr'].retries, 1);
+  t += 30000 + 28 * DAY; h.at(t - 1); assert.equal(h.caps.usable('avplay:hdr'), false);
+  h.at(t); h.caps.ok('avplay:hdr'); h.caps.crashStart('avplay:hdr');
+  h = boot(h.store, { now: t + 30000 });
+  assert.equal(h.caps.report().paths['avplay:hdr'].retries, 2, 'the good start did not reset it');
+  h.at(t + 30000 + 56 * DAY - 1); assert.equal(h.caps.usable('avplay:hdr'), false);
+  // Clean runs before a crash earn nothing.
+  const f = boot(); let now = 100000;
+  f.caps.ok('avplay:cbcs');
+  for (let i = 0; i < 3; i++) { f.caps.crashStart('avplay:cbcs'); now += 11 * 60000; f.at(now); f.caps.crashEnd(); }
+  assert.equal(f.caps.report().paths['avplay:cbcs'].cleanRuns, undefined);
+});
+
+test("an older record's wait starts at its last outcome once; a good try or an unclear failure later does not restart it", () => {
+  const old = { version: 1, firmware: 'TV-1', browser: { cenc: null, cbcs: null }, paths: { 'avplay:hdr': { ok: 0, failed: 0, crashed: 2, last: 5000 } } };
+  const h = boot({ 'f1tv.caps': JSON.stringify(old) }, { now: 5000 + 14 * DAY });
+  assert.equal(h.caps.report().paths['avplay:hdr'].badAt, 5000);
+  assert.equal(h.caps.usable('avplay:hdr'), true);
+  h.caps.failed('avplay:hdr', true);
+  h.caps.ok('avplay:hdr');
+  assert.equal(h.caps.usable('avplay:hdr'), true);
 });

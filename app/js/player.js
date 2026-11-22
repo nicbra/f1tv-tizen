@@ -69,6 +69,7 @@ var Player = (function () {
     // Preload on the idle player, paused: the TV can only decode one video at a time.
     var slots = [];
     var cur = 0;
+    var reloadedAt = 0;   // when reloadIfFrozen last loaded a frozen start again
     var licenseHeaders = {};
     var userPaused = false;
     var swapping = false;   // a feed switch is under way; the outgoing feed stays current until it is done
@@ -267,9 +268,34 @@ var Player = (function () {
      * starting up, presumably); loading it again plays it too (Mexico FP3 replay, 2026-10-31).
      */
     function reloadIfFrozen(slot, stream, startTime, gen) {
-      setTimeout(function () {
+      var done = false;
+      function frozen(ms) {
         var q = slot.v.getVideoPlaybackQuality ? slot.v.getVideoPlaybackQuality() : null;
-        if (gen !== generation || userPaused || !q || q.totalVideoFrames > 0 || (slot.v.readyState < 3 && !stream.cenc)) return;
+        if (done || gen !== generation || userPaused || !q || q.totalVideoFrames > 0) return false;
+        // At any check: seconds of data, ready to play, playing, and not one frame (the first player_tm start after
+        // launch, 2026-11-22: readyState 4, 5.8 s buffered, 0 frames; its reload then took 12 s, which the app's 25 s
+        // start watch only just allowed), or a seek stuck with data under the playhead (the TS start of 2026-11-19 and
+        // player_tm resumes, 2026-11-22: readyState 1, seeking, 17-23 s buffered around it, 0 frames for 26 s; seeking to
+        // the segment's start didn't help, loading again did; the data can come seconds after the 5 s check).
+        if (slot.v.readyState >= 4 && !slot.v.paused && bufferedAhead(slot.v) >= 4) return true;
+        if (stuckSeeking(slot.v)) return true;
+        // At 5 s, as before: frozen unless still waiting for data (below readyState 3), except cenc (its DRM start-up).
+        return ms === 5000 && !(slot.v.readyState < 3 && !stream.cenc) ? 'now' : false;
+      }
+      // Seen at two checks in a row (2.5 s apart), so data that has only just come gets its chance to decode first;
+      // the 5 s rule as before.
+      var seen = 0;
+      [2500, 5000, 7500, 10000, 12500, 15000].forEach(function (ms) {
+        setTimeout(function () {
+          var stuck = frozen(ms);
+          if (stuck === 'now') return reload();
+          seen = stuck ? seen + 1 : 0;
+          if (seen >= 2) reload();
+        }, ms);
+      });
+      function reload() {
+        done = true;
+        reloadedAt = Date.now();
         // From where it is now, which includes a seek made meanwhile.
         var at = slot.v.currentTime > 0 ? slot.v.currentTime : startTime;
         diag('player.frozen-reload', { hdr: !!stream.hdr, cenc: !!stream.cenc, readyState: slot.v.readyState, at: at });
@@ -281,7 +307,21 @@ var Player = (function () {
           slot.v.play().catch(function () {});
           keepPlaying(slot.v, 5000);
         }).catch(function () { /* the start watch in app.js falls back to SDR */ });
-      }, 5000);
+      }
+    }
+
+    function stuckSeeking(v) {
+      var b = v.buffered;
+      if (!v.seeking || !b) return false;
+      for (var i = 0; i < b.length; i++) if (b.start(i) <= v.currentTime && b.end(i) - v.currentTime >= 2) return true;
+      return false;
+    }
+
+    /** Seconds buffered from the playhead on, in the range that holds it (a later range past a gap doesn't count). */
+    function bufferedAhead(v) {
+      var b = v.buffered;
+      if (b) for (var i = 0; i < b.length; i++) if (b.start(i) <= v.currentTime && v.currentTime < b.end(i)) return b.end(i) - v.currentTime;
+      return 0;
     }
 
     /**
@@ -450,10 +490,12 @@ var Player = (function () {
       position: function () { return V().currentTime; },
       exactPosition: function () { return V().currentTime; },
       decodedFrames: decodedFrames,
+      reloadedAt: function () { return reloadedAt; },
       bufferedEnd: function () { var b = V().buffered; return b.length ? b.end(b.length - 1) : 0; },
       seekTo: function (t, done) { V().currentTime = t; if (done) done(); },
       // The viewer's pause counts even while showFrame plays a switched-to feed until it has a picture.
       paused: function () { return userPaused || V().paused; },
+      viewerPaused: function () { return userPaused; },
       play: function () { userPaused = false; V().play(); },
       pause: function () { userPaused = true; V().pause(); },
       snapshot: snapshot
@@ -545,7 +587,10 @@ var Player = (function () {
         }).then(function (lic) {
           if (g !== openGen) return;   // a newer open has the player now
           var param = data.session_id + 'PARAM_START_POSITION' + bytesToB64(lic) + 'PARAM_START_POSITION';
-          av.setDrm('WIDEVINE_CDM', 'widevine_license_data', param);
+          // The TV refusing the licence it got is the TV's (app.js counts it against the path); 'License: ' below is the
+          // download only (the network or the licence server).
+          try { av.setDrm('WIDEVINE_CDM', 'widevine_license_data', param); }
+          catch (e) { emit('error', 'Licence install: ' + (e && e.message || e), { code: 'DRM_ERROR', platform: null }); }
         }).catch(function (e) {
           if (typeof DiagUpload !== 'undefined') DiagUpload.apiFailed('playback_license', e.status || null, 0);
           emit('error', 'License: ' + e.message, { code: 'DRM_ERROR', platform: null });
@@ -626,9 +671,8 @@ var Player = (function () {
         });
       }
       if (s.hdrEncrypted) {
-        var prefs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
-        var prepare = s.info && s.info.dynamic ? StreamProxy.hdrLive(s, s.startDelay, prefs) :
-          StreamProxy.hdrManifest(s, { audio: prefs.audio, text: prefs.text, surround: !s.noSurround });
+        var prefs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')), surround: !s.noSurround };
+        var prepare = s.info && s.info.dynamic ? StreamProxy.hdrLive(s, s.startDelay, prefs) : StreamProxy.hdrManifest(s, prefs);
         return prepare.then(function (prepared) {
           if (stream !== s) throw new Error('cancelled');
           s.surround = prepared.surround || 0;
@@ -1237,6 +1281,12 @@ var Player = (function () {
     /** Frames decoded since the load (a new load restarts the count), or null where the engine doesn't tell (AVPlay). */
     decodedFrames: proxy('decodedFrames', null),
     bufferedEnd: proxy('bufferedEnd', 0),
+    /** Whether Shaka loaded a frozen start again (reloadIfFrozen) at or after `since` (ms): that start is still loading. */
+    reloadedSince: function (since) { return engine === ShakaEngine && ShakaEngine.reloadedAt() >= since; },
+    /** When that reload began (ms), or 0. */
+    reloadedAt: function () { return engine === ShakaEngine ? ShakaEngine.reloadedAt() : 0; },
+    /** Paused by the viewer (Shaka's element is also paused while a frozen start loads again). */
+    isViewerPaused: function () { return engine === ShakaEngine ? ShakaEngine.viewerPaused() : !!(engine && engine.paused()); },
     engineName: function () { return engineName; },
     /**
      * Long-segment replays on AVPlay (30 s segments): { size, origin } of the segment grid. A seek

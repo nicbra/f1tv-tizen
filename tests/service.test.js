@@ -420,6 +420,37 @@ test('live HDR: a time-shifted start trims the HLG timeline like the rest', asyn
   } finally { Date.now = realNow; }
 });
 
+// Live 5.1: the app's AC-3 sets follow the HLG set after <!--audio-->, each waiting for the official audio's timeline.
+const AC3_SET = (lang) => '<AdaptationSet xmlns:cenc="urn:mpeg:cenc:2013" contentType="audio" mimeType="audio/mp4" lang="' + lang + '"><Representation id="mc0" bandwidth="384000" codecs="ac-3">' +
+  '<SegmentTemplate timescale="48000" presentationTimeOffset="1" startNumber="1" media="http://127.0.0.1:18765/s/x/a51_$Number$.mp4"><!--timeline--></SegmentTemplate></Representation></AdaptationSet>';
+
+test('live HDR 5.1: the AC-3 sets go on the official audio timeline, before the stereo, and follow the language order', async () => {
+  const live = 'https://ott-video-cf.formula1.com/v2/x/Main/index.mpd';
+  const { s } = service({ [live]: { body: LIVE_HDR_MPD } });
+  assert.equal((await post(s, '/hdr/mc-1', HLG_SET + '<!--audio-->' + AC3_SET('eng') + AC3_SET('spa'))).status, 201);
+  const mpd = (await get(s, '/mpd?u=' + encodeURIComponent(live) + '&audio=eng&hdr=mc-1&notext=1')).body.toString();
+  const sets = mpd.match(/<AdaptationSet\b[^>]*>/g);
+  assert.deepEqual(sets.map((h) => (/contentType="(\w+)"/.exec(h) || [])[1] + ':' + ((/lang="(\w+)"/.exec(h) || [])[1] || '')),
+    ['video:', 'audio:eng', 'audio:spa', 'audio:eng', 'video:']);
+  assert.ok(mpd.indexOf('codecs="ac-3"') < mpd.indexOf('<Representation id="A"'), 'the 5.1 comes first');
+  // The audio's own timeline and addressing (its startNumber; the official audio has no offset: the DASH default 0, not the stored one).
+  assert.ok(mpd.includes('<SegmentTemplate timescale="48000" presentationTimeOffset="0" startNumber="311365738" media="http://127.0.0.1:18765/s/x/a51_$Number$.mp4"><SegmentTimeline><S t="86086398965760" d="276480" r="738"/></SegmentTimeline>'));
+  assert.ok(mpd.includes('<S t="89673332256000" d="288000" r="738"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet>'), 'the HLG video keeps the video timeline');
+  // Spanish chosen: the Spanish 5.1 first.
+  const spa = (await get(s, '/mpd?u=' + encodeURIComponent(live) + '&audio=spa&hdr=mc-1&notext=1')).body.toString();
+  assert.ok(spa.indexOf('lang="spa"') < spa.indexOf('lang="eng"'));
+});
+
+test('live HDR 5.1: without the official audio timeline the 5.1 is left out and the video still plays', async () => {
+  const live = 'https://ott-video-cf.formula1.com/v2/x/Main/index.mpd';
+  const noAudio = LIVE_HDR_MPD.replace(/<AdaptationSet contentType="audio"[\s\S]*?<\/AdaptationSet>/, '');
+  const { s } = service({ [live]: { body: noAudio } });
+  await post(s, '/hdr/mc-2', HLG_SET + '<!--audio-->' + AC3_SET('eng'));
+  const r = await get(s, '/mpd?u=' + encodeURIComponent(live) + '&hdr=mc-2&notext=1');
+  assert.equal(r.status, 200);
+  assert.ok(!r.body.toString().includes('ac-3') && r.body.toString().includes('hlg0'));
+});
+
 test('GET /log lists recent requests by kind and CDN host, without paths or tokens', async () => {
   const live = 'https://ott-video-cf.formula1.com/v2/pa_TOKEN/Main/index.mpd?secret=1';
   const { s } = service({ [live]: { body: LIVE_HDR_MPD } });

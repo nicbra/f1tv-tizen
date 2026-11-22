@@ -552,6 +552,86 @@ test('an HDR video frozen on its first frame is loaded once more; one that plays
   }
 });
 
+test('a start with seconds of data, ready and playing but without a frame, is loaded again once seen at two checks', async () => {
+  for (const [ahead, paused, readyState, gap] of [[6, false, 4, false], [2, false, 4, false], [6, true, 4, false], [6, false, 3, false], [6, false, 4, true]]) {
+    let loads = 0;
+    const timers = [];
+    const P = await player(fakeAvPlay(), undefined, () => { loads++; return Promise.resolve(); },
+      { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return 0; } });
+    P.forceEngine = 'shaka';
+    // gap: the data lies in a later range, past a hole at the playhead.
+    Object.assign(P.videos[0], { readyState, paused, currentTime: 30, play: () => Promise.resolve(),
+      buffered: gap ? { length: 2, start: (i) => [30, 31][i], end: (i) => [30.5, 31 + ahead][i] } : { length: 1, start: () => 30, end: () => 30 + ahead },
+      getVideoPlaybackQuality: () => ({ totalVideoFrames: 0 }) });
+    const before = Date.now();
+    await P.load({ url: 'https://cdn/hdr.m3u8', licenseUrl: '', multiFeed: true, hdr: true, info: { dynamic: false } }, 30);
+    timers.find((t) => t.ms === 2500).fn();
+    await new Promise(setImmediate);
+    assert.equal(loads, 1, 'one check is not enough: the data may just have come');
+    // At 5 s: the second sighting, or the 5 s rule as before (ready, not cenc); either way once.
+    timers.find((t) => t.ms === 5000).fn();
+    await new Promise(setImmediate);
+    assert.equal(loads, 2, JSON.stringify({ ahead, paused, readyState, gap }));
+    assert.equal(P.reloadedSince(before), true);
+    timers.find((t) => t.ms === 7500).fn();
+    await new Promise(setImmediate);
+    assert.equal(loads, 2);
+  }
+});
+
+test('a freeze seen at one check only, then decoding, is not loaded again', async () => {
+  let loads = 0, frames = 0;
+  const timers = [];
+  const P = await player(fakeAvPlay(), undefined, () => { loads++; return Promise.resolve(); },
+    { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return 0; } });
+  P.forceEngine = 'shaka';
+  Object.assign(P.videos[0], { readyState: 1, seeking: true, currentTime: 297.9, play: () => Promise.resolve(),
+    buffered: { length: 1, start: () => 293.8, end: () => 316.8 }, getVideoPlaybackQuality: () => ({ totalVideoFrames: frames }) });
+  await P.load({ url: 'https://cdn/tm.m3u8', licenseUrl: '', multiFeed: true, hdr: true, hlsAes: true, info: { dynamic: false } }, 297.9);
+  timers.find((t) => t.ms === 2500).fn();
+  frames = 3;
+  for (const ms of [5000, 7500, 10000, 12500, 15000]) timers.find((t) => t.ms === ms).fn();
+  await new Promise(setImmediate);
+  assert.equal(loads, 1);
+});
+
+test('a start stuck seeking with data under the playhead is loaded again at 5 s; one still waiting for data is not', async () => {
+  for (const [seeking, from, to, reloads] of [[true, 720, 737, 1], [true, 730, 737, 0], [true, 720, 725.5, 0], [false, 720, 737, 0]]) {
+    let loads = 0;
+    const timers = [];
+    const P = await player(fakeAvPlay(), undefined, () => { loads++; return Promise.resolve(); },
+      { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return 0; } });
+    P.forceEngine = 'shaka';
+    Object.assign(P.videos[0], { readyState: 1, seeking, currentTime: 724.1, play: () => Promise.resolve(),
+      buffered: { length: 1, start: () => from, end: () => to }, getVideoPlaybackQuality: () => ({ totalVideoFrames: 0 }) });
+    await P.load({ url: 'https://cdn/tm.m3u8', licenseUrl: '', multiFeed: true, hdr: true, hlsAes: true, info: { dynamic: false } }, 724.1);
+    timers.find((t) => t.ms === 2500).fn();
+    timers.find((t) => t.ms === 5000).fn();
+    await new Promise(setImmediate);
+    assert.equal(loads, 1 + reloads, JSON.stringify({ seeking, from, to }));
+  }
+});
+
+test('the freeze checks repeat until 15 s: a seek whose data comes after the 5 s check is still loaded again, once', async () => {
+  let loads = 0, end = 299.5;
+  const timers = [];
+  const P = await player(fakeAvPlay(), undefined, () => { loads++; return Promise.resolve(); },
+    { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return 0; } });
+  P.forceEngine = 'shaka';
+  Object.assign(P.videos[0], { readyState: 1, seeking: true, currentTime: 297.9, play: () => Promise.resolve(),
+    buffered: { length: 1, start: () => 293.8, end: () => end }, getVideoPlaybackQuality: () => ({ totalVideoFrames: 0 }) });
+  await P.load({ url: 'https://cdn/tm.m3u8', licenseUrl: '', multiFeed: true, hdr: true, hlsAes: true, info: { dynamic: false } }, 297.9);
+  const at = (ms) => timers.find((t) => t.ms === ms).fn();
+  at(2500); at(5000);
+  await new Promise(setImmediate);
+  assert.equal(loads, 1, 'only 1.6 s of data yet');
+  end = 316.8;
+  at(7500); at(10000); at(12500);
+  await new Promise(setImmediate);
+  assert.equal(loads, 2);
+  assert.deepEqual(timers.map((t) => t.ms).filter((ms) => ms >= 2500 && ms <= 15000).sort((a, b) => a - b), [2500, 5000, 7500, 10000, 12500, 15000]);
+});
+
 test('the frozen-HDR reload stands down after a stop, starts from a seek, and does not undo a pause', async () => {
   const setup = async () => {
     const loads = [], timers = [];
@@ -910,7 +990,7 @@ test('live native HDR opens the helper\'s live manifest with the HLG video, time
   const s = Object.assign({}, LIVE, { url: 'https://cdn/live/master.m3u8', hdr: true, hdrEncrypted: true, widevineManifestUrl: LIVE.url, startDelay: 600 });
   await P.load(s, null);
   assert.equal(P.engineName(), 'avplay');
-  assert.deepEqual(JSON.parse(JSON.stringify(asked)), { shift: 600, langs: { audio: 'deu', text: '' } });
+  assert.deepEqual(JSON.parse(JSON.stringify(asked)), { shift: 600, langs: { audio: 'deu', text: '', surround: true } });
   assert.equal(av.calls.find((c) => c[0] === 'open')[1], 'http://127.0.0.1:18765/mpd?u=x&hdr=1&notext=1');
   assert.equal(P.isLive(), true);
   assert.equal(av.calls.filter((c) => c[0] === 'setStreamingProperty')[0][2], 'STARTBITRATE=HIGHEST');   // never locked

@@ -2,6 +2,18 @@
 var Caps = (function () {
   var KEY = 'f1tv.caps', firmware = 'unknown', timer = null;
   var SDR = ['shaka:cenc', 'avplay:cbcs', 'avplay:cenc'];
+  var DAY = 86400000;
+  // A path ruled out comes back for one try after a while (a bad evening, F1's servers or a since fixed bug should not
+  // turn something off for good): 3 days after failures, 14 after a crash, twice as long after each try that went wrong
+  // again, at most 60 days.
+  var RETRY_FAILED = 3 * DAY, RETRY_CRASHED = 14 * DAY, RETRY_MAX = 60 * DAY;
+  // A crash wears off after three clean runs of at least 10 minutes on the same path.
+  var CLEAN_RUN = 10 * 60000, CLEAN_RUNS = 3;
+  /**
+   * Paths a release fixed, with a label for that release: { 'avplay:hdr': '1.3.0' } forgets the path's crashes once
+   * on every TV that runs it. Failures are forgotten with every app update anyway (see below).
+   */
+  var FIXED = {};
   try { firmware = String(webapis.productinfo.getFirmware()); } catch (e) { /* desktop or unavailable */ }
   var record;
   try { record = JSON.parse(localStorage.getItem(KEY)); } catch (e) { /* unavailable or corrupt */ }
@@ -19,12 +31,34 @@ var Caps = (function () {
     listeners.forEach(function (fn) { try { fn(kind); } catch (e) { /* a listener never breaks playback */ } });
   }
 
+  function entry(path) {
+    return record.paths[path] || (record.paths[path] = { ok: 0, failed: 0, crashed: 0, last: 0 });
+  }
+
   function count(path, outcome) {
-    var p = record.paths[path] || (record.paths[path] = { ok: 0, failed: 0, crashed: 0, last: 0 });
+    var p = entry(path), wasOut = ruledOut(p);
     p.streak = failures(p);
     p[outcome]++;
-    if (outcome === 'ok') p.streak = 0;
-    else if (outcome === 'failed') p.streak++;
+    // A good start clears the failures, not a crash's longer wait: the Tizen 9 crash came seconds after good starts.
+    if (outcome === 'ok') { p.streak = 0; if (!crashes(p)) p.retries = 0; }
+    else {
+      if (outcome === 'failed') p.streak++;
+      p.badAt = Date.now();
+      // A second chance that went wrong too: the next one waits longer.
+      if (wasOut) p.retries = (p.retries || 0) + 1;
+    }
+    p.last = Date.now();
+    save();
+    changed('paths');
+  }
+
+  /**
+   * A failure that says nothing about the path (the network, F1's servers or the licence server: see app.js
+   * unclearFailure): kept as a number, never towards ruling the path out.
+   */
+  function unclear(path) {
+    var p = entry(path);
+    p.unclear = (p.unclear || 0) + 1;
     p.last = Date.now();
     save();
     changed('paths');
@@ -39,6 +73,32 @@ var Caps = (function () {
     count(marker.path, 'crashed');
     previous = { path: marker.path, minutes: Math.floor((Date.now() - marker.at) / 60000) };
   }
+
+  // A new app version (an installed package or a downloaded bundle, rollbacks too) forgets the failures: they may have
+  // been the app's. Crashes stay (the TV's own player is the usual cause) unless the release lists the path in FIXED.
+  var version = '';
+  try { version = String((typeof Launcher !== 'undefined' && Launcher.version) || tizen.application.getCurrentApplication().appInfo.version || ''); }
+  catch (e) { /* desktop or unavailable: no version, nothing forgotten */ }
+  if (version && record.appVersion !== version) {
+    Object.keys(record.paths).forEach(function (k) {
+      var p = record.paths[k];
+      p.streak = 0;
+      if (!crashes(p)) p.retries = 0;
+    });
+    record.appVersion = version;
+  }
+  // Records from before `badAt`: their last outcome was the bad one (only adverse evidence restarts a wait from now on).
+  Object.keys(record.paths).forEach(function (k) {
+    var p = record.paths[k];
+    if (p.badAt == null && (p.failed || p.crashed)) p.badAt = p.last || 0;
+  });
+  record.fixed = record.fixed || {};
+  Object.keys(FIXED).forEach(function (k) {
+    if (record.fixed[k] === FIXED[k]) return;
+    var p = record.paths[k];
+    if (p) { p.forgiven = p.crashed; p.streak = 0; p.retries = 0; p.cleanRuns = 0; }
+    record.fixed[k] = FIXED[k];
+  });
   save();
 
   /**
@@ -52,14 +112,27 @@ var Caps = (function () {
     return p.streak != null ? p.streak : (p.ok > 0 ? 0 : p.failed);
   }
 
+  /** Crashes still held against the path: those not worn off by clean runs or forgotten by a fix (`crashed` is all of them). */
+  function crashes(p) {
+    return Math.max(0, p.crashed - (p.forgiven || 0));
+  }
+
+  function ruledOut(p) {
+    var c = crashes(p), f = failures(p);
+    return c >= 2 || (c >= 1 && f >= 1) || f >= 2;
+  }
+
+  /** Ruled out and not yet due for its next try (records from before `badAt` count from their last outcome). */
   function avoided(path) {
     var p = record.paths[path];
-    return !!p && (p.crashed >= 2 || (p.crashed >= 1 && failures(p) >= 1) || failures(p) >= 2);
+    if (!p || !ruledOut(p)) return false;
+    var wait = Math.min(RETRY_MAX, (crashes(p) ? RETRY_CRASHED : RETRY_FAILED) * Math.pow(2, p.retries || 0));
+    return Date.now() - (p.badAt || 0) < wait;
   }
 
   function score(path) {
     var p = record.paths[path];
-    return p ? p.crashed * 2 + failures(p) : 0;
+    return p ? crashes(p) * 2 + failures(p) : 0;
   }
 
   function usable(path) {
@@ -78,10 +151,28 @@ var Caps = (function () {
     return path === best;
   }
 
-  function crashEnd() {
+  /**
+   * The protected AVPlay video stopped playing. Unless it ended in a failure (`failed`), a run of at least 10 minutes is a
+   * clean one, and every third clean run wears one crash off.
+   */
+  function crashEnd(failed) {
     clearInterval(timer);
     timer = null;
-    if (record.playing) { delete record.playing; save(); }
+    var run = record.playing;
+    if (!run) return;
+    delete record.playing;
+    var p = record.paths[run.path];
+    // Only while a crash is held against the path: earlier good evenings don't cancel a crash that comes later.
+    if (failed !== true && p && crashes(p) && Date.now() - run.since >= CLEAN_RUN) {
+      p.cleanRuns = (p.cleanRuns || 0) + 1;
+      if (p.cleanRuns >= CLEAN_RUNS) {
+        p.forgiven = (p.forgiven || 0) + 1;
+        p.cleanRuns = 0;
+        if (!crashes(p)) p.retries = 0;
+        changed('paths');
+      }
+    }
+    save();
   }
 
   function crashStart(path) {
@@ -115,9 +206,7 @@ var Caps = (function () {
 
   setTimeout(function () { probe('cenc'); probe('cbcs'); }, 10000);
   if (typeof window !== 'undefined') {
-    window.addEventListener('pagehide', crashEnd);
-    window.addEventListener('beforeunload', crashEnd);
-    window.addEventListener('unload', crashEnd);
+    ['pagehide', 'beforeunload', 'unload'].forEach(function (name) { window.addEventListener(name, function () { crashEnd(); }); });
   }
   if (typeof document !== 'undefined') document.addEventListener('visibilitychange', function () {
     if (document.hidden) crashEnd();
@@ -127,7 +216,7 @@ var Caps = (function () {
   function reset() {
     crashEnd();
     var browser = record.browser;
-    record = { version: 1, firmware: firmware, browser: browser, paths: {} };
+    record = { version: 1, firmware: firmware, browser: browser, paths: {}, appVersion: record.appVersion, fixed: record.fixed };
     save();
     changed('paths');
   }
@@ -135,7 +224,8 @@ var Caps = (function () {
   return {
     ok: function (path) { count(path, 'ok'); },
     avoided: avoided, reset: reset,
-    failed: function (path) { count(path, 'failed'); },
+    /** A failed start or playback on the path; `unclear` when the cause was the network or a server (not counted against it). */
+    failed: function (path, isUnclear) { if (isUnclear) unclear(path); else count(path, 'failed'); },
     crashStart: crashStart, crashEnd: crashEnd, usable: usable,
     browser: function (scheme) { return record.browser[scheme]; },
     report: function () { return JSON.parse(JSON.stringify(record)); },
