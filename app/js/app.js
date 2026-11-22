@@ -1208,7 +1208,8 @@
 
   // What the app has learned about playing copy-protected video on this TV (js/caps.js), in words.
   var CAPS_NAMES = { 'shaka:cenc': 'Shaka, CENC', 'avplay:cbcs': 'AVPlay, CBCS', 'avplay:cenc': 'AVPlay, CENC',
-    'avplay:hdr': 'AVPlay, 4K HDR', 'avplay:ac3': 'AVPlay, 5.1 sound in 4K HDR', 'shaka:hlsaes': 'Shaka, 4K HDR (AES-128 HLS)' };
+    'avplay:hdr': 'AVPlay, 4K HDR', 'avplay:ac3': 'AVPlay, 5.1 sound in 4K HDR', 'shaka:hlsaes': 'Shaka, 4K HDR (AES-128 HLS)',
+    'shaka:tmgrid': 'Shaka, 4K HDR multiview (AES-128 HLS)' };
 
   function capsSummary() {
     var paths = Caps.report().paths, n = 0;

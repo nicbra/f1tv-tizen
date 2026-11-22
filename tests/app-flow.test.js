@@ -3818,12 +3818,13 @@ test('About shows what the app learned about playback on this TV, in words, and 
   const store = learnedStore(['avplay:cbcs']);
   const record = JSON.parse(store['f1tv.caps']);
   record.paths['shaka:cenc'] = { ok: 3, failed: 1, crashed: 0, last: NOW };
+  record.paths['shaka:tmgrid'] = { ok: 2, failed: 0, crashed: 0, last: NOW };
   store['f1tv.caps'] = JSON.stringify(record);
   const app = await boot({ store });
   await app.press('UP');
   await app.pick(/^Nicholas$/, ['RIGHT']);
   const row = app.$('list-inner').querySelectorAll('.list-row').find((r) => /^Playback on this TV/.test(r.textContent));
-  assert.equal(row.textContent, 'Playback on this TVLearned from 6 video starts');
+  assert.equal(row.textContent, 'Playback on this TVLearned from 8 video starts');
   await app.pick(/^Playback on this TV/, ['DOWN']);
   const text = app.$('dialog-text').textContent;
   assert.equal(app.$('dialog-title').textContent, 'Playback on this TV');
@@ -3831,6 +3832,7 @@ test('About shows what the app learned about playback on this TV, in words, and 
   assert.match(text, /• Shaka, CENC: 3 played, 1 failed, 0 crashed\n/);
   assert.match(text, /• AVPlay, CBCS: 0 played, 0 failed, 2 crashed \(avoided\)/);
   assert.match(text, /• AVPlay, 4K HDR: not tried yet/);
+  assert.match(text, /• Shaka, 4K HDR multiview \(AES-128 HLS\): 2 played, 0 failed, 0 crashed/);
   // Forget: everything learned goes, the browser check stays.
   await app.pick(/^Forget$/, ['RIGHT']);
   assert.deepEqual(app.context.Caps.report().paths, {});
