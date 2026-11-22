@@ -72,6 +72,7 @@ async function player(av, storage, shakaLoad, globals, manifest) {
     getNetworkingEngine() { return { registerRequestFilter() {}, registerResponseFilter: (fn) => this.responseFilters.push(fn) }; }
     getBufferedInfo() { return { video: [{ start: 0, end: 10 }] }; }
     selectAudioLanguage(l) { languages.push(['audio', l]); }
+    getAudioLanguages() { return context.audioLanguages || []; }
     selectTextLanguage(l) { languages.push(['text', l]); }
     setTextTrackVisibility(on) { languages.push(['subtitles', on]); }
     addEventListener() {}
@@ -642,6 +643,24 @@ test('team radio chosen on one engine is found on the other ("tea" in HLS, "team
   av.setSelectTrack = (type, i) => av.calls.push(['setSelectTrack', type, i]);
   const A = await player(av, { 'f1tv.settings': JSON.stringify({ audio: 'tea' }) });
   await A.load({ url: 'https://cdn/single.m3u8', licenseUrl: '', multiFeed: false, info: { dynamic: false } }, null);
+  assert.deepEqual(av.calls.find((c) => c[0] === 'setSelectTrack'), ['setSelectTrack', 'AUDIO', 3]);
+});
+
+test('an onboard plays its team radio, whatever the commentary language (Shaka and AVPlay)', async () => {
+  const P = await player(fakeAvPlay(), { 'f1tv.settings': JSON.stringify({ audio: 'eng' }) }, async () => {});
+  Object.assign(P.videos[0], { play: () => Promise.resolve() });
+  P.context.audioLanguages = ['en', 'teamradio'];   // 2024 HLS names it "teamradio", 2026 "tea"
+  await P.load({ url: 'https://cdn/onboard.m3u8', licenseUrl: '', multiFeed: true, onboardSound: true, info: { dynamic: false } }, null);
+  assert.deepEqual(P.languages[0], ['audio', 'teamradio']);
+  assert.equal(P.audioSetting(), 'onboardAudio');
+  await P.load({ url: 'https://cdn/main.m3u8', licenseUrl: '', multiFeed: true, info: { dynamic: false } }, null);
+  assert.deepEqual(P.languages.filter((l) => l[0] === 'audio').at(-1), ['audio', 'en']);
+  assert.equal(P.audioSetting(), 'audio');
+  const av = fakeAvPlay();
+  av.getTotalTrackInfo = () => [{ type: 'AUDIO', index: 0, extra_info: '{"language":"eng"}' }, { type: 'AUDIO', index: 3, extra_info: '{"language":"teamradio"}' }];
+  av.setSelectTrack = (type, i) => av.calls.push(['setSelectTrack', type, i]);
+  const A = await player(av, { 'f1tv.settings': JSON.stringify({ audio: 'eng' }) });
+  await A.load({ url: 'https://cdn/onboard.m3u8', licenseUrl: '', multiFeed: false, onboardSound: true, info: { dynamic: false } }, null);
   assert.deepEqual(av.calls.find((c) => c[0] === 'setSelectTrack'), ['setSelectTrack', 'AUDIO', 3]);
 });
 

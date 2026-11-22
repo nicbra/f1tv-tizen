@@ -365,7 +365,7 @@ var F1Api = (function () {
         if (s.type !== 'obc' && main.title === 'Main feed' && !/^main/i.test(name)) main.title = name;
         return;
       }
-      feeds.push({ title: name, type: s.type === 'obc' ? (s.teamName || 'Onboard') : '', channelId: channelId, hex: s.hex || '',
+      feeds.push({ title: name, type: s.type === 'obc' ? (s.teamName || 'Onboard') : '', onboard: s.type === 'obc', channelId: channelId, hex: s.hex || '',
         full: s.driverFirstName ? s.driverFirstName + ' ' + s.driverLastName : '',
         num: s.type === 'obc' && s.racingNumber != null ? String(s.racingNumber) : '' });
     });

@@ -252,7 +252,7 @@ test('feedsFrom plays INTERNATIONAL as the main stream instead of by its channel
   ] });
   assert.deepEqual(plain(feeds.map((f) => [f.title, f.type, f.channelId])), [
     ['INTERNATIONAL', 'Broadcast', null], ['F1 LIVE', '', '1033'], ['TRACKER', '', '1003'], ['VER', 'Red Bull Racing', '1009']]);
-  assert.deepEqual(plain(feeds[3]), { title: 'VER', type: 'Red Bull Racing', channelId: '1009', hex: '#3671C6',
+  assert.deepEqual(plain(feeds[3]), { title: 'VER', type: 'Red Bull Racing', onboard: true, channelId: '1009', hex: '#3671C6',
     full: 'Max Verstappen', num: '1' });
 });
 

@@ -62,6 +62,14 @@ var Player = (function () {
   var LANG3 = { en: 'eng', de: 'deu', fr: 'fra', nl: 'nld', pt: 'por', ja: 'jpn', es: 'spa', it: 'ita', tea: 'teamradio' };
   function lang3(l) { return LANG3[l] || l; }
   function sameLang(a, b) { return !!a && !!b && lang3(a) === lang3(b); }
+  /**
+   * The sound wanted for a stream. F1 puts F1 LIVE's commentary on every onboard besides its team radio, so an onboard
+   * (alone, or the multiview's "Sound from" feed: app.js sets onboardSound) plays its own team radio unless the viewer
+   * picked something else on an onboard (setting onboardAudio, kept apart from the commentary language).
+   */
+  function wantedAudio(s) { return Settings.get(s && s.onboardSound ? 'onboardAudio' : 'audio'); }
+  /** The same as a manifest language code, for the helper's ordering (team radio is "tea" in F1's DASH and 2026 HLS). */
+  function audioPref(s) { var l = lang3(wantedAudio(s)); return l === 'teamradio' ? 'tea' : l; }
 
   // Shaka (MSE/EME)
 
@@ -198,8 +206,16 @@ var Player = (function () {
       });
     }
 
-    function applyPrefs(player) {
-      try { player.selectAudioLanguage(langOf(Settings.get('audio'))); } catch (e) { /* single track */ }
+    /** Shaka matches languages loosely but not "tea" to "teamradio" (2024 HLS): use the stream's own code. */
+    function selectAudio(player, want) {
+      var have = [];
+      try { have = player.getAudioLanguages(); } catch (e) { /* not loaded */ }
+      var code = have.filter(function (l) { return sameLang(l, want); })[0] || langOf(want);
+      try { player.selectAudioLanguage(code); } catch (e) { /* single track */ }
+    }
+
+    function applyPrefs(player, stream) {
+      selectAudio(player, wantedAudio(stream));
       textTrack(player, Settings.get('subtitles'));
     }
 
@@ -214,7 +230,7 @@ var Player = (function () {
       slot.v.classList.remove('hidden');
       userPaused = false;
       return slot.p.load(stream.url, startTime == null ? null : startTime).then(function () {
-        applyPrefs(slot.p);
+        applyPrefs(slot.p, stream);
         // Resetting another video element can cancel play(); keepPlaying retries it.
         var started = slot.v.play();
         keepPlaying(slot.v, 5000);
@@ -239,7 +255,7 @@ var Player = (function () {
         slot.p.load(stream.url, at == null ? null : at).then(function () {
           if (gen !== generation) return;
           // A new load starts on the stream's default tracks (French subtitles on F1's replays).
-          applyPrefs(slot.p);
+          applyPrefs(slot.p, stream);
           if (userPaused) return;
           slot.v.play().catch(function () {});
           keepPlaying(slot.v, 5000);
@@ -319,7 +335,7 @@ var Player = (function () {
       return next.p.load(stream.url, startTime == null ? null : startTime).then(function () {
         return whenBuffered(next, 4, 6000);
       }).then(function () {
-        applyPrefs(next.p);
+        applyPrefs(next.p, stream);
         old.v.style.zIndex = '2';           // keep the old picture on top until the new one runs
         next.v.style.zIndex = '1';
         next.v.classList.remove('hidden');
@@ -398,7 +414,7 @@ var Player = (function () {
       load: load,
       swap: swap,
       tracks: tracks,
-      setAudio: function (l) { try { P().selectAudioLanguage(langOf(l)); } catch (e) { /* single track */ } },
+      setAudio: function (l) { selectAudio(P(), l); },
       setSubtitles: function (l) { textTrack(P(), l); },
       unload: unload,
       isLive: function () { return P().isLive(); },
@@ -561,7 +577,7 @@ var Player = (function () {
       // An H.264 multiview (grid.engine 'h264') plays the big feed's own stream here, in the grid rect; its small
       // feeds are the app's (js/mvsoft.js).
       if (s.grid && s.grid.engine !== 'h264') {
-        var gridPrefs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
+        var gridPrefs = { audio: audioPref(s), text: lang3(Settings.get('subtitles')) };
         var gridReady = s.info && s.info.dynamic ? StreamProxy.gridLive(s, s.startDelay, gridPrefs) :
           StreamProxy.gridManifest(s.grid.streams, s.grid.layout, gridPrefs, startTime, s.grid.audioPos || 0);
         return gridReady.then(function (prepared) {
@@ -572,7 +588,7 @@ var Player = (function () {
         });
       }
       if (s.hdrEncrypted) {
-        var prefs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
+        var prefs = { audio: audioPref(s), text: lang3(Settings.get('subtitles')) };
         var prepare = s.info && s.info.dynamic ? StreamProxy.hdrLive(s, s.startDelay, prefs) : StreamProxy.hdrManifest(s, prefs);
         return prepare.then(function (prepared) {
           if (stream !== s) throw new Error('cancelled');
@@ -582,7 +598,7 @@ var Player = (function () {
       }
       // Encrypted live DASH goes through the local service, which fixes the audio segments.
       if (s.licenseUrl && /\.mpd(\?|$)/.test(s.url)) {
-        var langs = { audio: lang3(Settings.get('audio')), text: lang3(Settings.get('subtitles')) };
+        var langs = { audio: audioPref(s), text: lang3(Settings.get('subtitles')) };
         return StreamProxy.ensure().then(function () {
           // Stopped while the helper started: opening now would leave AVPlay open over the next video.
           if (stream !== s) throw new Error('cancelled');
@@ -681,7 +697,7 @@ var Player = (function () {
             started = true;
             var d = av.getDuration();
             live = s.info ? s.info.dynamic : (!!s.live || !d || d <= 0);
-            selectAudio(Settings.get('audio'));
+            selectAudio(wantedAudio(s));
             // Live streams start where the manifest's presentation delay puts them (see StreamProxy.manifest).
             av.play();
             ensurePlaying(s);
@@ -843,7 +859,7 @@ var Player = (function () {
         var st = '';
         try { st = av.getState(); } catch (e) { return; }
         if (st !== 'PLAYING' && st !== 'PAUSED') return setTimeout(check, 400);
-        var want = Settings.get('audio'), cur = null;
+        var want = wantedAudio(s), cur = null;
         if (!want) return;
         try { cur = av.getCurrentStreamInfo().filter(function (t) { return t.type === 'AUDIO'; })[0]; } catch (e) { /* unknown */ }
         var info = {};
@@ -1173,6 +1189,10 @@ var Player = (function () {
      */
     seekGrid: function () { return engine === AvEngine ? AvEngine.grid() : null; },
     tracks: function () { return engine ? engine.tracks() : { audio: [], text: [] }; },
+    /** The setting the Commentary choice belongs to for what plays now, and its value. */
+    audioSetting: function () { return current && current.onboardSound ? 'onboardAudio' : 'audio'; },
+    wantedAudio: function () { return wantedAudio(current); },
+    sameLang: sameLang,
     setAudio: traced('player.setAudio', function (l) { if (engine) engine.setAudio(l); }, function (l) { return { lang: l }; }),
     setSubtitles: traced('player.setSubtitles', function (l) { if (engine) engine.setSubtitles(l); }, function (l) { return { lang: l }; }),
     forceEngine: null,

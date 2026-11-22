@@ -2182,6 +2182,9 @@
           stream.contentId = feedsCtx.contentId;
           stream.channelId = f.channelId;
           stream.feed = f.title;
+          // Sound from an onboard: its team radio, not the F1 LIVE commentary F1 also puts on it (Player wantedAudio).
+          var soundFeed = s.grid ? feedsCtx.feeds[s.grid.audio] : f;
+          stream.onboardSound = !!(soundFeed && soundFeed.onboard);
           diagTrail('play.offer', { streamType: s.streamType, hdr: !!s.hdr, cenc: !!s.cenc, ms: Date.now() - askedAt });
           stream.live = feedsCtx.live;
           stream.multiFeed = feedsCtx.feeds.length > 1;
@@ -3131,10 +3134,12 @@
 
     var audio = opts.audio;
     if (audio.length > 1) {
+      // On an onboard (alone or as the multiview's sound) the choice is the onboard's own (team radio by default).
       deferredSetting('Commentary', audio, function () {
-        return audio.indexOf(Settings.get('audio')) >= 0 ? Settings.get('audio') : audio[0];
+        var want = Player.wantedAudio();
+        return audio.filter(function (l) { return Player.sameLang(l, want); })[0] || audio[0];
       }, function (cur) { return LANG_NAMES[cur] || cur; }, function (next) {
-        Settings.set('audio', next);
+        Settings.set(Player.audioSetting(), next);
         Player.setAudio(next);
       }, 'audio');
     }

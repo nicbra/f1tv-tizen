@@ -5,6 +5,7 @@ var Settings = (function () {
     timing: true,        // timing tower overlay in the player
     tower: '',           // what the tower shows (see TOWER_VIEWS in app.js); '' = the session's default
     audio: 'eng',        // preferred commentary track (language code, 'fx' = track sound only)
+    onboardAudio: 'teamradio',   // an onboard's sound: its team radio, or what the viewer picked on an onboard
     subtitles: '',       // subtitle language, '' = off
     spoilerFree: false,  // blur the artwork of replays and highlights
     hdr: true,           // 4K HDR where the subscription and TV allow it; off: always SDR

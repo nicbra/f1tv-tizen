@@ -349,6 +349,10 @@ async function boot(options = {}) {
     tracks: () => player.trackList || { audio: [], text: [] },
     chosen: [],
     setAudio(l) { player.chosen.push(['audio', l]); }, setSubtitles(l) { player.chosen.push(['subtitles', l]); },
+    // As player.js: an onboard's sound has a setting of its own (team radio by default).
+    audioSetting: () => (player.current && player.current.onboardSound ? 'onboardAudio' : 'audio'),
+    wantedAudio: () => context.Settings.get(player.audioSetting()),
+    sameLang(a, b) { const l3 = { en: 'eng', de: 'deu', fr: 'fra', tea: 'teamradio' }; return !!a && !!b && (l3[a] || a) === (l3[b] || b); },
     on(name, fn) { if (options.bootThrows) throw Error('broken synchronous boot'); player.listeners[name] = fn; }
   };
 
@@ -1655,12 +1659,21 @@ test('in a multiview, Sound from picks the feed the commentary comes from, once 
   assert.deepEqual(Array.from(g.slots), Array.from(grid.slots), 'the same feeds, in the same places');
   assert.equal(g.audio, grid.slots[1]);
   assert.equal(g.audioPos, 1);
+  // An onboard's sound is its team radio, not the commentary F1 also puts on it.
+  assert.equal(app.player.current.onboardSound, false, 'F1 LIVE: its commentary');
   assert.doesNotMatch(shown, /INTERNATIONAL/, 'the next feed shown while browsing');
   // The sound's feed gets the full offer (licence, commentary); the others their HDR video alone.
   assert.deepEqual(offers.filter((o) => !o[1]).length, 1);
   // The choice is saved for a restart.
   await app.advance(3100);
   assert.equal(JSON.parse(app.store['f1tv.watching']).multiview.audio, grid.slots[1]);
+  // Sound from the onboard: its team radio, not the F1 LIVE commentary F1 also puts on it.
+  await app.press('UP');
+  await app.moveTo(/^Sound from/, ['UP', 'DOWN']);
+  await app.press('RIGHT');
+  await app.advance(6500);
+  assert.equal(app.player.current.grid.audio, grid.slots[2]);
+  assert.equal(app.player.current.onboardSound, true);
 });
 
 test('subtitles: a box behind each line, and in a multiview at the bottom of the big feed', async () => {
@@ -2552,6 +2565,26 @@ test('commentary offered as team radio is named so', async () => {
   app.player.trackList = { audio: [{ lang: 'eng' }, { lang: 'teamradio' }], text: [] };
   await app.press('UP');
   assert.match(app.$('panel-list').textContent, /Commentary‹ Team radio ›/);
+});
+
+test('an onboard plays its team radio, and a commentary chosen there stays the onboards\' own', async () => {
+  const app = await boot();
+  await play(app, 'Race');
+  assert.equal(app.player.current.onboardSound, false);
+  await app.press('UP');
+  await app.pick(/^1VER/, ['DOWN']);
+  await app.advance(300);
+  assert.equal(app.player.loads.at(-1).url, 'https://cdn/101/1009.m3u8');
+  assert.equal(app.player.current.onboardSound, true);
+  app.player.trackList = { audio: [{ lang: 'teamradio' }, { lang: 'eng' }, { lang: 'deu' }], text: [] };
+  await app.press('UP');
+  assert.match(app.$('panel-list').textContent, /Commentary‹ Team radio ›/);
+  await app.moveTo(/^Commentary/, ['UP']);
+  await app.press('RIGHT');
+  await app.advance(2100);
+  assert.deepEqual(app.player.chosen, [['audio', 'eng']]);
+  assert.equal(app.context.Settings.get('onboardAudio'), 'eng');
+  assert.equal(app.context.Settings.get('audio'), 'eng');   // the commentary language itself is untouched
 });
 
 test('a race titled "Race Replay" gets its timing', async () => {
