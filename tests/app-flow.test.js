@@ -241,7 +241,8 @@ async function boot(options = {}) {
     video: (id) => Promise.resolve({ metadata: JSON.parse(JSON.stringify(VIDEOS[id])) }),
     play: options.play || ((id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' })),
     info: options.info || ((url) => {
-      const id = /cdn\/(\d+)\//.exec(url)[1];
+      // The stream helper's player_tm multiview plays the race's timeline (101).
+      const id = /^http:\/\/127\.0\.0\.1:18765\/stitch\//.test(url) ? '101' : /cdn\/(\d+)\//.exec(url)[1];
       // Live: a DVR window of the last hour, on the wall clock.
       if (id === '106') return Promise.resolve({ dynamic: true, windowStart: 1000, windowEnd: 4600, delay: 25, marks: [], epochAtZero: NOW / 1000 - 4600 });
       return Promise.resolve({ dynamic: false, windowStart: 0, windowEnd: 7200, delay: 25, marks: [], epochAtZero: CLOCKS[id] });
@@ -408,7 +409,9 @@ async function boot(options = {}) {
       pair: () => Object.assign(new Promise(() => {}), { cancel() {} }), pairUrl: () => '', PAIR_PAGE: 'https://f1tv.formula1.com/tv' },
     Stats: stats,
     // The HEVC heights in a stream's master playlist (multiview layouts need theirs).
-    HdrStream: { heights: async (url, range) => (options.heights ? options.heights(url, range) : [270, 360, 540, 720, 1080, 1620, 2160]) },
+    HdrStream: { heights: async (url, range) => (options.heights ? options.heights(url, range) : [270, 360, 540, 720, 1080, 1620, 2160]),
+      // A multiview from F1's player_tm feeds (options.tmGrid: what the helper answers).
+      tmGrid: (...a) => (options.tmGrid ? options.tmGrid(...a) : Promise.reject(new Error('no player_tm grid'))) },
     Updates: { check: async () => ({}), status: () => ({ page: 'https://github.com/nicbra/f1tv-tizen', current: '1.0.0' }),
       installedBy: () => 'apps2samsung' },
     // options.av: the real player.js on that fake AVPlay instead of the Player stub.
@@ -463,6 +466,8 @@ async function boot(options = {}) {
     resumePosition: (id) => net.resume(id),
     savePosition: async (...a) => { saved.push(a); }
   });
+  // F1's Tiledmedia answer for the video (options.tm), as api.js keeps it.
+  if (options.tm) Object.assign(api, { tmKnown: () => options.tm, tmAnswer: async () => options.tm });
   if (options.releases || options.launcherResult) vm.runInContext(readFileSync('app/js/updates.js', 'utf8'), context, { filename: 'updates.js' });
   vm.runInContext(readFileSync('app/js/app.js', 'utf8'), context, { filename: 'app.js' });
   if (windowListeners.load) windowListeners.load();
@@ -1873,6 +1878,114 @@ test('a feed chosen while a resumed multiview waits for its big feed is not over
   again.player.progress = true;
   await again.advance(5000);
   assert.ok(!again.player.current.grid, 'the viewer\'s feed stays');
+});
+
+// ---------- multiview from F1's player_tm feeds ----------
+
+const TM = { streamType: 'HDR_UHD_HLSCK', main: '1025', who: 'TOKEN', keyHeaders: { ascendontoken: 'TOKEN', entitlementtoken: 'ENT' },
+  feeds: { 1025: 'https://cdn/101/1025/tm.m3u8', 1033: 'https://cdn/101/1033/tm.m3u8', 1009: 'https://cdn/101/1009/tm.m3u8' } };
+const tmGridOf = (grids, fails) => async (masters, layout, opts) => {
+  grids.push({ masters, layout, opts });
+  if (fails && fails()) throw new Error('grid helper: refused');
+  return { url: 'http://127.0.0.1:18765/stitch/' + opts.id + '/master.m3u8', width: 2880, height: 1624, start: 0 };
+};
+async function showLayout(app, name, dirs) {
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(name, dirs || ['RIGHT']);
+  await app.pick(/^Show (this )?multiview/, ['DOWN']);
+  await app.advance(3000);
+}
+
+test('a multiview from F1\'s player_tm answer: no PLAY request per feed, the helper\'s grid of their masters, on Shaka', async () => {
+  const asked = [], grids = [];
+  const app = await premiumHdr({ play: tmOffers(asked), tm: TM, tmGrid: tmGridOf(grids) });
+  await play(app, 'Race');
+  await app.advance(1000);
+  const before = asked.length;
+  await showLayout(app, /^Big \+ 2$/);
+  const s = app.player.current;
+  assert.equal(s.grid.engine, 'tm');
+  assert.equal(asked.length, before, 'every feed is in the one answer');
+  assert.deepEqual(Array.from(grids[0].masters), [TM.feeds[1025], TM.feeds[1033], TM.feeds[1009]]);
+  assert.equal(grids[0].layout, 'side2');
+  assert.match(s.url, /^http:\/\/127\.0\.0\.1:18765\/stitch\/tm[a-z0-9]+\/master\.m3u8$/);
+  assert.ok(s.hdr && s.hlsAes && s.keyHeaders.ascendontoken === 'TOKEN', 'Shaka sends the tokens with the commentary\'s key requests');
+  assert.equal(s.capsPath, 'shaka:tmgrid');
+  // The sound: the sound feed's own, else F1 LIVE's, else the main feed's.
+  assert.deepEqual(Array.from(grids[0].opts.sound), [TM.feeds[1025], TM.feeds[1033], TM.feeds[1025]]);
+  assert.match(app.$('osd-feed').textContent, /^Multiview · 3 feeds · HDR/);
+  // Sound from the onboard: its team radio (onboardSound), from its own master.
+  await app.press('UP');
+  await app.moveTo(/^Sound from/, ['UP', 'DOWN']);
+  await app.press('RIGHT', 'RIGHT');
+  await app.advance(6500);
+  const g = app.player.current.grid;
+  assert.equal(g.engine, 'tm');
+  assert.equal(grids.at(-1).opts.sound[0], TM.feeds[1009]);
+  assert.equal(app.player.current.onboardSound, true);
+});
+
+test('player_tm multiview: layouts that cover part of a feed, and a failed one, play the usual way', async () => {
+  const asked = [], grids = [];
+  let fail = true;
+  const app = await premiumHdr({ play: tmOffers(asked), tm: TM, tmGrid: tmGridOf(grids, () => fail) });
+  await play(app, 'Race');
+  await app.advance(1000);
+  // Picture in picture: F1's tiles aren't motion-constrained, the covered feed would smear: today's route.
+  await showLayout(app, /^Picture in picture ½$/);
+  assert.equal(grids.length, 0);
+  assert.equal(app.player.current.grid.engine, 'hevc');
+  // Big + 2: the helper refuses it, so the same multiview plays the usual way, and this video doesn't try again.
+  await showLayout(app, /^Big \+ 2$/, ['LEFT']);
+  await app.advance(3000);
+  assert.equal(grids.length, 1);
+  assert.equal(app.player.current.grid.layout, 'side2');
+  assert.equal(app.player.current.grid.engine, 'hevc');
+  fail = false;
+  await showLayout(app, /^Picture in picture ½$/);
+  await showLayout(app, /^Big \+ 2$/, ['LEFT']);
+  assert.equal(grids.length, 1, 'not again for this video');
+});
+
+test('a player_tm multiview that never plays: the same multiview the usual way, and Caps learns it', async () => {
+  const asked = [], grids = [];
+  const app = await premiumHdr({ play: tmOffers(asked), tm: TM, tmGrid: tmGridOf(grids) });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.progress = false;
+  await showLayout(app, /^Big \+ 2$/);
+  assert.equal(app.player.current.grid.engine, 'tm');
+  const tmStream = app.player.current;
+  await app.advance(40000);
+  app.player.progress = true;
+  await app.advance(5000);
+  // The start watch gave up on it (no progress at first): the retry is the usual multiview.
+  assert.notEqual(app.player.current, tmStream);
+  assert.equal(app.player.current.grid.engine, 'hevc');
+  assert.equal(app.player.current.grid.layout, 'side2');
+  // Fresh offers the usual way, not the player_tm masters (AVPlay's grid needs CMAF).
+  assert.ok(app.player.current.grid.streams.every((x) => !x.hlsAes && !/tm\.m3u8/.test(x.url)), JSON.stringify(app.player.current.grid.streams.map((x) => x.url)));
+  assert.notEqual(app.player.current.capsPath, 'shaka:hlsaes');
+  assert.equal(JSON.parse(app.store['f1tv.caps'] || '{"paths":{}}').paths['shaka:tmgrid'].failed > 0 ||
+    app.context.Caps.report().paths['shaka:tmgrid'].failed > 0, true);
+});
+
+test('a player_tm multiview that fails while playing: the same multiview the usual way, not player_tm again', async () => {
+  const asked = [], grids = [];
+  const app = await premiumHdr({ play: tmOffers(asked), tm: TM, tmGrid: tmGridOf(grids) });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  await showLayout(app, /^Big \+ 2$/);
+  await app.advance(5000);
+  assert.equal(app.player.current.grid.engine, 'tm');
+  app.player.listeners.error('Playback error 3016: media decode', { code: 'MEDIA_ERROR', platform: '3016' });
+  await app.advance(8000);
+  assert.equal(grids.length, 1, 'no second player_tm grid');
+  assert.equal(app.player.current.grid.engine, 'hevc');
+  assert.ok(app.player.current.grid.streams.every((x) => !x.hlsAes));
 });
 
 test('in a multiview, Sound from picks the feed the commentary comes from, once the choice settles', async () => {

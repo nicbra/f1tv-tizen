@@ -86,13 +86,15 @@ var HdrStream = (function () {
           r.text().then(function (body) { return { body: body, url: r.url || url }; });
       });
     }
+    var over = false;
     function deadline(work) {
       return new Promise(function (resolve, reject) {
-        var timer = setTimeout(function () { if (controller) controller.abort(); reject(new Error('HDR preparation timed out')); }, ms || 12000);
-        work.then(function (value) { clearTimeout(timer); resolve(value); }, function (e) { clearTimeout(timer); if (controller) controller.abort(); reject(e); });
+        var timer = setTimeout(function () { over = true; if (controller) controller.abort(); reject(new Error('HDR preparation timed out')); }, ms || 12000);
+        work.then(function (value) { clearTimeout(timer); resolve(value); }, function (e) { clearTimeout(timer); over = true; if (controller) controller.abort(); reject(e); });
       });
     }
-    return { get: get, deadline: deadline };
+    // signal: for this preparation's other requests; expired(): it timed out or failed (later work must not go on).
+    return { get: get, deadline: deadline, signal: controller ? controller.signal : undefined, expired: function () { return over; } };
   }
   function official(mpd, url, langs) {
     if (!/<MPD\b[^>]*\btype="static"/.test(mpd) || (mpd.match(/<Period\b/g) || []).length !== 1 || /<BaseURL\b/.test(mpd)) return fail('unsupported Widevine VOD layout');
@@ -592,6 +594,155 @@ var HdrStream = (function () {
     }));
   }
 
+  /**
+   * Multiview from F1's player_tm feeds (HDR_UHD_HLSCK: HLG HEVC in AES-128 TS). The stream helper decrypts, unpacks and
+   * stitches the feeds' segments (service/tm-ts.js) into one clear picture, as from the CMAF offers (the same encode),
+   * and serves an HLS master for Shaka: the grid's playlist (the first feed's, rewritten: replays and live alike) as
+   * its video, and the commentary and subtitles of the sound feed's own master (F1's AES-128 playlists, which Shaka
+   * plays like a single player_tm feed). TRACKER and DATA have no sound in player_tm (F1's player takes another
+   * feed's): `sound` lists masters to take it from, in order.
+   * masters: each place's player_tm master URL; opts: { id, sound: [master URL], at (replay seconds) or wall (clock time,
+   * Unix seconds), keyHeaders }.
+   * Resolves { url, width, height, start } (start: where the replay's first prepared segment begins, seconds).
+   */
+  function tmGrid(masters, layout, opts) {
+    opts = opts || {};
+    var known = typeof MultiviewLayouts !== 'undefined' && MultiviewLayouts.layouts[layout], heights = known && known.feeds;
+    if (!heights || heights.length !== masters.length) return Promise.reject(new Error('HDR: layout ' + layout + ' needs ' + (heights ? heights.length : '?') + ' feeds'));
+    var io = fetcher(20000), keys = {}, id = opts.id;
+    function key(uri) {
+      // The account's tokens go to F1's key server only (as Shaka's key filter in player.js does), never redirected.
+      if (!/^https:\/\/f1tv\.formula1\.com\//.test(uri)) return Promise.reject(new Error('HDR: player_tm key not on F1\'s key server'));
+      if (!keys[uri]) {
+        keys[uri] = fetch(uri, { headers: opts.keyHeaders || {}, redirect: 'error', signal: io.signal }).then(function (r) {
+          if (!r.ok) return fail('player_tm key: HTTP ' + r.status);
+          return r.arrayBuffer();
+        }).then(function (b) {
+          var u = new Uint8Array(b), hex = '';
+          if (u.length !== 16) return fail('player_tm key is not 16 bytes');
+          for (var i = 0; i < 16; i++) hex += (u[i] < 16 ? '0' : '') + u[i].toString(16);
+          return hex;
+        });
+      }
+      return keys[uri];
+    }
+    function variantOf(url, height) {
+      return io.get(url).then(function (master) {
+        var lines = master.body.split(/\r?\n/), uri = null, a = null;
+        lines.forEach(function (line, i) {
+          if (uri || !/^#EXT-X-STREAM-INF:/.test(line)) return;
+          var x = attrs(line.slice(18)), size = /^(\d+)x(\d+)$/.exec(x.RESOLUTION || '');
+          if (size && +size[2] === height && x['VIDEO-RANGE'] === 'HLG' && /(hev1|hvc1)\./.test(x.CODECS || '')) { uri = (lines[i + 1] || '').trim(); a = x; }
+        });
+        if (!uri) return fail('no ' + height + 'p HLG variant in player_tm');
+        return io.get(new URL(uri, master.url).toString()).then(function (response) {
+          var text = response.body;
+          if (!/^#EXTM3U\s/.test(text) || /^#EXT-X-DISCONTINUITY\s*$/m.test(text) || /^#EXT-X-(?:BYTERANGE|MAP):/m.test(text)) return fail('unsupported player_tm playlist');
+          var keyLines = text.match(/^#EXT-X-KEY:.*$/gm) || [], k = keyLines.length === 1 ? attrs(keyLines[0].slice(11)) : {};
+          if (k.URI) k.URI = new URL(k.URI, response.url).toString();
+          if (k.METHOD !== 'AES-128' || !/^https:\/\//.test(k.URI || '') || (k.KEYFORMAT && k.KEYFORMAT !== 'identity')) return fail('unsupported player_tm key');
+          var seq = +((/^#EXT-X-MEDIA-SEQUENCE:(\d+)/m.exec(text) || [])[1] || 0), durations = [];
+          (text.match(/^#EXTINF:\s*([\d.]+)/gm) || []).forEach(function (l) { durations.push(parseFloat(l.slice(8))); });
+          var uris = text.split(/\r?\n/).filter(function (l) { return l.trim() && l.charAt(0) !== '#'; })
+            .map(function (l) { return new URL(l.trim(), response.url).toString(); });
+          var pattern = CmafDash.template(uris);
+          // The helper fetches segment n by its media sequence number: the names must carry it.
+          if (!pattern || pattern.startNumber !== seq || uris.length !== durations.length) return fail('unsupported player_tm segment names');
+          // Each segment's clock time: PROGRAM-DATE-TIME where the playlist gives one (replays have several: the clock
+          // jumps at breaks), else the previous segment's plus its length.
+          var walls = [], wall = NaN;
+          text.split(/\r?\n/).forEach(function (l) {
+            if (/^#EXT-X-PROGRAM-DATE-TIME:/.test(l)) wall = Date.parse(l.slice(25).trim()) / 1000;
+            else if (/^#EXTINF:/.test(l)) { walls.push(wall); wall += parseFloat(l.slice(8)) || 0; }
+          });
+          return { url: response.url, seq: seq, count: uris.length, durations: durations, media: pattern.media, keyUri: k.URI,
+            iv: k.IV || null, bandwidth: +a.BANDWIDTH || 0, end: /^#EXT-X-ENDLIST\s*$/m.test(text), walls: walls };
+        });
+      });
+    }
+    /** The renditions of the first master (of opts.sound) whose HLG variants have sound: { media, groups: [{ id, codec }], subs }. */
+    function soundOf(list) {
+      if (!list.length) return Promise.resolve({ media: [], groups: [], subs: null });
+      return io.get(list[0]).then(function (master) {
+        // The HLG variants' sound groups, each with its codec and the subtitle group those variants name.
+        var lines = master.body.split(/\r?\n/), groups = {}, order = [], subs = null, used = {};
+        lines.forEach(function (line) {
+          if (!/^#EXT-X-STREAM-INF:/.test(line)) return;
+          var x = attrs(line.slice(18));
+          if (x['VIDEO-RANGE'] !== 'HLG') return;
+          if (x.SUBTITLES) used[x.SUBTITLES] = true;
+          if (!x.AUDIO && x.SUBTITLES && !subs) subs = x.SUBTITLES;
+          if (x.AUDIO && !groups[x.AUDIO]) {
+            groups[x.AUDIO] = { codec: (x.CODECS || '').split(',').map(function (c) { return c.trim(); }).filter(function (c) { return /^(mp4a|ac-3|ec-3)/.test(c); })[0] || 'mp4a.40.2',
+              subs: x.SUBTITLES || null };
+            order.push(x.AUDIO);
+          }
+        });
+        var media = lines.filter(function (l) { return /^#EXT-X-MEDIA:/.test(l); }).filter(function (l) {
+          var x = attrs(l.slice(13));
+          return x.URI && ((x.TYPE === 'AUDIO' && groups[x['GROUP-ID']]) || (x.TYPE === 'SUBTITLES' && used[x['GROUP-ID']]));
+        }).map(function (l) {
+          return l.replace(/URI="([^"]*)"/, function (m, u) { return 'URI="' + new URL(u, master.url).toString() + '"'; });
+        });
+        if (!order.length) return list.length > 1 ? soundOf(list.slice(1)) : { media: media, groups: [], subs: subs };
+        return { media: media, groups: order.map(function (g) { return { id: g, codec: groups[g].codec, subs: groups[g].subs }; }), subs: subs };
+      });
+    }
+    var sound$ = soundOf((opts.sound || []).filter(function (u, i, all) { return u && all.indexOf(u) === i; }));
+    return io.deadline(Promise.all(masters.map(function (url, n) { return variantOf(url, heights[n]); })).then(function (feeds) {
+      var live = feeds.some(function (f) { return !f.end; });
+      // The grid's playlist is the first feed's: a replay's feeds must cover the same segments (they do: F1 numbers and
+      // times every feed of a session alike), or a seek near either end would miss a feed's segment.
+      if (!live && feeds.some(function (f) { return f.seq !== feeds[0].seq || f.count !== feeds[0].count; })) return fail('player_tm feeds differ in length');
+      // The segment every feed has: live a few back from the newest (complete on the CDN), a replay where `at` falls.
+      var first = Math.max.apply(Math, feeds.map(function (f) { return f.seq; }));
+      var last = Math.min.apply(Math, feeds.map(function (f) { return f.seq + f.count - 1; }));
+      if (last < first) return fail('player_tm feeds do not overlap');
+      var probe, start = 0;
+      if (opts.wall > 0 && !(opts.at > 0) && feeds[0].walls.some(function (w) { return w <= opts.wall; })) {
+        // A moment by the clock (a resume, a switch from one feed, a live start behind the edge): the last segment of
+        // the first feed that began by then.
+        var w = feeds[0].walls, j = 0;
+        for (var q = 0; q < w.length; q++) if (w[q] <= opts.wall) j = q;
+        j = Math.max(first - feeds[0].seq, Math.min(j, (live ? last - 3 : last) - feeds[0].seq));
+        probe = feeds[0].seq + j;
+        for (var d = 0; d < j; d++) start += feeds[0].durations[d];
+      } else if (live) probe = Math.max(first, last - 3);
+      else {
+        var lead = feeds[0], i = Math.max(0, first - lead.seq), t = 0;
+        for (var k = 0; k < i; k++) t += lead.durations[k];
+        while (opts.at > 0 && i < lead.count - 1 && lead.seq + i < last && t + lead.durations[i] <= opts.at) t += lead.durations[i++];
+        probe = lead.seq + i;
+        start = t;
+      }
+      return Promise.all(feeds.map(function (f) { return key(f.keyUri); }).concat([sound$])).then(function (got) {
+        var sound = got[feeds.length], bandwidth = feeds.reduce(function (n, f) { return n + f.bandwidth; }, 0);
+        var head = ['#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-INDEPENDENT-SEGMENTS'].concat(sound.media);
+        // The helper fills in the grid's codec and size once it has built it.
+        // CLOSED-CAPTIONS=NONE: else Shaka fetches the first segment (a whole grid) to look for captions in it.
+        var inf = '#EXT-X-STREAM-INF:BANDWIDTH=' + bandwidth + ',RESOLUTION=$GRIDRESOLUTION$,FRAME-RATE=50.000,VIDEO-RANGE=HLG,CLOSED-CAPTIONS=NONE';
+        var variants = sound.groups.length ? sound.groups.map(function (g) {
+          return inf + ',CODECS="$GRIDCODECS$,' + g.codec + '",AUDIO="' + g.id + '"' + (g.subs ? ',SUBTITLES="' + g.subs + '"' : '');
+        }) : [inf + ',CODECS="$GRIDCODECS$"' + (sound.subs ? ',SUBTITLES="' + sound.subs + '"' : '')];
+        var master = head.concat([].concat.apply([], variants.map(function (v) { return [v, 'video.m3u8']; }))).join('\n') + '\n';
+        // lead: seconds of the first feed's playlist before the probe (the helper keeps every time from there on >= 0).
+        var lead = 0;
+        for (var b = 0; b < probe - feeds[0].seq; b++) lead += feeds[0].durations[b];
+        var body = { kind: 'hevc', layout: layout, probe: probe, lead: lead, live: live, ua: navigator.userAgent, playlist: feeds[0].url, master: master,
+          feeds: feeds.map(function (f, n) { return { ts: true, absolute: true, media: f.media, key: got[n], iv: f.iv }; }) };
+        // Timed out or failed meanwhile (the app has gone on the usual way): no grid for nobody.
+        if (io.expired()) return fail('player_tm preparation timed out');
+        return fetch(LOCAL + '/stitch/' + id, { method: 'POST', body: JSON.stringify(body), signal: io.signal }).then(function (r) {
+          return r.text().then(function (txt) {
+            if (!r.ok) return fail('grid helper: ' + txt);
+            var info = JSON.parse(txt);
+            return { url: LOCAL + '/stitch/' + id + '/master.m3u8', width: info.width, height: info.height, start: start, live: live };
+          });
+        });
+      });
+    }));
+  }
+
   /** A variant's VIDEO-RANGE; HLS defines a missing one as SDR (F1's SDR-only playlists name none). */
   function videoRange(a) { return a['VIDEO-RANGE'] || 'SDR'; }
 
@@ -681,5 +832,5 @@ var HdrStream = (function () {
     }));
   }
 
-  return { build: build, live: live, grid: grid, liveGrid: liveGrid, regrid: regrid, heights: heights, subtitleTracks: subtitleTracks };
+  return { build: build, live: live, grid: grid, liveGrid: liveGrid, regrid: regrid, tmGrid: tmGrid, heights: heights, subtitleTracks: subtitleTracks };
 })();

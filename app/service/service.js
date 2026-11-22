@@ -53,6 +53,8 @@ function logged(req, res, u) {
     var host = '';
     try { host = u.pathname === '/mpd' ? urlLib.parse(String(u.query.u)).host : /^\/s\/([^/]+)\//.test(u.pathname) ? urlLib.parse(b64urlDecode(RegExp.$1)).host : ''; } catch (e) { /* no host */ }
     var entry = { at: new Date(t0).toISOString(), kind: kind, method: req.method || 'GET', host: host, status: status, ms: Date.now() - t0 };
+    if (kind === 'stitch') entry.path = String(u.pathname).replace(/^\/stitch\/[^/]+/, '');
+    if (req.headers && req.headers.range) entry.range = String(req.headers.range).slice(0, 40);
     // Multiview: which segment, where the time went, and why it failed (no URLs or tokens).
     if (res.f1) Object.keys(res.f1).forEach(function (k) { entry[k] = res.f1[k]; });
     recent.push(entry);
@@ -380,8 +382,9 @@ function handle(req, res) {
 
 // --- Multiview by stitching (experiment) ---
 
-var stitchHevc = null;
+var stitchHevc = null, tmTs = null;
 try { stitchHevc = require('./stitch-hevc'); } catch (e) { console.log('stitch unavailable: ' + e); }
+try { tmTs = require('./tm-ts'); } catch (e) { console.log('player_tm grids unavailable: ' + e); }
 
 /** HEVC grid: a feed's media segment n (0-based) from its template or list. */
 /** n: the index in the playlist, or for live (`absolute`) the segment number itself (as in the DASH timeline). */
@@ -396,9 +399,15 @@ function hevcSegmentUrl(feed, n) {
 /**
  * POST /stitch/<id> with { kind: 'hevc', layout: name or { cols, rows, cells }, feeds: [{ init, media, startNumber, count } | { init, urls }] }
  * (see stitch-hevc.js LAYOUTS).
+ *
+ * player_tm feeds (F1's HDR_UHD_HLSCK, tm-ts.js) instead: feeds [{ ts: true, media, absolute: true, key, iv }] (TS segments
+ * by their media sequence number, AES-128 key and IV in hex, no init: it comes from the segments' parameter sets),
+ * plus `playlist` (the first feed's variant playlist, which video.m3u8 follows: replays and live alike) and `master`
+ * (the HLS master the app made, served as master.m3u8: its video variant is video.m3u8, its sound and subtitles F1's).
  */
 function hevcGridPost(res, id, body) {
   buildGrid(body, function (status, err, grid) {
+    res.f1 = { probe: +body.probe || 0, ts: !!(grid && grid.ts) };
     if (err) return send(res, status, toBuf(err));
     stitches[id] = grid;
     var ids = Object.keys(stitches);
@@ -438,34 +447,56 @@ function hevcRegridPost(res, id, body) {
 function buildGrid(body, cb) {
   var feeds = body && Array.isArray(body.feeds) ? body.feeds : [];
   if (feeds.length < 1 || feeds.length > 9) return cb(400, 'need 1-9 feeds');
-  if (!feeds.every(function (f) { return f && typeof f === 'object' && typeof f.init === 'string' && (Array.isArray(f.urls) || typeof f.media === 'string'); })) return cb(400, 'bad feeds');
+  var ts = feeds.some(function (f) { return f && f.ts; });
+  if (ts && !tmTs) return cb(501, 'player_tm grids unavailable');
+  if (!feeds.every(function (f) {
+    if (!f || typeof f !== 'object') return false;
+    // player_tm: every feed TS, numbered as in the playlist, with its key (the init comes from the segments).
+    if (ts) return !!f.ts && f.absolute && typeof f.media === 'string' && /^[0-9a-f]{32}$/i.test(String(f.key)) && (f.iv == null || /^(0x)?[0-9a-f]{32}$/i.test(String(f.iv)));
+    return typeof f.init === 'string' && (Array.isArray(f.urls) || typeof f.media === 'string');
+  })) return cb(400, 'bad feeds');
+  if (ts && !(typeof body.playlist === 'string' && f1Cdn(body.playlist) && typeof body.master === 'string' && body.master.length < 65536)) return cb(400, 'player_tm grids need the playlist and master');
   var live = !!body.live, count0 = feeds[0].urls ? feeds[0].urls.length : feeds[0].count;
-  var probe = live ? +body.probe : Math.max(0, Math.min(count0 - 1, +body.probe || 0)), all = [];
-  if (live && !(probe > 0 && feeds.every(function (f) { return f.absolute && f.media; }))) return cb(400, 'live grids need absolute numbers');
-  feeds.forEach(function (f) { all.push(f.init, hevcSegmentUrl(f, probe)); });
+  var probe = live || ts ? +body.probe : Math.max(0, Math.min(count0 - 1, +body.probe || 0)), all = [];
+  // Live CMAF numbers come from the DASH timeline (never 0); a player_tm replay may start at media sequence 0.
+  var numbered = ts ? probe >= 0 && probe === Math.floor(probe) : probe > 0;
+  if ((live || ts) && !(numbered && feeds.every(function (f) { return f.absolute && f.media; }))) return cb(400, (ts ? 'player_tm' : 'live') + ' grids need absolute numbers');
+  feeds.forEach(function (f) { if (!f.ts) all.push(f.init); all.push(hevcSegmentUrl(f, probe)); });
   if (!all.every(function (u) { return f1Cdn(String(u)); })) return cb(400, 'need F1 media');
-  // A replay grid is as long as its shortest feed.
-  var count = live ? Infinity : Math.min.apply(Math, feeds.map(function (f) { return f.urls ? f.urls.length : +f.count || 0; })), ua = body.ua ? String(body.ua).slice(0, 300) : null;
+  // A replay grid is as long as its shortest feed (a player_tm grid: as its playlist, which the player follows).
+  var count = live || ts ? Infinity : Math.min.apply(Math, feeds.map(function (f) { return f.urls ? f.urls.length : +f.count || 0; })), ua = body.ua ? String(body.ua).slice(0, 300) : null;
   // Akamai serves a stream only to the user agent that opened it: the manifest and commentary too.
   if (ua) browserUa = ua;
   if (body.prepareOnly) {
     // Only fetch the inputs now (the viewer is choosing); the grid is built when chosen, a moment later:
     // the segment after too.
     var later = feeds.map(function (f) { return hevcSegmentUrl(f, probe + 1); }).filter(function (u) { return u && f1Cdn(String(u)); });
-    return fetchInputs(all.concat(live || probe + 1 < count0 ? later : []), function (err) { cb(err ? 502 : 204, err ? String(err) : null, null); }, 2, ua, live);
+    return fetchInputs(all.concat(live || ts || probe + 1 < count0 ? later : []), function (err) { cb(err ? 502 : 204, err ? String(err) : null, null); }, 2, ua, live || ts);
   }
   fetchInputs(all, function (err, got) {
     if (err) return cb(502, String(err));
     try {
       var inits = [], firsts = [];
-      got.forEach(function (b, i) { (i % 2 ? firsts : inits).push(b); });
+      if (ts) {
+        // player_tm: decrypt and unpack each feed's probe segment; its parameter sets make the feed's init.
+        feeds = feeds.map(function (f, n) {
+          var made = tmTs.convert(got[n], f, probe, null);
+          // Every time of the playlist's window stays at or above zero: a probe just after the 33-bit clock wrapped
+          // would put the segments before it (body.lead seconds of them) below zero, so this epoch starts one higher.
+          if (made.firstDts - (+body.lead || 0) * 90000 < 0) made = tmTs.convert(got[n], f, probe, made.firstDts + tmTs.WRAP);
+          inits.push(tmTs.init(made.aus));
+          firsts.push(made.segment);
+          return { ts: true, media: f.media, absolute: true, key: f.key, iv: f.iv || null, base: made.firstDts, probe: probe };
+        });
+      } else got.forEach(function (b, i) { (i % 2 ? firsts : inits).push(b); });
       var g = stitchHevc.prepare(inits, firsts, body.layout || 'grid2x2', 50);
       // Stitch the probe now: it proves the feeds fit together, and is likely the first segment asked for.
       var warm = stitchHevc.gridSegment(firsts, g.cfg);
-      cb(200, null, { kind: 'hevc', live: live, feeds: feeds, count: count, init: g.init, cfg: g.cfg, cache: [{ number: probe, body: warm }],
-        pending: {}, at: Date.now(), ua: ua, info: { width: g.width, height: g.height, codecs: g.codecs } });
+      cb(200, null, { kind: 'hevc', live: live, ts: ts, feeds: feeds, count: count, init: g.init, cfg: g.cfg, cache: [{ number: probe, body: warm }],
+        pending: {}, at: Date.now(), ua: ua, playlist: ts ? body.playlist : null, master: ts ? body.master : null, asked: probe,
+        info: { width: g.width, height: g.height, codecs: g.codecs } });
     } catch (e) { cb(422, String(e && e.message || e)); }
-  }, 2, ua, live);
+  }, 2, ua, live || ts);
 }
 
 var stitches = {};   // id -> { kind, feeds, count, init, cfg, cache, at } (and mpd for the H.264 stack)
@@ -540,7 +571,7 @@ function fetchAll(urls, cb, parallel, ua, missing) {
 
 function stitchRequest(req, res, u) {
   if (!stitchHevc) return send(res, 501, toBuf('stitching unavailable'));
-  var m = /^\/stitch\/([a-z0-9-]{1,64})(?:\.mpd|\/(init\.mp4|audio-init\.mp4|a?\d+\.m4s|layout|prepare))?$/.exec(u.pathname);
+  var m = /^\/stitch\/([a-z0-9-]{1,64})(?:\.mpd|\/(init\.mp4|audio-init\.mp4|a?\d+\.m4s|layout|prepare|master\.m3u8|video\.m3u8))?$/.exec(u.pathname);
   if (!m) return send(res, 404, toBuf('not found'));
   var id = m[1], what = m[2] || (/\.mpd$/.test(u.pathname) ? 'mpd' : null);
   if (req.method === 'POST' && (!what || what === 'layout' || what === 'prepare')) {
@@ -571,13 +602,68 @@ function stitchRequest(req, res, u) {
   s.at = Date.now();
   if (s.kind === 'h264x') return stitchx.get(res, s, what, id);
   if (what === 'mpd') return send(res, 200, s.mpd, 'application/dash+xml');
+  if (what === 'master.m3u8') {
+    if (!s.master) return send(res, 404, toBuf('not found'));
+    // The app wrote the master before the grid existed: its codec and size go in now.
+    return send(res, 200, toBuf(s.master.replace(/\$GRIDCODECS\$/g, s.info.codecs).replace(/\$GRIDRESOLUTION\$/g, s.info.width + 'x' + s.info.height)), 'application/vnd.apple.mpegurl');
+  }
+  if (what === 'video.m3u8') return s.playlist ? tmPlaylist(res, s) : send(res, 404, toBuf('not found'));
   if (what === 'init.mp4') return send(res, 200, s.init, 'video/mp4');
   var number = parseInt(what, 10);
   if (!(number >= 0 && number < s.count)) return send(res, 404, toBuf('no such segment'));
+  s.asked = number;   // where the player is: the background fetches follow it (a seek back included)
   segmentFor(s, number, function (status, body, timing) {
     res.f1 = timing;
     send(res, status, body, status === 200 ? 'video/mp4' : 'text/plain');
   });
+}
+
+/**
+ * A player_tm grid's video playlist: the first feed's own (F1's; a replay's whole list, live as it grows), its segments
+ * the grid's (<media sequence number>.m4s) and clear (no EXT-X-KEY), with the grid's init. Its PROGRAM-DATE-TIME and
+ * durations stay F1's, so the player lines it up with the sound and subtitles of the master. Kept 1 s.
+ */
+function tmPlaylist(res, s) {
+  var kept = s.playlistCache;
+  if (kept && Date.now() - kept.at < 1000) return send(res, 200, kept.body, 'application/vnd.apple.mpegurl');
+  fetchBuffer(s.playlist, 3, function (err, status, body) {
+    if (err || status !== 200) return send(res, 502, toBuf('playlist: ' + (err ? String(err).replace(/https?:\/\/\S*/g, '') : 'HTTP ' + status)));
+    var out = tmRewrite(body.toString('utf8'), s.feeds[0].iv);
+    if (typeof out !== 'string') return send(res, 502, toBuf('playlist: ' + (out && out.why || 'not an HLS media playlist')));
+    s.playlistCache = { at: Date.now(), body: toBuf(out) };
+    send(res, 200, s.playlistCache.body, 'application/vnd.apple.mpegurl');
+  }, s.ua, f1Cdn);
+}
+
+/**
+ * tmPlaylist's rewrite of an HLS media playlist (text), or { why } when it isn't one or no longer matches what the grid
+ * was built for: the helper converts every segment with the first key and IV (`iv`, hex or null), and can't follow a
+ * discontinuity (new timestamps, parameter sets) or byte ranges. The player then fails, and the app falls back.
+ */
+function tmRewrite(text, iv) {
+  var lines = text.split(/\r?\n/);
+  if (!/^#EXTM3U/.test(lines[0] || '')) return null;
+  if (/^#EXT-X-(?:DISCONTINUITY\s*$|BYTERANGE:|MAP:)/m.test(text)) return { why: 'a discontinuity or byte range' };
+  var keys = (text.match(/^#EXT-X-KEY:.*$/gm) || []), want = iv ? String(iv).replace(/^0x/i, '').toLowerCase() : null;
+  if (keys.some(function (k) {
+    var got = (/[:,]IV=0x([0-9a-f]+)/i.exec(k) || [])[1];
+    return !/[:,]METHOD=AES-128(?:,|$)/.test(k) || (got ? got.toLowerCase() : null) !== want;
+  }) || keys.length > 1 && keys.some(function (k) { return k !== keys[0]; })) return { why: 'the key changed' };
+  var seq = 0, mapped = false, out = [];
+  lines.forEach(function (line) {
+    var m = /^#EXT-X-MEDIA-SEQUENCE:(\d+)/.exec(line);
+    if (m) seq = +m[1];
+    if (/^#EXT-X-KEY:/.test(line) || /^#EXT-X-MAP:/.test(line)) return;
+    if (/^#EXT-X-VERSION:/.test(line)) return out.push('#EXT-X-VERSION:7');
+    // The init before the first segment's own tags (its duration, clock time, ...).
+    if (!mapped && (/^#EXT(?:INF|-X-PROGRAM-DATE-TIME|-X-DISCONTINUITY|-X-BYTERANGE|-X-GAP)\b/.test(line) || (line && line.charAt(0) !== '#'))) {
+      out.push('#EXT-X-MAP:URI="init.mp4"');
+      mapped = true;
+    }
+    if (line && line.charAt(0) !== '#') return out.push(String(seq++) + '.m4s');
+    out.push(line);
+  });
+  return out.join('\n');
 }
 
 /**
@@ -604,8 +690,21 @@ function segmentFor(s, number, cb) {
   fetchAll(segUrls, function (err, segs) {
     timing.fetchMs = Date.now() - t0;
     if (err) return answer(502, toBuf(String(err)));
+    // player_tm grids: Shaka asks for one segment at a time, and fetching four feeds takes most of a segment's
+    // length, so the next one's fetch starts now, while this one is unpacked and stitched (two ahead at most).
+    if (s.ts && number + 1 <= s.asked + 2) setTimeout(function () { aheadOf(s, number + 1); }, 0);
     var out, t1 = Date.now();
-    try { out = stitchHevc.gridSegment(segs, s.cfg); }
+    try {
+      if (s.ts) {
+        // Each segment unwrapped around where its time should be (5.76 s a segment from the probe's).
+        segs = segs.map(function (raw, n) {
+          var f = s.feeds[n];
+          return tmTs.convert(raw, f, number, f.base + (number - f.probe) * tmTs.SEGMENT).segment;
+        });
+        timing.convertMs = Date.now() - t1;
+      }
+      out = stitchHevc.gridSegment(segs, s.cfg);
+    }
     catch (e) { return answer(422, toBuf(String(e && e.message || e))); }
     timing.stitchMs = Date.now() - t1;
     timing.mb = Math.round(out.length / 1e5) / 10;
@@ -613,6 +712,13 @@ function segmentFor(s, number, cb) {
     if (s.cache.length > 4) s.cache.shift();
     answer(200, out);
   }, 0, s.ua, s.live);
+}
+
+/** Builds segment `number` in the background unless it is kept or being built already. */
+function aheadOf(s, number) {
+  if (!(number < s.count) || number > s.asked + 2 || s.pending && s.pending[number] || s.cache.some(function (c) { return c.number === number; })) return;
+  if (Object.keys(stitches).every(function (k) { return stitches[k] !== s; })) return;   // replaced meanwhile
+  segmentFor(s, number, function () {});
 }
 
 /**

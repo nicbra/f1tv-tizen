@@ -828,6 +828,32 @@ test('team radio chosen on one engine is found on the other ("tea" in HLS, "team
   assert.deepEqual(av.calls.find((c) => c[0] === 'setSelectTrack'), ['setSelectTrack', 'AUDIO', 3]);
 });
 
+test('a player_tm multiview on Shaka: its subtitles go to the app (over the frames), the video\'s own stay hidden', async () => {
+  const P = await player(fakeAvPlay(), { 'f1tv.settings': JSON.stringify({ subtitles: 'eng' }) }, async () => {});
+  const video = P.videos[0];
+  Object.assign(video, { play: () => Promise.resolve(), currentTime: 10 });
+  // Shaka's displayer track, with the cue that shows now.
+  const listeners = {};
+  const track = { label: 'Shaka Player TextTrack', kind: 'subtitles', cues: [], activeCues: [],
+    addEventListener: (t, fn) => { listeners[t] = fn; }, removeEventListener: (t, fn) => { if (listeners[t] === fn) delete listeners[t]; } };
+  video.textTracks = [track];
+  const shown = [];
+  P.on('subtitle', (x) => shown.push(x));
+  await P.load({ url: 'http://127.0.0.1:18765/stitch/tm1/master.m3u8', hdr: true, hlsAes: true, licenseUrl: '', info: { dynamic: false },
+    grid: { engine: 'tm', layout: 'side2', streams: [] } }, null);
+  assert.deepEqual(P.languages.filter((l) => l[0] !== 'audio'), [['text', 'en'], ['subtitles', false]]);
+  assert.equal(P.configs.at(-1).streaming.alwaysStreamText, true, 'loaded though hidden');
+  track.activeCues = [{ text: 'Box, box', endTime: 12 }];
+  listeners.cuechange();
+  track.activeCues = [];
+  listeners.cuechange();
+  assert.deepEqual(shown.map((x) => ({ ...x })), [{ text: 'Box, box', ms: 2000 }, { text: '' }]);
+  // One feed again: Shaka shows them itself, and the app gets nothing from that track.
+  await P.load({ url: 'https://cdn/main.m3u8', licenseUrl: '', multiFeed: true, info: { dynamic: false } }, null);
+  assert.equal(listeners.cuechange, undefined);
+  assert.deepEqual(P.languages.at(-1), ['subtitles', true]);
+});
+
 test('an onboard plays its team radio, whatever the commentary language (Shaka and AVPlay)', async () => {
   const P = await player(fakeAvPlay(), { 'f1tv.settings': JSON.stringify({ audio: 'eng' }) }, async () => {});
   Object.assign(P.videos[0], { play: () => Promise.resolve() });

@@ -49,7 +49,7 @@ function parseSps(rbsp) {
   s.cropBottom = 0; s.confAt = r.p;
   if (r.u(1)) { if (r.ue() || r.ue() || r.ue()) fail('only bottom cropping is handled'); s.cropBottom = r.ue() * (s.chroma === 1 ? 2 : 1); }
   s.confEnd = r.p;
-  r.ue(); r.ue(); s.log2Poc = r.ue() + 4;
+  s.bitDepth = r.ue() + 8; s.bitDepthC = r.ue() + 8; s.log2Poc = r.ue() + 4;
   var ordering = r.u(1); for (var i = ordering ? 0 : s.maxSub; i <= s.maxSub; i++) { r.ue(); r.ue(); r.ue(); }
   var minCb = r.ue() + 3; s.minCb = 1 << minCb; s.ctb = 1 << (minCb + r.ue());
   s.minTb = 1 << (r.ue() + 2); s.maxTb = s.minTb << r.ue(); s.depthInter = r.ue(); s.depthIntra = r.ue();

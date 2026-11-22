@@ -104,6 +104,21 @@ var Player = (function () {
     function P() { return slots[cur].p; }
     function V() { return slots[cur].v; }
 
+    /*
+     * A multiview's picture area on screen ([x, y, w, h], set by the app, as AVPlay's display rect), used while a
+     * stitched grid plays here (F1's player_tm feeds); other streams fill the screen.
+     */
+    var gridRect = null;
+    /** Places a slot's video: in the grid rect while it holds a grid (slot.grid), else the whole screen. */
+    function placeSlot(slot) {
+      var r = slot.grid && gridRect;
+      slot.v.style.left = r ? r[0] + 'px' : '';
+      slot.v.style.top = r ? r[1] + 'px' : '';
+      slot.v.style.width = r ? r[2] + 'px' : '';
+      slot.v.style.height = r ? r[3] + 'px' : '';
+    }
+    function setGridRect(rect) { gridRect = rect; slots.forEach(placeSlot); }
+
     /**
      * HLG must be a constraint, not just a preference: Shaka can otherwise select an SDR variant
      * from F1's mixed master after a seek or an adaptation, making the TV change picture modes.
@@ -240,7 +255,8 @@ var Player = (function () {
         // Keep recent video for backward seeks. A 10 Mbit/s estimate starts F1 streams at 1080p.
         // 4K HDR keeps less: 30 s ahead at 2160p (~17 Mbit/s) filled the TV's video buffer, and Shaka then dropped 2160p
         // for 30 s at a time (LV Qualifying, 2026-11-21: 2160p ~27 s, 1620p ~30 s, over and over); 15 + 10 s held 2160p.
-        streaming: { bufferingGoal: stream.hdr ? 15 : 30, rebufferingGoal: 1, bufferBehind: stream.hdr ? 10 : 90,
+        // alwaysStreamText: a multiview's subtitles stay hidden in the video (the app draws them, relayCues) but load.
+        streaming: { alwaysStreamText: !!stream.grid, bufferingGoal: stream.hdr ? 15 : 30, rebufferingGoal: 1, bufferBehind: stream.hdr ? 10 : 90,
           retryParameters: { maxAttempts: 4, baseDelay: 1000, backoffFactor: 2 } },
         abr: { enabled: true, defaultBandwidthEstimate: startEstimate(slot, stream.hdr), useNetworkInformation: false, switchInterval: 4 },
         // F1's DASH says minBufferTime PT30S, and Shaka waits for max(that, rebufferingGoal) at playbackRate 0 before
@@ -259,7 +275,28 @@ var Player = (function () {
 
     function applyPrefs(player, stream) {
       selectAudio(player, wantedAudio(stream));
-      textTrack(player, Settings.get('subtitles'));
+      textTrack(player, Settings.get('subtitles'), !!(stream && stream.grid));
+    }
+
+    /*
+     * A multiview's subtitles: the video shows the grid under the app's frames, so Shaka's own rendering would sit behind
+     * them, at the bottom of the whole picture. As from AVPlay, the app draws them (its box, under the big feed): Shaka's
+     * track stays hidden (its cues still turn active) and each change of what shows goes to the app.
+     */
+    function relayCues(slot) {
+      if (slot.cueRelay) { slot.cueRelay.track.removeEventListener('cuechange', slot.cueRelay.fn); slot.cueRelay = null; }
+      if (!slot.grid) return;
+      var track = Array.prototype.filter.call(slot.v.textTracks || [], function (t) { return t.label === 'Shaka Player TextTrack'; })[0];
+      if (!track) return;
+      var fn = function () {
+        if (slots[cur] !== slot) return;
+        var cues = Array.prototype.slice.call(track.activeCues || []);
+        var text = cues.map(function (c) { return c.text; }).filter(Boolean).join('\n');
+        var end = Math.max.apply(Math, cues.map(function (c) { return c.endTime; }).concat([0]));
+        emit('subtitle', text ? { text: text, ms: Math.max(500, Math.round((end - slot.v.currentTime) * 1000)) } : { text: '' });
+      };
+      track.addEventListener('cuechange', fn);
+      slot.cueRelay = { track: track, fn: fn };
     }
 
     function load(stream, startTime) {
@@ -268,12 +305,15 @@ var Player = (function () {
 
     function loadSlot(stream, startTime) {
       var slot = slots[cur], gen = ++generation;
+      slot.grid = !!stream.grid;
+      placeSlot(slot);
       configure(slot, stream);
       slot.v.muted = false;
       slot.v.classList.remove('hidden');
       userPaused = false;
       return slot.p.load(stream.url, startTime == null ? null : startTime).then(function () {
         applyPrefs(slot.p, stream);
+        relayCues(slot);
         // Resetting another video element can cancel play(); keepPlaying retries it.
         var started = slot.v.play();
         keepPlaying(slot.v, 5000);
@@ -415,12 +455,15 @@ var Player = (function () {
       generation++;
       rememberBandwidth(old);   // before the incoming slot reads it for its start
       configure(next, stream);
+      next.grid = !!stream.grid;   // its own place (the outgoing one keeps its own until it is hidden)
+      placeSlot(next);
       next.v.muted = true;
       swapping = true;
       return next.p.load(stream.url, startTime == null ? null : startTime).then(function () {
         return whenBuffered(next, 4, 6000);
       }).then(function () {
         applyPrefs(next.p, stream);
+        relayCues(next);
         old.v.style.zIndex = '2';           // keep the old picture on top until the new one runs
         next.v.style.zIndex = '1';
         next.v.classList.remove('hidden');
@@ -452,10 +495,11 @@ var Player = (function () {
     var LANG2 = { eng: 'en', deu: 'de', fra: 'fr', nld: 'nl', por: 'pt', jpn: 'ja', spa: 'es', ita: 'it', teamradio: 'tea' };
     function langOf(l) { return LANG2[l] || l; }
 
-    function textTrack(player, l) {
+    /** Subtitles in language l ('' off); `drawn`: the app draws them (a multiview), so the video's own stay hidden. */
+    function textTrack(player, l, drawn) {
       try {
         if (l) player.selectTextLanguage(langOf(l));
-        player.setTextTrackVisibility(!!l);
+        player.setTextTrackVisibility(!!l && !drawn);
       } catch (e) { /* no text tracks */ }
     }
 
@@ -501,6 +545,7 @@ var Player = (function () {
       init: init,
       load: load,
       swap: swap,
+      setGridRect: setGridRect,
       tracks: tracks,
       setAudio: function (l) { selectAudio(P(), l); },
       /** Channels of the audio playing (2, or 6 for F1's 5.1 AC-3), or null before a variant is chosen. */
@@ -508,7 +553,7 @@ var Player = (function () {
         var a = P().getVariantTracks().filter(function (t) { return t.active; })[0];
         return a && a.channelsCount ? a.channelsCount : null;
       },
-      setSubtitles: function (l) { textTrack(P(), l); },
+      setSubtitles: function (l) { textTrack(P(), l, !!slots[cur].grid); },
       setHlsLiveSegments: function (n) { hlsLiveSegments = Math.max(1, Math.min(6, Math.round(+n) || 3)); return hlsLiveSegments; },
       unload: unload,
       isLive: function () { return P().isLive(); },
@@ -1158,7 +1203,8 @@ var Player = (function () {
   function choose(stream) {
     if (Player.forceEngine) return engines[Player.forceEngine];
     // Multiview: the stream helper's stitched HEVC, native only (clear or encrypted).
-    if (stream.grid) return AvEngine;
+    // F1's player_tm feeds stitched by the helper (clear HEVC, AES-128 commentary): Shaka, like a single player_tm feed.
+    if (stream.grid) return stream.grid.engine === 'tm' ? ShakaEngine : AvEngine;
     if (stream.hdrEncrypted && stream.licenseUrl && hasAvPlay()) return AvEngine;
     // F1's cenc stream (asked as a Chromecast): the browser decrypts it, so Shaka plays it.
     if (stream.cenc) return stream.cencAvplay && hasAvPlay() ? AvEngine : ShakaEngine;
@@ -1339,7 +1385,7 @@ var Player = (function () {
     setSubtitles: traced('player.setSubtitles', function (l) { if (engine) engine.setSubtitles(l); }, function (l) { return { lang: l }; }),
     forceEngine: null,
     /** Multiview: where AVPlay draws the grid's picture ([x, y, w, h] on the 1920x1080 screen, null: all of it). */
-    setGridRect: function (rect) { AvEngine.setGridRect(rect); },
+    setGridRect: function (rect) { AvEngine.setGridRect(rect); ShakaEngine.setGridRect(rect); },
     on: function (name, fn) { listeners[name] = fn; }
   };
 })();

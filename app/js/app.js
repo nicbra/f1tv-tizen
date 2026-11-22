@@ -1699,6 +1699,14 @@
       }
       return;
     }
+    // A multiview from F1's player_tm feeds that fails: the same multiview the usual way next (feedsCtx.tmGridFailed).
+    if (stream.grid && stream.grid.engine === 'tm') {
+      feedsCtx.tmGridFailed = true;
+      // The multiview chooses its way again (the usual one now), whichever path retries it.
+      if (feedsCtx.multiview && feedsCtx.multiview.engine === 'tm') feedsCtx.multiview.engine = null;
+      if (typeof Caps !== 'undefined') Caps.failed('shaka:tmgrid', unclear);
+      return;
+    }
     // F1's Tiledmedia offer (AES-128 HLS on Shaka) that fails: today's 4K HDR route next (feedsCtx.tmFailed), and only
     // a failure of that one counts against HDR.
     if (stream.hlsAes) {
@@ -1755,11 +1763,13 @@
   /** Reads the playing offer's HEVC heights (once per stream); resolves the source once known (null: unread). */
   function mvReadSource() {
     var s = Player.stream();
-    if (!s || !s.url) return Promise.resolve(null);
-    if (mvSource && mvSource.url === s.url) return mvSource.ready;
-    var src = mvSource = { url: s.url, hdr: !!s.hdr, heights: null };
+    // A player_tm multiview plays the helper's master (one variant, the grid): its big feed's own master has the heights.
+    var url = s && s.grid && s.grid.engine === 'tm' ? s.grid.streams[0].url : s && s.url;
+    if (!url) return Promise.resolve(null);
+    if (mvSource && mvSource.url === url) return mvSource.ready;
+    var src = mvSource = { url: url, hdr: !!s.hdr, heights: null };
     // A failed read is asked again the next time (all layouts are shown meanwhile; a missing size fails when played).
-    src.ready = HdrStream.heights(s.url, src.hdr ? 'HLG' : 'SDR').then(function (h) { src.heights = h; return src; },
+    src.ready = HdrStream.heights(url, src.hdr ? 'HLG' : 'SDR').then(function (h) { src.heights = h; return src; },
       function () { if (mvSource === src) mvSource = null; return null; });
     return src.ready;
   }
@@ -1776,10 +1786,26 @@
   function mvEngineFor(layout, src, s) {
     var L = mvLayouts(), l = L.layouts[layout], sh = L.shape(layout);
     if (!l || l.feeds.length > feedsCtx.feeds.length) return null;
+    if (mvTmFits(layout)) return 'tm';
     var missing = src && src.heights && l.feeds.some(function (h) { return src.heights.indexOf(h) < 0; });
     if (!missing) return Player.hevcDecodes(sh.width, sh.height, src ? src.hdr : hdrWanted()) ? 'hevc' : null;
     return src.heights.length === 0 && mvSoftLayout(l) && !feedsCtx.live && s && mvKind(s) === 'sdr' &&
       typeof MvSoftware !== 'undefined' && MvSoftware.supported() ? 'h264' : null;
+  }
+
+  /**
+   * 'tm': multiview from F1's player_tm feeds (HdrStream.tmGrid), played on Shaka: first wherever F1's Tiledmedia answer
+   * for this video is kept and is HDR, until it failed for this video (then the usual way) or on this TV (Caps). It
+   * needs no DRM, live and replays alike, and one PLAY answer has every feed. Layouts that cover part of a feed are
+   * left out: F1's tiles aren't motion-constrained, so the covered feed would smear around the inset.
+   */
+  function mvTmFits(layout) {
+    var L = mvLayouts(), l = L.layouts[layout], sh = L.shape(layout);
+    if (!l || l.feeds.length > feedsCtx.feeds.length || !hdrAllowed() || feedsCtx.tmGridFailed || !pathUsable('shaka:tmgrid')) return false;
+    if (!(F1Api.tmKnown && F1Api.tmKnown(feedsCtx.contentId))) return false;
+    // player_tm: up to 2160p on the broadcast feeds, 1080p on the rest (onboards, TRACKER, DATA).
+    if (l.feeds.slice(1).some(function (h) { return h > 1080; }) || mvHasInset(L.onScreen(layout, 1920, 1080, 'center'))) return false;
+    return Player.hevcDecodes(sh.width, sh.height, true);
   }
 
   /** Layouts the H.264 multiview plays: one big feed (AVPlay) and up to three small 540p ones (software). */
@@ -1789,9 +1815,16 @@
 
   function mvFits(layout) { return !!mvEngine(layout); }
 
+  /** F1's Tiledmedia answer for this video, where a player_tm multiview could use it (kept 30 min: asked again after). */
+  function mvTmReady() {
+    if (!hdrAllowed() || feedsCtx.tmGridFailed || !pathUsable('shaka:tmgrid') || !F1Api.tmAnswer || (F1Api.tmKnown && F1Api.tmKnown(feedsCtx.contentId))) return Promise.resolve();
+    return F1Api.tmAnswer(feedsCtx.contentId, feedsCtx.feeds[0].tmChannel).catch(function () { return null; });
+  }
+
   function multiviewAvailable() {
     if (!feedsCtx || feedsCtx.feeds.length < 2 || !mvLayouts()) return false;
     mvReadSource();
+    mvTmReady();
     return mvLayouts().order.some(mvFits);
   }
 
@@ -1856,8 +1889,56 @@
     return mv.audio != null && mv.slots.indexOf(mv.audio) >= 0 ? mv.audio : mv.slots[0];
   }
 
+  /**
+   * A player_tm multiview's places, from F1's one Tiledmedia answer for the video (every feed's master; no PLAY request
+   * per feed). Each carries the answer's feeds (tmAll), for the sound when the sound feed has none (TRACKER, DATA).
+   */
+  function mvTmStreams(mv) {
+    var feeds = feedsCtx.feeds;
+    return F1Api.tmAnswer(feedsCtx.contentId, feeds[0].tmChannel).then(function (t) {
+      if (!t) throw new Error('no player_tm offer');
+      var main = t.main || feeds[0].tmChannel || null;
+      return mv.slots.map(function (idx) {
+        var f = feeds[idx], ch = f.channelId != null ? String(f.channelId) : main, url = ch && t.feeds[ch];
+        if (!url) throw new Error('no player_tm offer for ' + f.title);
+        return { url: url, streamType: t.streamType, platform: 'BIG_SCREEN_HLS', licenseUrl: '', hdr: true, hlsAes: true,
+          keyHeaders: t.keyHeaders, tmChannel: ch, tmAll: t.feeds, tmMain: main, offeredAt: Date.now(), offeredWho: t.who };
+      });
+    });
+  }
+
+  /**
+   * Has the stream helper build a player_tm multiview (HdrStream.tmGrid); the stream then plays the helper's master on
+   * Shaka. The sound comes from the sound feed, else F1 LIVE, else the main feed (TRACKER and DATA have none there).
+   */
+  function mvTmPrepare(s, opts, from) {
+    var g = s.grid, all = s.tmAll || {};
+    // Where it starts, to prepare that segment first: a position asked for, else a moment by the clock (a resume, a
+    // switch from one feed: the same moment), else a switch's position (replays share a timeline).
+    var at = opts.startAt != null ? opts.startAt : null, wall = null;
+    if (at == null && opts.liveAt) wall = opts.liveAt;
+    else if (at == null && from && !from.atLive) {
+      if (from.wall) wall = from.wall + (from.paused ? 0 : (Date.now() - from.at) / 1000);
+      else at = from.pos;
+    }
+    g.id = 'tm' + Date.now().toString(36);
+    // The stream helper running (and current) first, as for the other grids.
+    return (typeof StreamProxy !== 'undefined' && StreamProxy.ensure ? StreamProxy.ensure() : Promise.resolve()).then(function () {
+      return HdrStream.tmGrid(g.streams.map(function (x) { return x.url; }), g.layout,
+        { id: g.id, sound: [s.url, all['1033'], s.tmMain && all[s.tmMain]], at: at || 0, wall: wall, keyHeaders: s.keyHeaders });
+    }).then(function (made) {
+      s.url = made.url;
+      g.width = made.width;
+      g.height = made.height;
+      return s;
+    });
+  }
+
   function mvStreams(mv) {
+    if (mv.engine === 'tm') return mvTmStreams(mv);
+    // A player_tm multiview's places are player_tm masters: nothing the usual way can use (its fallback asks anew).
     var prev = Player.stream() && Player.stream().grid;
+    if (prev && prev.engine === 'tm') prev = null;
     if (prev && prev.layout === mv.layout && prev.slots.join() === mv.slots.join() && prev.audio === mvSound(mv) &&
         prev.streams.every(function (o) { return o.offeredWho === F1Api.state.ascendon; })) return Promise.resolve(prev.streams);
     var list = [], sound = mvSound(mv), asked = 0;
@@ -1915,7 +1996,7 @@
   /** The offers for a multiview's feeds: those playing (or prepared) keep their sessions, the rest are asked for. */
   function mvOffers(g, mv) {
     var have = {}, list = [];
-    g.slots.forEach(function (idx, k) { have[idx] = g.streams[k]; });
+    if (g.engine !== 'tm') g.slots.forEach(function (idx, k) { have[idx] = g.streams[k]; });
     if (mvAhead && mvAhead.list && mvAhead.content === feedsCtx.contentId && Date.now() - mvAhead.at < 60000) mvAhead.slots.forEach(function (idx, k) { if (!have[idx]) have[idx] = mvAhead.list[k]; });
     return mv.slots.reduce(function (chain, idx) {
       return chain.then(function () {
@@ -2248,14 +2329,14 @@
           if (!mv) return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(true), tm: tmWanted(), langs: f.langs, mainChannel: f.tmChannel, cenc: route !== 'avplay:cbcs', cbcs: nativeHdrUsable() });
           // Multiview: the first feed's offer gives the clock, licence and commentary; the player builds the grid.
           // How it plays (mvEngine) needs the playing offer's HEVC heights: a resumed multiview hasn't read them yet.
-          return (mv.engine ? Promise.resolve() : mvReadSource()).then(function () {
+          return (mv.engine ? Promise.resolve() : Promise.all([mvReadSource(), mvTmReady()])).then(function () {
             if (!mv.engine) mv.engine = mvEngine(mv.layout) || 'hevc';
             return mvStreams(mv);
           }).then(function (list) {
             // audio: the feed whose commentary and subtitles play (mvSound), audioPos: its place in the layout.
             var lead = mv.slots.indexOf(mvSound(mv)), s = Object.assign({}, list[lead]);
             s.grid = { streams: list, layout: mv.layout, slots: mv.slots.slice(), audio: mv.slots[lead], audioPos: lead, engine: mv.engine };
-            return s;
+            return mv.engine === 'tm' ? mvTmPrepare(s, opts, from) : s;
           });
         })
         .then(function (s) {
@@ -2278,6 +2359,7 @@
           // or this TV has learned that it doesn't play it ('avplay:ac3').
           if (stream.hdrEncrypted) stream.noSurround = !!feedsCtx.noSurround || (typeof Caps !== 'undefined' && Caps.avoided('avplay:ac3'));
           if (stream.hlsAes) stream.capsPath = 'shaka:hlsaes';   // learned per TV like the DRM paths
+          if (stream.grid && stream.grid.engine === 'tm') stream.capsPath = 'shaka:tmgrid';
           // Live HDR plays on the official live DASH timeline (the helper swaps in the HLG video).
           var timeline = stream.hdrEncrypted && stream.live ? stream.widevineManifestUrl : stream.url;
           return F1Api.streamInfo(timeline).then(function (info) { stream.info = info; }, function () {}).then(function () {
@@ -2392,6 +2474,15 @@
             }
             return recovery;
           };
+          // A multiview from F1's player_tm feeds that failed, or couldn't be prepared (then only this video's: the
+          // helper refused these feeds, say): the same multiview the usual way.
+          if (mv && mv.engine === 'tm' && feedsCtx.multiview === mv) {
+            feedsCtx.tmGridFailed = true;
+            mv.engine = null;
+            diag('play.fallback', { to: 'multiview-usual', why: String((e && e.message) || e).slice(0, 120) });
+            if (!queuedFeed && screen === 'player') playFeed(i, retryOpts({}));
+            return;
+          }
           // A start with the 5.1 commentary failed (held against the 5.1 above): the same HDR, multiview included, in stereo.
           // F1's Tiledmedia offer failed: today's 4K HDR route.
           if (stream && (stream.surround || stream.hlsAes)) {
@@ -2566,7 +2657,9 @@
       // A start that never played (AVPlay reports 0) retries at the position it asked for.
       if (!(from > 0) && (stream.surround || stream.hlsAes) && stream.askedStart > 0) from = stream.askedStart;
       var wall = from > 0 ? Player.wallClock(from) : null;
-      if (stream.surround || stream.hlsAes) { /* playbackFailed turned the 5.1 or the Tiledmedia offer off: HDR again */ }
+      // A player_tm multiview (playbackFailed turned it off for this video): the same multiview the usual way.
+      if (stream.grid && stream.grid.engine === 'tm') { if (feedsCtx.multiview) feedsCtx.multiview.engine = null; }
+      else if (stream.surround || stream.hlsAes) { /* playbackFailed turned the 5.1 or the Tiledmedia offer off: HDR again */ }
       else if (stream.grid) feedsCtx.multiview = null;   // the retry plays the big feed alone
       else if (stream.hdr) { feedsCtx.hdrFailed = true; feedsCtx.hdrFailures = (feedsCtx.hdrFailures || 0) + 1; }
       else if (stream.cenc) feedsCtx.cencFailed = true;

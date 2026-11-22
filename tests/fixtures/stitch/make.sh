@@ -12,3 +12,7 @@ for i in 0 1 2 3; do
     -x265-params ctu=32:wpp=0:temporal-mvp=0:weightp=0:weightb=0:repeat-headers=1:sao=1:keyint=8:min-keyint=8:scenecut=0:bframes=2:b-adapt=0:b-pyramid=0:ref=2:open-gop=0:info=0:log-level=error \
     -tag:v hev1 $MP4 "hevc$i.mp4"
 done
+# The same clips as MPEG-TS (Annex B, parameter sets in band), the way F1's player_tm feeds carry HEVC (tests/tm-grid.test.js).
+for i in 0 1 2 3; do
+  ffmpeg -v error -y -i "hevc$i.mp4" -c copy -bsf:v hevc_mp4toannexb -f mpegts -mpegts_copyts 1 -muxdelay 0 -muxpreload 0 "hevc$i.ts"
+done

@@ -843,6 +843,28 @@ var F1Api = (function () {
     prefetchTm: function (contentId, mainChannel) {
       return state.ascendon ? tmAnswerFor(contentId, null, mainChannel).then(function () { return null; }, function () { return null; }) : Promise.resolve(null);
     },
+    /**
+     * Multiview from F1's Tiledmedia offer: the answer already kept for this video and sign-in (or null), synchronously,
+     * for deciding which layouts play that way. { streamType, feeds: { channel: master URL }, main }.
+     */
+    tmKnown: function (contentId) {
+      var key = state.ascendon + '|' + String(contentId);
+      var a = tmAnswers.filter(function (x) { return x.key === key && Date.now() < x.until; })[0];
+      return a && !a.refused && /^HDR_/.test(a.streamType) ? a : null;
+    },
+    /**
+     * The Tiledmedia answer for a multiview (asked if not kept): { streamType, feeds, main, keyHeaders } (the headers
+     * Shaka sends with the playlists' key requests), or null when F1 gives no HDR in it.
+     */
+    tmAnswer: function (contentId, mainChannel) {
+      var who = state.ascendon;
+      if (!who) return Promise.resolve(null);
+      return tmAnswerFor(contentId, null, mainChannel).then(function (t) {
+        if (!t || t.refused || !/^HDR_/.test(t.streamType) || state.ascendon !== who) return null;
+        return { streamType: t.streamType, feeds: t.feeds, main: t.main, who: who,
+          keyHeaders: { ascendontoken: who, entitlementtoken: t.entitlementToken || state.entitlement } };
+      });
+    },
     scheduleFrom: scheduleFrom,
     seasonFrom: seasonFrom,
     streamInfo: streamInfo,
