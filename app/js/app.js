@@ -1834,13 +1834,27 @@
     return !!(s && s.grid && s.grid.engine === 'hevc' && !s.hdrEncrypted && !s.licenseUrl && !feedsCtx.live);
   }
 
-  /** Where a clear grid plays: 'shaka' or 'avplay', by what failed for this video, what this TV learned, then GRID_FIRST. */
+  /** A single feed (Player.stream()) whose multiview would be a clear grid (gridClear), before the grid is built. */
+  function gridClearFor(s) { return !!s && !s.hdrEncrypted && !s.licenseUrl && !feedsCtx.live; }
+
+  /**
+   * The engines a clear grid may still try: { avplay, shaka }, each neither failed for this video nor ruled out on this
+   * TV (Caps). With neither, the helper's clear multiview isn't offered (mvEngineFor), like 4K HDR once it's ruled out:
+   * the big feed alone plays fine, and each try would cost a failed start (up to the 25 s start watch). Caps brings each
+   * engine back for one try after 3 days (doubling to 60), a new app version forgets the failures and a new firmware all
+   * of it, so nothing is off for good.
+   */
+  function gridEngines() {
+    return { avplay: !avplayStuck && !feedsCtx.gridAvFailed && pathUsable('avplay:grid'),
+      shaka: !feedsCtx.gridShakaFailed && pathUsable('shaka:grid') };
+  }
+
+  /** Where a clear grid plays: 'shaka' or 'avplay', by gridEngines, then GRID_FIRST. */
   function gridPlayer() {
-    var av = !avplayStuck && !feedsCtx.gridAvFailed && pathUsable('avplay:grid');
-    var sh = !feedsCtx.gridShakaFailed && pathUsable('shaka:grid');
-    if (av && sh) return GRID_FIRST;
-    if (av || sh) return av ? 'avplay' : 'shaka';
-    // Both ruled out on this TV, neither failed for this video: the one not yet failed here, else GRID_FIRST.
+    var g = gridEngines();
+    if (g.avplay && g.shaka) return GRID_FIRST;
+    if (g.avplay || g.shaka) return g.avplay ? 'avplay' : 'shaka';
+    // Neither, and the multiview comes anyway (a resumed one, mvEngine unread): the one not failed for this video.
     return feedsCtx.gridShakaFailed ? 'avplay' : feedsCtx.gridAvFailed || avplayStuck ? 'shaka' : GRID_FIRST;
   }
 
@@ -1853,7 +1867,8 @@
   /** After a clear grid failed (playbackFailed noted it): whether the same multiview can play on the other engine. */
   function gridRetryable(s) {
     if (!gridClear(s) || !s.grid.player || !/:grid$/.test(s.capsPath || '')) return false;
-    return s.grid.player === 'shaka' ? !feedsCtx.gridAvFailed && !avplayStuck : !feedsCtx.gridShakaFailed;
+    var g = gridEngines();
+    return s.grid.player === 'shaka' ? g.avplay : g.shaka;
   }
 
   /**
@@ -1975,11 +1990,15 @@
     var L = mvLayouts(), l = L.layouts[layout], sh = L.shape(layout);
     if (!l || l.feeds.length > feedsCtx.feeds.length) return null;
     if (mvTmFits(layout)) return 'tm';
-    // AVPlay stuck: only a clear HEVC grid, which Shaka plays (gridPlayer); not the encrypted or live ones, nor H.264's.
-    if (avplayStuck && (feedsCtx.live || feedsCtx.gridShakaFailed || !s || s.hdrEncrypted || s.licenseUrl)) return null;
     var missing = src && src.heights && l.feeds.some(function (h) { return src.heights.indexOf(h) < 0; });
-    if (avplayStuck && missing) return null;
-    if (!missing) return Player.hevcDecodes(sh.width, sh.height, src ? src.hdr : hdrWanted()) ? 'hevc' : null;
+    if (!missing) {
+      // The helper's HEVC grid: a clear one on an engine still open (gridEngines); an encrypted or live one is AVPlay's.
+      var g = gridClearFor(s) ? gridEngines() : null;
+      if (g ? !g.avplay && !g.shaka : avplayStuck) return null;
+      return Player.hevcDecodes(sh.width, sh.height, src ? src.hdr : hdrWanted()) ? 'hevc' : null;
+    }
+    // H.264's big feed plays on AVPlay.
+    if (avplayStuck) return null;
     return src.heights.length === 0 && mvSoftLayout(l) && !feedsCtx.live && s && mvKind(s) === 'sdr' &&
       typeof MvSoftware !== 'undefined' && MvSoftware.supported() ? 'h264' : null;
   }

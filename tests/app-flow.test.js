@@ -2152,7 +2152,7 @@ test('an encrypted multiview stays on AVPlay: no Shaka route for cbcs', async ()
   assert.ok(!app.player.current.grid || app.player.current.grid.player === undefined);
 });
 
-test('a clear multiview on Shaka that never starts: the same multiview on AVPlay', async () => {
+test('a clear multiview on Shaka that never starts, with AVPlay ruled out on this TV: the big feed, AVPlay not tried', async () => {
   const app = await premiumHdr({ play: clearHdrOffer });
   app.context.Caps.failed('avplay:grid');
   app.context.Caps.failed('avplay:grid');
@@ -2167,8 +2167,59 @@ test('a clear multiview on Shaka that never starts: the same multiview on AVPlay
   app.player.progress = true;
   await app.advance(5000);
   assert.notEqual(app.player.current, shaka);
-  assert.equal(app.player.current.grid.player, 'avplay');
+  assert.ok(!app.player.current.grid, 'the big feed alone');
   assert.equal(gridPaths(app)['shaka:grid'].failed, 1);
+  assert.equal(gridPaths(app)['avplay:grid'].failed, 2, 'AVPlay not tried again');
+});
+
+const multiviewRow = (app) => app.$('panel-list').children.some((e) => /^Multiview/.test(e.textContent));
+
+test('with both engines ruled out on this TV, the helper\'s clear multiview isn\'t offered (no failed start per try)', async () => {
+  const app = await premiumHdr({ play: clearHdrOffer });
+  ['avplay:grid', 'shaka:grid'].forEach((p) => { app.context.Caps.failed(p); app.context.Caps.failed(p); });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  await app.press('UP');   // the first time, the playlist is read
+  await app.press('BACK');
+  await app.advance(500);
+  await app.press('UP');
+  assert.equal(app.$('panel-title').textContent, 'Watch options');
+  assert.ok(!multiviewRow(app));
+});
+
+test('after both engines failed for a video, it offers no multiview; the next start does (one failure each is no verdict)', async () => {
+  const app = await premiumHdr({ play: clearHdrOffer });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.hold = deferred();
+  await showLayout(app, /^Big \+ 2$/);
+  let h = app.player.hold;
+  app.player.hold = deferred();
+  h.reject(unsupported());
+  await app.advance(6000);
+  h = app.player.hold;
+  app.player.hold = null;
+  h.reject(unsupported());
+  await app.advance(6000);
+  assert.ok(!app.player.current.grid);
+  await app.press('UP');
+  assert.equal(app.$('panel-title').textContent, 'Watch options');
+  assert.ok(!multiviewRow(app), 'not again in this video');
+  assert.equal(gridPaths(app)['avplay:grid'].failed, 1);
+  assert.equal(gridPaths(app)['shaka:grid'].failed, 1);
+  const again = await premiumHdr({ store: app.store, play: clearHdrOffer });   // the next start, what Caps learned kept
+  await again.advance(4000);   // resumes the video at the saved moment
+  assert.ok(again.player.current && !again.player.current.grid);
+  again.player.progress = true;
+  await again.advance(1000);
+  await again.press('UP');
+  await again.press('BACK');
+  await again.advance(500);
+  await again.press('UP');
+  assert.ok(multiviewRow(again), 'the next video tries again');
+  assert.equal(gridPaths(again)['avplay:grid'].failed, 1, 'Caps kept');
 });
 
 test('a player_tm answer in CMAF (weeks-old replays) makes no player_tm multiview: the usual one, nothing held against it', async () => {
