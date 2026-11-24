@@ -32,6 +32,8 @@ var DiagPlay = (function () {
   /** The engine and input actually used: Caps' path for protected video, else the engine with clear input. */
   function pathOf(stream, engine) {
     var p = stream && stream.capsPath;
+    // The helper's clear multiview ('avplay:grid', 'shaka:grid' in Caps): the engine with clear input, as the contract has it.
+    if (/:grid$/.test(p || '') && stream && !stream.licenseUrl) p = null;
     if (!p && (engine === 'shaka' || engine === 'avplay') && stream && !stream.licenseUrl) p = engine + ':clear';
     return vocab().paths.indexOf(p) >= 0 ? p : p ? 'other' : 'unknown';
   }

@@ -283,6 +283,7 @@ var Player = (function () {
 
     /** What a slot loads: a combined master (its copy that starts at the stream's feed), or the stream's own URL. */
     function srcOf(stream) {
+      if (stream.gridUrl && stream.grid && stream.grid.player === 'shaka') return stream.gridUrl;
       if (!stream.combo) return stream.url;
       return typeof FeedCombo !== 'undefined' && FeedCombo.startAt && stream.combo.info ? FeedCombo.startAt(stream.combo.info, stream.combo.k) : stream.combo.uri;
     }
@@ -533,8 +534,51 @@ var Player = (function () {
       return renewStuck().then(function () { return loadSlot(stream, startTime); });
     }
 
+    /*
+     * The stream helper's clear multiview on Shaka (app.js gridPlayer): the helper builds the grid's DASH manifest for
+     * this start, as for AVPlay (StreamProxy.gridManifest: the helper's stitched picture and F1's own commentary), and the
+     * app draws its subtitles from the WebVTT playlists of the sound feed (ttml.js, on this video's clock), as from AVPlay.
+     * player_tm's grid comes ready from the app (mvTmPrepare).
+     */
+    function gridReady(stream, startTime) {
+      if (!stream.grid || stream.grid.player !== 'shaka') return Promise.resolve();
+      var prefs = { audio: audioPref(stream), text: lang3(Settings.get('subtitles')), surround: !stream.noSurround };
+      return StreamProxy.gridManifest(stream.grid.streams, stream.grid.layout, prefs, startTime, stream.grid.audioPos || 0).then(function (prepared) {
+        stream.gridUrl = prepared.url;
+        stream.grid.id = prepared.id;
+        stream.surround = prepared.surround || 0;
+        stream.gridSubtitles = prepared.subtitles || [];
+      });
+    }
+
+    function stopCaptions(slot) {
+      if (slot && slot.captions) { slot.captions.stop(); slot.captions = null; }
+    }
+
+    /** The app's own subtitles for a slot that plays the helper's grid (gridReady), in the language set. */
+    function startCaptions(slot, stream) {
+      stopCaptions(slot);
+      var list = stream.grid && stream.grid.player === 'shaka' ? stream.gridSubtitles : null;
+      if (!list || !list.length || typeof Ttml === 'undefined') return;
+      slot.captions = Ttml.reader(list, {
+        position: function () { var t = slot.v.currentTime; return slots[cur] === slot && t > 0 ? t : null; },
+        show: function (cue) { if (slots[cur] === slot) emit('subtitle', cue); },
+        same: sameLang
+      });
+      slot.captions.select(Settings.get('subtitles') || null);
+    }
+
     function loadSlot(stream, startTime) {
       var slot = slots[cur], gen = ++generation;
+      slots.forEach(stopCaptions);
+      if (!stream.grid || stream.grid.player !== 'shaka') return loadPrepared(slot, gen, stream, startTime);
+      return gridReady(stream, startTime).then(function () {
+        if (gen !== generation) throw new Error('cancelled');
+        return loadPrepared(slot, gen, stream, startTime);
+      });
+    }
+
+    function loadPrepared(slot, gen, stream, startTime) {
       slot.grid = !!stream.grid;
       placeSlot(slot);
       configure(slot, stream);
@@ -544,6 +588,7 @@ var Player = (function () {
       return slot.p.load(srcOf(stream), startTime == null ? null : startTime, mimeOf(stream)).then(function () {
         applyPrefs(slot.p, stream);
         relayCues(slot);
+        startCaptions(slot, stream);
         // Resetting another video element can cancel play(); keepPlaying retries it.
         var started = slot.v.play();
         keepPlaying(slot.v, 5000);
@@ -690,12 +735,16 @@ var Player = (function () {
       // the newer one may be loading (a combined master's own-master fallback reused it while this one still ran).
       var mine = function () { if (gen !== generation) throw new Error('cancelled'); };
       rememberBandwidth(old);   // before the incoming slot reads it for its start
-      configure(next, stream);
-      next.grid = !!stream.grid;   // its own place (the outgoing one keeps its own until it is hidden)
-      placeSlot(next);
-      next.v.muted = true;
+      var start = function () {
+        configure(next, stream);
+        next.grid = !!stream.grid;   // its own place (the outgoing one keeps its own until it is hidden)
+        placeSlot(next);
+        next.v.muted = true;
+        return next.p.load(srcOf(stream), startTime == null ? null : startTime, mimeOf(stream));
+      };
       swapping = true;
-      return next.p.load(srcOf(stream), startTime == null ? null : startTime, mimeOf(stream)).then(function () {
+      var started = stream.grid && stream.grid.player === 'shaka' ? gridReady(stream, startTime).then(function () { mine(); return start(); }) : start();
+      return started.then(function () {
         mine();
         return whenBuffered(next, 4, 6000);
       }).then(function () {
@@ -718,6 +767,8 @@ var Player = (function () {
         next.v.muted = paused;
         cur = 1 - cur;
         swapping = false;
+        stopCaptions(old);
+        startCaptions(next, stream);
         old.v.classList.add('hidden');
         old.v.style.zIndex = '';
         next.v.style.zIndex = '';
@@ -765,6 +816,7 @@ var Player = (function () {
           text: P().getTextTracks().filter(function (t) { return String(t.label || '').indexOf(k + '|') === 0; })
             .map(function (t) { return t.language; }).reduce(uniq, []).map(lang) };
       }
+      if (slot && slot.captions) return { audio: P().getAudioLanguages().map(lang), text: slot.captions.langs().map(lang) };
       return { audio: P().getAudioLanguages().map(lang), text: P().getTextLanguages().map(lang) };
     }
 
@@ -1055,7 +1107,7 @@ var Player = (function () {
       prep.leftAudio = null;
       clearTimeout(prep.timer);
       Ahead.clear();
-      slots.forEach(function (s) { s.combo = null; s.extras = null; });
+      slots.forEach(function (s) { s.combo = null; s.extras = null; stopCaptions(s); });
       slots.forEach(function (s) { s.v.classList.add('hidden'); s.v.style.zIndex = ''; });
       // Shaka's unload has been seen never to finish on the TV (2026-11-11, switching to a multiview): the next load
       // waits for it (Player.unload's teardown), so it gets 10 s; then the next load goes on, and a Shaka load first
@@ -1100,7 +1152,10 @@ var Player = (function () {
         try { a = P().getVariantTracks().filter(function (t) { return t.active; })[0]; } catch (e) { a = null; }
         return !!a && ((a.channelsCount || 0) > 2 || /^(ac-3|ec-3)/.test(String(a.audioCodec || '')));
       },
-      setSubtitles: function (l) { textTrack(P(), l, !!slots[cur].grid); },
+      setSubtitles: function (l) {
+        if (slots[cur].captions) return slots[cur].captions.select(l || null);
+        textTrack(P(), l, !!slots[cur].grid);
+      },
       comboSwitch: comboSwitch,
       comboPrepare: comboPrepare,
       comboStatus: function () {
@@ -1765,7 +1820,8 @@ var Player = (function () {
     if (Player.forceEngine) return engines[Player.forceEngine];
     // Multiview: the stream helper's stitched HEVC, native only (clear or encrypted).
     // F1's player_tm feeds stitched by the helper (clear HEVC, AES-128 commentary): Shaka, like a single player_tm feed.
-    if (stream.grid) return stream.grid.engine === 'tm' ? ShakaEngine : AvEngine;
+    // The helper's clear grid: AVPlay or Shaka, as the app learned on this TV (app.js gridPlayer).
+    if (stream.grid) return stream.grid.engine === 'tm' || stream.grid.player === 'shaka' ? ShakaEngine : AvEngine;
     // Every feed in one master (js/combo.js): feed switches are variant switches in Shaka.
     if (stream.combo) return ShakaEngine;
     if (stream.hdrEncrypted && stream.licenseUrl && hasAvPlay()) return AvEngine;

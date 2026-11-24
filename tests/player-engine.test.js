@@ -861,6 +861,45 @@ test('a player_tm multiview on Shaka: its subtitles go to the app (over the fram
   assert.deepEqual(P.languages.at(-1), ['subtitles', true]);
 });
 
+test('the helper\'s clear multiview on Shaka: the grid manifest built for that start, and the app draws its subtitles', async () => {
+  const loads = [], built = [], vtt = 'WEBVTT\n\n00:00:09.000 --> 00:00:12.000\nBox, box\n';
+  const P = await player(fakeAvPlay(), { 'f1tv.settings': JSON.stringify({ subtitles: 'eng', audio: 'eng' }) }, async (url, start) => { loads.push([url, start]); },
+    { fetch: async (u) => (/\.vtt$/.test(u) ? { ok: true, arrayBuffer: async () => new TextEncoder().encode(vtt).buffer } : { ok: true }), TextEncoder });
+  P.context.StreamProxy.gridManifest = async (streams, layout, langs, at, audio) => {
+    built.push({ layout, langs: { ...langs }, at, audio });
+    return { id: 'mv1', url: 'http://127.0.0.1:18765/vod/mv1.mpd', surround: 0,
+      subtitles: [{ lang: 'eng', vtt: true, offset: 0, timescale: 1, list: [{ url: 'https://cdn/s/0.vtt', start: 0, end: 60 }] }] };
+  };
+  const video = P.videos[0];
+  Object.assign(video, { play: () => Promise.resolve(), currentTime: 10 });
+  const shown = [];
+  P.on('subtitle', (x) => shown.push(x));
+  const s = { url: 'https://cdn/main/hdr.m3u8', hdr: true, licenseUrl: '', info: { dynamic: false },
+    grid: { engine: 'hevc', player: 'shaka', layout: 'side2', streams: [{}, {}, {}], audioPos: 1 } };
+  await P.load(s, 42);
+  assert.equal(P.engineName(), 'shaka');
+  assert.deepEqual(built, [{ layout: 'side2', langs: { audio: 'eng', text: 'eng', surround: true }, at: 42, audio: 1 }]);
+  assert.deepEqual(loads, [['http://127.0.0.1:18765/vod/mv1.mpd', 42]], 'Shaka plays the helper\'s manifest');
+  assert.equal(s.grid.id, 'mv1');
+  assert.equal(s.url, 'https://cdn/main/hdr.m3u8', 'the offer\'s own address stays (its clock, the layout list\'s heights)');
+  for (let k = 0; k < 10; k++) await new Promise(setImmediate);
+  assert.deepEqual(P.tracks().text.map((t) => t.lang), ['eng']);
+  assert.ok(shown.some((x) => x && x.text === 'Box, box'), JSON.stringify(shown));
+  P.setSubtitles('');
+  assert.equal(shown.at(-1), null, 'off');
+  await P.unload();
+});
+
+test('a clear multiview the app gives to AVPlay still plays there', async () => {
+  const av = fakeAvPlay();
+  const P = await player(av);
+  P.context.StreamProxy.gridManifest = async () => ({ id: 'g1', url: 'http://127.0.0.1:18765/vod/g1.mpd', subtitles: [] });
+  await P.load({ url: 'https://cdn/main/hdr.m3u8', hdr: true, licenseUrl: '', info: { dynamic: false },
+    grid: { engine: 'hevc', player: 'avplay', layout: 'side2', streams: [] } }, null);
+  assert.equal(P.engineName(), 'avplay');
+  assert.equal(av.calls.find((c) => c[0] === 'open')[1], 'http://127.0.0.1:18765/vod/g1.mpd');
+});
+
 /** Shaka's pieces the combined master needs (js/combo.js), spied on: registerScheme counts the store's hook. */
 function comboShaka(P) {
   const ctx = P.context, spy = { schemes: 0, factories: 0 };

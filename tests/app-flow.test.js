@@ -1988,6 +1988,189 @@ async function showLayout(app, name, dirs) {
   await app.advance(3000);
 }
 
+// ---------- the helper's clear multiview: AVPlay or Shaka, learned per TV (app.js gridPlayer) ----------
+
+const clearHdrOffer = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '/hdr.m3u8', hdr: true, streamType: 'HDR_UHD_CMAF' });
+const unsupported = () => Object.assign(new Error('Playback error: PLAYER_ERROR_NOT_SUPPORTED_FORMAT'), { info: { code: 'UNSUPPORTED', platform: 'avplay' } });
+const gridPaths = (app) => app.context.Caps.report().paths;
+
+test('a clear multiview that AVPlay refuses (Tizen 5.5, issue #6) plays the same multiview on Shaka', async () => {
+  const app = await premiumHdr({ play: clearHdrOffer });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.hold = deferred();
+  await showLayout(app, /^Big \+ 2$/);
+  const first = app.player.current;
+  assert.equal(first.grid.engine, 'hevc');
+  assert.equal(first.grid.player, 'avplay', 'AVPlay first, as before');
+  assert.equal(first.capsPath, 'avplay:grid');
+  const h = app.player.hold;
+  app.player.hold = null;
+  h.reject(unsupported());
+  await app.advance(6000);
+  const s = app.player.current;
+  assert.notEqual(s, first);
+  assert.ok(s.grid, 'still a multiview');
+  assert.equal(s.grid.layout, 'side2');
+  assert.equal(s.grid.player, 'shaka');
+  assert.equal(s.capsPath, 'shaka:grid');
+  assert.equal(gridPaths(app)['avplay:grid'].failed, 1);
+  await app.advance(3000);
+  assert.ok(gridPaths(app)['shaka:grid'].ok >= 1, 'Caps learns that Shaka plays it');
+  assert.doesNotMatch(app.toast() || '', /Multiview didn't work/);
+});
+
+test('once AVPlay has refused clear multiviews twice on this TV, the next one starts on Shaka', async () => {
+  const app = await premiumHdr({ play: clearHdrOffer });
+  app.context.Caps.failed('avplay:grid');
+  app.context.Caps.failed('avplay:grid');
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  await showLayout(app, /^Big \+ 2$/);
+  assert.equal(app.player.current.grid.player, 'shaka');
+  assert.equal(app.player.loads.filter((l) => /hdr\.m3u8/.test(l.url)).length >= 1, true);
+});
+
+test('a clear multiview that fails on both engines plays its big feed alone', async () => {
+  const app = await premiumHdr({ play: clearHdrOffer });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.hold = deferred();
+  await showLayout(app, /^Big \+ 2$/);
+  let h = app.player.hold;
+  app.player.hold = deferred();
+  h.reject(unsupported());
+  await app.advance(6000);
+  assert.equal(app.player.current.grid.player, 'shaka');
+  h = app.player.hold;
+  app.player.hold = null;
+  h.reject(Object.assign(new Error('Shaka error 4032'), { info: { code: 'UNSUPPORTED', platform: '4032' } }));
+  await app.advance(6000);
+  assert.ok(app.player.current && !app.player.current.grid, 'one feed plays');
+  assert.equal(app.player.current.feed, 'INTERNATIONAL');
+  assert.match(app.toast(), /Multiview didn't work/);
+});
+
+test('a clear SDR multiview that fails on both engines leaves the video\'s SDR route alone (single feeds keep Shaka cenc)', async () => {
+  const asked = [];
+  const app = await premiumHdr({ hdrCapable: false, capsRouting: true,
+    play: (id, channel, opts) => { asked.push(Object.assign({ channel }, opts)); return Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'SDR_HD_CMAF' }); } });
+  app.context.Caps.browser = () => true;   // the browser's cenc works (the stub's probe would say no after 10 s)
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  const singles = () => asked.filter((o) => 'langs' in o);   // one-feed requests (a multiview's carry no langs)
+  const single = singles().at(-1), before = singles().length, route = app.player.current.capsRoute;
+  assert.equal(route, 'shaka:cenc');
+  app.player.hold = deferred();
+  await showLayout(app, /^Big \+ 2$/);
+  assert.equal(app.player.current.capsPath, 'avplay:grid');
+  let h = app.player.hold;
+  app.player.hold = deferred();
+  h.reject(unsupported());
+  await app.advance(6000);
+  assert.equal(app.player.current.grid.player, 'shaka');
+  h = app.player.hold;
+  app.player.hold = null;
+  h.reject(unsupported());
+  await app.advance(6000);
+  assert.ok(!app.player.current.grid, 'one feed after both engines failed');
+  await app.press('CH_DOWN');   // another feed: its own PLAY request, by the video's SDR route
+  await app.advance(6000);
+  assert.ok(singles().length > before, 'the next feed asks for its offer');
+  const after = singles().at(-1);
+  assert.equal(after.cenc, single.cenc);
+  assert.equal(app.player.current.capsRoute, route, 'the next feed takes the same SDR route');
+});
+
+test('a clear SDR multiview that never starts on AVPlay (the start watch) plays on Shaka', async () => {
+  const app = await premiumHdr({ hdrCapable: false,
+    play: (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'SDR_HD_CMAF' }) });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.progress = false;
+  await showLayout(app, /^Big \+ 2$/);
+  const first = app.player.current;
+  assert.equal(first.grid.player, 'avplay');
+  await app.advance(20000);
+  app.player.progress = true;
+  await app.advance(5000);
+  assert.equal(app.player.current.grid && app.player.current.grid.player, 'shaka');
+});
+
+test('a clear multiview the helper can\'t build (feeds that differ) is no engine\'s fault: no Shaka retry, nothing learned', async () => {
+  const app = await premiumHdr({ play: clearHdrOffer });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.hold = deferred();
+  await showLayout(app, /^Big \+ 2$/);
+  const h = app.player.hold;
+  app.player.hold = null;
+  h.reject(new Error('HDR: feeds differ in discontinuities'));
+  await app.advance(6000);
+  assert.ok(app.player.current && !app.player.current.grid, 'the big feed alone, as before');
+  assert.match(app.toast(), /Multiview didn't work/);
+  const paths = gridPaths(app);
+  assert.ok(!paths['avplay:grid'] || paths['avplay:grid'].failed === 0, JSON.stringify(paths['avplay:grid']));
+  assert.ok(!paths['shaka:grid'], 'Shaka never tried');
+});
+
+test('a clear multiview whose AVPlay preparation hangs goes to Shaka at once', async () => {
+  const app = await premiumHdr({ play: clearHdrOffer });
+  app.player.kind = 'avplay';
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.hold = deferred();
+  await showLayout(app, /^Big \+ 2$/);
+  const h = app.player.hold;
+  app.player.hold = null;
+  h.reject(Object.assign(new Error('The video player did not start'), { code: 'PREPARE_TIMEOUT' }));
+  await app.advance(6000);
+  assert.equal(app.player.current.grid.player, 'shaka');
+  assert.equal(app.player.current.grid.layout, 'side2');
+});
+
+test('an encrypted multiview stays on AVPlay: no Shaka route for cbcs', async () => {
+  const app = await premiumHdr({ play: premiumOffer });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.hold = deferred();
+  await showLayout(app, /^Big \+ 2$/);
+  assert.equal(app.player.current.grid.player, undefined);
+  assert.equal(app.player.current.capsPath, 'avplay:hdr');
+  const h = app.player.hold;
+  app.player.hold = null;
+  h.reject(unsupported());
+  await app.advance(6000);
+  assert.ok(!app.player.current.grid || app.player.current.grid.player === undefined);
+});
+
+test('a clear multiview on Shaka that never starts: the same multiview on AVPlay', async () => {
+  const app = await premiumHdr({ play: clearHdrOffer });
+  app.context.Caps.failed('avplay:grid');
+  app.context.Caps.failed('avplay:grid');
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.progress = false;
+  await showLayout(app, /^Big \+ 2$/);
+  const shaka = app.player.current;
+  assert.equal(shaka.grid.player, 'shaka');
+  await app.advance(30000);
+  app.player.progress = true;
+  await app.advance(5000);
+  assert.notEqual(app.player.current, shaka);
+  assert.equal(app.player.current.grid.player, 'avplay');
+  assert.equal(gridPaths(app)['shaka:grid'].failed, 1);
+});
+
 test('a player_tm answer in CMAF (weeks-old replays) makes no player_tm multiview: the usual one, nothing held against it', async () => {
   const asked = [], grids = [];
   const app = await premiumHdr({ play: tmOffers(asked), tm: Object.assign({}, TM, { streamType: 'HDR_UHD_CMAF' }), tmGrid: tmGridOf(grids) });
