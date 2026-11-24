@@ -252,3 +252,22 @@ test('a new consent epoch forgets the attempt under way', () => {
   t.P.leave();
   assert.equal(t.events.length, n, 'no summary from before');
 });
+
+test('a multiview\'s own Caps ways report as before: the engine with clear input, or the DRM of a copy-protected grid', () => {
+  const paths = [];
+  for (const [engine, stream] of [
+    ['avplay', { capsPath: 'avplay:grid', grid: { layout: 'big3' } }],
+    ['shaka', { capsPath: 'shaka:grid', grid: { layout: 'big3' } }],
+    ['avplay', { capsPath: 'mvsoft:h264', grid: { layout: 'big3', engine: 'h264' } }],
+    ['avplay', { capsPath: 'avplay:drmgrid', licenseUrl: 'x', hdrEncrypted: true, grid: { layout: 'big3' } }],
+  ]) {
+    const t = load();
+    t.player.engine = engine;
+    const tr = t.P.request({ layout: 'big3', feeds: 3, content: 'replay', tier: 'premium' });
+    t.P.loading(tr); t.wait(1000); t.P.loaded(tr, stream, 0);
+    t.wait(15000);
+    t.P.failed(null, null, { noProgress: true, final: true });
+    paths.push(t.events[0].fields.path);
+  }
+  assert.deepEqual(paths, ['avplay:clear', 'shaka:clear', 'avplay:clear', 'avplay:hdr']);
+});

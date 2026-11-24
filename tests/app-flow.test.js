@@ -351,7 +351,7 @@ async function boot(options = {}) {
     reloadedSince: (t) => (player.reloadedMs || 0) >= t,
     reloadedAt: () => player.reloadedMs || 0,
     // As player.js for the errors tests make: an error's own `info` ({ code, platform }), else OTHER.
-    errorInfo: (e) => (e && e.info) || { code: 'OTHER', platform: null },
+    errorInfo: (e) => (e && (e.diag || e.info)) || { code: 'OTHER', platform: null },   // as player.js: an error's own diag first
     isLive: () => !!player.engine && !!player.live,
     isPaused: () => !!player.engine && player.paused,
     // player.viewerPaused: the viewer's own pause where it differs from the element's (Shaka, while reloading).
@@ -1757,6 +1757,47 @@ test('H.264 multiview: small feeds that fail start once more, then the big feed 
   assert.ok(!app.player.current.grid, 'the big feed alone');
   assert.match(app.player.current.url, /\/main\.m3u8$/);
   assert.equal(app.mvSoft.starts.length, 2);
+  assert.equal(app.context.Caps.report().paths['mvsoft:h264'].failed, 1, 'learned like every multiview way');
+  await app.press('UP');
+  assert.ok(!/Multiview/.test(app.$('panel-list').textContent), 'not offered again in this video');
+});
+
+test('H.264 multiview the helper refuses (feeds not aligned, Sakhir 2020): this video only, nothing learned on the TV', async () => {
+  const app = await premiumHdr({ heights: () => [], mvSoftware: true });
+  await play(app, 'Race');
+  app.net.play = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' });
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(3000);
+  const refused = () => Object.assign(new Error('helper: the feeds\' segments are not aligned'), { diag: { code: 'HELPER_ERROR', platform: null } });
+  app.mvSoft.starts[0].onError(refused());
+  await app.advance(2500);
+  app.mvSoft.starts[1].onError(refused());
+  await app.advance(3000);
+  assert.ok(!app.player.current.grid, 'the big feed alone');
+  const p = app.context.Caps.report().paths['mvsoft:h264'];
+  assert.ok(!p || !p.failed, JSON.stringify(p));
+  await app.press('UP');
+  assert.ok(!/Multiview/.test(app.$('panel-list').textContent), 'not offered again in this video');
+});
+
+test('H.264 multiview counts as playing once its small feeds show, not when its big feed alone does', async () => {
+  const app = await premiumHdr({ heights: () => [], mvSoftware: true });
+  await play(app, 'Race');
+  app.net.play = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' });
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  await app.pick(/^Show multiview/, ['DOWN']);
+  app.player.progress = true;
+  await app.advance(5000);
+  assert.equal(app.player.current.capsPath, 'mvsoft:h264');
+  assert.ok(!(app.context.Caps.report().paths['mvsoft:h264'] || {}).ok, 'the big feed alone plays: not yet');
+  app.mvSoft.starts[0].onShown();
+  await app.advance(3000);
+  assert.equal(app.context.Caps.report().paths['mvsoft:h264'].ok, 1);
 });
 
 test('an H.264 replay offers no multiview on a TV without Samsung\'s software decoding', async () => {
@@ -1993,6 +2034,7 @@ async function showLayout(app, name, dirs) {
 const clearHdrOffer = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '/hdr.m3u8', hdr: true, streamType: 'HDR_UHD_CMAF' });
 const unsupported = () => Object.assign(new Error('Playback error: PLAYER_ERROR_NOT_SUPPORTED_FORMAT'), { info: { code: 'UNSUPPORTED', platform: 'avplay' } });
 const gridPaths = (app) => app.context.Caps.report().paths;
+const multiviewRow = (app) => app.$('panel-list').children.some((e) => /^Multiview/.test(e.textContent));
 
 test('a clear multiview that AVPlay refuses (Tizen 5.5, issue #6) plays the same multiview on Shaka', async () => {
   const app = await premiumHdr({ play: clearHdrOffer });
@@ -2144,12 +2186,33 @@ test('an encrypted multiview stays on AVPlay: no Shaka route for cbcs', async ()
   app.player.hold = deferred();
   await showLayout(app, /^Big \+ 2$/);
   assert.equal(app.player.current.grid.player, undefined);
-  assert.equal(app.player.current.capsPath, 'avplay:hdr');
+  assert.equal(app.player.current.capsPath, 'avplay:drmgrid', 'its own way, not the single feed\'s 4K HDR');
   const h = app.player.hold;
   app.player.hold = null;
   h.reject(unsupported());
   await app.advance(6000);
-  assert.ok(!app.player.current.grid || app.player.current.grid.player === undefined);
+  assert.ok(!app.player.current.grid, 'no other way: the big feed alone');
+  assert.equal(gridPaths(app)['avplay:drmgrid'].failed, 1);
+  assert.equal(gridPaths(app)['avplay:hdr'].failed || 0, 0, 'single-feed 4K HDR not blamed');
+  assert.equal(app.player.current.capsPath, 'avplay:hdr', 'the big feed plays its 4K HDR');
+  await app.press('UP');
+  assert.ok(!multiviewRow(app), 'not offered again in this video');
+});
+
+test('encrypted multiviews that keep failing leave single-feed 4K HDR on (issue #6: a TV may refuse only multiviews)', async () => {
+  const app = await premiumHdr({ play: premiumOffer });
+  app.context.Caps.failed('avplay:drmgrid');
+  app.context.Caps.failed('avplay:drmgrid');   // ruled out on this TV
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(3000);
+  assert.equal(app.player.current.capsPath, 'avplay:hdr');
+  assert.ok(app.player.current.hdr);
+  await app.press('UP');
+  await app.press('BACK');
+  await app.advance(500);
+  await app.press('UP');
+  assert.ok(!multiviewRow(app), 'no way left for the copy-protected multiview');
 });
 
 test('a clear multiview on Shaka that never starts, with AVPlay ruled out on this TV: the big feed, AVPlay not tried', async () => {
@@ -2171,8 +2234,6 @@ test('a clear multiview on Shaka that never starts, with AVPlay ruled out on thi
   assert.equal(gridPaths(app)['shaka:grid'].failed, 1);
   assert.equal(gridPaths(app)['avplay:grid'].failed, 2, 'AVPlay not tried again');
 });
-
-const multiviewRow = (app) => app.$('panel-list').children.some((e) => /^Multiview/.test(e.textContent));
 
 test('with both engines ruled out on this TV, the helper\'s clear multiview isn\'t offered (no failed start per try)', async () => {
   const app = await premiumHdr({ play: clearHdrOffer });

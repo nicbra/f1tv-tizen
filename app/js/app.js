@@ -1209,7 +1209,8 @@
   // What the app has learned about playing copy-protected video on this TV (js/caps.js), in words.
   var CAPS_NAMES = { 'shaka:cenc': 'Shaka, CENC', 'avplay:cbcs': 'AVPlay, CBCS', 'avplay:cenc': 'AVPlay, CENC',
     'avplay:hdr': 'AVPlay, 4K HDR', 'avplay:ac3': 'AVPlay, 5.1 sound in 4K HDR', 'shaka:hlsaes': 'Shaka, 4K HDR (AES-128 HLS)',
-    'shaka:tmgrid': 'Shaka, 4K HDR multiview (AES-128 HLS)', 'avplay:grid': 'AVPlay, multiview', 'shaka:grid': 'Shaka, multiview' };
+    'shaka:tmgrid': 'Shaka, 4K HDR multiview (AES-128 HLS)', 'avplay:grid': 'AVPlay, multiview', 'shaka:grid': 'Shaka, multiview',
+    'avplay:drmgrid': 'AVPlay, copy-protected multiview', 'mvsoft:h264': 'Software decoding, H.264 multiview' };
 
   function capsSummary() {
     var paths = Caps.report().paths, n = 0;
@@ -1812,63 +1813,88 @@
     if (path === 'shaka:cenc') feedsCtx.cencFailed = true;
     else if (path === 'avplay:cbcs') feedsCtx.cbcsFailed = true;
     else if (path === 'avplay:cenc') feedsCtx.avCencFailed = true;
-    else if (path === 'avplay:grid') feedsCtx.gridAvFailed = true;
-    else if (path === 'shaka:grid') feedsCtx.gridShakaFailed = true;
   }
 
   /*
-   * The stream helper's clear multiview (HEVC stitched from clear HDR or SDR offers: a DASH manifest of the helper's grid
-   * and F1's own commentary) plays on AVPlay or on Shaka. Encrypted and live grids are AVPlay's alone (cbcs, the live
-   * DASH the helper rewrites). AVPlay refused every clear grid with NOT_SUPPORTED on a Tizen 5.5 Q95T (issue #6, v1.2.0),
-   * and its preparation can hang (avplayStuck); Shaka plays the same manifest. Each TV learns both ('avplay:grid',
-   * 'shaka:grid'); a grid that fails on one plays on the other before the big feed plays alone.
-   * AVPlay stays first where both play (QE55Q77A, Las Vegas replay, 2026-11-24): it changes a feed in place without a
-   * gap (regrid) and started a grid with F1 LIVE's 5.1 in ~3 s after the offers (Shaka ~6.5 s, a reopen for the Dolby
-   * rule). Shaka was quicker only with stereo sound (~1 s, loaded beside the playing feed: no black screen); with 5.1
-   * its feed changes went black ~4 s. Both played 2x2 HD / Big + 3 without dropped frames.
+   * Multiview, every kind by one rule. A kind plays one or more ways, each a Caps path learned per TV on its own, never
+   * mixed with a single feed's (a multiview that fails says nothing about one feed: AVPlay refused every clear multiview
+   * with NOT_SUPPORTED on a Tizen 5.5 Q95T, issue #6, v1.2.0):
+   *   tm         F1's player_tm feeds, unpacked and stitched by the helper, on Shaka    shaka:tmgrid
+   *   clear      the helper's grid from clear HDR or SDR offers (a DASH manifest of    avplay:grid, shaka:grid
+   *              the grid and F1's own commentary)
+   *   protected  the helper's grid from encrypted 4K HDR (cbcs replays, live)          avplay:drmgrid (no cbcs on Shaka)
+   *   h264       2018-2024: the big feed on AVPlay, the small ones decoded in software  mvsoft:h264
+   * A way that failed for this video isn't tried again in it until it plays (feedsCtx.mvFailed); one ruled out on this TV
+   * isn't either until Caps gives it its next try (3 days, doubling to 60; a new app version forgets failures, a new
+   * firmware all). A kind with no way left isn't offered (mvEngineFor), like 4K HDR once ruled out: the big feed alone
+   * plays, and each try would cost a failed start. A multiview that fails plays another way (mvAgain: its kind's next
+   * one; after player_tm's, the helper's usual grid), else its big feed alone. One that fails before a player has it
+   * (the helper can't build it, its offers don't match) is the feeds' fault: its kind is off for this video (another
+   * way would build the same), nothing learned on the TV.
+   * Clear grids: AVPlay first where both play (QE55Q77A, Las Vegas replay, 2026-11-24): it changes a feed in place
+   * without a gap (regrid) and started a grid with F1 LIVE's 5.1 in ~3 s after the offers (Shaka ~6.5 s, a reopen for
+   * the Dolby rule). Shaka was quicker only with stereo sound (~1 s, loaded beside the playing feed: no black screen);
+   * with 5.1 its feed changes went black ~4 s. Both played 2x2 HD / Big + 3 without dropped frames.
    */
   var GRID_FIRST = 'avplay';
+  var MV_WAYS = { tm: ['shaka:tmgrid'], clear: GRID_FIRST === 'avplay' ? ['avplay:grid', 'shaka:grid'] : ['shaka:grid', 'avplay:grid'],
+    protected: ['avplay:drmgrid'], h264: ['mvsoft:h264'] };
 
-  /** A grid (playFeed's stream with `grid`) whose picture the helper stitches in the clear: it may play on either. */
-  function gridClear(s) {
-    return !!(s && s.grid && s.grid.engine === 'hevc' && !s.hdrEncrypted && !s.licenseUrl && !feedsCtx.live);
+  /** A multiview's kind, by its engine (mvEngine) and the stream it is built from (the playing feed, or its own grid). */
+  function mvKindFor(engine, s) {
+    if (engine !== 'hevc') return engine || null;
+    return s && !s.hdrEncrypted && !s.licenseUrl && !feedsCtx.live ? 'clear' : 'protected';
   }
 
-  /** A single feed (Player.stream()) whose multiview would be a clear grid (gridClear), before the grid is built. */
-  function gridClearFor(s) { return !!s && !s.hdrEncrypted && !s.licenseUrl && !feedsCtx.live; }
-
-  /**
-   * The engines a clear grid may still try: { avplay, shaka }, each neither failed for this video nor ruled out on this
-   * TV (Caps). With neither, the helper's clear multiview isn't offered (mvEngineFor), like 4K HDR once it's ruled out:
-   * the big feed alone plays fine, and each try would cost a failed start (up to the 25 s start watch). Caps brings each
-   * engine back for one try after 3 days (doubling to 60), a new app version forgets the failures and a new firmware all
-   * of it, so nothing is off for good.
-   */
-  function gridEngines() {
-    return { avplay: !avplayStuck && !feedsCtx.gridAvFailed && pathUsable('avplay:grid'),
-      shaka: !feedsCtx.gridShakaFailed && pathUsable('shaka:grid') };
+  /** A way still open: not failed for this video, not ruled out on this TV, not on AVPlay while it is stuck. */
+  function mvWayOpen(way) {
+    if (avplayStuck && /^(avplay|mvsoft):/.test(way)) return false;   // H.264's big feed plays on AVPlay
+    return !(feedsCtx.mvFailed && feedsCtx.mvFailed[way]) && pathUsable(way);
   }
 
-  /** Where a clear grid plays: 'shaka' or 'avplay', by gridEngines, then GRID_FIRST. */
+  /** The ways a kind may still try, in order. */
+  function mvWays(kind) { return (MV_WAYS[kind] || []).filter(mvWayOpen); }
+
+  /** The way a built multiview (playFeed's stream with `grid`) plays: its Caps path. */
+  function mvWayOf(s) {
+    var kind = s && s.grid ? mvKindFor(s.grid.engine, s) : null;
+    if (!kind) return null;
+    return kind === 'clear' ? (s.grid.player || GRID_FIRST) + ':grid' : MV_WAYS[kind][0];
+  }
+
+  /** Where a clear grid plays: 'avplay' or 'shaka' (Player.choose), its first way still open. */
   function gridPlayer() {
-    var g = gridEngines();
-    if (g.avplay && g.shaka) return GRID_FIRST;
-    if (g.avplay || g.shaka) return g.avplay ? 'avplay' : 'shaka';
-    // Neither, and the multiview comes anyway (a resumed one, mvEngine unread): the one not failed for this video.
-    return feedsCtx.gridShakaFailed ? 'avplay' : feedsCtx.gridAvFailed || avplayStuck ? 'shaka' : GRID_FIRST;
+    var way = mvWays('clear')[0];
+    if (way) return way.split(':')[0];
+    // None, and the multiview comes anyway (a resumed one: mvEngine unread): one that didn't fail for this video.
+    var failed = feedsCtx.mvFailed || {};
+    return failed['shaka:grid'] ? 'avplay' : failed['avplay:grid'] || avplayStuck ? 'shaka' : GRID_FIRST;
   }
 
-  /** A grid that failed before any engine played it: hdr.js refused the feeds ('HDR: …') or the helper didn't take it. */
+  /** Ways that failed for this video: a way's own failure (playbackFailed), or every way of a kind (mvKindOff). */
+  function mvOff(ways) {
+    feedsCtx.mvFailed = feedsCtx.mvFailed || {};
+    ways.forEach(function (way) { feedsCtx.mvFailed[way] = true; });
+  }
+
+  /** The feeds failed, not a way (see above): the kind is off for this video, nothing learned on the TV. */
+  function mvKindOff(kind) { mvOff(MV_WAYS[kind] || []); }
+
+  /** A grid the helper couldn't build: hdr.js refused the feeds ('HDR: …'), or the helper didn't take it. */
   function gridBuildFailure(e) {
     var m = String((e && e.message) || e || '');
     return /^HDR: |^Could not prepare multiview$/.test(m) || (Player.errorInfo(e) || {}).code === 'HELPER_ERROR';
   }
 
-  /** After a clear grid failed (playbackFailed noted it): whether the same multiview can play on the other engine. */
-  function gridRetryable(s) {
-    if (!gridClear(s) || !s.grid.player || !/:grid$/.test(s.capsPath || '')) return false;
-    var g = gridEngines();
-    return s.grid.player === 'shaka' ? g.avplay : g.shaka;
+  /**
+   * After a multiview failed (mvOff noted it): whether the same multiview plays another way now (else its big feed alone).
+   * If so, its retry chooses the engine again (the reopen over a hung AVPlay keeps it: it doesn't ask).
+   */
+  function mvAgain() {
+    var mv = feedsCtx.multiview;
+    if (!mv || !mvEngine(mv.layout)) return false;
+    mv.engine = null;
+    return true;
   }
 
   /**
@@ -1901,12 +1927,13 @@
       }
       return;
     }
-    // A multiview from F1's player_tm feeds that fails: the same multiview the usual way next (feedsCtx.tmGridFailed).
-    if (stream.grid && stream.grid.engine === 'tm') {
-      feedsCtx.tmGridFailed = true;
-      // The multiview chooses its way again (the usual one now), whichever path retries it.
-      if (feedsCtx.multiview && feedsCtx.multiview.engine === 'tm') feedsCtx.multiview.engine = null;
-      if (typeof Caps !== 'undefined') Caps.failed('shaka:tmgrid', unclear);
+    // A multiview: held against its own way (mvWayOf), never a single feed's path; not tried again in this video.
+    if (stream.grid) {
+      mvOff([stream.capsPath]);
+      if (typeof Caps !== 'undefined') {
+        Caps.failed(stream.capsPath, unclear);
+        if (Player.stream() === stream) Caps.crashEnd(true);
+      }
       return;
     }
     // F1's Tiledmedia offer (AES-128 HLS on Shaka) that fails: today's 4K HDR route next (feedsCtx.tmFailed), and only
@@ -1921,9 +1948,8 @@
       if (Player.stream() === stream) Caps.crashEnd(true);
     }
     failPath(stream.capsPath);
-    // The server may decline the cenc offer and return cbcs. Don't request that same dead end forever. (A clear grid's
-    // failure says nothing about the SDR DRM route.)
-    if (!stream.hdr && !/:grid$/.test(stream.capsPath)) failPath(stream.capsRoute);
+    // The server may decline the cenc offer and return cbcs. Don't request that same dead end forever.
+    if (!stream.hdr) failPath(stream.capsRoute);
   }
 
   /** Position advancing, rather than load/prepare succeeding, is evidence that the path plays. */
@@ -1931,10 +1957,13 @@
     var s = Player.stream();
     if (!s || !s.capsPath || typeof Caps === 'undefined') return;
     // Where the engine counts frames (Shaka), a decoded one too: a frozen start can move its position (0 -> 2.13 s).
-    if (!s.capsOk && !s.capsFailed && !Player.isPaused() && s.capsPosition != null && Player.position() > s.capsPosition + 0.5 &&
+    // An H.264 multiview plays once its small feeds show too (mvSoftShown), not when its big feed alone does.
+    var whole = !(s.grid && s.grid.engine === 'h264') || mvSoftShown;
+    if (whole && !s.capsOk && !s.capsFailed && !Player.isPaused() && s.capsPosition != null && Player.position() > s.capsPosition + 0.5 &&
       Player.decodedFrames() !== 0) {
       s.capsOk = true;
       Caps.ok(s.capsPath);
+      if (s.grid && feedsCtx.mvFailed) delete feedsCtx.mvFailed[s.capsPath];   // it plays (after a reopen, say)
       if (s.surround && Player.audioChannels() > 2) Caps.ok('avplay:ac3');   // only when the 5.1 is what plays
     }
     // A crash while the 5.1 plays counts against the 5.1 first (as a failed start does): the next start leaves it out.
@@ -1990,16 +2019,10 @@
     var L = mvLayouts(), l = L.layouts[layout], sh = L.shape(layout);
     if (!l || l.feeds.length > feedsCtx.feeds.length) return null;
     if (mvTmFits(layout)) return 'tm';
+    // Each kind only with a way left to play it (mvWays).
     var missing = src && src.heights && l.feeds.some(function (h) { return src.heights.indexOf(h) < 0; });
-    if (!missing) {
-      // The helper's HEVC grid: a clear one on an engine still open (gridEngines); an encrypted or live one is AVPlay's.
-      var g = gridClearFor(s) ? gridEngines() : null;
-      if (g ? !g.avplay && !g.shaka : avplayStuck) return null;
-      return Player.hevcDecodes(sh.width, sh.height, src ? src.hdr : hdrWanted()) ? 'hevc' : null;
-    }
-    // H.264's big feed plays on AVPlay.
-    if (avplayStuck) return null;
-    return src.heights.length === 0 && mvSoftLayout(l) && !feedsCtx.live && s && mvKind(s) === 'sdr' &&
+    if (!missing) return mvWays(mvKindFor('hevc', s)).length && Player.hevcDecodes(sh.width, sh.height, src ? src.hdr : hdrWanted()) ? 'hevc' : null;
+    return src.heights.length === 0 && mvSoftLayout(l) && !feedsCtx.live && s && mvKind(s) === 'sdr' && mvWays('h264').length &&
       typeof MvSoftware !== 'undefined' && MvSoftware.supported() ? 'h264' : null;
   }
 
@@ -2011,7 +2034,7 @@
    */
   function mvTmFits(layout) {
     var L = mvLayouts(), l = L.layouts[layout], sh = L.shape(layout);
-    if (!l || l.feeds.length > feedsCtx.feeds.length || !hdrAllowed() || feedsCtx.tmGridFailed || !pathUsable('shaka:tmgrid')) return false;
+    if (!l || l.feeds.length > feedsCtx.feeds.length || !hdrAllowed() || !mvWays('tm').length) return false;
     // Only F1's TS kind (HDR_UHD_HLSCK), which the helper unpacks (service/tm-ts.js). A CMAF answer (weeks-old replays,
     // São Paulo 2026) failed there every time and counted against the way of playing: the usual multiview plays it.
     var known = F1Api.tmKnown && F1Api.tmKnown(feedsCtx.contentId);
@@ -2030,7 +2053,7 @@
 
   /** F1's Tiledmedia answer for this video, where a player_tm multiview could use it (kept 30 min: asked again after). */
   function mvTmReady() {
-    if (!hdrAllowed() || feedsCtx.tmGridFailed || !pathUsable('shaka:tmgrid') || !F1Api.tmAnswer || (F1Api.tmKnown && F1Api.tmKnown(feedsCtx.contentId))) return Promise.resolve();
+    if (!hdrAllowed() || !mvWays('tm').length || !F1Api.tmAnswer || (F1Api.tmKnown && F1Api.tmKnown(feedsCtx.contentId))) return Promise.resolve();
     return F1Api.tmAnswer(feedsCtx.contentId, feedsCtx.feeds[0].tmChannel).catch(function () { return null; });
   }
 
@@ -2376,6 +2399,10 @@
           return setTimeout(function () { if (Player.stream() === stream && screen === 'player') mvSoftStart(stream, true); }, 2000);
         }
         toast('Multiview didn\'t work (' + ((e && e.message) || e) + ').', 8000);
+        // The helper refusing these feeds (segments that aren't aligned, Sakhir 2020): the feeds' fault, this video only.
+        // Anything else is held against the way ('mvsoft:h264').
+        if (gridBuildFailure(e)) mvKindOff('h264');
+        else playbackFailed(stream, unclearFailure(Player.errorInfo(e), e && e.message));
         if (feedsCtx.multiview) {
           feedsCtx.multiview = null;
           playFeed(feedsCtx.index, { switching: true, retrying: true, recover: true });   // retrying: the message above stays
@@ -2560,7 +2587,7 @@
             // audio: the feed whose commentary and subtitles play (mvSound), audioPos: its place in the layout.
             var lead = mv.slots.indexOf(mvSound(mv)), s = Object.assign({}, list[lead]);
             s.grid = { streams: list, layout: mv.layout, slots: mv.slots.slice(), audio: mv.slots[lead], audioPos: lead, engine: mv.engine };
-            if (gridClear(s)) s.grid.player = gridPlayer();   // Player.choose: Shaka or AVPlay
+            if (mvKindFor(mv.engine, s) === 'clear') s.grid.player = gridPlayer();   // Player.choose: Shaka or AVPlay
             return mv.engine === 'tm' ? mvTmPrepare(s, opts, from) : s;
           });
         })
@@ -2585,8 +2612,7 @@
           // or this TV has learned that it doesn't play it ('avplay:ac3').
           if (stream.hdrEncrypted) stream.noSurround = !!feedsCtx.noSurround || (typeof Caps !== 'undefined' && Caps.avoided('avplay:ac3'));
           if (stream.hlsAes) stream.capsPath = 'shaka:hlsaes';   // learned per TV like the DRM paths
-          if (stream.grid && stream.grid.engine === 'tm') stream.capsPath = 'shaka:tmgrid';
-          if (stream.grid && stream.grid.player) stream.capsPath = stream.grid.player + ':grid';
+          if (stream.grid) stream.capsPath = mvWayOf(stream);   // a multiview learns its own way
           // Live HDR plays on the official live DASH timeline (the helper swaps in the HLG video).
           var timeline = stream.hdrEncrypted && stream.live ? stream.widevineManifestUrl : stream.url;
           // A start or a switch that loads: the feeds in one master, if built within 2 s (the feed list started the
@@ -2703,9 +2729,14 @@
             if (!queuedFeed && screen === 'player') playFeed(i, usual);
             return;
           }
-          // A clear multiview the helper couldn't build (feeds that differ, a refused segment): the feeds' fault, not the
-          // engine's. Nothing learned, no other engine (Las Vegas, an onboard with other breaks, 2026-11-24).
-          if (gridClear(stream) && gridBuildFailure(e)) stream.capsPath = null;
+          // A multiview that failed before a player had it (its offers, player_tm's preparation) or that the helper couldn't
+          // build (feeds that differ, a refused segment): the feeds' fault, no way's. Its kind is off for this video, nothing
+          // learned on the TV (Las Vegas, an onboard with other breaks, 2026-11-24).
+          var mvOn = !!(mv && feedsCtx.multiview === mv);
+          if (mvOn && (!stream || !stream.grid || !stream.capsPath || gridBuildFailure(e))) {
+            mvKindOff(stream && stream.grid ? mvKindFor(stream.grid.engine, stream) : mvKindFor(mv.engine, Player.stream()));
+            if (stream && stream.grid) stream.capsPath = null;
+          }
           playbackFailed(stream, unclearFailure(Player.errorInfo(e), e && e.message) || !!(stream && stream.unclearCause));
           // An SDR engine failed before starting. Try the next path at the requested moment;
           // native cenc still goes through the helper, as in PR #3.
@@ -2717,9 +2748,10 @@
           // AVPlay's preparation hung (player.js PREPARE_MS): one more try opens over it, as BACK and trying again
           // did (Mexico 2026 multiview). Another hang, or a player that won't open again, needs the app restarted;
           // what played last is saved (saveWatching), so it comes back at that moment.
-          // (A clear multiview goes to Shaka instead, below.)
-          var gridAgain = !!(mv && feedsCtx.multiview === mv && gridRetryable(stream));
-          if (e && (e.code === 'PREPARE_TIMEOUT' || e.code === 'PLAYER_STUCK') && !gridAgain) {
+          // (A multiview with another way to play goes there instead, below.) A start with the 5.1 commentary that failed
+          // isn't the multiview's: the same one again in stereo (below).
+          var mvNext = mvOn && !(stream && stream.surround) && mvAgain();
+          if (e && (e.code === 'PREPARE_TIMEOUT' || e.code === 'PLAYER_STUCK') && !mvNext) {
             if (e.code === 'PLAYER_STUCK' || feedsCtx.prepareRetried) {
               avplayStuck = true;
               // A multiview: its big feed alone, which Shaka plays (a single 4K HDR or SDR replay feed doesn't need
@@ -2758,23 +2790,14 @@
             }
             return recovery;
           };
-          // A multiview from F1's player_tm feeds that failed, or couldn't be prepared (then only this video's: the
-          // helper refused these feeds, say): the same multiview the usual way.
-          if (mv && mv.engine === 'tm' && feedsCtx.multiview === mv) {
-            feedsCtx.tmGridFailed = true;
-            mv.engine = null;
-            diag('play.fallback', { to: 'multiview-usual', why: String((e && e.message) || e).slice(0, 120) });
-            if (!queuedFeed && screen === 'player') playFeed(i, retryOpts({}));
-            return;
-          }
-          // A clear multiview that failed on one engine (playbackFailed noted it): the same multiview on the other. A hung
-          // AVPlay preparation counts as above (twice, or a player that won't open: stuck until the app restarts).
-          if (gridAgain) {
+          // A multiview that failed one way: the same multiview the next way (mvAgain). A hung AVPlay preparation counts
+          // as above (twice, or a player that won't open: stuck until the app restarts).
+          if (mvNext) {
             if (e && (e.code === 'PREPARE_TIMEOUT' || e.code === 'PLAYER_STUCK')) {
               if (e.code === 'PLAYER_STUCK' || feedsCtx.prepareRetried) avplayStuck = true;
               feedsCtx.prepareRetried = true;
             }
-            diag('play.fallback', { to: stream.grid.player === 'shaka' ? 'grid-avplay' : 'grid-shaka', why: String((e && (e.code || e.message)) || e).slice(0, 120) });
+            diag('play.fallback', { to: 'multiview-next', from: (stream && stream.capsPath) || null, why: String((e && (e.code || e.message)) || e).slice(0, 120) });
             var other = retryOpts({});
             other.retrying = true;
             toast('Multiview didn\'t start, trying again…', 4000);
@@ -2782,8 +2805,8 @@
             return;
           }
           // A start with the 5.1 commentary failed (held against the 5.1 above): the same HDR, multiview included, in stereo.
-          // F1's Tiledmedia offer failed: today's 4K HDR route.
-          if (stream && (stream.surround || stream.hlsAes)) {
+          // F1's Tiledmedia offer failed: today's 4K HDR route (a player_tm multiview's feeds are that offer too: above).
+          if (stream && (stream.surround || (stream.hlsAes && !mvOn))) {
             diag('play.fallback', { to: stream.hlsAes ? 'hdr-usual' : 'hdr-stereo' });
             if (!queuedFeed && screen === 'player') playFeed(i, retryOpts({}));
             return;
@@ -2974,7 +2997,8 @@
       // of playing, and never the last try (the feed's own master comes next).
       var comboBack = !!(stream.combo && !stream.grid);
       if (!comboBack) playbackFailed(stream, noData || unclearFailure(null) || !!stream.unclearCause);
-      var last = !comboBack && opts.retry && !stream.hdr && !gridRetryable(stream) && (!stream.capsPath || sdrPath() === stream.capsRoute);
+      // A multiview is never the last try: another way or its big feed alone follows.
+      var last = !comboBack && opts.retry && !stream.hdr && !stream.grid && (!stream.capsPath || sdrPath() === stream.capsRoute);
       dplay('failed', null, null, { noProgress: true, final: last });
       if (last) return;
       toast('The video didn\'t start, trying again…', 3000);
@@ -2983,13 +3007,12 @@
       // A start that never played (AVPlay reports 0) retries at the position it asked for.
       if (!(from > 0) && (stream.surround || stream.hlsAes || comboBack) && stream.askedStart > 0) from = stream.askedStart;
       var wall = from > 0 ? Player.wallClock(from) : null;
-      // A player_tm multiview (playbackFailed turned it off for this video): the same multiview the usual way.
-      if (stream.grid && stream.grid.engine === 'tm') { if (feedsCtx.multiview) feedsCtx.multiview.engine = null; }
+      // A multiview (playbackFailed noted its way): the same multiview the next way, else its big feed alone. With the 5.1
+      // commentary: the same one in stereo.
+      if (stream.grid && !stream.surround) { if (!mvAgain()) feedsCtx.multiview = null; }
       // A combined master (js/combo.js): this feed's own master next, the usual switches for this video.
       else if (stream.combo) feedsCtx.comboOff = true;
       else if (stream.surround || stream.hlsAes) { /* playbackFailed turned the 5.1 or the Tiledmedia offer off: HDR again */ }
-      else if (gridRetryable(stream)) { /* playbackFailed noted the engine: the same multiview on the other one */ }
-      else if (stream.grid) feedsCtx.multiview = null;   // the retry plays the big feed alone
       else if (stream.hdr) { feedsCtx.hdrFailed = true; feedsCtx.hdrFailures = (feedsCtx.hdrFailures || 0) + 1; }
       else if (stream.cenc) feedsCtx.cencFailed = true;
       var again = {};
@@ -4345,12 +4368,15 @@
       var ownMaster = !!(s && s.combo && !s.grid);
       if (ownMaster) feedsCtx.comboOff = true;
       else playbackFailed(s, unclearFailure(info, msg));
-      var fallback = ownMaster || !!(s && s.capsPath && (s.surround || s.hlsAes || gridRetryable(s) || (!s.grid && (s.hdr || sdrPath() !== s.capsRoute))));
+      // A multiview always has something next: another way, or its big feed alone.
+      var fallback = ownMaster || !!(s && s.capsPath && (s.grid || s.surround || s.hlsAes || s.hdr || sdrPath() !== s.capsRoute));
       // A failure while playing (the load's own catch or start watch records the others); final when nothing follows.
       dplay('failed', null, info ? { diag: info } : null, { runtime: true, final: !fallback });
       if (fallback) {
         // With the 5.1 or the Tiledmedia offer, or from a combined master: HDR again first, without them.
         if (s.hdr && !s.surround && !s.hlsAes && !ownMaster && !s.grid) feedsCtx.hdrFailed = true;
+        // A multiview (playbackFailed noted its way): the next way, else its big feed alone.
+        if (s.grid && !s.surround && !mvAgain()) feedsCtx.multiview = null;
         if (ownMaster) diag('play.fallback', { to: 'feed-own-master', runtime: true });
         // The position, or before it played the one it was asked to start at.
         var pos = Player.position() > 0 ? Player.position() : (s.askedStart > 0 ? s.askedStart : 0);

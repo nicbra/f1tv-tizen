@@ -32,8 +32,10 @@ var DiagPlay = (function () {
   /** The engine and input actually used: Caps' path for protected video, else the engine with clear input. */
   function pathOf(stream, engine) {
     var p = stream && stream.capsPath;
-    // The helper's clear multiview ('avplay:grid', 'shaka:grid' in Caps): the engine with clear input, as the contract has it.
-    if (/:grid$/.test(p || '') && stream && !stream.licenseUrl) p = null;
+    // A multiview's own ways in Caps (app.js MV_WAYS), reported as the engine and protection, as the contract has them:
+    // clear grids and H.264's big feed as the engine with clear input, the copy-protected grid by its DRM.
+    if (/^(avplay|shaka):grid$|^mvsoft:h264$/.test(p || '') && stream && !stream.licenseUrl) p = null;
+    if (p === 'avplay:drmgrid') p = stream.hdrEncrypted ? 'avplay:hdr' : stream.cenc ? 'avplay:cenc' : 'avplay:cbcs';
     if (!p && (engine === 'shaka' || engine === 'avplay') && stream && !stream.licenseUrl) p = engine + ':clear';
     return vocab().paths.indexOf(p) >= 0 ? p : p ? 'other' : 'unknown';
   }
