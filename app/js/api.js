@@ -750,8 +750,11 @@ var F1Api = (function () {
   function hlsInfo(url) {
     var m = lastMaster, kept = m && m.url === url && m.who === state.ascendon && Date.now() - m.at < 60000 ? m : null;
     var offer = null, base = kept ? kept.base : url;
+    var surround = false;
     return (kept ? Promise.resolve(kept.text) : manifest(url, /^\s*#EXTM3U/)).then(function (master) {
       offer = withOffer({}, hlsOffer, master).offer || null;
+      // For playing, not only the diagnostics (offer is filled only while they record): Dolby Digital in the master.
+      surround = /^#EXT-X-STREAM-INF:.*CODECS="[^"]*\b(ac-3|ec-3)\b/m.test(master);
       var lines = master.split('\n');
       for (var i = 0; i < lines.length - 1; i++) {
         if (lines[i].indexOf('#EXT-X-STREAM-INF') === 0) {
@@ -771,7 +774,7 @@ var F1Api = (function () {
       });
       var live = !/#EXT-X-ENDLIST/.test(playlist) && !/PLAYLIST-TYPE:VOD/.test(playlist);
       var info = { dynamic: live, windowStart: 0, windowEnd: pos, delay: 25, marks: marks,
-        epochAtZero: marks.length ? marks[0].wall - marks[0].pos : 0, encrypted: hasKeys(playlist) };
+        epochAtZero: marks.length ? marks[0].wall - marks[0].pos : 0, encrypted: hasKeys(playlist), surround: surround };
       if (offer) info.offer = offer;
       return info;
     });

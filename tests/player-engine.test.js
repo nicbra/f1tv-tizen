@@ -11,6 +11,7 @@ const el = () => {
   return {
     classList: { add() {}, remove() {}, toggle() {} }, style: {}, textTracks: [textTrack()],
     addEventListener: (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); },
+    removeEventListener: (type, fn) => { listeners[type] = (listeners[type] || []).filter((f) => f !== fn); },
     fire: (type) => (listeners[type] || []).forEach((fn) => fn())
   };
 };
@@ -59,9 +60,10 @@ async function player(av, storage, shakaLoad, globals, manifest) {
   class ShakaPlayer {
     constructor() { this.responseFilters = []; (context.shakaPlayers = context.shakaPlayers || []).push(this); }
     attach() { return Promise.resolve(); }
-    resetConfiguration() {}
-    configure(config) { configs.push(config); }
+    resetConfiguration() { this.abrFactory = null; }
+    configure(config, value) { configs.push(config); if (config === 'abrFactory') this.abrFactory = value; }
     async load(url, start) {
+      if (this.abrFactory) this.abrFactory();   // as Shaka: the ABR manager of this load
       if (manifest != null) {
         const response = { data: Buffer.from(manifest), uri: url };
         for (const filter of this.responseFilters) await filter(0, response);
@@ -70,9 +72,14 @@ async function player(av, storage, shakaLoad, globals, manifest) {
       return shakaLoad ? shakaLoad(url, start) : Promise.reject(new Error('no stream'));
     }
     getNetworkingEngine() { return { registerRequestFilter: (fn) => { (this.requestFilters = this.requestFilters || []).push(fn); }, registerResponseFilter: (fn) => this.responseFilters.push(fn) }; }
-    getBufferedInfo() { return { video: [{ start: 0, end: 10 }] }; }
+    getBufferedInfo() { return context.buffered || { video: [{ start: 0, end: 10 }] }; }
     selectAudioLanguage(l, role, count) { languages.push(['audio', l]); channels.push(count); }
     getAudioLanguages() { return context.audioLanguages || []; }
+    // A combined master's text tracks; selections recorded in context.selected (variants: context.variants).
+    getTextTracks() { return context.textTracks || []; }
+    selectVariantTrack(t, clear, margin) { (context.selected = context.selected || []).push([t.id, clear, margin]); (context.variants || []).forEach((x) => { x.active = x === t; }); }
+    selectTextTrack(t) { (context.selected = context.selected || []).push(['text', t.id]); }
+    getManifest() { return { variants: [] }; }
     getVariantTracks() { return context.variants || []; }
     getStats() { return { estimatedBandwidth: context.bandwidth || NaN }; }
     selectTextLanguage(l) { languages.push(['text', l]); }
@@ -854,6 +861,126 @@ test('a player_tm multiview on Shaka: its subtitles go to the app (over the fram
   assert.deepEqual(P.languages.at(-1), ['subtitles', true]);
 });
 
+/** Shaka's pieces the combined master needs (js/combo.js), spied on: registerScheme counts the store's hook. */
+function comboShaka(P) {
+  const ctx = P.context, spy = { schemes: 0, factories: 0 };
+  Object.assign(ctx.shaka.net.NetworkingEngine, { registerScheme: () => { spy.schemes++; }, PluginPriority: { APPLICATION: 3 },
+    RequestType: Object.assign({ SEGMENT: 1 }, ctx.shaka.net.NetworkingEngine.RequestType) });
+  ctx.shaka.net.HttpFetchPlugin = { isSupported: () => true, parse: () => null };
+  ctx.shaka.abr = { SimpleAbrManager: function () { spy.factories++; this.setVariants = () => {}; this.chooseVariant = () => null; } };
+  ctx.FeedCombo = { TAG: 100 };
+  return spy;
+}
+const comboInfo = { feeds: [{ k: 0, variants: [{ height: 2160, uri: 'https://cdn/f0/v2160.m3u8' }] }, { k: 1, variants: [{ height: 540, uri: 'https://cdn/f1/v540.m3u8' }] }] };
+
+test('a normal Shaka stream (Pro, SDR, one feed) never gets the combined master\'s request hook or ABR', async () => {
+  const P = await player(fakeAvPlay(), {}, async () => {});
+  const spy = comboShaka(P);
+  Object.assign(P.videos[0], { play: () => Promise.resolve() });
+  await P.load({ url: 'https://cdn/main.m3u8', licenseUrl: '', multiFeed: true, info: { dynamic: false } }, null);
+  assert.equal(spy.schemes, 0);
+  assert.ok(!P.configs.some((c) => c === 'abrFactory'));
+  assert.equal(P.comboStatus().combo, false);
+});
+
+test('a combined master loads from its blob address; a switch picks the new feed\'s 1080p in the wanted sound, in the same player', async () => {
+  const P = await player(fakeAvPlay(), { 'f1tv.settings': JSON.stringify({ audio: 'eng' }) }, async () => {});
+  const spy = comboShaka(P), v = P.videos[0];
+  let frames = 0;
+  Object.assign(v, { play: () => Promise.resolve(), currentTime: 100, getVideoPlaybackQuality: () => ({ totalVideoFrames: frames }) });
+  P.context.variants = [
+    { id: 1, bandwidth: 17000000, height: 2160, width: 3840, language: 'en', channelsCount: 6, active: true },
+    { id: 2, bandwidth: 2000001, height: 540, width: 960, language: 'en', channelsCount: 2 },
+    { id: 3, bandwidth: 2000001, height: 540, width: 960, language: 'es', channelsCount: 2 },
+    { id: 4, bandwidth: 7000001, height: 1080, width: 1920, language: 'en', channelsCount: 2 }];
+  await P.load({ url: 'https://cdn/f0/master.m3u8', hdr: true, licenseUrl: '', multiFeed: true, info: { dynamic: false },
+    combo: { uri: 'blob:combo', k: 0, info: comboInfo } }, null);
+  assert.equal(spy.schemes, 1, 'the store\'s hook, once combined masters play');
+  assert.ok(P.configs.includes('abrFactory'));
+  assert.deepEqual(Array.from(P.tracks().audio, (t) => t.lang), ['eng'], 'the playing feed\'s sound only');
+  P.context.selected = [];
+  P.context.buffered = { video: [{ start: 90, end: 115 }] };   // the old feed, 15 s ahead
+  const done = P.switchTo({ url: 'https://cdn/f1/master.m3u8', hdr: true, licenseUrl: '', multiFeed: true, info: { dynamic: false },
+    combo: { uri: 'blob:combo', k: 1, info: comboInfo }, comboSwitch: true }, null);
+  assert.deepEqual(Array.from(P.context.selected[0]), [4, true, 0], 'feed 1 at 1080p (not its 540p), English, the buffer cleared');
+  // Shaka flushes (a seek) and the old feed's frames still count: not shown yet.
+  v.fire('seeked');
+  frames += 5;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  let shown = false;
+  done.then(() => { shown = true; });
+  await wait(150);
+  assert.equal(shown, false, 'the old feed\'s video is still buffered');
+  // The old video leaves the buffer, the new feed's arrives, then its pictures decode.
+  P.context.buffered = { video: [] };
+  await wait(100);
+  P.context.buffered = { video: [{ start: 97, end: 103.8 }] };
+  await wait(100);
+  assert.equal(shown, false, 'no new picture yet');
+  frames += 3;
+  await done;
+  assert.equal(P.stream().combo.k, 1);
+  assert.deepEqual(Array.from(P.tracks().audio, (t) => t.lang).sort(), ['eng', 'spa']);
+  assert.equal(P.comboStatus().k, 1);
+  await P.unload();   // no preparation timers left
+});
+
+test('a switch that changes the sound codec (a new MediaSource: the frame count starts again) shows as soon as the new feed decodes', async () => {
+  const P = await player(fakeAvPlay(), { 'f1tv.settings': JSON.stringify({ audio: 'eng' }) }, async () => {});
+  comboShaka(P);
+  const v = P.videos[0];
+  let frames = 27000;
+  Object.assign(v, { play: () => Promise.resolve(), currentTime: 100, getVideoPlaybackQuality: () => ({ totalVideoFrames: frames }) });
+  P.context.variants = [
+    { id: 1, bandwidth: 17000000, height: 2160, width: 3840, language: 'en', channelsCount: 6, audioCodec: 'ac-3', active: true },
+    { id: 4, bandwidth: 7000001, height: 1080, width: 1920, language: 'en', channelsCount: 2, audioCodec: 'mp4a.40.2' }];
+  await P.load({ url: 'https://cdn/f0/master.m3u8', hdr: true, licenseUrl: '', multiFeed: true, info: { dynamic: false },
+    combo: { uri: 'blob:combo', k: 0, info: comboInfo } }, null);
+  P.context.buffered = { video: [{ start: 90, end: 115 }] };
+  const done = P.switchTo({ url: 'https://cdn/f1/master.m3u8', hdr: true, licenseUrl: '', multiFeed: true, info: { dynamic: false },
+    combo: { uri: 'blob:combo', k: 1, info: comboInfo }, comboSwitch: true }, null);
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  // As on the TV: the video flush and the new feed's first data come first, while the count still runs on...
+  P.context.buffered = { video: [] };
+  await wait(100);
+  P.context.buffered = { video: [{ start: 97, end: 103.8 }] };
+  frames = 27001;
+  await wait(100);
+  // ...then Shaka's 'reload' sets up a new MediaSource for the sound codec (the count starts again) and it decodes.
+  frames = 0;
+  await wait(100);
+  frames = 4;
+  const t0 = Date.now();
+  await done;
+  assert.ok(Date.now() - t0 < 1000, 'well before the 8 s give-up');
+  assert.equal(P.stream().combo.k, 1);
+  await P.unload();
+});
+
+test('a feed switch keeps the sound codec playing when the new feed has it (no 5.1 <-> stereo change, which needs a new MediaSource)', async () => {
+  const P = await player(fakeAvPlay(), { 'f1tv.settings': JSON.stringify({ audio: 'eng' }) }, async () => {});
+  comboShaka(P);
+  const v = P.videos[0];
+  let frames = 100;
+  Object.assign(v, { play: () => Promise.resolve(), currentTime: 100, getVideoPlaybackQuality: () => ({ totalVideoFrames: frames }) });
+  const stereoMain = { id: 1, bandwidth: 7000000, height: 1080, width: 1920, language: 'en', channelsCount: 2, audioCodec: 'mp4a.40.2', active: true };
+  const liveStereo = { id: 2, bandwidth: 7000001, height: 1080, width: 1920, language: 'en', channelsCount: 2, audioCodec: 'mp4a.40.2' };
+  const liveDolby = { id: 3, bandwidth: 7300001, height: 1080, width: 1920, language: 'en', channelsCount: 6, audioCodec: 'ac-3' };
+  P.context.variants = [stereoMain, liveStereo, liveDolby];
+  await P.load({ url: 'https://cdn/f0/master.m3u8', hdr: true, licenseUrl: '', multiFeed: true, info: { dynamic: false },
+    combo: { uri: 'blob:combo', k: 0, info: comboInfo } }, null);
+  P.context.selected = [];
+  P.context.buffered = { video: [] };
+  const done = P.switchTo({ url: 'https://cdn/f1/master.m3u8', hdr: true, licenseUrl: '', multiFeed: true, info: { dynamic: false },
+    combo: { uri: 'blob:combo', k: 1, info: comboInfo }, comboSwitch: true }, null);
+  assert.equal(P.context.selected[0][0], 2, 'F1 LIVE\'s stereo after a stereo feed, not its 5.1');
+  P.context.buffered = { video: [{ start: 97, end: 103.8 }] };
+  await new Promise((r) => setTimeout(r, 100));
+  frames += 5;
+  await done;
+  await P.unload();
+});
+
 test('an onboard plays its team radio, whatever the commentary language (Shaka and AVPlay)', async () => {
   const P = await player(fakeAvPlay(), { 'f1tv.settings': JSON.stringify({ audio: 'eng' }) }, async () => {});
   Object.assign(P.videos[0], { play: () => Promise.resolve() });
@@ -1143,4 +1270,47 @@ test('a Shaka start whose play() never resolves still finishes loading, so the a
   timers.filter((t) => t.ms === 3000).forEach((t) => t.fn());
   await loading;
   assert.equal(done, true);
+});
+
+test('Dolby Digital 5.1 never plays beside another stream: switches to or from it stop the playing feed first', async () => {
+  const urls = [];
+  const P = await player(fakeAvPlay(), undefined, (url) => { urls.push(url); return Promise.resolve(); });
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); });
+  const hls = (n, codecs) => Object.assign({}, REPLAY, { url: 'https://cdn/' + n + '.m3u8', licenseUrl: '', multiFeed: true,
+    info: { dynamic: false, offer: { kind: 'hls', variants: codecs.map((c) => ({ codecs: c + ',hvc1.2.4.L153.B0' })) } } });
+  const stereo = hls('international', ['mp4a.40.2']), live = hls('f1live', ['mp4a.40.2', 'ac-3']), onboard = hls('onboard', ['mp4a.40.2']);
+  P.context.variants = [{ id: 1, active: true, audioCodec: 'mp4a.40.2', channelsCount: 2 }];
+  await P.load(stereo, 600);
+  assert.equal(P.switchKind(onboard), 'swap', 'stereo to stereo: loaded beside the playing feed');
+  // Release builds don't fill info.offer (diagnostics only): the master's own flag decides; no facts at all: reopen.
+  assert.equal(P.switchKind(Object.assign({}, onboard, { info: { dynamic: false, surround: true } })), 'reopen');
+  assert.equal(P.switchKind(Object.assign({}, onboard, { info: undefined })), 'reopen');
+  assert.equal(P.switchKind(live), 'reopen', 'to a master offering 5.1');
+  await P.switchTo(live, 610);
+  assert.notEqual(P.videos[1].muted, true, 'the second element (preloading) was never used');
+  // Playing the 5.1 now: away from it, the same.
+  P.context.variants = [{ id: 2, active: true, audioCodec: 'ac-3', channelsCount: 6 }];
+  assert.equal(P.switchKind(onboard), 'reopen', 'from a playing 5.1 stream');
+  await P.switchTo(onboard, 620);
+  assert.deepEqual(urls, ['https://cdn/international.m3u8', 'https://cdn/f1live.m3u8', 'https://cdn/onboard.m3u8']);
+  assert.equal(P.stream().url, 'https://cdn/onboard.m3u8');
+});
+
+test('BACK while a reopening switch waits for the previous player to close: the new feed never starts', async () => {
+  const urls = [];
+  const P = await player(fakeAvPlay(), undefined, (url) => { urls.push(url); return Promise.resolve(); });
+  P.videos.forEach((v) => { v.play = () => Promise.resolve(); });
+  const live = Object.assign({}, REPLAY, { url: 'https://cdn/f1live.m3u8', licenseUrl: '', multiFeed: true, info: { dynamic: false, surround: true } });
+  const intl = Object.assign({}, REPLAY, { url: 'https://cdn/intl.m3u8', licenseUrl: '', multiFeed: true, info: { dynamic: false } });
+  await P.load(intl, 600);
+  // The playing Shaka players take a while to unload.
+  let release;
+  P.context.shakaPlayers.forEach((p) => { p.unload = () => new Promise((r) => { release = r; }); });
+  const sw = P.switchTo(live, 610).then(() => 'loaded', (e) => e.message);
+  await new Promise((r) => setTimeout(r, 10));
+  P.unload();   // the viewer leaves
+  release();
+  P.context.shakaPlayers.forEach((p) => { p.unload = () => Promise.resolve(); });
+  assert.equal(await sw, 'cancelled');
+  assert.deepEqual(urls, ['https://cdn/intl.m3u8'], 'the new feed was never opened');
 });

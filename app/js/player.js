@@ -119,6 +119,175 @@ var Player = (function () {
     }
     function setGridRect(rect) { gridRect = rect; slots.forEach(placeSlot); }
 
+    /*
+     * Instant feed switches (js/combo.js): one master holds every feed, so a switch is a variant switch in this player.
+     * Ahead: segments the app fetched before a switch asks for them (the TV's browser doesn't cache F1's segments).
+     * Installed the first time a combined master plays; from then on Shaka's https requests ask it first (a lookup by
+     * address, then Shaka's own fetch), and only files the app prefetched come from memory. Copies go out (the TS
+     * worker takes the buffers it gets).
+     */
+    var Ahead = (function () {
+      var store = {}, order = [], bytes = 0, MAX = 32 * 1024 * 1024, TTL = 30000, installed = false;
+      var inflight = [], aborted = [], pending = {};   // Shaka's segment downloads; the app's own prefetches by address
+      function drop(uri) {
+        var e = store[uri];
+        if (!e) return;
+        bytes -= e.data.byteLength;
+        delete store[uri];
+        order.splice(order.indexOf(uri), 1);
+      }
+      function fresh(e) { return !!e && (e.keep || Date.now() - e.at <= TTL); }
+      function put(uri, data, keep) {
+        drop(uri);
+        store[uri] = { data: data, at: Date.now(), keep: !!keep };
+        order.push(uri);
+        bytes += data.byteLength;
+        // Old media first; inits and keys (tiny, needed by every switch to their feed) only when nothing else is left.
+        for (var i = 0; bytes > MAX && i < order.length;) { if (store[order[i]].keep) i++; else drop(order[i]); }
+        while (bytes > MAX && order.length) drop(order[0]);
+      }
+      function take(uri) {
+        var e = store[uri];
+        if (!fresh(e)) { drop(uri); return null; }
+        return e.data.slice(0);
+      }
+      /** The app's own download of `uri` (a prefetch): kept while under way, so a switch asking for it joins it. */
+      function fetchInto(uri, keep, init) {
+        if (fresh(store[uri])) return Promise.resolve();
+        if (pending[uri]) return pending[uri].promise;
+        var ctl = typeof AbortController === 'function' ? new AbortController() : null;
+        var job = { ctl: ctl };
+        // A prefetch is a guess: given up after 15 s (a switch joined to it then downloads it itself).
+        var deadline = setTimeout(function () { if (ctl) ctl.abort(); }, 15000);
+        job.promise = fetch(uri, Object.assign({ signal: ctl ? ctl.signal : undefined }, init || {})).then(function (r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.arrayBuffer();
+        }).then(function (b) {
+          clearTimeout(deadline);
+          if (pending[uri] === job) delete pending[uri];
+          if (job.data === false) return;   // cleared meanwhile (unload)
+          put(uri, b, keep);
+        }, function (e) { clearTimeout(deadline); if (pending[uri] === job) delete pending[uri]; throw e; });
+        pending[uri] = job;
+        return job.promise;
+      }
+      function install() {
+        if (installed) return;
+        installed = true;
+        var NE = shaka.net.NetworkingEngine, F = shaka.net.HttpFetchPlugin, X = shaka.net.HttpXHRPlugin;
+        var net = F && F.isSupported && F.isSupported() ? F.parse : X.parse;
+        NE.registerScheme('https', function (uri, request, type, progress, headersReceived, config) {
+          // Part of a file (a byte range): never from the store, which holds whole files.
+          var h = request.headers || {}, ranged = !!(h.Range || h.range);
+          var data = null;
+          try { data = ranged ? null : take(uri); } catch (e) { data = null; }
+          var done = function (d) { return { uri: uri, originalUri: uri, data: d, headers: {}, fromCache: true }; };
+          if (data) return shaka.util.AbortableOperation.completed(done(data));
+          // A prefetch of it still under way: wait for that rather than download it twice. If it fails (or gives up),
+          // the usual download; cancelled by Shaka, it stops waiting at once.
+          var job = ranged ? null : pending[uri];
+          if (job && shaka.util.AbortableOperation) {
+            var E = shaka.util.Error, cancelled = false, inner = null, stop = null;
+            var stopped = new Promise(function (res, rej) { stop = rej; });
+            var waited = Promise.race([job.promise, stopped]).then(function () { return take(uri); }, function () { return null; });
+            var promise = waited.then(function (d) {
+              if (cancelled) throw new E(E.Severity.CRITICAL, E.Category.PLAYER, E.Code.OPERATION_ABORTED);
+              if (d) return done(d);
+              inner = net(uri, request, type, progress, headersReceived, config);
+              return inner.promise;
+            });
+            return new shaka.util.AbortableOperation(promise, function () {
+              cancelled = true;
+              stop(new Error('cancelled'));
+              return inner ? inner.abort() : Promise.resolve();
+            });
+          }
+          var op = net(uri, request, type, progress, headersReceived, config);
+          // Shaka's segment downloads in flight, with the stream they are for (the slot's request filter marks
+          // them), so a feed switch can cancel the outgoing stream's (see abortFor).
+          if (type === NE.RequestType.SEGMENT && op && op.promise && op.abort && request.f1Owner) {
+            var entry = { uri: uri, owner: request.f1Owner, op: op, at: Date.now() };
+            inflight.push(entry);
+            var gone = function () { var i = inflight.indexOf(entry); if (i >= 0) inflight.splice(i, 1); };
+            op.promise.then(gone, gone);
+          }
+          return op;
+        }, NE.PluginPriority.APPLICATION, true);
+      }
+      /**
+       * Cancels this slot's downloads for the outgoing streams (`streams`): Shaka flushes for a switch only once what it
+       * is fetching for that type has arrived, and on a slow line a 2160p segment of the old feed (~12 MB), or a sound
+       * segment, held switches for seconds (2026-11-23). Shaka takes an aborted download as it does its own.
+       * Also stops the app's prefetches other than `keep(uri)` (the destination's), so the switch gets the line.
+       */
+      function abortFor(slot, streams, keep) {
+        inflight.slice().forEach(function (e) {
+          if (e.owner.slot !== slot || streams.indexOf(e.owner.stream) < 0) return;
+          try { e.op.abort(); } catch (x) { /* done already */ }
+          aborted.push({ uri: e.uri.replace(/^.*\//, ''), type: e.owner.type, ms: Date.now() - e.at });
+          if (aborted.length > 10) aborted.shift();
+        });
+        Object.keys(pending).forEach(function (uri) {
+          if (keep(uri)) return;
+          var job = pending[uri];
+          delete pending[uri];
+          if (job.ctl) job.ctl.abort();
+        });
+      }
+      function clear() {
+        order.slice().forEach(drop);
+        Object.keys(pending).forEach(function (uri) { var job = pending[uri]; job.data = false; if (job.ctl) job.ctl.abort(); delete pending[uri]; });
+      }
+      return { has: function (uri) { return fresh(store[uri]) || !!pending[uri]; }, ready: function (uri) { return fresh(store[uri]); },
+        take: take, fetchInto: fetchInto, install: install,
+        abortFor: abortFor, clear: clear,
+        size: function () { return { files: order.length, bytes: bytes, pending: Object.keys(pending).length, inflight: inflight.length, aborted: aborted.slice() }; } };
+    })();
+
+    /** Feed number of a Shaka variant (track) of a combined master; -1 for other streams. */
+    function feedOf(t) { return typeof FeedCombo !== 'undefined' && t && t.bandwidth != null ? t.bandwidth % FeedCombo.TAG : -1; }
+
+    /**
+     * ABR inside one feed of a combined master: Shaka's own manager, given only the playing feed's variants (the other
+     * feeds' variants would look like qualities of the same video to it).
+     */
+    function FeedAbr(k, slot) { this.inner = new shaka.abr.SimpleAbrManager(); this.all = []; this.k = k; this.slot = slot; this.audio = null; this.cap = 0; }
+    ['init', 'stop', 'release', 'enable', 'disable', 'segmentDownloaded', 'trySuggestStreams', 'getBandwidthEstimate',
+      'playbackRateChanged', 'setMediaElement', 'setCmsdManager', 'configure', 'chooseVariant'].forEach(function (m) {
+      FeedAbr.prototype[m] = function () { var f = this.inner[m]; return typeof f === 'function' ? f.apply(this.inner, arguments) : undefined; };
+    });
+    FeedAbr.prototype.mine = function () {
+      // Never another feed's. Shaka hands ABR the variants of one sound (the DEFAULT one at a load, the selected one's
+      // after a switch): when those hold none of this feed's, this feed's own from the manifest, with the sound it plays
+      // (or its first), playable ones only.
+      var k = this.k, audio = this.audio, own = this.all.filter(function (v) { return feedOf(v) === k; });
+      if (own.length) return own;
+      var m = null;
+      try { m = this.slot && this.slot.p.getManifest(); } catch (e) { m = null; }
+      // Playable as Shaka counts it (StreamUtils): allowed, and not disabled for a while after a failed download.
+      var mine = ((m && m.variants) || []).filter(function (v) {
+        return feedOf(v) === k && v.allowedByApplication !== false && v.allowedByKeySystem !== false && !(v.disabledUntilTime > 0);
+      });
+      var withSound = mine.filter(function (v) { return v.audio === (audio || (mine[0] && mine[0].audio)); });
+      return withSound.length ? withSound : mine;
+    };
+    FeedAbr.prototype.setVariants = function (v) { this.all = v || []; return this.inner.setVariants(this.capped(this.mine())); };
+    /** At most `cap` rows high while set (0: no cap), but never nothing. */
+    FeedAbr.prototype.capped = function (list) {
+      var cap = this.cap, low = cap ? list.filter(function (v) { return !v.video || (v.video.height || 0) <= cap; }) : list;
+      return low.length ? low : list;
+    };
+    FeedAbr.prototype.setCap = function (h) { this.cap = h || 0; this.inner.setVariants(this.capped(this.mine())); };
+    /** The feed (and the sound stream it plays: Shaka's variant.audio) ABR chooses within from now on. */
+    FeedAbr.prototype.setFeed = function (k, audio) { this.k = k; this.audio = audio || null; this.inner.setVariants(this.capped(this.mine())); };
+
+    /** What a slot loads: a combined master (its copy that starts at the stream's feed), or the stream's own URL. */
+    function srcOf(stream) {
+      if (!stream.combo) return stream.url;
+      return typeof FeedCombo !== 'undefined' && FeedCombo.startAt && stream.combo.info ? FeedCombo.startAt(stream.combo.info, stream.combo.k) : stream.combo.uri;
+    }
+    function mimeOf(stream) { return stream.combo ? 'application/x-mpegurl' : undefined; }
+
     /**
      * HLG must be a constraint, not just a preference: Shaka can otherwise select an SDR variant
      * from F1's mixed master after a seek or an adaptation, making the TV change picture modes.
@@ -152,8 +321,10 @@ var Player = (function () {
       var player = new shaka.Player();
       var slot = { p: player, v: video, hdr: false };
       return player.attach(video).then(function () {
-        player.getNetworkingEngine().registerRequestFilter(function (type, request) {
+        player.getNetworkingEngine().registerRequestFilter(function (type, request, context) {
           var types = shaka.net.NetworkingEngine.RequestType;
+          // Which slot and stream a segment download is for (Ahead.abortFor cancels the outgoing stream's at a switch).
+          if (type === types.SEGMENT && context && context.stream) request.f1Owner = { slot: slot, stream: context.stream, type: context.type || '' };
           // Key requests get the tokens only from F1's own server, whatever address a playlist names.
           var add = type === types.LICENSE ? licenseHeaders :
             type === types.KEY && /^https:\/\/f1tv\.formula1\.com\//.test(request.uris[0] || '') ? slot.keyHeaders : null;
@@ -170,6 +341,9 @@ var Player = (function () {
           if (slots[cur] !== slot) return;
           var d = ev.detail || {};
           if (d.severity === 1) return diag('player.recoverable', { code: d.code, category: d.category }, 'info');
+          // Not one of Shaka's own errors (an exception inside it or a hook): what and where, for the log.
+          if (d.code == null) diag('player.error-unknown', { name: String(d.name || ''), message: String(d.message || d).slice(0, 200),
+            stack: String(d.stack || '').slice(0, 700), combo: !!slot.combo }, 'error');
           emit('error', describe(d), errorInfo(d));
         });
         player.addEventListener('buffering', function (ev) { if (slots[cur] === slot) emit('buffering', ev.buffering); });
@@ -225,6 +399,8 @@ var Player = (function () {
     function describe(err) {
       if (!err) return 'Unknown playback error';
       if (err.category === shaka.util.Error.Category.DRM) return 'DRM error ' + err.code;
+      // An exception rather than a Shaka error: its message ("Playback error undefined" said nothing).
+      if (err.code == null && err.message) return 'Playback error: ' + String(err.message).slice(0, 120);
       return 'Playback error ' + err.code + (err.data && err.data[0] ? ': ' + String(err.data[0]).slice(0, 120) : '');
     }
 
@@ -233,7 +409,7 @@ var Player = (function () {
     // the playlist's end, unless the playlist says HOLD-BACK. Shaka's default, 3, played ~46 s behind real time
     // (F1 Academy, 2026-11-22; AVPlay's live DASH ~30 s). Fewer may stall when F1 publishes a segment late: to be
     // measured at a live session (Player.setHlsLiveSegments in DevTools; the next load uses it).
-    var hlsLiveSegments = 3;
+    var hlsLiveSegments = 3, comboCodecSwitch = null;
 
     function configure(slot, stream) {
       var player = slot.p;
@@ -244,6 +420,18 @@ var Player = (function () {
       slot.keyHeaders = (stream.hlsAes && stream.keyHeaders) || {};
       var drm = stream.licenseUrl ? { servers: { 'com.widevine.alpha': stream.licenseUrl } } : {};
       player.resetConfiguration();
+      slot.combo = stream.combo || null;
+      slot.abr = null;
+      if (slot.combo) {
+        Ahead.install();
+        player.configure('abrFactory', function () { return (slot.abr = new FeedAbr(slot.combo.k, slot)); });
+        // Shaka's default on Tizen is 'reload' (a MediaSource reset when the sound codec changes: F1 LIVE's AC-3 5.1
+        // <-> another feed's AAC): such switches took 1.7-2.5 s; with 'smooth' (SourceBuffer.changeType) 0.5-1.4 s
+        // (QE55Q77A, 2026-11-23). The default stays: Dolby Digital takes the TV's own audio path (a muted element still
+        // played it), and whether 'smooth' keeps its sound is unheard; a reset starts the 5.1 alone, like a fresh load,
+        // which played with sound. Settable for listening tests (Player.setComboCodecSwitch('smooth')).
+        if (comboCodecSwitch) player.configure('mediaSource.codecSwitchingStrategy', comboCodecSwitch);
+      }
       player.configure({
         drm: drm,
         preferredVideoHdrLevel: stream.hdr ? 'HLG' : 'AUTO',
@@ -265,8 +453,50 @@ var Player = (function () {
       });
     }
 
+    function slotOf(player) { return slots.filter(function (x) { return x.p === player; })[0] || null; }
+
+    function codecFamily(c) { return String(c || '').split('.')[0]; }
+
+    /*
+     * The sound codec a feed switch keeps: the one playing. A change between Dolby Digital 5.1 (F1 LIVE, and TRACKER/DATA
+     * on its sound) and AAC stereo needs a new MediaSource on this TV (Shaka's 'reload'; 'smooth' showed the new feed,
+     * then stuck): ~3 s and another freeze from the segment start, where a switch keeping the codec takes 0.4-0.9 s
+     * (2026-11-24). So F1 LIVE after a stereo feed plays its stereo commentary; a video started on F1 LIVE plays 5.1 and
+     * keeps it on the feeds that carry it. The viewer's own sound choice (selectAudio) still takes the most channels.
+     */
+    function keptCodec(player) { var a = activeTrack(player); return a ? a.audioCodec || null : null; }
+
+    /** A combined master's variant tracks of feed k (all its qualities and sounds). */
+    function feedTracks(player, k) { return player.getVariantTracks().filter(function (t) { return feedOf(t) === k; }); }
+
+    /**
+     * In a combined master, feed k's variant with sound `want` (its most channels up to SURROUND) at the height `h`
+     * (else the nearest): selectAudioLanguage would pick any feed's variant with that language. `codec`: the sound
+     * codec playing, kept when the feed has it (see keptCodec).
+     */
+    function comboPick(player, k, want, h, codec) {
+      var mine = feedTracks(player, k), lang = mine.filter(function (t) { return sameLang(t.language, want); });
+      var pool = lang.length ? lang : mine;
+      if (!pool.length) return null;
+      var same = codec ? pool.filter(function (t) { return codecFamily(t.audioCodec) === codecFamily(codec); }) : [];
+      if (same.length) pool = same;
+      var ch = Math.max.apply(Math, pool.map(function (t) { return Math.min(t.channelsCount || 2, SURROUND); }));
+      pool = pool.filter(function (t) { return Math.min(t.channelsCount || 2, SURROUND) === ch; });
+      return pool.slice().sort(function (a, b) { return Math.abs((a.height || 0) - h) - Math.abs((b.height || 0) - h); })[0];
+    }
+
     /** Shaka matches languages loosely but not "tea" to "teamradio" (2024 HLS): use the stream's own code. */
     function selectAudio(player, want) {
+      var slot = slotOf(player);
+      if (slot && slot.combo) {
+        var active = player.getVariantTracks().filter(function (t) { return t.active; })[0];
+        var t = comboPick(player, slot.combo.k, want, active ? active.height : 1080);
+        if (t && !t.active) try {
+          if (slot.abr) slot.abr.audio = (variantOf(player, t) || {}).audio || null;   // its ABR stays with this sound
+          player.selectVariantTrack(t, true, 0.5);
+        } catch (e) { /* not loaded */ }
+        return;
+      }
       var have = [];
       try { have = player.getAudioLanguages(); } catch (e) { /* not loaded */ }
       var code = have.filter(function (l) { return sameLang(l, want); })[0] || langOf(want);
@@ -311,7 +541,7 @@ var Player = (function () {
       slot.v.muted = false;
       slot.v.classList.remove('hidden');
       userPaused = false;
-      return slot.p.load(stream.url, startTime == null ? null : startTime).then(function () {
+      return slot.p.load(srcOf(stream), startTime == null ? null : startTime, mimeOf(stream)).then(function () {
         applyPrefs(slot.p, stream);
         relayCues(slot);
         // Resetting another video element can cancel play(); keepPlaying retries it.
@@ -362,7 +592,7 @@ var Player = (function () {
         // From where it is now, which includes a seek made meanwhile.
         var at = slot.v.currentTime > 0 ? slot.v.currentTime : startTime;
         diag('player.frozen-reload', { hdr: !!stream.hdr, cenc: !!stream.cenc, readyState: slot.v.readyState, at: at });
-        slot.p.load(stream.url, at == null ? null : at).then(function () {
+        slot.p.load(srcOf(stream), at == null ? null : at, mimeOf(stream)).then(function () {
           if (gen !== generation) return;
           // A new load starts on the stream's default tracks (French subtitles on F1's replays).
           applyPrefs(slot.p, stream);
@@ -434,13 +664,17 @@ var Player = (function () {
      * The TV decodes only one video, and no frame of a paused one: a feed switched to while paused
      * plays, muted, from when the old feed has let go of the decoder until it shows a frame.
      */
-    function showFrame(v) {
-      var t0 = Date.now();
+    /** Plays a paused video muted until it shows a frame past `base` (decoded frames before; 0 for a fresh load). */
+    function showFrame(v, base) {
+      var t0 = Date.now(), last = base || 0;
       (function check() {
         if (V() !== v) return;
-        var q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
+        var q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null, n = q ? q.totalVideoFrames : 0;
+        // A count that went back: a new MediaSource (a sound codec change); every frame from here is the new one's.
+        if (n < last) base = 0;
+        last = n;
         // Shown (or given up on), or the viewer pressed play meanwhile.
-        if (!userPaused || (q && q.totalVideoFrames > 0) || Date.now() - t0 > 5000) {
+        if (!userPaused || (q && n > (base || 0)) || Date.now() - t0 > 5000) {
           if (userPaused) v.pause();
           v.muted = false;
           return;
@@ -451,17 +685,21 @@ var Player = (function () {
     }
 
     function swap(stream, startTime) {
-      var old = slots[cur], next = slots[1 - cur];
-      generation++;
+      var old = slots[cur], next = slots[1 - cur], gen = ++generation;
+      // Superseded (a newer switch or load, an unload): it goes no further, and never touches the slot again, which
+      // the newer one may be loading (a combined master's own-master fallback reused it while this one still ran).
+      var mine = function () { if (gen !== generation) throw new Error('cancelled'); };
       rememberBandwidth(old);   // before the incoming slot reads it for its start
       configure(next, stream);
       next.grid = !!stream.grid;   // its own place (the outgoing one keeps its own until it is hidden)
       placeSlot(next);
       next.v.muted = true;
       swapping = true;
-      return next.p.load(stream.url, startTime == null ? null : startTime).then(function () {
+      return next.p.load(srcOf(stream), startTime == null ? null : startTime, mimeOf(stream)).then(function () {
+        mine();
         return whenBuffered(next, 4, 6000);
       }).then(function () {
+        mine();
         applyPrefs(next.p, stream);
         relayCues(next);
         old.v.style.zIndex = '2';           // keep the old picture on top until the new one runs
@@ -471,9 +709,11 @@ var Player = (function () {
         return Promise.race([next.v.play().catch(function () { /* paused by the TV; whenPlaying retries below */ }),
           new Promise(function (r) { setTimeout(r, 3000); })]);
       }).then(function () {
+        mine();
         keepPlaying(next.v, 3000, true);
         return whenPlaying(next.v, 3000);
       }).then(function () {
+        mine();
         var paused = userPaused;   // paused before or during the switch: the new feed stays paused
         next.v.muted = paused;
         cur = 1 - cur;
@@ -484,10 +724,12 @@ var Player = (function () {
         old.p.unload().then(function () { if (paused) showFrame(next.v); else keepPlaying(next.v); });
         if (!paused) keepPlaying(next.v);
       }, function (err) {
-        swapping = false;
-        next.v.classList.add('hidden');
-        next.p.unload();
-        old.v.style.zIndex = '';
+        if (gen === generation) {
+          swapping = false;
+          next.v.classList.add('hidden');
+          next.p.unload();
+          old.v.style.zIndex = '';
+        }
         throw err;
       });
     }
@@ -497,6 +739,17 @@ var Player = (function () {
 
     /** Subtitles in language l ('' off); `drawn`: the app draws them (a multiview), so the video's own stay hidden. */
     function textTrack(player, l, drawn) {
+      var slot = slotOf(player);
+      if (slot && slot.combo) {
+        // The playing feed's own subtitles (their names start with its number), or none.
+        var prefix = slot.combo.k + '|';
+        var t = l ? player.getTextTracks().filter(function (x) { return String(x.label || '').indexOf(prefix) === 0 && sameLang(x.language, langOf(l)); })[0] : null;
+        try {
+          if (t) player.selectTextTrack(t);
+          player.setTextTrackVisibility(!!t && !drawn);
+        } catch (e) { /* no text tracks */ }
+        return;
+      }
       try {
         if (l) player.selectTextLanguage(langOf(l));
         player.setTextTrackVisibility(!!l && !drawn);
@@ -504,8 +757,289 @@ var Player = (function () {
     }
 
     function tracks() {
-      var lang = function (l) { return { lang: lang3(l) }; };
+      var lang = function (l) { return { lang: lang3(l) }; }, slot = slots[cur];
+      if (slot && slot.combo) {
+        // The playing feed's languages only.
+        var k = slot.combo.k, uniq = function (a, x) { if (a.indexOf(x) < 0) a.push(x); return a; };
+        return { audio: feedTracks(P(), k).map(function (t) { return t.language; }).reduce(uniq, []).map(lang),
+          text: P().getTextTracks().filter(function (t) { return String(t.label || '').indexOf(k + '|') === 0; })
+            .map(function (t) { return t.language; }).reduce(uniq, []).map(lang) };
+      }
       return { audio: P().getAudioLanguages().map(lang), text: P().getTextLanguages().map(lang) };
+    }
+
+    function framesOf(v) { var q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null; return q ? q.totalVideoFrames : 0; }
+
+    /*
+     * The quality a switch shows the new feed in first, before ABR's choice for it (firstPick). 540p started fastest
+     * (~1.5 MB a segment) but looked bad on a 4K TV for the seconds until the step up (user, 2026-11-23): 1080p
+     * (~4.3 MB a 5.76 s HLG segment) when it is prepared or the line fetches it in FIRST_WITHIN seconds; that took
+     * ~3.5 s at 10 Mbit/s (the same evening), so a slower line starts lower, 540p at the lowest.
+     */
+    var FIRST_HEIGHT = 1080, FIRST_WITHIN = 1.5;
+
+    /** The segment reference a track's video would play at the playhead, if its playlist is parsed. */
+    function segmentAt(slot, track) {
+      var variant = variantOf(slot.p, track), idx = variant && variant.video && variant.video.segmentIndex;
+      var pos = idx ? idx.find(slot.v.currentTime) : null;
+      return pos != null ? idx.get(pos) : null;
+    }
+
+    function firstPick(slot, k, want) {
+      var p = slot.p, codec = keptCodec(p), top = comboPick(p, k, want, FIRST_HEIGHT, codec);
+      var ref = top && segmentAt(slot, top);
+      // Prepared (in memory, not still downloading: that could take longer than the budget): no download at all.
+      if (!top || (ref && Ahead.ready(ref.getUris()[0]))) return top;
+      var est = 0;
+      try { est = p.getStats().estimatedBandwidth || 0; } catch (e) { est = 0; }
+      // The segment's own length when known (F1's: 5.76 s).
+      var seconds = ref ? ref.getEndTime() - ref.getStartTime() : 5.76;
+      var fits = function (t) { return !(est > 0) || (t.bandwidth || 0) * seconds / est <= FIRST_WITHIN; };
+      if (fits(top)) return top;
+      var lower = [720, 540].map(function (h) { return comboPick(p, k, want, h, codec); })
+        .filter(function (t) { return t && (t.height || 0) < (top.height || 0); });
+      return lower.filter(fits)[0] || lower[lower.length - 1] || top;
+    }
+
+    /**
+     * A feed switch inside a combined master (stream.combo.k: the new feed). Shows the new feed first in firstPick's
+     * quality (from Ahead when comboPrepare fetched it: the feed just left) with the sound the viewer wants, then hands
+     * quality to Shaka's ABR within the feed (finish). Resolves once the new feed's first picture shows; rejects (code
+     * COMBO) when it doesn't within 8 s, and the app switches the usual way.
+     */
+    function comboSwitch(stream) {
+      var slot = slots[cur], p = slot.p, v = slot.v, k = stream.combo.k, gen = ++generation;
+      if (!slot.combo || !slot.abr || slot.combo.uri !== stream.combo.uri) return Promise.reject(comboError('no combined master'));
+      var low = firstPick(slot, k, wantedAudio(stream));
+      if (!low) return Promise.reject(comboError('feed ' + k + ' not in the master'));
+      var t0 = Date.now(), left = prep.left = slot.combo.k, sawSeek = false, w0 = v.videoWidth, f0 = framesOf(v);
+      // The sound the feed left played (an onboard's team radio): what preparing it again for the way back fetches.
+      prep.leftAudio = (activeTrack(p) || {}).language || null;
+      var onSeeked = function () { sawSeek = true; };
+      v.addEventListener('seeked', onSeeked);
+      // Shown = the old feed's video left the buffer (Shaka clears it all: the end of what is buffered at the playhead
+      // drops, or nothing is), the new feed's arrived at the playhead, and a frame of it was decoded after that. Seeked
+      // alone isn't enough (a sound flush seeks too), nor a frame count (the old feed's frames count).
+      var oldEnd = videoEnd(p, v), gone = false, fRefill = null, ended = false, lastF = f0;   // ended: ABR back on (finish)
+      // The streams that change (Shaka keeps a stream that stays, e.g. a sound two feeds share): their downloads in
+      // flight are cancelled, as are prefetches not of the new feed's (its files live beside its playlists).
+      var was = variantOf(p, activeTrack(p)), next = variantOf(p, low), outgoing = [];
+      if (was && next && was.video !== next.video) outgoing.push(was.video);
+      if (was && next && was.audio && was.audio !== next.audio) outgoing.push(was.audio);
+      var dirs = feedDirs(slot, k), before = slot.combo;
+      try {
+        slot.combo = { uri: before.uri, k: k, info: before.info };
+        Ahead.abortFor(slot, outgoing, function (uri) { return dirs.some(function (d) { return uri.indexOf(d) === 0; }); });
+        p.configure('abr.enabled', false);
+        slot.abr.setFeed(k, next && next.audio);
+        // Capped from the start: a sound codec change sets up a new MediaSource, where Shaka chooses the quality again
+        // (it took 2160p, a 13 MB segment: no picture for 10 s, 2026-11-24). finish() keeps it until 8 s are buffered.
+        slot.abr.setCap(low.height);
+        p.selectVariantTrack(low, true, 0);
+        textTrack(p, Settings.get('subtitles'), false);
+      } catch (e) {
+        v.removeEventListener('seeked', onSeeked);
+        slot.combo = before;
+        try { slot.abr.setFeed(before.k); slot.abr.setCap(0); p.configure('abr.enabled', true); } catch (x) { /* unloaded */ }
+        return Promise.reject(comboError(e && e.message || String(e)));
+      }
+      return new Promise(function (resolve, reject) {
+        (function check() {
+          if (gen !== generation) { v.removeEventListener('seeked', onSeeked); return reject(new Error('cancelled')); }
+          var end = videoEnd(p, v), f = framesOf(v);
+          // A count that went back: Shaka set up a new MediaSource (a sound codec change, 'reload'), so the old feed is
+          // gone and every frame from here on is the new feed's (comparing with the count before missed the picture
+          // until the 8 s timeout: F1 LIVE -> INTERNATIONAL, 2026-11-24).
+          if (f < lastF) { gone = true; fRefill = fRefill != null ? 0 : null; }
+          lastF = f;
+          // Little was buffered before: the drop can't be seen, Shaka's flush (seeked) stands for it.
+          if (!gone && (end < 0 || end < oldEnd - 0.5 || (oldEnd - v.currentTime < 1.5 && sawSeek))) gone = true;
+          if (gone && fRefill == null && end > v.currentTime) {
+            fRefill = framesOf(v);
+            if (userPaused) { v.muted = true; showFrame(v, fRefill); }   // the TV shows no frame of a paused video
+          }
+          var moved = (fRefill != null && framesOf(v) > fRefill + (userPaused ? 0 : 1)) ||
+            // Another size than the old feed's picture, decoding: the new feed shows.
+            (low.width && v.videoWidth === low.width && w0 !== low.width && framesOf(v) > f0 + 1);
+          if (moved) {
+            v.removeEventListener('seeked', onSeeked);
+            diag('player.combo-switch', { k: k, ms: Date.now() - t0, height: low.height, codec: low.audioCodec || '', left: left }, 'info');
+            finish();
+            return resolve();
+          }
+          if (Date.now() - t0 > 8000) {
+            v.removeEventListener('seeked', onSeeked);
+            try { p.configure('abr.enabled', true); } catch (e) { /* unloaded */ }
+            return reject(comboError('the new feed did not show'));
+          }
+          setTimeout(check, 40);
+        })();
+      });
+      /*
+       * Quality from here is Shaka's ABR within the feed, one segment at a time from the end of the buffer, kept at
+       * the first quality until 8 s are buffered (a switch starts with next to nothing; a 2160p segment is ~13 MB).
+       * An own step to the top quality (its segment fetched into Ahead, then selected with a margin) competed with the
+       * buffer's own downloads right after the switch and froze the picture 2-3 s on a 15-30 Mbit/s line (2026-11-23).
+       */
+      function finish() {
+        if (ended) return;
+        ended = true;
+        try { slot.abr.setCap(low.height); p.configure('abr.enabled', true); } catch (e) { /* unloaded meanwhile */ }
+        var capAt = Date.now();
+        (function lift() {
+          if (gen !== generation) return;   // another switch (it sets its own cap) or an unload
+          if (bufferedAhead(v) >= 8 || Date.now() - capAt > 30000) { try { slot.abr.setCap(0); } catch (e) { /* unloaded */ } return; }
+          setTimeout(lift, 1000);
+        })();
+        setTimeout(function () { if (gen === generation) comboPrepare(prep.items); }, 1000);
+      }
+    }
+
+    function comboError(why) { var e = new Error('COMBO: ' + why); e.code = 'COMBO'; return e; }
+    /** End of the video buffered at the playhead (Shaka's video buffer, not the sound's), or -1 if none. */
+    function videoEnd(p, v) {
+      var info = null;
+      try { info = p.getBufferedInfo(); } catch (e) { info = null; }
+      var list = (info && info.video) || [], t = v.currentTime;
+      for (var i = 0; i < list.length; i++) if (list[i].start <= t + 0.1 && list[i].end > t) return list[i].end;
+      return -1;
+    }
+    function activeTrack(p) { return p.getVariantTracks().filter(function (t) { return t.active; })[0] || null; }
+    function variantOf(p, track) { return track ? p.getManifest().variants.filter(function (x) { return x.id === track.id; })[0] || null : null; }
+    function feedInfo(slot, k) { return ((slot.combo && slot.combo.info.feeds) || []).filter(function (f) { return f.k === k; })[0] || null; }
+    function feedDirs(slot, k) {
+      var info = feedInfo(slot, k);
+      return info ? info.variants.map(function (x) { return x.uri.slice(0, x.uri.lastIndexOf('/') + 1); }) : [];
+    }
+    /** Feed k's video playlist at `height` in the codec family of `codecs` (F1's web masters have H.264 and HEVC). */
+    function videoPlaylist(slot, k, height, codecs) {
+      var info = feedInfo(slot, k), fam = function (c) { return String(c || '').slice(0, 4).replace('hev1', 'hvc1').replace('avc3', 'avc1'); };
+      var at = info ? info.variants.filter(function (x) { return x.height === height; }) : [];
+      var same = at.filter(function (x) { return !codecs || !x.video || fam(x.video) === fam(codecs); });
+      return ((same[0] || at[0]) || {}).uri;
+    }
+    /** The sound playlist of feed k a track plays: by its language and channels (F1 LIVE: stereo and 5.1 English). */
+    function soundPlaylist(slot, k, track) {
+      var info = feedInfo(slot, k);
+      if (!info) return null;
+      var key = Object.keys(info.audio).filter(function (x) { return x === track.language || sameLang(x, track.language); })[0];
+      var list = key ? info.audio[key] : null;
+      if (!list || !list.length) return null;
+      var same = list.filter(function (x) { return x.channels === (track.channelsCount || 2); })[0];
+      return (same || list[0]).uri;
+    }
+
+    /*
+     * Feeds made ready for an instant switch: exactly what a switch to them would play first (comboPick with the sound
+     * the app says that feed plays: team radio on an onboard), its playlists parsed (Shaka parses a playlist only when
+     * first chosen: 0.4-0.7 s each here, and drops it when it switches away from a stream). The first item (the feed just
+     * left, the likeliest way back) also gets its init, key and the two segments at the playhead in Ahead, refreshed
+     * while it stays ready (~6 Mbit/s at 1080p); the other only its playlists. One playlist at a time.
+     */
+    var prep = { items: [], gen: 0, timer: null, parses: [], left: null, leftAudio: null };
+    function comboPrepare(items) {
+      var slot = slots[cur];
+      if (!slot || !slot.combo) return;
+      // Items: { k, audio } (or bare numbers: the viewer's commentary). The feed just left first: the likeliest way back.
+      var list = (items || []).map(function (x) { return typeof x === 'number' ? { k: x, audio: null } : x; });
+      if (prep.left != null && !list.some(function (x) { return x.k === prep.left; })) {
+        list.unshift({ k: prep.left, audio: prep.leftAudio || null });
+      } else if (prep.left != null) list.sort(function (a, b) { return (b.k === prep.left) - (a.k === prep.left); });
+      var seen = {};
+      // Two at most (the feed left and one more): only the first gets segments (~6 Mbit/s at 1080p beside 2160p's ~18).
+      prep.items = list.filter(function (x) { if (x.k < 0 || x.k === slot.combo.k || seen[x.k]) return false; seen[x.k] = true; return true; }).slice(0, 2);
+      var g = ++prep.gen;
+      clearTimeout(prep.timer);
+      var queue = prep.items.slice();
+      (function next() {
+        if (g !== prep.gen || slots[cur] !== slot || !slot.combo) return;
+        var item = queue.shift();
+        if (!item) return refreshLater(g, slot);
+        // Playlists always (a small download, then the page's CPU); segments only with room to spare: playback itself
+        // comes first (Shaka's ABR doesn't see these downloads).
+        readyFeed(slot, item, g, item === prep.items[0] && bufferedAhead(slot.v) >= 10).then(function () { setTimeout(next, 300); }, function () { setTimeout(next, 300); });
+      })();
+    }
+    function refreshLater(g, slot) {
+      if (!prep.items.length) return;   // nothing to keep ready
+      prep.timer = setTimeout(function () {
+        if (g !== prep.gen || slots[cur] !== slot || !slot.combo) return;
+        // Not while paused: nothing moves (and a seek re-asks). Playlists Shaka dropped meanwhile are read again; the
+        // feed just left keeps its next segments while there is room to spare.
+        if (slot.v.paused) return refreshLater(g, slot);
+        var spare = bufferedAhead(slot.v) >= 10;
+        prep.items.reduce(function (c, item, n) { return c.then(function () { return readyFeed(slot, item, g, n === 0 && spare).catch(function () {}); }); }, Promise.resolve())
+          .then(function () { refreshLater(g, slot); });
+      }, 4000);
+    }
+
+    /** What a switch to feed item.k would play first: { track, video, audio } (Shaka's manifest streams). */
+    function firstStreams(slot, item) {
+      var t = comboPick(slot.p, item.k, item.audio || Settings.get('audio'), FIRST_HEIGHT, keptCodec(slot.p));
+      var variant = variantOf(slot.p, t);
+      return variant ? { track: t, video: variant.video, audio: variant.audio } : null;
+    }
+
+    /**
+     * Makes feed item.k ready (see above): its playlists, and with `segments` its first files in Ahead; stops at any
+     * step once `g` is no longer the current preparation.
+     */
+    function readyFeed(slot, item, g, segments) {
+      var alive = function () { return g === prep.gen && slots[cur] === slot && !!slot.combo; };
+      var first = firstStreams(slot, item);
+      if (!first || !alive()) return Promise.resolve();
+      var lists = [{ stream: first.video, playlist: videoPlaylist(slot, item.k, first.track.height, first.video && first.video.codecs) }];
+      if (first.audio) lists.push({ stream: first.audio, playlist: soundPlaylist(slot, item.k, first.track) });
+      return lists.reduce(function (chain, x) {
+        return chain.then(function () {
+          if (!x.stream || !alive()) return null;
+          if (x.stream.segmentIndex) return segments ? fetchAhead(slot, x.stream, x.playlist, 2, alive) : null;
+          // Parsed again when Shaka dropped it (after switching away from it).
+          var t0 = Date.now();
+          return x.stream.createSegmentIndex().then(function () {
+            prep.parses.push(Date.now() - t0);
+            if (prep.parses.length > 8) prep.parses.shift();
+            return alive() && segments ? fetchAhead(slot, x.stream, x.playlist, 2, alive) : null;
+          });
+        });
+      }, Promise.resolve());
+    }
+
+    /**
+     * Puts `count` segments of `stream` from the playhead on, its init and (AES-128) key into Ahead, while `alive()`.
+     * Whole files only (Ahead answers by address). Shaka exposes no init reference (its field names are minified; only
+     * SegmentReference's getters are exported), so the init and key addresses come from the stream's own playlist
+     * (`playlist`, read once per slot).
+     */
+    function fetchAhead(slot, stream, playlist, count, alive) {
+      var idx = stream.segmentIndex, pos = idx && idx.find(slot.v.currentTime), refs = [];
+      if (pos == null || !alive()) return Promise.resolve();
+      var whole = function (r) { return !!r && !((r.getStartByte ? r.getStartByte() : 0) > 0) && (r.getEndByte ? r.getEndByte() : null) == null; };
+      for (var n = 0; n < (count || 2); n++) { var r = idx.get(pos + n); if (whole(r)) refs.push(r); }
+      if (!refs.length) return Promise.resolve();
+      var jobs = refs.map(function (x) { return Ahead.fetchInto(x.getUris()[0], false); });
+      if (playlist) jobs.push(extrasOf(slot, playlist).then(function (extra) {
+        if (!alive()) return null;
+        var more = [];
+        if (extra.init) more.push(Ahead.fetchInto(extra.init, true));
+        // F1's key server only, with the account's tokens (as the slot's request filter adds them).
+        // redirect 'error': the tokens never follow a redirect elsewhere (as hdr.js tmGrid's key requests).
+        if (extra.key && /^https:\/\/f1tv\.formula1\.com\//.test(extra.key)) more.push(Ahead.fetchInto(extra.key, true, { headers: slot.keyHeaders || {}, redirect: 'error' }));
+        return Promise.all(more);
+      }));
+      return Promise.all(jobs);
+    }
+
+    /** The init (EXT-X-MAP, whole files only) and AES-128 key addresses of a media playlist, read once per slot. */
+    function extrasOf(slot, playlist) {
+      var extras = slot.extras = slot.extras || {};
+      if (extras[playlist]) return extras[playlist];
+      return (extras[playlist] = fetch(playlist).then(function (res) { return res.ok ? res.text() : ''; }).then(function (text) {
+        var map = /^#EXT-X-MAP:(.*)$/m.exec(text), uri = map && /URI="([^"]+)"/.exec(map[1]);
+        var key = /^#EXT-X-KEY:.*METHOD=AES-128.*URI="([^"]+)"/m.exec(text);
+        return { init: uri && !/BYTERANGE=/.test(map[1]) ? new URL(uri[1], playlist).toString() : null,
+          key: key ? new URL(key[1], playlist).toString() : null };
+      }).catch(function () { delete extras[playlist]; return { init: null, key: null }; }));
     }
 
     // Slots whose Shaka player didn't finish unloading in time (see unload): replaced before the next load.
@@ -515,6 +1049,13 @@ var Player = (function () {
       rememberBandwidth(slots[cur]);
       licenseHeaders = {};
       generation++;
+      prep.gen++;
+      prep.items = [];
+      prep.left = null;
+      prep.leftAudio = null;
+      clearTimeout(prep.timer);
+      Ahead.clear();
+      slots.forEach(function (s) { s.combo = null; s.extras = null; });
       slots.forEach(function (s) { s.v.classList.add('hidden'); s.v.style.zIndex = ''; });
       // Shaka's unload has been seen never to finish on the TV (2026-11-11, switching to a multiview): the next load
       // waits for it (Player.unload's teardown), so it gets 10 s; then the next load goes on, and a Shaka load first
@@ -553,8 +1094,23 @@ var Player = (function () {
         var a = P().getVariantTracks().filter(function (t) { return t.active; })[0];
         return a && a.channelsCount ? a.channelsCount : null;
       },
+      /** Whether the playing slot plays Dolby Digital (AC-3/E-AC-3) or more than two channels. */
+      surroundPlaying: function () {
+        var a = null;
+        try { a = P().getVariantTracks().filter(function (t) { return t.active; })[0]; } catch (e) { a = null; }
+        return !!a && ((a.channelsCount || 0) > 2 || /^(ac-3|ec-3)/.test(String(a.audioCodec || '')));
+      },
       setSubtitles: function (l) { textTrack(P(), l, !!slots[cur].grid); },
+      comboSwitch: comboSwitch,
+      comboPrepare: comboPrepare,
+      comboStatus: function () {
+        var s = slots[cur], parsed = {};
+        if (s && s.combo) prep.items.forEach(function (item) { var f = firstStreams(s, item); parsed[item.k] = f ? [!!(f.video && f.video.segmentIndex), !!(f.audio && f.audio.segmentIndex)] : null; });
+        return { combo: !!(s && s.combo), k: s && s.combo ? s.combo.k : null, prepared: prep.items.map(function (x) { return x.k; }), parsed: parsed,
+          parseMs: prep.parses.slice(), ahead: Ahead.size() };
+      },
       setHlsLiveSegments: function (n) { hlsLiveSegments = Math.max(1, Math.min(6, Math.round(+n) || 3)); return hlsLiveSegments; },
+      setComboCodecSwitch: function (x) { comboCodecSwitch = x === 'smooth' || x === 'reload' ? x : null; return comboCodecSwitch; },
       unload: unload,
       isLive: function () { return P().isLive(); },
       range: function () { return P().seekRange(); },
@@ -792,7 +1348,12 @@ var Player = (function () {
           onbufferingcomplete: function () { emit('buffering', false); clearTimeout(stallTimer); },
           oncurrentplaytime: function (ms) { posMs = ms; noteSmooth(s); },
           onstreamcompleted: function () { emit('ended'); },
-          onerror: function (e) { emit('error', 'Player error: ' + e, avError(e)); },
+          // Not after another engine took over (a preparation that hung and was given up still reports, seconds later,
+          // over a Shaka feed playing fine: "Player error: PLAYER_ERROR_GENEREIC", 2026-11-24).
+          onerror: function (e) {
+            if (engine !== AvEngine) return diagTrail('avplay.late-error', { error: String(e).slice(0, 60) });
+            emit('error', 'Player error: ' + e, avError(e));
+          },
           // The type only: its data is often binary (Tizen 6) and could carry anything.
           onevent: function (type) { diagTrail('avplay.event', { type: type }); },
           onsubtitlechange: function (duration, text) {
@@ -1205,6 +1766,8 @@ var Player = (function () {
     // Multiview: the stream helper's stitched HEVC, native only (clear or encrypted).
     // F1's player_tm feeds stitched by the helper (clear HEVC, AES-128 commentary): Shaka, like a single player_tm feed.
     if (stream.grid) return stream.grid.engine === 'tm' ? ShakaEngine : AvEngine;
+    // Every feed in one master (js/combo.js): feed switches are variant switches in Shaka.
+    if (stream.combo) return ShakaEngine;
     if (stream.hdrEncrypted && stream.licenseUrl && hasAvPlay()) return AvEngine;
     // F1's cenc stream (asked as a Chromecast): the browser decrypts it, so Shaka plays it.
     if (stream.cenc) return stream.cencAvplay && hasAvPlay() ? AvEngine : ShakaEngine;
@@ -1217,10 +1780,16 @@ var Player = (function () {
   var current = null;
   var channelsSeen = { stream: null, at: 0, n: null };   // Player.audioChannels(), kept 2 s
 
+  // Each load, and each unload from outside, takes a number: a load still waiting for the previous player to close
+  // goes no further once the viewer left (BACK during a 'reopen' switch started the new feed after leaving).
+  var loadGen = 0;
+
   function load(stream, startTime) {
     current = stream;
     channelsSeen = { stream: null, at: 0, n: null };
-    return unload().then(function () {
+    var gen = ++loadGen;
+    return stopEngine().then(function () {
+      if (gen !== loadGen) throw new Error('cancelled');
       engine = choose(stream);
       engineName = engine === AvEngine ? 'avplay' : 'shaka';
       return engine.load(stream, startTime);
@@ -1232,6 +1801,11 @@ var Player = (function () {
   var teardown = null;
 
   function unload() {
+    loadGen++;
+    return stopEngine();
+  }
+
+  function stopEngine() {
     if (typeof Caps !== 'undefined') Caps.crashEnd();
     var e = engine;
     engine = null;
@@ -1276,10 +1850,49 @@ var Player = (function () {
     return info.epochAtZero > 1e9 ? wall - info.epochAtZero : null;
   }
 
+  /**
+   * Whether what a switch loads offers Dolby Digital (AC-3/E-AC-3), which Shaka picks (preferredAudioChannelCount):
+   * the stream's own master (api.js hlsInfo `surround`), or, for a combined master, the feed it starts at. Unknown
+   * (no facts read): yes, the safe way.
+   */
+  function offersSurround(stream) {
+    var c = stream && stream.combo;
+    if (c && c.info) {
+      var f = (c.info.feeds || []).filter(function (x) { return x.k === c.k; })[0];
+      return !f || !!f.surround;
+    }
+    var info = stream && stream.info;
+    if (!info) return true;
+    return !!info.surround || (!!info.offer && (info.offer.variants || []).some(function (v) { return /(^|,)\s*(ac-3|ec-3)/.test(String(v.codecs || '')); }));
+  }
+
+  /**
+   * How a switch to `stream` plays: 'combo' (a variant switch in the playing combined master, js/combo.js), 'swap'
+   * (Shaka loads it beside the playing feed and shows it once it runs) or 'reopen' (the playing feed stops first).
+   * Only one Dolby Digital stream at a time: a 5.1 stream loaded beside a playing one stayed silent, and a feed loaded
+   * beside a playing 5.1 one froze until that one was gone, then the switch failed (QE55Q77A with a Dolby soundbar,
+   * São Paulo race on v1.2.0, 2026-11-23). Encrypted feeds can't be preloaded either: the TV has one secure decoder,
+   * and the preloaded cenc feed barely moves (164 frames in 9 s, Mexico FP3).
+   */
+  function switchKind(stream) {
+    if (stream.combo && stream.comboSwitch && engine === ShakaEngine && current && current.combo && current.combo.uri === stream.combo.uri) return 'combo';
+    if (engine !== ShakaEngine || choose(stream) !== ShakaEngine || stream.cenc || (current && current.cenc)) return 'reopen';
+    var surround = false;
+    try { surround = ShakaEngine.surroundPlaying(); } catch (e) { surround = false; }
+    return surround || offersSurround(stream) ? 'reopen' : 'swap';
+  }
+
   function switchTo(stream, startTime) {
-    // Encrypted feeds can't be preloaded beside the playing one: the TV has one secure decoder, and the
-    // preloaded cenc feed barely moves (164 frames in 9 s, Mexico FP3). They load like AVPlay's.
-    if (engine === ShakaEngine && choose(stream) === ShakaEngine && !stream.cenc && !(current && current.cenc)) {
+    var kind = switchKind(stream);
+    if (kind === 'combo') {
+      var was = current;
+      current = stream;
+      return ShakaEngine.comboSwitch(stream).catch(function (e) {
+        if (current === stream) current = was;
+        throw e;
+      });
+    }
+    if (kind === 'swap') {
       var prev = current;
       current = stream;
       // A failed switch leaves the previous feed playing, on its own clock.
@@ -1336,7 +1949,12 @@ var Player = (function () {
     unload: traced('player.unload', unload),
     seekBy: traced('player.seekBy', seekBy, function (d) { return { by: d }; }),
     seekTo: traced('player.seekTo', seekTo, function (t) { return { to: t }; }),
-    switchTo: traced('player.switchTo', switchTo, function (s, t) { return { start: t, cenc: !!(s && s.cenc), hdr: !!(s && s.hdr) }; }),
+    switchTo: traced('player.switchTo', switchTo, function (s, t) { return { start: t, cenc: !!(s && s.cenc), hdr: !!(s && s.hdr), kind: switchKind(s) }; }),
+    /** 'combo', 'swap' or 'reopen': how a switch to the stream would play (the app learns a lead for swap and reopen). */
+    switchKind: switchKind,
+    /** Combined master (js/combo.js): makes feeds (their numbers k in the master) ready for an instant switch. */
+    comboPrepare: function (ks) { if (engine === ShakaEngine && current && current.combo) ShakaEngine.comboPrepare(ks); },
+    comboStatus: function () { return engine === ShakaEngine ? ShakaEngine.comboStatus() : null; },
     snapshot: snapshot,
     errorInfo: errorInfo,
     avTuning: AvEngine.tuning,
@@ -1344,6 +1962,8 @@ var Player = (function () {
     positionAt: positionAt,
     /** DevTools: how many segments behind a live HLS playlist's end Shaka starts (3 = Shaka's default). */
     setHlsLiveSegments: function (n) { return ShakaEngine.setHlsLiveSegments(n); },
+    /** DevTools: Shaka's codec-switching strategy for combined masters ('smooth' | 'reload' | null: Shaka's default). */
+    setComboCodecSwitch: function (x) { return ShakaEngine.setComboCodecSwitch(x); },
     stream: function () { return current; },
     togglePause: traced('player.togglePause', togglePause, function () { return { wasPaused: !!(engine && engine.paused()) }; }),
     isLive: proxy('isLive', false),

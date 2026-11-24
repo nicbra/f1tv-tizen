@@ -160,24 +160,36 @@
     }
     return null;
   }
-  function playlist(text) {
+  /*
+   * A complete VOD playlist: { init, segments: [{ uri, duration }], keys, breaks }. EXT-X-DISCONTINUITY is refused
+   * unless opts.breaks: then `breaks` lists the segments that follow one, and the caller must check that the media
+   * timestamps run on across each (hdr.js continuous), since the DASH built from it has a single timeline.
+   */
+  function playlist(text, opts) {
     if (!/^#EXTM3U\s/.test(text) || !/^#EXT-X-ENDLIST\s*$/m.test(text)) throw new Error('requires a complete VOD playlist');
-    if (/^#EXT-X-DISCONTINUITY\s*$/m.test(text)) throw new Error('unsupported media discontinuity');
+    if (!(opts && opts.breaks) && /^#EXT-X-DISCONTINUITY\s*$/m.test(text)) throw new Error('unsupported media discontinuity');
+    var breaks = [], broken = false;
     if (/^#EXT-X-BYTERANGE:|^#EXT-X-MAP:.*\bBYTERANGE=/m.test(text)) throw new Error('unsupported media byte range');
     var init = (/^#EXT-X-MAP:.*URI="([^"]+)"/m.exec(text) || [])[1], duration = null, segments = [], keys = [];
     if (!init) throw new Error('missing CMAF initialization map');
+    // One init for the whole timeline: a new one (at a discontinuity, say) would need another representation.
+    var maps = (text.match(/^#EXT-X-MAP:.*URI="[^"]+"/gm) || []).map(function (l) { return /URI="([^"]+)"/.exec(l)[1]; });
+    if (maps.some(function (m) { return m !== init; })) throw new Error('unsupported media initialization change');
     text.split(/\r?\n/).forEach(function (line) {
       if (/^#EXT-X-(?:SESSION-)?KEY:/.test(line)) keys.push(line);
+      else if (/^#EXT-X-DISCONTINUITY\s*$/.test(line)) broken = true;
       else if (/^#EXTINF:/.test(line)) {
         if (duration !== null) throw new Error('missing URI for media segment');
         duration = parseFloat(line.slice(8));
       } else if (line.trim() && line.charAt(0) !== '#') {
         if (!positive(duration)) throw new Error('invalid media segment duration');
+        if (broken && segments.length) breaks.push(segments.length);
+        broken = false;
         segments.push({ uri: line.trim(), duration: duration }); duration = null;
       }
     });
     if (!segments.length || duration !== null) throw new Error('incomplete media segments');
-    return { init: init, segments: segments, keys: keys };
+    return { init: init, segments: segments, keys: keys, breaks: breaks };
   }
   function xml(value) { return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); }
   function positive(n) { return typeof n === 'number' && isFinite(n) && n > 0; }

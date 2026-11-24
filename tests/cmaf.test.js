@@ -57,10 +57,16 @@ test('the template inference preserves signed query parameters and only substitu
   assert.equal(cmaf.template(['https://cdn.example/v_100.m4s', 'https://cdn.example/v_102.m4s']), null);
 });
 
-test('a discontinuity sequence counter is allowed, while real discontinuities are rejected', () => {
-  const media = '#EXTM3U\n#EXT-X-DISCONTINUITY-SEQUENCE:0\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:5.76,\nv_100.m4s\n#EXT-X-ENDLIST\n';
-  assert.deepEqual(cmaf.playlist(media), { init: 'init.mp4', segments: [{ uri: 'v_100.m4s', duration: 5.76 }], keys: [] });
-  assert.throws(() => cmaf.playlist(media.replace('#EXTINF:', '#EXT-X-DISCONTINUITY\n#EXTINF:')), /discontinuity/i);
+test('a discontinuity sequence counter is allowed; real discontinuities only when the caller checks them (breaks)', () => {
+  const media = '#EXTM3U\n#EXT-X-DISCONTINUITY-SEQUENCE:0\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:5.76,\nv_100.m4s\n#EXTINF:5.76,\nv_101.m4s\n#EXT-X-ENDLIST\n';
+  assert.deepEqual(cmaf.playlist(media), { init: 'init.mp4', segments: [{ uri: 'v_100.m4s', duration: 5.76 }, { uri: 'v_101.m4s', duration: 5.76 }], keys: [], breaks: [] });
+  const broken = media.replace('#EXTINF:5.76,\nv_101', '#EXT-X-DISCONTINUITY\n#EXTINF:5.76,\nv_101');
+  assert.throws(() => cmaf.playlist(broken), /discontinuity/i);
+  assert.deepEqual(Array.from(cmaf.playlist(broken, { breaks: true }).breaks), [1], 'the segment after the break');
+  // A new init at the break: one representation can't hold it.
+  assert.throws(() => cmaf.playlist(broken.replace('#EXT-X-DISCONTINUITY\n', '#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI="init2.mp4"\n'), { breaks: true }), /initialization change/);
+  // One before the first segment breaks nothing.
+  assert.deepEqual(Array.from(cmaf.playlist(media.replace('#EXTINF:', '#EXT-X-DISCONTINUITY\n#EXTINF:'), { breaks: true }).breaks), []);
 });
 
 function track(type, hdr = false) {

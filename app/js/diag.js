@@ -151,6 +151,8 @@ var Diag = (function () {
       if (s[k] != null && s[k] !== false) o[k] = s[k];
     });
     if (s.grid) o.multiview = true;
+    // Every feed in one master (js/combo.js): its range and number of feeds; an instant switch in it.
+    if (s.combo && s.combo.info) o.combo = (s.combo.info.range || 'HLG') + ':' + ((s.combo.info.feeds || []).length) + (s.comboSwitch ? ':switch' : '');
     o.device = s.hdr ? 'tvos' : s.cenc ? 'chromecast' : 'web';
     o.drm = s.cenc ? 'cenc' : s.licenseUrl ? 'cbcs' : 'clear';
     if (s.info) {

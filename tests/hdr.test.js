@@ -48,8 +48,10 @@ test('encrypted HDR keeps only HLG qualities and preserves every official commen
  assert.ok(xml.indexOf('lang="deu"')<xml.indexOf('contentType="audio" lang="eng"'));
  assert.ok(h.calls.filter(c=>c.url.includes('v_100')).every(c=>c.opts.headers.Range==='bytes=0-65535'));
 });
+// A discontinuity whose media timestamps jump (the harness serves every segment with the first one's tfdt).
+const broken=playlist.replace('#EXTINF:5.76,\nv_101','#EXT-X-DISCONTINUITY\n#EXTINF:5.76,\nv_101');
 for(const [name,url,body] of [
- ['discontinuity','https://video.formula1.com/vod/v/uhd.m3u8',playlist.replace('#EXTINF:','#EXT-X-DISCONTINUITY\n#EXTINF:')],
+ ['a discontinuity where the timestamps jump','https://video.formula1.com/vod/v/uhd.m3u8',broken],
  ['key mismatch','https://video.formula1.com/vod/v/uhd.m3u8',playlist.replace(hdrKid,kid)],
  ['unmatched clock','https://video.formula1.com/sdr/index.mpd',mpd.replaceAll('presentationTimeOffset="89669822112000"','presentationTimeOffset="89669812112000"')],
  ['dynamic source','https://video.formula1.com/sdr/index.mpd',mpd.replace('type="static"','type="dynamic"')],
@@ -254,4 +256,32 @@ test('a clear HDR multiview gets the HLS master\'s WebVTT subtitles, on the vide
   assert.deepEqual(tracks, [{ lang: 'eng', vtt: true, offset: 0.02, timescale: 1, list: [
     { url: 'https://cdn/x/eng/index_22_0_1.vtt', start: 0.02, end: 5.78 },
     { url: 'https://cdn/x/eng/index_22_0_2.vtt', start: 5.78, end: 11.54 }] }]);
+});
+
+// São Paulo 2026: EXT-X-DISCONTINUITY in every playlist while the media timestamps run on to the tick.
+test('encrypted HDR keeps a discontinuity whose media timestamps run on (one timeline), checking the segment after it',async()=>{
+ const next=Buffer.alloc(8);next.writeBigUInt64BE(89669822112000n+288000n);
+ const after=box('moof',box('traf',box('tfdt',Buffer.concat([Buffer.from([1,0,0,0]),next]))));
+ const h=harness({'https://video.formula1.com/vod/v/uhd.m3u8':broken,'https://video.formula1.com/vod/v/v_101.m4s?sig=keep&n=2':after});
+ const xml=await h.build();
+ assert.ok(xml.includes('width="3840" height="2160"'));
+ assert.ok(h.calls.some(c=>c.url==='https://video.formula1.com/vod/v/v_101.m4s?sig=keep&n=2'&&c.opts.headers.Range==='bytes=0-65535'),'the segment after the break, its head only');
+});
+test('a multiview of feeds with a discontinuity: built when their timestamps run on, refused when they jump',async()=>{
+ const next=Buffer.alloc(8);next.writeBigUInt64BE(89669822112000n+288000n);
+ const after=box('moof',box('traf',box('tfdt',Buffer.concat([Buffer.from([1,0,0,0]),next]))));
+ const grid=(over)=>{
+  const h=harness(Object.assign({'https://video.formula1.com/vod/v/uhd.m3u8':broken,'https://video.formula1.com/vod/v/hd.m3u8':broken,
+   'http://127.0.0.1:18765/stitch/g3':JSON.stringify({width:3840,height:3264,codecs:'hev1.2.4.L153.B0'})},over));
+  h.ctx.MultiviewLayouts={layouts:{duo:{feeds:[2160,1080]}}};h.ctx.navigator={userAgent:'test'};
+  const lead={url:'https://video.formula1.com/vod/master.m3u8',widevineManifestUrl:'https://video.formula1.com/sdr/index.mpd',hdr:true,hdrEncrypted:true};
+  return h.ctx.HdrStream.grid([lead,{url:'https://video.formula1.com/vod/master.m3u8',hdr:true}],'duo',{id:'g3',langs:{audio:'eng',text:''},audio:0});
+ };
+ const {mpd}=await grid({'https://video.formula1.com/vod/v/v_101.m4s?sig=keep&n=2':after});
+ assert.ok(mpd.includes('<AdaptationSet contentType="video"'));
+ await assert.rejects(grid({}),/discontinuity/);
+ // The second feed's own clock jumping at the break (each feed is checked, not only the first).
+ await assert.rejects(grid({'https://video.formula1.com/vod/v/v_101.m4s?sig=keep&n=2':after,'https://video.formula1.com/vod/v/hd.m3u8':broken.replaceAll('v_10','w_10')}),/timestamps jump/);
+ // Feeds whose breaks differ can't share one timeline.
+ await assert.rejects(grid({'https://video.formula1.com/vod/v/v_101.m4s?sig=keep&n=2':after,'https://video.formula1.com/vod/v/hd.m3u8':playlist}),/differ in discontinuities/);
 });

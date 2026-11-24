@@ -26,6 +26,38 @@ var HdrStream = (function () {
   var LANG3 = { en: 'eng', de: 'deu', fr: 'fra', nl: 'nld', pt: 'por', ja: 'jpn', es: 'spa', it: 'ita' };
   function lang3(l) { l = String(l || '').toLowerCase(); return LANG3[l] || l; }
   function total(segments) { return segments.reduce(function (n, s) { return n + s.duration; }, 0); }
+
+  /*
+   * F1's replays can carry EXT-X-DISCONTINUITY where the packager restarted, while the media timestamps run on to the
+   * tick (São Paulo 2026: one at segment 1240 of 1396 in every feed's video and sound; only the wall clock jumped,
+   * 11.52 s, which the PROGRAM-DATE-TIME marks keep). The single DASH timeline built here holds only then: the first
+   * segment after each break (CmafDash.playlist breaks) is read, and must start where the durations before it end.
+   * known: { init (bytes), timing } of the playlist when the caller has them. Resolves, or fails.
+   */
+  function continuous(io, parsed, base, known) {
+    var breaks = parsed.breaks || [];
+    if (!breaks.length) return Promise.resolve();
+    if (breaks.length > 4) return Promise.resolve().then(function () { fail('unsupported media discontinuity (' + breaks.length + ')'); });
+    var url = function (n) { return new URL(parsed.segments[n].uri, base).toString(); };
+    var start$ = known ? Promise.resolve(known) : Promise.all([io.get(new URL(parsed.init, base).toString(), true), io.get(url(0), true, true)])
+      .then(function (d) { return { init: d[0], timing: CmafDash.timing(d[0], d[1]) }; });
+    return start$.then(function (k) {
+      return Promise.all(breaks.map(function (n) {
+        return io.get(url(n), true, true).then(function (fragment) {
+          var at = CmafDash.timing(k.init, fragment).baseTime, want = k.timing.baseTime + total(parsed.segments.slice(0, n)) * k.timing.timescale;
+          // The DASH timeline is built from the EXTINF durations: they must meet the media's own clock (F1's did to the
+          // tick), within 0.1 s.
+          if (Math.abs(at - want) > 0.1 * k.timing.timescale) fail('unsupported media discontinuity (timestamps jump at segment ' + n + ')');
+        });
+      }));
+    });
+  }
+
+  /** The same breaks (or none) in every playlist of a set that shares one timeline (a grid's feeds). */
+  function sameBreaks(list) {
+    var first = String((list[0] && list[0].breaks) || []);
+    list.forEach(function (x) { if (String(x.breaks || []) !== first) fail('feeds differ in discontinuities'); });
+  }
   function binary(kid) { return kid.replace(/-/g, '').match(/../g).map(function (x) { return String.fromCharCode(parseInt(x, 16)); }).join(''); }
   function psshFor(source, kid) {
     var raw = atob(source.pssh), before = binary(source.kid);
@@ -184,11 +216,14 @@ var HdrStream = (function () {
     var io = fetcher(left);
     return io.deadline(Promise.all(list.map(function (a, i) {
       return Promise.resolve().then(function () { return io.get(new URL(a.URI, masterUrl).toString()); }).then(function (response) {
-        var parsed = CmafDash.playlist(response.body);
+        var parsed = CmafDash.playlist(response.body, { breaks: true });
         var init = new URL(parsed.init, response.url).toString();
         var segments = parsed.segments.map(function (s) { return { url: new URL(s.uri, response.url).toString(), duration: s.duration }; });
         return Promise.all([io.get(init, true), io.get(segments[0].url, true, true)]).then(function (data) {
-          var timing = CmafDash.timing(data[0], data[1]), own = CmafDash.encryption(data[0]);
+          var timing = CmafDash.timing(data[0], data[1]);
+          return continuous(io, parsed, response.url, { init: data[0], timing: timing }).then(function () { return [data, timing]; });
+        }).then(function (got) {
+          var data = got[0], timing = got[1], own = CmafDash.encryption(data[0]);
           if (!own || own.scheme !== 'cbcs') return fail('surround not CBCS');
           checkKeys(parsed.keys, own.kid);
           if (Math.abs(timing.baseTime / timing.timescale - epoch) > 0.1) return fail('surround clock differs');
@@ -235,10 +270,13 @@ var HdrStream = (function () {
         var playlistUrl = new URL(v.uri, sources[0].url).toString();
         return get(playlistUrl).then(function (response) {
           playlistUrl = response.url;
-          var parsed = CmafDash.playlist(response.body);
+          var parsed = CmafDash.playlist(response.body, { breaks: true });
           var segments = parsed.segments.map(function (s) { return { url: new URL(s.uri, playlistUrl).toString(), duration: s.duration }; });
           var init = new URL(parsed.init, playlistUrl).toString();
           return Promise.all([get(init, true), get(segments[0].url, true, true)]).then(function (data) {
+            var timing = CmafDash.timing(data[0], data[1]);
+            return continuous(io, parsed, playlistUrl, { init: data[0], timing: timing }).then(function () { return data; });
+          }).then(function (data) {
             var timing = CmafDash.timing(data[0], data[1]), protection = CmafDash.encryption(data[0]);
             if (!protection || protection.scheme !== 'cbcs') return fail('unsupported media encryption');
             checkKeys(parsed.keys, protection.kid);
@@ -416,10 +454,10 @@ var HdrStream = (function () {
           });
           if (!uri) return fail('no ' + height + 'p ' + range + ' HEVC variant');
           return get(new URL(uri, master.url).toString()).then(function (response) {
-            var parsed = CmafDash.playlist(response.body);
+            var parsed = CmafDash.playlist(response.body, { breaks: true });
             var urls = parsed.segments.map(function (s) { return new URL(s.uri, response.url).toString(); });
             return { init: new URL(parsed.init, response.url).toString(), urls: urls, durations: parsed.segments.map(function (s) { return s.duration; }),
-              keys: parsed.keys, bandwidth: +a.BANDWIDTH || 0, codec: (a.CODECS || '').split(',').filter(function (c) { return /^(hev1|hvc1)\./.test(c); })[0],
+              parsed: parsed, playlistUrl: response.url, breaks: parsed.breaks, keys: parsed.keys, bandwidth: +a.BANDWIDTH || 0, codec: (a.CODECS || '').split(',').filter(function (c) { return /^(hev1|hvc1)\./.test(c); })[0],
               master: master.body, masterUrl: master.url, audioGroup: a.AUDIO,
               audioCodec: (a.CODECS || '').split(',').filter(function (c) { return /^(mp4a|ac-3|ec-3)/.test(c); })[0] };
           });
@@ -427,7 +465,14 @@ var HdrStream = (function () {
       })).then(function (feeds) {
         var count = feeds[0].urls.length;
         feeds.forEach(function (f) { if (f.urls.length !== count) fail('feeds differ in length'); });
+        sameBreaks(feeds);
         return Promise.all([get(feeds[0].init, true), get(feeds[0].urls[0], true, true)]).then(function (data) {
+          var timing = CmafDash.timing(data[0], data[1]);
+          // Every feed of the grid (each could reset its own clock at the break): the first with what is read already.
+          return Promise.all(feeds.map(function (f, n) {
+            return continuous(io, f.parsed, f.playlistUrl, n === 0 ? { init: data[0], timing: timing } : null);
+          })).then(function () { return data; });
+        }).then(function (data) {
           var timing = CmafDash.timing(data[0], data[1]), protection = CmafDash.encryption(data[0]);
           if (encrypted) {
             if (!protection || protection.scheme !== 'cbcs') return fail('unsupported media encryption');
@@ -502,12 +547,15 @@ var HdrStream = (function () {
     return Promise.all(list.map(function (a, i) {
       var url = new URL(a.URI, feed.masterUrl).toString();
       return io.get(url).then(function (response) {
-        var parsed = CmafDash.playlist(response.body);
+        var parsed = CmafDash.playlist(response.body, { breaks: true });
         var segments = parsed.segments.map(function (s) { return { url: new URL(s.uri, response.url).toString(), duration: s.duration }; });
         var init = new URL(parsed.init, response.url).toString();
         return Promise.all([io.get(init, true), io.get(segments[0].url, true, true)]).then(function (data) {
-          return { type: 'audio', id: 'a' + i, language: a.LANGUAGE || 'und', codecs: feed.audioCodec || 'mp4a.40.2', bandwidth: 128000,
-            timing: CmafDash.timing(data[0], data[1]), init: init, segments: segments };
+          var timing = CmafDash.timing(data[0], data[1]);
+          return continuous(io, parsed, response.url, { init: data[0], timing: timing }).then(function () {
+            return { type: 'audio', id: 'a' + i, language: a.LANGUAGE || 'und', codecs: feed.audioCodec || 'mp4a.40.2', bandwidth: 128000,
+              timing: timing, init: init, segments: segments };
+          });
         });
       });
     }));
@@ -780,9 +828,10 @@ var HdrStream = (function () {
         if (!map) return fail('missing CMAF initialization map');
         var init = new URL(map[1], response.url).toString(), bandwidth = +a.BANDWIDTH || 0;
         if (/^#EXT-X-ENDLIST\s*$/m.test(text)) {
-          var parsed = CmafDash.playlist(text);
+          var parsed = CmafDash.playlist(text, { breaks: true });
           return { init: init, urls: parsed.segments.map(function (s) { return new URL(s.uri, response.url).toString(); }),
-            durations: parsed.segments.map(function (s) { return s.duration; }), keys: keys, bandwidth: bandwidth };
+            durations: parsed.segments.map(function (s) { return s.duration; }), keys: keys, bandwidth: bandwidth,
+            parsed: parsed, playlistUrl: response.url, breaks: parsed.breaks };
         }
         var uris = text.split(/\r?\n/).filter(function (l) { return l.trim() && l.charAt(0) !== '#'; }).map(function (l) { return new URL(l.trim(), response.url).toString(); });
         var pattern = uris.length >= 4 && CmafDash.template(uris.slice(-4, -1));
@@ -802,6 +851,10 @@ var HdrStream = (function () {
     if (!heights || heights.length !== streams.length) return Promise.reject(new Error('HDR: layout ' + layout + ' needs ' + (heights ? heights.length : '?') + ' feeds'));
     var io = fetcher(20000);
     return io.deadline(Promise.all(streams.map(function (s, n) { return variantOf(io, s, heights[n], opts.range || gridRange(streams)); })).then(function (feeds) {
+      if (!feeds[0].live) sameBreaks(feeds);
+      return (feeds[0].live ? Promise.resolve() : Promise.all(feeds.map(function (f) { return continuous(io, f.parsed, f.playlistUrl); })))
+        .then(function () { return feeds; });
+    }).then(function (feeds) {
       var live = feeds[0].live, body = { kind: 'hevc', layout: layout, live: !!live, ua: navigator.userAgent };
       if (feeds.some(function (f) { return !!f.live !== !!live; })) return fail('live and replay feeds mixed');
       if (live) {

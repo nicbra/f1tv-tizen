@@ -254,7 +254,7 @@ async function boot(options = {}) {
       { pos: 2, code: 'PIA', first: 'Oscar', last: 'Piastri', team: 'McLaren', teamId: 'mclaren', points: 300, wins: 5, id: 'piastri', number: '81' }] }),
     season: () => Promise.resolve([])
   };
-  const requests = [], saved = [];
+  const requests = [], saved = [], combos = [];
   // The timing worker: tests mark it loaded and answer its queries with timing.state(path, t).
   // timing.hold keeps the worker's answers in timing.held, to arrive whenever the test calls them.
   const timing = { workers: [], held: [], hold: false, state: () => null,
@@ -296,7 +296,8 @@ async function boot(options = {}) {
   // The video player: loads resolve unless the test holds them; positions move only when the test says.
   // frames: decoded frames, as Shaka counts them (a number, from 0 at each load), or null (AVPlay counts none).
   const player = {
-    current: null, engine: null, pos: 0, paused: false, loads: [], listeners: {}, hold: null, frames: null,
+    current: null, engine: null, pos: 0, paused: false, loads: [], listeners: {}, hold: null, frames: null, comboSwitches: [], prepared: [],
+    comboPrepare(ks) { player.prepared.push(Array.from(ks)); },
     init: async () => {},
     hdrCapable: () => !!options.hdrCapable,
     cencCapable: () => !!options.capsRouting && context.Caps.browser('cenc') !== false,
@@ -317,6 +318,13 @@ async function boot(options = {}) {
     // Shaka switches in the background: on failure the previous feed plays on as the current
     // stream, and a viewer's pause carries over. AVPlay reopens, playing.
     switchTo(s, start) {
+      // A feed of the combined master (js/combo.js): a variant switch in the same player, from where it is.
+      if (s.comboSwitch) {
+        player.comboSwitches.push(s.combo.k);
+        if (options.comboFails && options.comboFails(s)) return Promise.reject(Object.assign(new Error('COMBO: the new feed did not show'), { code: 'COMBO' }));
+        player.current = s;
+        return Promise.resolve();
+      }
       if (player.kind === 'avplay') return player.load(s, start);
       // Shaka: the old feed (its position and pause) stays current until the new one runs.
       const prev = player.current;
@@ -380,6 +388,8 @@ async function boot(options = {}) {
     document,
     ...(options.launcher ? { Launcher: options.launcher, StreamProxy: { ensure: options.ensure || (async () => true) } } : {}),
     ...(options.diag ? { Diag: options.diag } : {}),
+    // js/combo.js: options.combo(list) answers a build (the combined master of a video's feeds).
+    ...(options.combo ? { FeedCombo: { TAG: 100, feedOf: (t) => t.bandwidth % 100, build: async (list, o) => { combos.push({ list, o }); return options.combo(list, o); } } } : {}),
     window: { addEventListener: (t, fn) => { windowListeners[t] = fn; }, localStorage },
     localStorage,
     setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, setInterval: clock.setInterval, clearInterval: clock.clearInterval,
@@ -483,7 +493,7 @@ async function boot(options = {}) {
   const KEYS = context.Keys.codes;
   const app = {
     mvSoft,
-    context, clock, net, player, timing, requests, exits, saved, $, deferred, api, auth, stats, store, windowListeners, uploads,
+    context, clock, net, player, timing, requests, exits, saved, $, deferred, api, auth, stats, store, windowListeners, uploads, combos,
     advance: (ms) => clock.advance(ms),
     async press(...names) {
       for (const name of names) {
@@ -819,6 +829,26 @@ test('BACK on the feed list while the session renews does not start the video', 
   assert.equal(app.player.loads.length, 0);
 });
 
+test('a new video starts with an empty progress bar while it loads, not where the previous video was', async () => {
+  const app = await boot();
+  app.player.progress = true;
+  await play(app, 'Race');
+  await app.advance(20000);
+  await app.press('LEFT');   // shows the bar
+  await app.advance(1500);
+  assert.notEqual(app.$('osd-progress').style.width, '0%');
+  await app.stop();
+  for (let i = 0; i < 3 && app.screen() !== 'browse'; i++) await app.press('BACK');
+  app.player.hold = deferred();
+  await play(app, 'Qualifying');
+  await app.advance(1000);
+  assert.equal(app.$('osd-pos').textContent, 'Loading…');
+  assert.equal(app.$('osd-progress').style.width, '0%');
+  assert.equal(app.$('osd-buffer').style.width, '0%');
+  app.player.hold.resolve();
+  app.player.hold = null;
+});
+
 test('a feed switch without the new feed\'s clock keeps the position', async () => {
   const app = await boot();
   await play(app, 'Race');
@@ -904,6 +934,35 @@ test('a start that hangs in AVPlay is tried once more at the same moment, then t
   assert.equal(app.player.loads.length, 2, 'no third open over a stuck player');
 });
 
+test('a multiview whose AVPlay hangs twice plays its big feed alone (Shaka still plays), not a dead screen', async () => {
+  const hung = () => Object.assign(new Error('The video player did not start'), { code: 'PREPARE_TIMEOUT' });
+  const app = await premiumHdr({ play: premiumOffer });
+  app.player.kind = 'avplay';
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.hold = deferred();
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(5000);
+  assert.ok(app.player.current.grid, 'the multiview is loading');
+  const first = app.player.hold;
+  app.player.hold = deferred();
+  first.reject(hung());
+  await app.advance(500);
+  assert.match(app.toast(), /didn't start, trying again/);
+  await app.advance(5000);   // the retry asks for its feeds again, then loads
+  const second = app.player.hold;
+  app.player.hold = null;
+  second.reject(hung());
+  await app.advance(5000);
+  assert.match(app.toast(), /Playing one feed/);
+  assert.ok(app.player.current && !app.player.current.grid, 'one feed plays');
+  assert.equal(app.player.current.feed, 'INTERNATIONAL');
+});
+
 test('after a hung start that recovered, a later hang gets its retry again', async () => {
   const hung = () => Object.assign(new Error('The video player did not start'), { code: 'PREPARE_TIMEOUT' });
   const app = await boot();
@@ -935,6 +994,38 @@ test('OK on the feed list before the saved position arrives still offers to cont
   await app.press('ENTER');
   await app.advance(200);
   assert.equal(app.player.loads.at(-1).start, 1800);
+});
+
+test('quick CH presses during a switch add up: three presses go three feeds on', async () => {
+  const app = await boot({ multiview: true });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.hold = deferred();
+  await app.press('CH_DOWN');   // to F1 LIVE: held
+  await app.advance(100);
+  await app.press('CH_DOWN');
+  await app.press('CH_DOWN');
+  const hold = app.player.hold;
+  app.player.hold = null;
+  hold.resolve();
+  await app.advance(6000);
+  // Three feeds (INTERNATIONAL, F1 LIVE, an onboard): three on is INTERNATIONAL again.
+  assert.equal(app.player.current.feed, 'INTERNATIONAL');
+});
+
+test('picking another feed than the first in the feed list offers to continue too, at the same moment', async () => {
+  const app = await boot();
+  app.net.resume = () => Promise.resolve(1800);
+  await app.pick(/^Race/);
+  await app.advance(100);
+  await app.pick(/^F1 LIVE/);
+  await app.advance(100);
+  assert.match(app.$('dialog-actions').textContent, /Continue from 30:00/);
+  await app.press('ENTER');
+  await app.advance(300);
+  assert.equal(app.player.loads.at(-1).start, 1800);
+  assert.equal(app.player.current.feed, 'F1 LIVE');
 });
 
 test('jumping back soon after the start is not taken for a video that did not start', async () => {
@@ -1897,6 +1988,18 @@ async function showLayout(app, name, dirs) {
   await app.advance(3000);
 }
 
+test('a player_tm answer in CMAF (weeks-old replays) makes no player_tm multiview: the usual one, nothing held against it', async () => {
+  const asked = [], grids = [];
+  const app = await premiumHdr({ play: tmOffers(asked), tm: Object.assign({}, TM, { streamType: 'HDR_UHD_CMAF' }), tmGrid: tmGridOf(grids) });
+  await play(app, 'Race');
+  await app.advance(1000);
+  await showLayout(app, /^Big \+ 2$/);
+  assert.equal(grids.length, 0, 'the helper never got a CMAF answer to unpack');
+  assert.ok(app.player.current.grid && app.player.current.grid.engine !== 'tm', JSON.stringify(app.player.current.grid && app.player.current.grid.engine));
+  const caps = app.context.Caps.report().paths['shaka:tmgrid'];
+  assert.ok(!caps || !caps.failed);
+});
+
 test('a multiview from F1\'s player_tm answer: no PLAY request per feed, the helper\'s grid of their masters, on Shaka', async () => {
   const asked = [], grids = [];
   const app = await premiumHdr({ play: tmOffers(asked), tm: TM, tmGrid: tmGridOf(grids) });
@@ -1986,6 +2089,222 @@ test('a player_tm multiview that fails while playing: the same multiview the usu
   assert.equal(grids.length, 1, 'no second player_tm grid');
   assert.equal(app.player.current.grid.engine, 'hevc');
   assert.ok(app.player.current.grid.streams.every((x) => !x.hlsAes));
+});
+
+// ---------- instant feed switches: one master for every feed (js/combo.js) ----------
+
+const comboOf = (list, o) => ({ uri: 'blob:combo-' + list.map((x) => x.index).join(''), master: '#EXTM3U', range: (o && o.range) || 'HLG',
+  feeds: list.map((x, k) => ({ index: x.index, channel: x.channel, url: x.url, k, variants: [], audio: {} })) });
+
+test('a 4K HDR replay plays every feed from one master: feed switches stay in the player, with no PLAY request', async () => {
+  const asked = [];
+  const app = await premiumHdr({ play: tmOffers(asked), tm: TM, combo: comboOf });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  const s = app.player.current;
+  assert.equal(s.combo.uri, 'blob:combo-012', 'the start loads the combined master');
+  assert.equal(s.combo.k, 0);
+  assert.deepEqual(Array.from(app.combos[0].list, (x) => x.channel), ['1025', '1033', '1009']);
+  assert.deepEqual(Array.from(app.combos[0].o.soundFrom), ['1033', '1025']);
+  const before = asked.length;
+  await app.press('CH_DOWN');
+  await app.advance(1000);
+  const t = app.player.current;
+  assert.ok(t.comboSwitch && t.combo.k === 1 && t.feed === 'F1 LIVE');
+  assert.equal(asked.length, before, 'no PLAY request for a feed of the master');
+  assert.deepEqual(app.player.comboSwitches, [1]);
+  assert.equal(t.url, TM.feeds[1033], 'the feed\'s own address, for what needs one');
+  assert.match(app.$('osd-feed').textContent, /^F1 LIVE/);
+  // Its neighbours are made ready for the next switch (feed numbers in the master).
+  await app.advance(3000);
+  const last = app.player.prepared.at(-1), ks = last.map((x) => x.k);
+  assert.ok(ks.includes(0) && ks.includes(2), JSON.stringify(app.player.prepared));
+  assert.equal(last.find((x) => x.k === 2).audio, 'teamradio', 'the onboard is prepared with its team radio');
+  assert.equal(last.find((x) => x.k === 0).audio, 'eng');
+  // And to the onboard: the same way; its sound is its team radio (onboardSound).
+  await app.press('CH_DOWN');
+  await app.advance(1000);
+  assert.equal(app.player.current.combo.k, 2);
+  assert.equal(app.player.current.onboardSound, true);
+  assert.equal(asked.length, before);
+});
+
+test('an instant switch that doesn\'t show the new feed switches the usual way, and the video switches the usual way from then on', async () => {
+  const asked = [];
+  const app = await premiumHdr({ play: tmOffers(asked), tm: TM, combo: comboOf, comboFails: () => true });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  const before = asked.length;
+  await app.press('CH_DOWN');
+  await app.advance(3000);
+  assert.deepEqual(app.player.comboSwitches, [1]);
+  assert.equal(app.player.current.feed, 'F1 LIVE');
+  assert.ok(!app.player.current.comboSwitch, 'the usual switch');
+  assert.ok(asked.length > before, 'with its PLAY request');
+  const caps = app.context.Caps.report().paths['shaka:hlsaes'];
+  assert.ok(!caps || !caps.failed, 'not held against the way of playing');
+  // From then on the usual switches, without the combined master.
+  const built = app.combos.length;
+  for (const key of ['CH_DOWN', 'CH_UP', 'CH_UP']) {
+    await app.press(key);
+    await app.advance(3000);
+    assert.ok(!app.player.current.combo && !app.player.current.comboSwitch, key);
+  }
+  assert.deepEqual(app.player.comboSwitches, [1]);
+  assert.equal(app.combos.length, built);
+});
+
+test('Pro and SDR with a web answer that isn\'t CMAF (replays before 2025): no combined master, feed switches as before', async () => {
+  // A Pro-like account: F1 gives no 4K HDR, the web offer plays; no Tiledmedia answer is kept.
+  const asked = [];
+  const app = await boot({ multiview: true, hdrCapable: true, play: (id, ch, o) => { asked.push(o); return Promise.resolve({ url: 'https://cdn/' + id + '/' + (ch || 'main') + '.m3u8', streamType: 'HLS' }); },
+    combo: comboOf });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  assert.ok(!app.player.current.combo);
+  await app.press('CH_DOWN');
+  await app.advance(1000);
+  assert.ok(!app.player.current.combo && !app.player.current.comboSwitch);
+  assert.equal(app.player.loads.at(-1).url, 'https://cdn/101/1033.m3u8');
+  assert.equal(app.combos.length, 0, 'never built');
+  assert.deepEqual(app.player.comboSwitches, []);
+});
+
+/** A Pro-like account (no 4K HDR from F1): the web answer, clear CMAF HLS per feed (2025 on). */
+const webCmaf = (asked) => (id, ch, o) => { asked.push({ ch, o }); return Promise.resolve({ url: 'https://cdn/' + id + '/' + (ch || 'main') + '/web.m3u8', streamType: 'SDR_HD_CMAF' }); };
+
+test('Pro and SDR: the feeds visited go into one SDR master from their web answers, so going back to one is instant', async () => {
+  const asked = [];
+  const app = await boot({ multiview: true, hdrCapable: true, play: webCmaf(asked), combo: comboOf });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  assert.ok(!app.player.current.combo, 'one feed known: its own master');
+  assert.equal(app.combos.length, 0);
+  // A new feed: its PLAY request as always, then a master of both feeds, loaded at the new one.
+  await app.press('CH_DOWN');
+  await app.advance(3000);
+  assert.equal(asked.length, 2);
+  assert.deepEqual(Array.from(app.combos.at(-1).list, (x) => x.url), ['https://cdn/101/main/web.m3u8', 'https://cdn/101/1033/web.m3u8']);
+  assert.equal(app.combos.at(-1).o.range, 'SDR');
+  const s = app.player.current;
+  assert.ok(s.combo && !s.comboSwitch && s.combo.k === 1 && s.feed === 'F1 LIVE', JSON.stringify(s.combo));
+  assert.equal(app.player.loads.at(-1).url, 'https://cdn/101/1033/web.m3u8');
+  // Back to the first feed: in the same player, no request.
+  await app.press('CH_UP');
+  await app.advance(1000);
+  assert.equal(asked.length, 2, 'no PLAY request for a feed already visited');
+  assert.ok(app.player.current.comboSwitch && app.player.current.combo.k === 0);
+  assert.deepEqual(app.player.comboSwitches, [0]);
+  // On to F1 LIVE (instant) and the onboard (new: its request and a master of all three).
+  await app.press('CH_DOWN');
+  await app.advance(1000);
+  assert.deepEqual(app.player.comboSwitches, [0, 1]);
+  await app.press('CH_DOWN');
+  await app.advance(3000);
+  assert.equal(asked.length, 3);
+  assert.deepEqual(Array.from(app.combos.at(-1).list, (x) => x.index), [0, 1, 2]);
+  assert.ok(app.player.current.combo.k === 2 && !app.player.current.comboSwitch);
+  assert.equal(app.player.current.onboardSound, true, 'the onboard plays its team radio');
+});
+
+test('a combined master that doesn\'t load: the feed\'s own master at once, and the usual switches for the video', async () => {
+  const asked = [];
+  const app = await boot({ multiview: true, hdrCapable: true, play: webCmaf(asked), combo: comboOf });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.switchTo = ((orig) => (s, start) => (s.combo && !s.comboSwitch ? Promise.reject(new Error('Playback error 4001')) : orig(s, start)))(app.player.switchTo);
+  await app.press('CH_DOWN');
+  await app.advance(4000);
+  const s = app.player.current;
+  assert.equal(s.feed, 'F1 LIVE');
+  assert.ok(!s.combo, 'its own master');
+  assert.equal(app.player.loads.at(-1).url, 'https://cdn/101/1033/web.m3u8');
+  assert.deepEqual(asked.map((x) => x.ch || 'main'), ['main', '1033'], 'its own answer again: no second PLAY');
+  const built = app.combos.length;
+  await app.press('CH_UP');
+  await app.advance(3000);
+  assert.ok(!app.player.current.combo && !app.player.current.comboSwitch);
+  assert.equal(app.combos.length, built, 'no more combined masters for this video');
+});
+
+test('a PLAY answer that comes after the viewer moved to another video never joins that video\'s master', async () => {
+  const asked = [], held = [];
+  const answers = (id, ch) => {
+    asked.push({ id, ch });
+    const answer = { url: 'https://cdn/' + id + '/' + (ch || 'main') + '/web.m3u8', streamType: 'SDR_HD_CMAF' };
+    if (id === 101 && ch === '1033') return new Promise((r) => held.push(() => r(answer)));   // the Race's F1 LIVE, late
+    return Promise.resolve(answer);
+  };
+  const app = await boot({ multiview: true, hdrCapable: true, play: answers, combo: comboOf });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  await app.press('CH_DOWN');   // asks for the Race's F1 LIVE: held
+  await app.advance(500);
+  await app.stop();
+  for (let i = 0; i < 3 && app.screen() !== 'browse'; i++) await app.press('BACK');
+  await play(app, 'Qualifying');
+  await app.advance(1000);
+  held.forEach((f) => f());   // the Race's answer arrives now
+  await app.advance(1000);
+  assert.equal(app.player.current.contentId, 103);
+  // Another of Qualifying's feeds (round the list the other way, so the Race's F1 LIVE answer isn't replaced first):
+  // a master of Qualifying's feeds only.
+  await app.press('CH_UP');
+  await app.advance(3000);
+  assert.ok(app.combos.length > 0, 'a master was built');
+  for (const c of app.combos) assert.ok(c.list.every((x) => /\/103\//.test(x.url)), JSON.stringify(c.list));
+  assert.equal(app.player.current.contentId, 103);
+});
+
+test('a combined master and then the feed\'s own player_tm master failing: the next try asks F1 anew, never the same master again', async () => {
+  const asked = [];
+  const app = await premiumHdr({ play: tmOffers(asked), tm: TM, combo: comboOf });
+  const load = app.player.load;
+  app.player.load = (s, start) => {
+    app.player.loads.push({ url: s.url, start, combo: !!s.combo, hlsAes: !!s.hlsAes });
+    if (s.combo || s.hlsAes) { app.player.current = s; return Promise.reject(new Error('Playback error 4001')); }
+    app.player.loads.pop();
+    return load(s, start);
+  };
+  await play(app, 'Race');
+  await app.advance(20000);
+  const tmLoads = app.player.loads.filter((l) => l.hlsAes && !l.combo).length;
+  assert.ok(tmLoads <= 1, 'the own player_tm master once: ' + JSON.stringify(app.player.loads));
+  assert.ok(app.player.loads.length < 8, 'no loop');
+  assert.ok(app.player.current && !app.player.current.hlsAes && !app.player.current.combo, 'today\'s other route plays');
+});
+
+test('a replay\'s progress is saved from any feed, not only the first (each is offered to continue)', async () => {
+  const app = await boot();
+  await app.pick(/^Race/);
+  await app.advance(100);
+  await app.pick(/^F1 LIVE/);
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.pos = 1900;
+  await app.advance(31000);
+  assert.ok(app.saved.some((a) => a[0] === 101 && a[1] >= 1800), JSON.stringify(app.saved));
+});
+
+test('live: no combined master (whether every feed\'s live playlist grows in step is unchecked)', async () => {
+  const asked = [];
+  const app = await premiumHdr({ play: tmOffers(asked), tm: TM, combo: comboOf });
+  await play(app, 'Race');
+  await app.advance(1000);
+  assert.ok(app.player.current.combo, 'the replay has one');
+  await app.stop();
+  for (let i = 0; i < 3 && app.screen() !== 'browse'; i++) await app.press('BACK');
+  const built = app.combos.length;
+  await playLive(app);
+  await app.advance(3000);
+  assert.ok(app.player.current && !app.player.current.combo, 'live plays its own master');
+  assert.equal(app.combos.length, built, 'nothing built for live');
 });
 
 test('in a multiview, Sound from picks the feed the commentary comes from, once the choice settles', async () => {

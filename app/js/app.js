@@ -1469,6 +1469,7 @@
         upcoming: !live && m.contentSubtype !== 'REPLAY' && !!ev && status(ev) === 'upcoming' };
       // The Tiledmedia answer covers every feed: asked now, a replay starts without waiting for F1's play API.
       if (F1Api.prefetchTm && !feedsCtx.upcoming && tmWanted()) F1Api.prefetchTm(contentId, feeds[0].tmChannel);
+      if (!feedsCtx.upcoming) comboReady();   // every feed in one master: instant feed switches (js/combo.js)
       var emf = m.emfAttributes || {};
       feedsCtx.timingMeta = {
         title: Timing.sessionName(m.titleBrief || tile.title), series: emf.Series || (ev && ev.series) || '',
@@ -1570,7 +1571,9 @@
 
   function startFrom(i) {
     if (feedsCtx.upcoming && Date.now() >= feedsCtx.start) feedsCtx.live = true;
-    if (!feedsCtx.live && feedsCtx.resume && i === 0) {
+    // Whichever feed is picked: a replay's feeds share one timeline, so the saved moment is the same in each (only
+    // the first feed asked before, and F1 LIVE, the feed many pick, started over).
+    if (!feedsCtx.live && feedsCtx.resume) {
       return ask('Continue watching?', 'You stopped at ' + fmtTime(feedsCtx.resume) + '.', [
         { label: 'Continue from ' + fmtTime(feedsCtx.resume), value: 'resume' }, { label: 'Start over', value: 'start' }
       ]).then(function (v) {
@@ -1590,6 +1593,10 @@
   // player
 
   var loadingFeed = false;   // a playFeed load is running
+  var feedTarget = null;     // the feed that load is for (set at once: feedsCtx.index follows only after the session check)
+  // AVPlay's preparation hung twice this session: it stays stuck until the app restarts (Shaka still plays). The
+  // multiviews it plays (the helper's grids, H.264's big feed) are left out until then.
+  var avplayStuck = false;
   var feedLoadSeq = 0;       // only the current load may release the queue
   var feedLoadTimer = null;  // bounds how long a load can hold the queue
   var playerExits = 0;       // counts leavePlayer calls: a load that outlives one was abandoned by the viewer
@@ -1604,6 +1611,7 @@
     if (applyingUpdate) return;
     if (loadingFeed) { queuedFeed = [i, opts]; return; }
     loadingFeed = true;
+    feedTarget = i;
     var seq = ++feedLoadSeq, finished = false;
     function done() {
       if (finished || seq !== feedLoadSeq) return;
@@ -1611,6 +1619,7 @@
       clearTimeout(feedLoadTimer);
       feedLoadTimer = null;
       loadingFeed = false;
+      feedTarget = null;
       if (queuedFeed) { var q = queuedFeed; queuedFeed = null; playFeed(q[0], q[1]); }
     }
     feedLoadTimer = setTimeout(done, 30000);
@@ -1654,6 +1663,141 @@
    */
   function tmWanted() {
     return hdrAllowed() && !feedsCtx.tmFailed && pathUsable('shaka:hlsaes');
+  }
+
+  /**
+   * Instant feed switches (js/combo.js, research local/docs/INSTANT-SWITCHING.md): the feeds of the video in one HLS
+   * master, so a feed switch is a variant switch in the playing Shaka player. Two ways, by what F1 answers (any tier):
+   * 4K HDR from F1's Tiledmedia answer (every feed at once, no PLAY request of its own; player_tm or clear HDR), and
+   * SDR from the web answers of the feeds visited so far (webCombo). For replays (live: unchecked whether every feed's
+   * live playlist grows in step), until it fails for this video (comboOff). Everything else switches as before.
+   */
+  function comboWanted() {
+    return typeof FeedCombo !== 'undefined' && !!feedsCtx && !feedsCtx.live && feedsCtx.feeds.length > 1 && !feedsCtx.comboOff;
+  }
+
+  /** Whether the playing stream's combined master may switch feeds: its 4K HDR one only while player_tm is wanted. */
+  function comboUsable(cur) {
+    if (!cur || !cur.combo || cur.grid || !comboWanted()) return false;
+    // The web addresses in an SDR master are signed for a day: switches in it stop well before.
+    if (cur.combo.info.range === 'SDR') return cur.combo.info.at == null || Date.now() - cur.combo.info.at < WEB_KEEP;
+    return !!F1Api.tmAnswer && tmWanted();
+  }
+
+  /** The video's 4K HDR combined master from F1's Tiledmedia answer (built once per video), or null. */
+  function comboReady() {
+    if (!comboWanted() || !F1Api.tmAnswer || !tmWanted()) return Promise.resolve(null);
+    if (feedsCtx.combo$) return feedsCtx.combo$;
+    var feeds = feedsCtx.feeds;
+    feedsCtx.combo$ = F1Api.tmAnswer(feedsCtx.contentId, feeds[0].tmChannel).then(function (t) {
+      if (!t) return null;
+      var main = t.main || feeds[0].tmChannel || null;
+      var list = feeds.map(function (f, index) {
+        var ch = f.channelId != null ? String(f.channelId) : main;
+        return { index: index, channel: ch, url: ch ? t.feeds[ch] : null };
+      }).filter(function (x) { return x.url; });
+      return FeedCombo.build(list, { soundFrom: ['1033', main], ms: 4000 });
+    }).catch(function () { return null; });
+    return feedsCtx.combo$;
+  }
+
+  /*
+   * The SDR way (Pro, SDR TVs, 4K HDR off): F1's web answer is clear CMAF HLS for every tier (2025 on), each feed's
+   * address signed for its own folder, so each feed needs its own PLAY request. Those the viewer's switches asked are
+   * kept (feedsCtx.webOffers), and the master holds every feed visited: the first visit loads as before, every later one
+   * is instant. No request of its own (F1's PLAY limit, CLAUDE.local.md).
+   */
+  var WEB_KEEP = 6 * 60 * 60 * 1000;   // F1 signs them for 24 h
+  function webComboable(s) {
+    return !!s && !s.hdr && !s.licenseUrl && !s.cenc && !s.hlsAes && !s.grid && /\.m3u8(\?|$)/.test(String(s.url || '')) &&
+      /CMAF/i.test(String(s.streamType || ''));
+  }
+
+  /**
+   * Keeps feed i's web address in `ctx` (the video it was asked for: a late answer of another video's is dropped), for
+   * the SDR combined master (webCombo).
+   */
+  function noteWebOffer(ctx, i, s) {
+    if (!webComboable(s) || feedsCtx !== ctx) return;
+    ctx.webOffers = ctx.webOffers || {};
+    var had = ctx.webOffers[i];
+    if (had && had.url === s.url) return;   // the same answer again (a fallback's): its age stays
+    ctx.webOffers[i] = { url: s.url, at: Date.now(), who: F1Api.state.ascendon };
+  }
+
+  /** What F1Api.play answered, without what loadFeed adds to the stream afterwards. */
+  function plainOffer(s) {
+    var o = {};
+    ['url', 'streamType', 'platform', 'licenseUrl', 'licenseHeaders', 'hdr', 'cenc', 'hlsAes', 'keyHeaders', 'hdrEncrypted',
+      'widevineManifestUrl', 'offers'].forEach(function (k) { if (s[k] !== undefined) o[k] = s[k]; });
+    return o;
+  }
+
+  /**
+   * Feed i's own answer from its last load (any kind: web, 4K HDR, DRM), a fresh copy, for a fallback from a combined
+   * master: within 30 min and for this sign-in (as multiview reuses offers), so the fallback asks F1 nothing again.
+   */
+  function ownAnswer(ctx, i) {
+    var o = ctx && ctx.ownOffers && ctx.ownOffers[i];
+    return o && o.who === F1Api.state.ascendon && Date.now() - o.at < 30 * 60 * 1000 ? Object.assign({}, o.answer) : null;
+  }
+  function noteOwnOffer(ctx, i, s) {
+    if (feedsCtx !== ctx) return;
+    ctx.ownOffers = ctx.ownOffers || {};
+    ctx.ownOffers[i] = { answer: plainOffer(s), at: Date.now(), who: F1Api.state.ascendon };
+  }
+
+  /** The SDR combined master of the feeds visited (feed `i` among them) in `ctx`, or null with fewer than two. */
+  function webCombo(ctx, i) {
+    var known = ctx.webOffers || {}, now = Date.now(), who = F1Api.state.ascendon;
+    var list = ctx.feeds.map(function (f, index) {
+      var o = known[index];
+      return o && o.who === who && now - o.at < WEB_KEEP ? { index: index, channel: f.channelId != null ? String(f.channelId) : 'main', url: o.url } : null;
+    }).filter(Boolean);
+    if (list.length < 2 || !list.some(function (x) { return x.index === i; })) return Promise.resolve(null);
+    // By the addresses themselves: a new answer for a feed builds anew; a build that didn't come is tried again.
+    var key = list.map(function (x) { return x.url; }).join('|');
+    if (ctx.webCombo && ctx.webCombo.key === key) return ctx.webCombo.promise;
+    var entry = { key: key };
+    entry.promise = FeedCombo.build(list, { range: 'SDR', soundFrom: ['1033', 'main'], ms: 4000 }).catch(function () { return null; }).then(function (c) {
+      if (ctx.webCombo === entry && (!c || c.feeds.length < list.length)) ctx.webCombo = null;
+      return c;
+    });
+    ctx.webCombo = entry;
+    return entry.promise;
+  }
+
+  /** Feed `index`'s place in a combined master (stream.combo), or null. */
+  function comboFeed(stream, index) {
+    var c = stream && stream.combo;
+    return c ? c.info.feeds.filter(function (x) { return x.index === index; })[0] || null : null;
+  }
+
+  /** The stream of feed `index` in the combined master `cur` plays: switched to in the same player (Player.switchTo). */
+  function comboStream(cur, mine) {
+    return { url: mine.url, streamType: cur.streamType, platform: cur.platform, licenseUrl: '', licenseHeaders: cur.licenseHeaders,
+      hdr: cur.hdr, hlsAes: cur.hlsAes, keyHeaders: cur.keyHeaders, offers: cur.offers, info: cur.info,
+      combo: { uri: cur.combo.uri, k: mine.k, info: cur.combo.info }, comboSwitch: true };
+  }
+
+  /** Makes the feeds next to the playing one (CH+ / CH-), and `also`, ready for an instant switch. */
+  var comboFocusTimer = null;
+  function comboNeighbours(also, wait) {
+    clearTimeout(comboFocusTimer);
+    var ctx = feedsCtx, armed = Player.stream();
+    comboFocusTimer = setTimeout(function () {
+      var s = Player.stream(), n = feedsCtx && feedsCtx.feeds.length;
+      // Only for the video (and combined master) it was asked for.
+      if (feedsCtx !== ctx || !s || !s.combo || !n || screen !== 'player') return;
+      if (armed && armed.combo && armed.combo.uri !== s.combo.uri) return;
+      if (loadingFeed) return comboNeighbours(also, 500);   // a switch still settling: shortly after it
+      var want = [also, (feedsCtx.index + 1) % n, (feedsCtx.index - 1 + n) % n].filter(function (x) { return x != null; });
+      // With the sound each feed would play (an onboard: its team radio), so what is fetched is what the switch takes.
+      Player.comboPrepare(want.map(function (idx) {
+        var m = comboFeed(s, idx), feed = feedsCtx.feeds[idx];
+        return { k: m ? m.k : -1, audio: Settings.get(feed && feed.onboard ? 'onboardAudio' : 'audio') };
+      }));
+    }, wait == null ? 5000 : wait);
   }
 
   /**
@@ -1788,6 +1932,7 @@
     var L = mvLayouts(), l = L.layouts[layout], sh = L.shape(layout);
     if (!l || l.feeds.length > feedsCtx.feeds.length) return null;
     if (mvTmFits(layout)) return 'tm';
+    if (avplayStuck) return null;
     var missing = src && src.heights && l.feeds.some(function (h) { return src.heights.indexOf(h) < 0; });
     if (!missing) return Player.hevcDecodes(sh.width, sh.height, src ? src.hdr : hdrWanted()) ? 'hevc' : null;
     return src.heights.length === 0 && mvSoftLayout(l) && !feedsCtx.live && s && mvKind(s) === 'sdr' &&
@@ -1803,7 +1948,10 @@
   function mvTmFits(layout) {
     var L = mvLayouts(), l = L.layouts[layout], sh = L.shape(layout);
     if (!l || l.feeds.length > feedsCtx.feeds.length || !hdrAllowed() || feedsCtx.tmGridFailed || !pathUsable('shaka:tmgrid')) return false;
-    if (!(F1Api.tmKnown && F1Api.tmKnown(feedsCtx.contentId))) return false;
+    // Only F1's TS kind (HDR_UHD_HLSCK), which the helper unpacks (service/tm-ts.js). A CMAF answer (weeks-old replays,
+    // São Paulo 2026) failed there every time and counted against the way of playing: the usual multiview plays it.
+    var known = F1Api.tmKnown && F1Api.tmKnown(feedsCtx.contentId);
+    if (!known || !/HLSCK/.test(known.streamType || '')) return false;
     // player_tm: up to 2160p on the broadcast feeds, 1080p on the rest (onboards, TRACKER, DATA).
     if (l.feeds.slice(1).some(function (h) { return h > 1080; }) || mvHasInset(L.onScreen(layout, 1920, 1080, 'center'))) return false;
     return Player.hevcDecodes(sh.width, sh.height, true);
@@ -2278,6 +2426,10 @@
 
   function loadFeed(i, opts) {
     opts = opts || {};
+    // The feed's own answer a fallback brought (opts.reuse): for this load only, so no later retry built from opts
+    // plays it again (a failing own master was loaded over and over).
+    var reuse = opts.reuse || null;
+    if (reuse) { opts = Object.assign({}, opts); delete opts.reuse; }
     var ctx = feedsCtx, exits = playerExits, seq = navSeq;
     // After an HDR failure this video plays SDR; the viewer's next feed switch tries HDR again,
     // until it has failed HDR_TRIES times.
@@ -2324,10 +2476,17 @@
         renderTower();
       }
       showOsd();
-      var stream, route = sdrPath();
+      var stream, answer = null, route = sdrPath();
       return (from || playing ? Promise.resolve() : Player.unload())
         .then(function () {
-          if (!mv) return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(true), tm: tmWanted(), langs: f.langs, mainChannel: f.tmChannel, cenc: route !== 'avplay:cbcs', cbcs: nativeHdrUsable() });
+          if (!mv) {
+            // A feed of the combined master playing: switched to in the same player, no request (js/combo.js).
+            var cur = Player.stream(), mine = from && !opts.noCombo && comboUsable(cur) ? comboFeed(cur, i) : null;
+            if (mine) return comboStream(cur, mine);
+            // A fallback from a combined master: the feed's own answer, already had (no second PLAY).
+            if (reuse) return Object.assign({}, reuse);
+            return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(true), tm: tmWanted(), langs: f.langs, mainChannel: f.tmChannel, cenc: route !== 'avplay:cbcs', cbcs: nativeHdrUsable() });
+          }
           // Multiview: the first feed's offer gives the clock, licence and commentary; the player builds the grid.
           // How it plays (mvEngine) needs the playing offer's HEVC heights: a resumed multiview hasn't read them yet.
           return (mv.engine ? Promise.resolve() : Promise.all([mvReadSource(), mvTmReady()])).then(function () {
@@ -2342,6 +2501,7 @@
         })
         .then(function (s) {
           stream = s;
+          if (!mv && !s.comboSwitch) { answer = plainOffer(s); noteWebOffer(ctx, i, s); if (!reuse) noteOwnOffer(ctx, i, s); }
           // For the diagnostics log: which video and feed this stream is.
           stream.contentId = feedsCtx.contentId;
           stream.channelId = f.channelId;
@@ -2363,19 +2523,34 @@
           if (stream.grid && stream.grid.engine === 'tm') stream.capsPath = 'shaka:tmgrid';
           // Live HDR plays on the official live DASH timeline (the helper swaps in the HLG video).
           var timeline = stream.hdrEncrypted && stream.live ? stream.widevineManifestUrl : stream.url;
-          return F1Api.streamInfo(timeline).then(function (info) { stream.info = info; }, function () {}).then(function () {
+          // A start or a switch that loads: the feeds in one master, if built within 2 s (the feed list started the
+          // 4K HDR one); otherwise this feed's own master, as before.
+          // 4K HDR on Shaka: player_tm (AES-128) or clear HDR (F1's weeks-old replays: the player_tm answer is clear
+          // CMAF then, and the usual offer plays). SDR: F1's web answer (clear CMAF HLS) with the feeds visited so far.
+          // Encrypted HDR (AVPlay), DRM and older replays switch as before.
+          var hdrComboable = stream.hlsAes || (stream.hdr && !stream.hdrEncrypted && !stream.licenseUrl);
+          var built$ = mv || stream.comboSwitch || opts.noCombo || !comboWanted() ? null :
+            hdrComboable ? comboReady() : webComboable(stream) && stream.multiFeed && feedsCtx === ctx ? webCombo(ctx, i) : null;
+          var combo$ = built$ ? Promise.race([built$, new Promise(function (r) { setTimeout(function () { r(null); }, 2000); })]) : Promise.resolve(null);
+          // An instant switch keeps the clock it has: every feed of the master shares it.
+          var info$ = stream.comboSwitch && stream.info ? Promise.resolve(stream.info) : F1Api.streamInfo(timeline);
+          return Promise.all([info$.then(function (info) { stream.info = info; }, function () {}), combo$.then(function (c) {
+            var mine = c ? comboFeed({ combo: { info: c } }, i) : null;
+            if (mine) stream.combo = { uri: c.uri, k: mine.k, info: c };
+          })]).then(function () {
             // What F1 offered for the main broadcast (the first feed), once per attempt.
             if (trial && !mv && i === 0 && dplay('wantsOffer', trial)) dplay('offered', trial, { offer: diagOffer(stream) });
           });
         })
         .then(function () {
           // Superseded by a newer request, or the viewer left the player while it loaded.
-          if (feedsCtx.index !== i || queuedFeed || screen !== 'player') return;
+          if (feedsCtx !== ctx || exits !== playerExits || feedsCtx.index !== i || queuedFeed || screen !== 'player') return;
           // Keys in the variant playlist: not playable here; the catch below falls back to SDR.
           if (stream.hdr && stream.info && stream.info.encrypted && !stream.hdrEncrypted && !stream.hlsAes) throw new Error('encrypted HDR stream');
           // Live HDR plays natively on the official live timeline (HdrStream.live), or as F1's Tiledmedia HLS on Shaka.
           if (stream.hdr && stream.live && !stream.hdrEncrypted && !stream.hlsAes) throw new Error('HDR: live needs the native path');
           $('osd-feed').textContent = feedLabel(stream);
+          if (from) from.kind = Player.switchKind ? Player.switchKind(stream) : 'swap';
           var start = startPosition(stream.info, opts, from);
           stream.askedStart = start;   // a retry of a start that never played (AVPlay reports 0) asks for it again
           // Where the lead decided the start (not a requested moment, a live point or the stream's own edge).
@@ -2397,10 +2572,11 @@
           // H.264 multiview: AVPlay shows the big feed in its place from the start.
           if (stream.grid && stream.grid.engine === 'h264') Player.setGridRect(mvBigRect(stream.grid.layout));
           dplay('loading', trial, stream);
-          if (!from) return Player.load(stream, start).then(function () { feedsCtx.playing = i; });
-          return Player.switchTo(stream, start).then(function () {
+          if (!from) return comboBound(Player.load(stream, start), stream).then(function () { feedsCtx.playing = i; });
+          return comboBound(Player.switchTo(stream, start), stream).then(function () {
             feedsCtx.playing = i;
-            if (leadPlaced) learnSwitchLead(stream, from);
+            // An instant switch has no lead to learn from: it plays on from where the player was.
+            if (leadPlaced && !stream.comboSwitch) learnSwitchLead(stream, from);
             // Paused or playing as the viewer last chose, also with a key pressed during the switch
             // (AVPlay reopens playing; Shaka carries the pause over).
             var want = switchPause;
@@ -2420,6 +2596,7 @@
           Timing.load(feedsCtx.timingMeta, F1Api.state.ascendon, feedsCtx.live);
           if (stream && Player.stream() === stream && typeof Diag !== 'undefined') Diag.playing(stream);
           if (stream && Player.stream() === stream) watchStart(stream, opts);
+          if (stream && stream.combo && Player.stream() === stream) comboNeighbours(null, stream.comboSwitch ? 1500 : 5000);
         })
         .catch(function (e) {
           $('spinner').classList.add('hidden');
@@ -2437,6 +2614,29 @@
             feedsCtx.index = feedsCtx.playing != null ? feedsCtx.playing : from.index;
             $('osd-feed').textContent = feedLabel(from.stream);
           }
+          // A combined master that didn't load: this feed's own master instead, and the usual switches for this video
+          // (nothing held against the way of playing yet: the retry tells).
+          if (stream && stream.combo && !stream.comboSwitch && !mv) {
+            feedsCtx.comboOff = true;
+            diag('play.fallback', { to: 'feed-own-master', why: String((e && e.message) || e).slice(0, 120) });
+            var own = recovering(from ? hereNow(from, opts) : sameMoment(from, opts));
+            own.noCombo = true;
+            if (answer) own.reuse = answer;
+            if (!queuedFeed && screen === 'player') playFeed(i, own);
+            return;
+          }
+          // An instant switch in the combined master that didn't show the new feed: the usual switch instead (nothing
+          // held against the way of playing: it plays), and the usual switches for the rest of this video.
+          if (stream && stream.comboSwitch && e && e.code === 'COMBO') {
+            feedsCtx.comboOff = true;
+            diag('play.fallback', { to: 'switch-usual', why: String(e.message || '').slice(0, 120) });
+            var usual = recovering(hereNow(from, opts));
+            usual.noCombo = true;
+            var kept = ownAnswer(feedsCtx, i);
+            if (kept) usual.reuse = kept;
+            if (!queuedFeed && screen === 'player') playFeed(i, usual);
+            return;
+          }
           playbackFailed(stream, unclearFailure(Player.errorInfo(e), e && e.message) || !!(stream && stream.unclearCause));
           // An SDR engine failed before starting. Try the next path at the requested moment;
           // native cenc still goes through the helper, as in PR #3.
@@ -2450,6 +2650,18 @@
           // what played last is saved (saveWatching), so it comes back at that moment.
           if (e && (e.code === 'PREPARE_TIMEOUT' || e.code === 'PLAYER_STUCK')) {
             if (e.code === 'PLAYER_STUCK' || feedsCtx.prepareRetried) {
+              avplayStuck = true;
+              // A multiview: its big feed alone, which Shaka plays (a single 4K HDR or SDR replay feed doesn't need
+              // AVPlay), rather than a dead screen (Las Vegas Big + 2 after Shaka playback, 2026-11-24).
+              if (mv && feedsCtx.multiview === mv) {
+                feedsCtx.multiview = null;
+                diag('play.fallback', { to: 'one-feed', why: 'avplay stuck' });
+                toast('Multiview didn\'t start: the TV\'s video player is stuck. Playing one feed (restart the app for multiview).', 10000);
+                var alone = recovering(sameMoment(from, opts));
+                alone.retrying = true;   // keeps the message above
+                if (!queuedFeed && screen === 'player') playFeed(i, alone);
+                return;
+              }
               dplay('gaveUp', e, null, trial);
               return toast('The TV\'s video player is stuck. Restart the app to continue where you were.', 20000);
             }
@@ -2469,7 +2681,7 @@
             // so retain the outgoing moment rather than deriving a new target from that zero.
             if (atLive) recovery.atLive = true;
             else if (from && recovery.startAt == null && recovery.liveAt == null) {
-              var ahead = from.paused ? 0 : (Date.now() - from.at) / 1000 + switchLead;
+              var ahead = from.paused ? 0 : (Date.now() - from.at) / 1000 + leadOf(from);
               if (from.wall) recovery.liveAt = from.wall + ahead;
               else recovery.startAt = from.pos + ahead;
             }
@@ -2603,6 +2815,31 @@
     return engines.indexOf('hevc') >= 0 ? 'hevc' : engines.indexOf('h264') >= 0 ? 'h264' : 'none';
   }
 
+  /**
+   * After a failed switch to a combined master's feed: the moment the player is at now (the outgoing feed, or the
+   * same player, played on; every feed shares the clock), paused as the viewer wants it now (keys during the switch).
+   */
+  function hereNow(from, opts) {
+    var pos = Player.position(), wall = pos > 0 ? Player.wallClock(pos) : null;
+    if (!(pos > 0)) return sameMoment(from, opts);
+    var o = { switching: true, switchPaused: switchPause != null ? switchPause : from.paused };
+    if (wall) o.liveAt = wall; else o.startAt = pos;
+    return o;
+  }
+
+  /** A combined master's load (not an instant switch) that doesn't settle in 20 s fails: the feed's own master then. */
+  function comboBound(loading, stream) {
+    if (!stream || !stream.combo || stream.comboSwitch) return loading;
+    return new Promise(function (resolve, reject) {
+      var timer = setTimeout(function () {
+        var e = new Error('COMBO: the combined master did not load in 20 s');
+        e.code = 'COMBO_LOAD';
+        reject(e);
+      }, 20000);
+      loading.then(function (x) { clearTimeout(timer); resolve(x); }, function (e) { clearTimeout(timer); reject(e); });
+    });
+  }
+
   function sameMoment(from, opts) {
     var o = {};
     if (from && from.atLive) {
@@ -2648,18 +2885,23 @@
       // On Shaka, nothing buffered means no data arrived (the network or the CDN): that says nothing about the path.
       // Data without a picture does (the first-HDR freeze, a decoder that refuses). AVPlay doesn't tell: it counts.
       var noData = Player.engineName() === 'shaka' && Player.bufferedEnd() - Player.position() < 1;
-      playbackFailed(stream, noData || unclearFailure(null) || !!stream.unclearCause);
-      var last = opts.retry && !stream.hdr && (!stream.capsPath || sdrPath() === stream.capsRoute);
+      // A combined master (js/combo.js): its own fault until the feed's own master fails too. Not held against the way
+      // of playing, and never the last try (the feed's own master comes next).
+      var comboBack = !!(stream.combo && !stream.grid);
+      if (!comboBack) playbackFailed(stream, noData || unclearFailure(null) || !!stream.unclearCause);
+      var last = !comboBack && opts.retry && !stream.hdr && (!stream.capsPath || sdrPath() === stream.capsRoute);
       dplay('failed', null, null, { noProgress: true, final: last });
       if (last) return;
       toast('The video didn\'t start, trying again…', 3000);
       // Through playFeed so it queues behind any other load instead of racing it.
       // AVPlay reports no position until it plays: 0 is no moment of the stream, so the retry repeats the request.
       // A start that never played (AVPlay reports 0) retries at the position it asked for.
-      if (!(from > 0) && (stream.surround || stream.hlsAes) && stream.askedStart > 0) from = stream.askedStart;
+      if (!(from > 0) && (stream.surround || stream.hlsAes || comboBack) && stream.askedStart > 0) from = stream.askedStart;
       var wall = from > 0 ? Player.wallClock(from) : null;
       // A player_tm multiview (playbackFailed turned it off for this video): the same multiview the usual way.
       if (stream.grid && stream.grid.engine === 'tm') { if (feedsCtx.multiview) feedsCtx.multiview.engine = null; }
+      // A combined master (js/combo.js): this feed's own master next, the usual switches for this video.
+      else if (stream.combo) feedsCtx.comboOff = true;
       else if (stream.surround || stream.hlsAes) { /* playbackFailed turned the 5.1 or the Tiledmedia offer off: HDR again */ }
       else if (stream.grid) feedsCtx.multiview = null;   // the retry plays the big feed alone
       else if (stream.hdr) { feedsCtx.hdrFailed = true; feedsCtx.hdrFailures = (feedsCtx.hdrFailures || 0) + 1; }
@@ -2671,6 +2913,11 @@
       // The usual HDR offer after the Tiledmedia one is another package: the same moment by its clock, else position.
       else if (!Player.isLive() && from && stream.hlsAes && wall) again = { liveAt: wall, fallbackAt: from, retry: true };
       else if (!Player.isLive() && from) again = { startAt: from, retry: true };
+      if (comboBack) {
+        again.noCombo = true;
+        var kept = ownAnswer(feedsCtx, feedsCtx.index);
+        if (kept) again.reuse = kept;
+      }
       playFeed(feedsCtx.index, again);
     }, wait || budget);
   }
@@ -2685,8 +2932,10 @@
     return now >= before ? now - before : now;
   }
 
-  // Seconds a feed switch takes; the new feed starts this far ahead so it lines up. Learned per switch.
-  var switchLead = 3;
+  // Seconds a feed switch takes; the new feed starts this far ahead so it lines up. Learned per switch, apart for the
+  // two ways a switch plays (Player.switchKind): beside the playing feed ('swap'), or after it stopped ('reopen').
+  var switchLeads = { swap: 3, reopen: 3 };
+  function leadOf(from) { return switchLeads[(from && from.kind) || 'swap'] || 3; }
 
   /**
    * A few seconds into a switched feed, compares the moment it shows with the moment the old feed would show now,
@@ -2709,11 +2958,11 @@
       } else if (!(stream.info && stream.info.dynamic) && from.pos > 0) {
         err = from.pos + elapsed - now;   // replays without a clock share one timeline
       } else return;
-      var was = switchLead;
+      var kind = from.kind || 'swap', was = leadOf(from);
       // Further off than a switch can be: the viewer seeked or it stalled meanwhile.
-      if (Math.abs(err) <= 6) switchLead = Math.max(0.5, Math.min(12, switchLead + 0.75 * err));
-      diag('play.switch_lead', { engine: Player.engineName(), feed: stream.feed, err: +err.toFixed(2),
-        was: +was.toFixed(2), lead: +switchLead.toFixed(2), skipped: Math.abs(err) > 6 });
+      if (Math.abs(err) <= 6) switchLeads[kind] = Math.max(0.5, Math.min(12, was + 0.75 * err));
+      diag('play.switch_lead', { engine: Player.engineName(), kind: kind, feed: stream.feed, err: +err.toFixed(2),
+        was: +was.toFixed(2), lead: +leadOf(from).toFixed(2), skipped: Math.abs(err) > 6 });
     }, 6000);
   }
 
@@ -2730,7 +2979,7 @@
       if (opts.fallbackAt > 0 && !(info && info.dynamic)) return opts.fallbackAt;
     }
     if (from) {
-      var ahead = from.paused ? 0 : (Date.now() - from.at) / 1000 + switchLead;
+      var ahead = from.paused ? 0 : (Date.now() - from.at) / 1000 + leadOf(from);
       var p = from.wall ? Player.positionAt(from.wall + ahead, info) : null;
       if (p != null && p >= info.windowStart && p <= info.windowEnd) return p;
       // No clock to line the feeds up (or no manifest facts): replays share a timeline, so the same position.
@@ -2785,6 +3034,12 @@
       $('osd-pos').textContent = 'Loading…';
       $('osd-dur').textContent = '';
       $('osd-live').classList.add('hidden');
+      // A video that hasn't played yet starts with an empty bar (not where the previous video was); a feed switch keeps
+      // its place: the same moment of the same video.
+      if (!feedsCtx || feedsCtx.playing == null) {
+        $('osd-progress').style.width = '0%';
+        $('osd-buffer').style.width = '0%';
+      }
       return;
     }
     var live = Player.isLive();
@@ -2907,8 +3162,10 @@
   }
 
   function saveProgress() {
-    // Not mid-switch: the position would be the other feed's.
-    if (screen !== 'player' || !feedsCtx || feedsCtx.live || feedsCtx.index !== 0 || !Player.engineName() || loadingFeed) return;
+    // Not mid-switch: the position would be the other feed's. Any feed (a replay's feeds share one timeline, and
+    // "Continue watching?" is asked for each), a multiview only from its first feed as before.
+    if (screen !== 'player' || !feedsCtx || feedsCtx.live || !Player.engineName() || loadingFeed) return;
+    if (feedsCtx.multiview ? feedsCtx.index !== 0 : feedsCtx.playing !== feedsCtx.index) return;
     var pos = Player.position() - Player.range().start;
     if (pos > 30) {
       F1Api.savePosition(feedsCtx.contentId, pos, feedsCtx.subtype);
@@ -3083,7 +3340,10 @@
     var n = feedsCtx.feeds.length;
     if (n < 2) return;
     if (scrub) scrubCancel();
-    var i = (feedsCtx.index + d + n) % n;
+    // From the feed already asked for while a switch is under way (quick presses add up: three CH+ go three feeds on).
+    var from = queuedFeed && queuedFeed[1] && queuedFeed[1].switching ? queuedFeed[0] :
+      loadingFeed && feedTarget != null ? feedTarget : feedsCtx.index;
+    var i = (from + d + n) % n;
     grid.r = i;
     playFeed(i, { switching: true });
   }
@@ -3415,6 +3675,8 @@
       onMove: function (r, c, e) {
         var top = e.offsetTop, view = $('panel-list').parentNode.clientHeight;
         box.style.transform = 'translateY(' + (-Math.max(0, top - view / 2)) + 'px)';
+        // A feed in focus in the combined master: made ready, so OK switches at once.
+        if (e._feed != null && e._feed !== feedsCtx.index) comboNeighbours(e._feed, 400);
       }
     });
     g.r = focusRow >= 0 ? focusRow : current;
@@ -3992,21 +4254,32 @@
       // Loading errors are handled by the load catch/start watch, once native preparation settles.
       if (screen !== 'player' || loadingFeed) return;
       var s = Player.stream();
-      playbackFailed(s, unclearFailure(info, msg));
-      var fallback = !!(s && s.capsPath && (s.surround || s.hlsAes || (!s.grid && (s.hdr || sdrPath() !== s.capsRoute))));
+      // A combined master (js/combo.js) that failed while playing: this feed's own master, the usual switches from now;
+      // held against the way of playing only if that fails too.
+      var ownMaster = !!(s && s.combo && !s.grid);
+      if (ownMaster) feedsCtx.comboOff = true;
+      else playbackFailed(s, unclearFailure(info, msg));
+      var fallback = ownMaster || !!(s && s.capsPath && (s.surround || s.hlsAes || (!s.grid && (s.hdr || sdrPath() !== s.capsRoute))));
       // A failure while playing (the load's own catch or start watch records the others); final when nothing follows.
       dplay('failed', null, info ? { diag: info } : null, { runtime: true, final: !fallback });
       if (fallback) {
-        // With the 5.1 or the Tiledmedia offer: HDR again first, without them.
-        if (s.hdr && !s.surround && !s.hlsAes) feedsCtx.hdrFailed = true;
+        // With the 5.1 or the Tiledmedia offer, or from a combined master: HDR again first, without them.
+        if (s.hdr && !s.surround && !s.hlsAes && !ownMaster) feedsCtx.hdrFailed = true;
+        if (ownMaster) diag('play.fallback', { to: 'feed-own-master', runtime: true });
         // The position, or before it played the one it was asked to start at.
         var pos = Player.position() > 0 ? Player.position() : (s.askedStart > 0 ? s.askedStart : 0);
         var wall = pos > 0 ? Player.wallClock(pos) : null;
         // The same HDR replay without the 5.1 shares this timeline: its position needs no clock lookup. Another
         // package (after the Tiledmedia offer), and live (a new time shift), by the clock, its position if that can't be placed.
         // Live with no known moment (it failed before its first position): the live point, never position 0.
-        playFeed(feedsCtx.index, recovering(wall && (!s.surround || s.live) ? { liveAt: wall, fallbackAt: pos || null } :
-          s.live && !(pos > 0) ? {} : { startAt: pos }));
+        var retry = recovering(wall && (!s.surround || s.live) ? { liveAt: wall, fallbackAt: pos || null } :
+          s.live && !(pos > 0) ? {} : { startAt: pos });
+        if (ownMaster) {
+          retry.noCombo = true;
+          var kept = ownAnswer(feedsCtx, feedsCtx.index);
+          if (kept) retry.reuse = kept;
+        }
+        playFeed(feedsCtx.index, retry);
       }
     });
     // During a jump the pending-seek logic owns the spinner (it waits a moment before showing it).
