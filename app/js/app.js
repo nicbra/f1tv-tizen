@@ -127,7 +127,7 @@
   function tickClock() { $('clock').textContent = hhmm(Date.now()); }
 
   function exitApp() {
-    if (typeof Caps !== 'undefined') Caps.crashEnd();
+    Caps.crashEnd();
     try { tizen.application.getCurrentApplication().exit(); } catch (e) { /* desktop */ }
   }
 
@@ -1206,28 +1206,24 @@
     });
   }
 
-  // What the app has learned about playing copy-protected video on this TV (js/caps.js), in words.
-  var CAPS_NAMES = { 'shaka:cenc': 'Shaka, CENC', 'avplay:cbcs': 'AVPlay, CBCS', 'avplay:cenc': 'AVPlay, CENC',
-    'avplay:hdr': 'AVPlay, 4K HDR', 'avplay:ac3': 'AVPlay, 5.1 sound in 4K HDR', 'shaka:hlsaes': 'Shaka, 4K HDR (AES-128 HLS)',
-    'shaka:tmgrid': 'Shaka, 4K HDR multiview (AES-128 HLS)', 'avplay:grid': 'AVPlay, multiview', 'shaka:grid': 'Shaka, multiview',
-    'avplay:drmgrid': 'AVPlay, copy-protected multiview', 'mvsoft:h264': 'Software decoding, H.264 multiview' };
+  // What the app has learned about playing video on this TV (js/caps.js), in words: every way js/ways.js lists.
 
   function capsSummary() {
     var paths = Caps.report().paths, n = 0;
     // The 5.1 sound is part of a 4K HDR start, not a start of its own.
-    Object.keys(paths).forEach(function (k) { if (k !== 'avplay:ac3') n += paths[k].ok + paths[k].failed + paths[k].crashed; });
+    Object.keys(paths).forEach(function (k) { if (k !== SURROUND) n += paths[k].ok + paths[k].failed + paths[k].crashed; });
     return n ? 'Learned from ' + n + ' video start' + (n === 1 ? '' : 's') : 'Nothing learned yet';
   }
 
   function capsText() {
     var r = Caps.report(), yes = function (v) { return v === true ? 'yes' : v === false ? 'no' : v === null ? 'unknown (older browser)' : 'not checked yet'; };
-    var lines = ['The app tries different ways of playing copy-protected video and remembers what works on this TV.',
+    var lines = ['The app tries different ways of playing video and remembers what works on this TV.',
       '', 'Browser copy protection', '• cenc: ' + yes(r.browser.cenc), '• cbcs: ' + yes(r.browser.cbcs), '',
       'Ways of playing'];
-    Object.keys(CAPS_NAMES).forEach(function (k) {
+    Ways.list().forEach(function (k) {
       var p = r.paths[k];
       var counts = p ? p.ok + ' played, ' + p.failed + ' failed, ' + p.crashed + ' crashed' : 'not tried yet';
-      lines.push('• ' + CAPS_NAMES[k] + ': ' + counts + (Caps.avoided(k) ? ' (avoided)' : ''));
+      lines.push('• ' + Ways.get(k).label + ': ' + counts + (Caps.avoided(k) ? ' (avoided)' : ''));
     });
     lines.push('', 'Firmware ' + r.firmware);
     return lines.join('\n');
@@ -1307,9 +1303,9 @@
             syncUpdateSetting();
             openAccount(idx);
           } }
-      ]).concat(typeof Caps !== 'undefined' ? [
+      ]).concat([
         { what: 'Playback on this TV', sub: capsSummary(), run: function (idx) { showCaps(idx); } }
-      ] : []).concat(diagRows(openAccount)).concat([
+      ]).concat(diagRows(openAccount)).concat([
         { info: true, what: 'Unofficial F1 TV app', sub: 'Not affiliated with Formula 1.' }
       ])
     }, focus || 0);
@@ -1623,16 +1619,36 @@
       feedTarget = null;
       if (queuedFeed) { var q = queuedFeed; queuedFeed = null; playFeed(q[0], q[1]); }
     }
-    feedLoadTimer = setTimeout(done, 30000);
+    feedLoadTimer = setTimeout(done, WAIT.feedLoad);
     loadFeed(i, opts).then(done, done);
   }
 
-  var HDR_TRIES = 3;   // HDR failures before a video stays SDR
+  /*
+   * How long a step of playing may take before the app moves on (ms), in one place. The player's own limits (AVPlay's
+   * preparation, Shaka's play(), the frozen-start reload) are in player.js.
+   *   feedLoad    a feed load that never settles frees the queue for the next request (playFeed)
+   *   comboBuild  building the combined master before the feed's own master plays instead (loadFeed)
+   *   comboLoad   a combined master's load (comboBound), then the feed's own master
+   *   start       a start without a moving picture (watchStart); 4K HDR's first segments took ~20 s when the CDN
+   *   startHdr    had to fetch them
+   */
+  var WAIT = { feedLoad: 30000, comboBuild: 2000, comboLoad: 20000, start: 15000, startHdr: 25000 };
 
-  function pathUsable(path) { return typeof Caps === 'undefined' || Caps.usable(path); }
+  function pathUsable(path) { return Caps.usable(path); }
 
-  function pathFailed(path) {
-    return path === 'shaka:cenc' ? feedsCtx.cencFailed : path === 'avplay:cbcs' ? feedsCtx.cbcsFailed : feedsCtx.avCencFailed;
+  /*
+   * What failed for this video (feedsCtx.off): ways of playing (js/ways.js names, the 5.1 sound as 'avplay:ac3') and
+   * 'combo' (the combined master). A way that failed isn't tried again in this video, unless it plays after all (a
+   * retry). feedsCtx.again: ways that had their one more try after a transient failure (recover).
+   */
+  var SURROUND = 'avplay:ac3';   // the 5.1 sound in encrypted 4K HDR, learned as a way of its own (js/ways.js)
+  function isOff(key) { return !!(feedsCtx && feedsCtx.off && feedsCtx.off[key]); }
+  function setOff(key) { if (!key) return; feedsCtx.off = feedsCtx.off || {}; feedsCtx.off[key] = true; }
+
+  /** A way this video may still try: not off for it, not ruled out on this TV, not on AVPlay while it is stuck. */
+  function wayOpen(way) {
+    if (avplayStuck && /^(avplay|mvsoft):/.test(way)) return false;   // H.264 multiview's big feed plays on AVPlay
+    return !isOff(way) && pathUsable(way);
   }
 
   /**
@@ -1642,18 +1658,56 @@
    */
   function sdrPath() {
     var paths = ['shaka:cenc', 'avplay:cbcs', 'avplay:cenc'];
-    if (!(Player.cencCapable && Player.cencCapable())) paths.shift();
+    if (!Player.cencCapable()) paths.shift();
     for (var i = 0; i < paths.length; i++) {
-      if (!pathFailed(paths[i]) && pathUsable(paths[i])) return paths[i];
+      if (wayOpen(paths[i])) return paths[i];
     }
     // Exhausted the preferred paths: still try an untried one, even if old evidence was bad.
-    for (var j = 0; j < paths.length; j++) if (!pathFailed(paths[j])) return paths[j];
+    for (var j = 0; j < paths.length; j++) if (!isOff(paths[j]) && !(avplayStuck && Ways.engine(paths[j]) === 'avplay')) return paths[j];
     return paths[paths.length - 1];
   }
 
-  function nativeHdrUsable() { return pathUsable('avplay:hdr') && pathUsable('avplay:cbcs'); }
+  /**
+   * The way a stream plays (js/ways.js): what Player.choose runs and Caps learns. Its own kind's way (Ways.preferred:
+   * F1's Chromecast cenc by the route asked for, F1 may answer cbcs to a cenc request), a multiview by its kind
+   * (MV_WAYS), unprotected video by the engines still open (clearWay).
+   */
+  function wayFor(stream, route) {
+    if (stream.grid) return mvWayOf(stream);
+    var way = Ways.preferred(stream);
+    return Ways.get(way).group === 'clear' ? clearWay(stream) : way;
+  }
 
-  function hdrAllowed() { return Settings.get('hdr') && !feedsCtx.hdrFailed && Player.hdrCapable(); }
+  /**
+   * Unprotected video (highlights, Race in 30, older replays): its preferred engine first, then the other; a combined
+   * master is Shaka's alone. The first way still open, else the first not failed for this video, else null: none left.
+   */
+  function clearWay(stream) {
+    var first = Ways.preferred(stream);
+    var order = stream.combo ? [first] : [first].concat(Ways.group('clear').filter(function (w) { return w !== first; }));
+    var open = order.filter(wayOpen);
+    if (open.length) return open[0];
+    var left = order.filter(function (w) { return !isOff(w) && !(avplayStuck && Ways.engine(w) === 'avplay'); });
+    return left[0] || null;
+  }
+
+  /** After a failure was held against a single feed's way: whether another way of playing that feed is left. */
+  function hasNextWay(stream) {
+    if (stream.hlsAes || stream.hdr) return true;   // the usual 4K HDR, else SDR
+    var way = Ways.get(stream.capsPath);
+    if (way && way.group === 'sdr') return !isOff(sdrPath()) && !(avplayStuck && Ways.engine(sdrPath()) === 'avplay');
+    if (way && way.group === 'clear') return !!clearWay(stream);
+    return false;
+  }
+
+  /** Native 4K HDR (encrypted, on AVPlay): open for this video and on this TV, and its CBCS too. */
+  function nativeHdrUsable() { return wayOpen('avplay:hdr') && pathUsable('avplay:cbcs'); }
+
+  /** Clear 4K HDR on Shaka (F1's clear Apple TV answer). */
+  function clearHdrUsable() { return wayOpen('shaka:hdr'); }
+
+  /** 4K HDR at all: the viewer's setting and the TV; each way of it is decided on its own (tmWanted, nativeHdrUsable…). */
+  function hdrAllowed() { return Settings.get('hdr') && Player.hdrCapable(); }
 
   /**
    * F1's Tiledmedia offer first (api.js playTm: every feed's 4K HDR in one answer, AES-128 HLS on Shaka) for one feed,
@@ -1663,7 +1717,7 @@
    * ~30 s, F1 Academy 2026-11-22): compatibility first (user's choice, 2026-11-22).
    */
   function tmWanted() {
-    return hdrAllowed() && !feedsCtx.tmFailed && pathUsable('shaka:hlsaes');
+    return hdrAllowed() && wayOpen('shaka:hlsaes');
   }
 
   /**
@@ -1671,18 +1725,21 @@
    * master, so a feed switch is a variant switch in the playing Shaka player. Two ways, by what F1 answers (any tier):
    * 4K HDR from F1's Tiledmedia answer (every feed at once, no PLAY request of its own; player_tm or clear HDR), and
    * SDR from the web answers of the feeds visited so far (webCombo). For replays (live: unchecked whether every feed's
-   * live playlist grows in step), until it fails for this video (comboOff). Everything else switches as before.
+   * live playlist grows in step), until it fails for this video (isOff('combo')). Everything else switches as before.
    */
   function comboWanted() {
-    return typeof FeedCombo !== 'undefined' && !!feedsCtx && !feedsCtx.live && feedsCtx.feeds.length > 1 && !feedsCtx.comboOff;
+    return typeof FeedCombo !== 'undefined' && !!feedsCtx && !feedsCtx.live && feedsCtx.feeds.length > 1 && !isOff('combo');
   }
 
-  /** Whether the playing stream's combined master may switch feeds: its 4K HDR one only while player_tm is wanted. */
+  /**
+   * Whether the playing stream's combined master may switch feeds: while its own way is open (shaka:clear, shaka:hdr or
+   * shaka:hlsaes: what plays it), and for an SDR one while its web addresses are signed.
+   */
   function comboUsable(cur) {
-    if (!cur || !cur.combo || cur.grid || !comboWanted()) return false;
+    if (!cur || !cur.combo || cur.grid || !comboWanted() || !wayOpen(cur.capsPath)) return false;
     // The web addresses in an SDR master are signed for a day: switches in it stop well before.
     if (cur.combo.info.range === 'SDR') return cur.combo.info.at == null || Date.now() - cur.combo.info.at < WEB_KEEP;
-    return !!F1Api.tmAnswer && tmWanted();
+    return !!F1Api.tmAnswer && hdrAllowed();
   }
 
   /** The video's 4K HDR combined master from F1's Tiledmedia answer (built once per video), or null. */
@@ -1806,13 +1863,10 @@
    * Tiledmedia offer. Replays can also take a clear Apple TV HLS offer (api.js).
    */
   function hdrWanted(oneFeed) {
-    return hdrAllowed() && (!feedsCtx.live || nativeHdrUsable() || (!!oneFeed && tmWanted()));
-  }
-
-  function failPath(path) {
-    if (path === 'shaka:cenc') feedsCtx.cencFailed = true;
-    else if (path === 'avplay:cbcs') feedsCtx.cbcsFailed = true;
-    else if (path === 'avplay:cenc') feedsCtx.avCencFailed = true;
+    if (!hdrAllowed()) return false;
+    if (feedsCtx.live) return nativeHdrUsable() || (!!oneFeed && tmWanted());
+    // A replay's one feed while some way of 4K HDR is still open; a multiview decides by its own ways (MV_WAYS).
+    return !oneFeed || tmWanted() || nativeHdrUsable() || clearHdrUsable();
   }
 
   /*
@@ -1824,7 +1878,7 @@
    *              the grid and F1's own commentary)
    *   protected  the helper's grid from encrypted 4K HDR (cbcs replays, live)          avplay:drmgrid (no cbcs on Shaka)
    *   h264       2018-2024: the big feed on AVPlay, the small ones decoded in software  mvsoft:h264
-   * A way that failed for this video isn't tried again in it until it plays (feedsCtx.mvFailed); one ruled out on this TV
+   * A way that failed for this video isn't tried again in it until it plays (feedsCtx.off); one ruled out on this TV
    * isn't either until Caps gives it its next try (3 days, doubling to 60; a new app version forgets failures, a new
    * firmware all). A kind with no way left isn't offered (mvEngineFor), like 4K HDR once ruled out: the big feed alone
    * plays, and each try would cost a failed start. A multiview that fails plays another way (mvAgain: its kind's next
@@ -1843,17 +1897,14 @@
   /** A multiview's kind, by its engine (mvEngine) and the stream it is built from (the playing feed, or its own grid). */
   function mvKindFor(engine, s) {
     if (engine !== 'hevc') return engine || null;
-    return s && !s.hdrEncrypted && !s.licenseUrl && !feedsCtx.live ? 'clear' : 'protected';
+    // Copy-protected by the same rule the way is chosen by (js/ways.js preferred); an unknown feed counts as protected.
+    if (!s) return 'protected';
+    var grid = { grid: { engine: 'hevc' }, hdrEncrypted: s.hdrEncrypted, licenseUrl: s.licenseUrl, live: feedsCtx.live };
+    return Ways.preferred(grid) === 'avplay:drmgrid' ? 'protected' : 'clear';
   }
 
-  /** A way still open: not failed for this video, not ruled out on this TV, not on AVPlay while it is stuck. */
-  function mvWayOpen(way) {
-    if (avplayStuck && /^(avplay|mvsoft):/.test(way)) return false;   // H.264's big feed plays on AVPlay
-    return !(feedsCtx.mvFailed && feedsCtx.mvFailed[way]) && pathUsable(way);
-  }
-
-  /** The ways a kind may still try, in order. */
-  function mvWays(kind) { return (MV_WAYS[kind] || []).filter(mvWayOpen); }
+  /** The ways a kind may still try, in order (wayOpen). */
+  function mvWays(kind) { return (MV_WAYS[kind] || []).filter(wayOpen); }
 
   /** The way a built multiview (playFeed's stream with `grid`) plays: its Caps path. */
   function mvWayOf(s) {
@@ -1867,28 +1918,15 @@
     var way = mvWays('clear')[0];
     if (way) return way.split(':')[0];
     // None, and the multiview comes anyway (a resumed one: mvEngine unread): one that didn't fail for this video.
-    var failed = feedsCtx.mvFailed || {};
-    return failed['shaka:grid'] ? 'avplay' : failed['avplay:grid'] || avplayStuck ? 'shaka' : GRID_FIRST;
-  }
-
-  /** Ways that failed for this video: a way's own failure (playbackFailed), or every way of a kind (mvKindOff). */
-  function mvOff(ways) {
-    feedsCtx.mvFailed = feedsCtx.mvFailed || {};
-    ways.forEach(function (way) { feedsCtx.mvFailed[way] = true; });
+    return isOff('shaka:grid') ? 'avplay' : isOff('avplay:grid') || avplayStuck ? 'shaka' : GRID_FIRST;
   }
 
   /** The feeds failed, not a way (see above): the kind is off for this video, nothing learned on the TV. */
-  function mvKindOff(kind) { mvOff(MV_WAYS[kind] || []); }
-
-  /** A grid the helper couldn't build: hdr.js refused the feeds ('HDR: …'), or the helper didn't take it. */
-  function gridBuildFailure(e) {
-    var m = String((e && e.message) || e || '');
-    return /^HDR: |^Could not prepare multiview$/.test(m) || (Player.errorInfo(e) || {}).code === 'HELPER_ERROR';
-  }
+  function mvKindOff(kind) { (MV_WAYS[kind] || []).forEach(setOff); }
 
   /**
-   * After a multiview failed (mvOff noted it): whether the same multiview plays another way now (else its big feed alone).
-   * If so, its retry chooses the engine again (the reopen over a hung AVPlay keeps it: it doesn't ask).
+   * After a multiview failed (noteFailure held it against its way): whether the same multiview plays another way now
+   * (else its big feed alone). If so, its retry chooses the engine again.
    */
   function mvAgain() {
     var mv = feedsCtx.multiview;
@@ -1897,65 +1935,49 @@
     return true;
   }
 
-  /**
-   * A failure that says nothing about the way of playing, so Caps doesn't hold it against the path (this video still
-   * falls back): no network, the network or F1's servers (Shaka's network errors, this app's own requests), or the licence
-   * server (Shaka 6007, AVPlay's licence request in player.js). AVPlay's PLAYER_ERROR_CONNECTION_FAILED does count: it
-   * is also what AVPlay says about segments it can't read (F1's audio senc without the helper, Tizen 6).
-   */
-  function unclearFailure(info, message) {
-    if (typeof navigator !== 'undefined' && navigator.onLine === false) return true;
-    // The TS worker stopped under a segment (ts-offload.js): the app's own fault; later loads transmux on the page.
-    if (/TS worker stopped/.test(String(message || ''))) return true;
-    if (!info) return false;
-    if (info.code === 'NETWORK_ERROR') return info.platform !== 'PLAYER_ERROR_CONNECTION_FAILED';
-    // AVPlay's licence download ('License: '), except a refusal (4xx: this TV or account may never get one).
-    var m = String(message || '');
-    return info.code === 'DRM_ERROR' && (info.platform === '6007' || (/^License: /.test(m) && !/answered 4\d\d/.test(m)));
+  /** What a failure means for the recovery (js/failure.js), with F1's "not started yet" answer. */
+  function failureCause(e, known, message) {
+    if (e && typeof F1Api !== 'undefined' && F1Api.isNotStarted && F1Api.isNotStarted(e)) return 'notStarted';
+    return Failure.cause(e, known, message);
   }
 
-  function playbackFailed(stream, unclear) {
-    if (!stream || !stream.capsPath || stream.capsFailed) return;
+  /**
+   * Holds a failure against what failed (recover's bookkeeping), the same for every stream. In order: the combined
+   * master (js/combo.js; nothing learned: the feed's own master tells), the 5.1 sound ('avplay:ac3': the retry plays the
+   * same in stereo), then the way the stream played (stream.capsPath, js/ways.js). A transient or unsure failure, or
+   * AVPlay's first hang, gives the way one more try ('again'), counted as unclear on this TV. Otherwise the way is off
+   * for this video and counts against it on this TV, unless the cause says nothing about it (transient, a hang) or was
+   * the video's own ('content'); a multiview the helper couldn't build takes its whole kind off. Returns what was
+   * blamed: 'combo', 'again', a way, or null (nothing to blame).
+   */
+  function noteFailure(stream, cause) {
+    if (!stream || stream.capsFailed || cause === 'cancelled') return null;
     stream.capsFailed = true;
-    // A start with the 5.1 commentary (encrypted 4K HDR) that fails counts against the 5.1, not against HDR: the retry
-    // plays the same HDR in stereo (feedsCtx.noSurround), and only if that fails too does HDR take the blame.
-    if (stream.surround) {
-      feedsCtx.noSurround = true;
-      if (typeof Caps !== 'undefined') {
-        Caps.failed('avplay:ac3', unclear);
-        if (Player.stream() === stream) Caps.crashEnd(true);
-      }
-      return;
+    if (stream.combo && !stream.grid) { setOff('combo'); return 'combo'; }
+    var way = stream.surround ? SURROUND : stream.capsPath;
+    if (!way) return null;
+    if (Player.stream() === stream) Caps.crashEnd(true);
+    var unclear = cause === 'transient' || cause === 'stuck';
+    feedsCtx.again = feedsCtx.again || {};
+    if ((unclear || cause === 'unsure') && !feedsCtx.again[way] && !(cause === 'stuck' && avplayStuck)) {
+      feedsCtx.again[way] = true;
+      Caps.failed(way, true);
+      return 'again';
     }
-    // A multiview: held against its own way (mvWayOf), never a single feed's path; not tried again in this video.
-    if (stream.grid) {
-      mvOff([stream.capsPath]);
-      if (typeof Caps !== 'undefined') {
-        Caps.failed(stream.capsPath, unclear);
-        if (Player.stream() === stream) Caps.crashEnd(true);
-      }
-      return;
-    }
-    // F1's Tiledmedia offer (AES-128 HLS on Shaka) that fails: today's 4K HDR route next (feedsCtx.tmFailed), and only
-    // a failure of that one counts against HDR.
-    if (stream.hlsAes) {
-      feedsCtx.tmFailed = true;
-      if (typeof Caps !== 'undefined') Caps.failed('shaka:hlsaes', unclear);
-      return;
-    }
-    if (typeof Caps !== 'undefined') {
-      Caps.failed(stream.capsPath, unclear);
-      if (Player.stream() === stream) Caps.crashEnd(true);
-    }
-    failPath(stream.capsPath);
-    // The server may decline the cenc offer and return cbcs. Don't request that same dead end forever.
-    if (!stream.hdr) failPath(stream.capsRoute);
+    if (cause !== 'content') Caps.failed(way, unclear);
+    setOff(way);
+    if (cause === 'content' && stream.grid) mvKindOff(mvKindFor(stream.grid.engine, stream));
+    // A protected SDR way: the server may decline the cenc offer and return cbcs, so the route asked for is off too
+    // (that same dead end isn't asked for again). Unprotected and 4K HDR failures say nothing about it.
+    var failed = Ways.get(way), route = Ways.get(stream.capsRoute);
+    if (failed && failed.group === 'sdr' && route && route.group === 'sdr') setOff(stream.capsRoute);
+    return way;
   }
 
   /** Position advancing, rather than load/prepare succeeding, is evidence that the path plays. */
   function playbackProgress() {
     var s = Player.stream();
-    if (!s || !s.capsPath || typeof Caps === 'undefined') return;
+    if (!s || !s.capsPath) return;
     // Where the engine counts frames (Shaka), a decoded one too: a frozen start can move its position (0 -> 2.13 s).
     // An H.264 multiview plays once its small feeds show too (mvSoftShown), not when its big feed alone does.
     var whole = !(s.grid && s.grid.engine === 'h264') || mvSoftShown;
@@ -1963,12 +1985,15 @@
       Player.decodedFrames() !== 0) {
       s.capsOk = true;
       Caps.ok(s.capsPath);
-      if (s.grid && feedsCtx.mvFailed) delete feedsCtx.mvFailed[s.capsPath];   // it plays (after a reopen, say)
-      if (s.surround && Player.audioChannels() > 2) Caps.ok('avplay:ac3');   // only when the 5.1 is what plays
+      // It plays (after one more try, say): open again for this video, and a later transient failure gets its try.
+      feedsCtx.recoveries = 0;
+      if (feedsCtx.off) delete feedsCtx.off[s.capsPath];
+      if (feedsCtx.again) delete feedsCtx.again[s.capsPath];
+      if (s.surround && Player.audioChannels() > 2) Caps.ok(SURROUND);   // only when the 5.1 is what plays
     }
     // A crash while the 5.1 plays counts against the 5.1 first (as a failed start does): the next start leaves it out.
     if (s.capsOk && !s.capsFailed && !s.capsEnded && Player.engineName() === 'avplay' && !Player.isPaused()) {
-      Caps.crashStart(s.surround && Player.audioChannels() > 2 ? 'avplay:ac3' : s.capsPath);
+      Caps.crashStart(s.surround && Player.audioChannels() > 2 ? SURROUND : s.capsPath);
     }
     else Caps.crashEnd();
   }
@@ -2398,15 +2423,9 @@
           toast('The small feeds stopped, starting them again…', 3000);
           return setTimeout(function () { if (Player.stream() === stream && screen === 'player') mvSoftStart(stream, true); }, 2000);
         }
-        toast('Multiview didn\'t work (' + ((e && e.message) || e) + ').', 8000);
-        // The helper refusing these feeds (segments that aren't aligned, Sakhir 2020): the feeds' fault, this video only.
-        // Anything else is held against the way ('mvsoft:h264').
-        if (gridBuildFailure(e)) mvKindOff('h264');
-        else playbackFailed(stream, unclearFailure(Player.errorInfo(e), e && e.message));
-        if (feedsCtx.multiview) {
-          feedsCtx.multiview = null;
-          playFeed(feedsCtx.index, { switching: true, retrying: true, recover: true });   // retrying: the message above stays
-        }
+        // As any failure (recover): the helper refusing these feeds (segments that aren't aligned, Sakhir 2020) is this
+        // video's; anything else counts against 'mvsoft:h264'. Its big feed plays alone.
+        recover({ phase: 'play', stream: stream, error: e, opts: {}, index: feedsCtx.index, multiview: feedsCtx.multiview });
       } });
   }
 
@@ -2508,7 +2527,7 @@
   function feedLabel(stream) {
     var grid = stream ? stream.grid : feedsCtx.multiview;
     // What plays: HDR, and 5.1 when the playing stream's audio has more than two channels.
-    var ch = stream && Player.stream() === stream && Player.audioChannels ? Player.audioChannels() : null;
+    var ch = stream && Player.stream() === stream ? Player.audioChannels() : null;
     var tags = [stream && stream.hdr ? 'HDR' : '', ch > 2 ? (ch === 6 ? '5.1' : ch === 8 ? '7.1' : 'Surround') : ''].filter(Boolean);
     if (grid) return ['Multiview · ' + (mvHeights(grid.layout) || []).length + ' feeds'].concat(tags).join(' · ');
     var title = feedsCtx.feeds.length > 1 ? feedsCtx.feeds[feedsCtx.index].title : '';
@@ -2522,9 +2541,7 @@
     var reuse = opts.reuse || null;
     if (reuse) { opts = Object.assign({}, opts); delete opts.reuse; }
     var ctx = feedsCtx, exits = playerExits, seq = navSeq;
-    // After an HDR failure this video plays SDR; the viewer's next feed switch tries HDR again,
-    // until it has failed HDR_TRIES times.
-    if (opts.switching && !opts.hdrRetry && feedsCtx.hdrFailed && (feedsCtx.hdrFailures || 0) < HDR_TRIES) feedsCtx.hdrFailed = false;
+    if (!opts.recover) feedsCtx.recoveries = 0;   // the viewer's own request: retries count from here
     var f = feedsCtx.feeds[i], mv = feedsCtx.multiview;
     mvSoftStop();   // an H.264 multiview's small feeds belong to what played
     var playing = screen === 'player' && Player.engineName();
@@ -2533,14 +2550,14 @@
     // Playing at LIVE (paused, the viewer keeps the moment). A retry keeps the first attempt's answer: the failed
     // native player it replaces reports position 0.
     var atLive = opts.atLive != null ? !!opts.atLive :
-      !!from && !from.paused && Player.isLive() && Player.range().end - from.pos < LIVE_MARGIN;
+      !!from && !from.paused && Player.isLive() && nearLive(from.pos);
     if (from) from.atLive = atLive;
     switchPause = from ? (opts.switchPaused != null ? opts.switchPaused : from.paused) : null;
     var askedAt = Date.now();
-    diagTrail('play.request', { feed: f && f.title, switching: !!from, retry: !!opts.retry, hdrRetry: !!opts.hdrRetry,
+    diagTrail('play.request', { feed: f && f.title, switching: !!from, retry: !!opts.retry,
       startAt: opts.startAt, liveAt: opts.liveAt, fromStart: !!opts.fromStart });
     var trial = uploading() ? dplay('request', { layout: mv ? mv.layout : null, switching: !!from, jump: !!opts.jump,
-      recover: !!(opts.recover || opts.retry || opts.retrying || opts.hdrRetry), feeds: feedsCtx.feeds.length,
+      recover: !!(opts.recover || opts.retry || opts.retrying), feeds: feedsCtx.feeds.length,
       content: diagContent(), tier: DiagUpload.currentTier() }) : null;
     if (trial) DiagUpload.quiet();
     return ensureSession().then(function (ok) {
@@ -2576,7 +2593,8 @@
             if (mine) return comboStream(cur, mine);
             // A fallback from a combined master: the feed's own answer, already had (no second PLAY).
             if (reuse) return Object.assign({}, reuse);
-            return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(true), tm: tmWanted(), langs: f.langs, mainChannel: f.tmChannel, cenc: route !== 'avplay:cbcs', cbcs: nativeHdrUsable() });
+            return F1Api.play(feedsCtx.contentId, f.channelId, { hdr: hdrWanted(true), tm: tmWanted(), langs: f.langs, mainChannel: f.tmChannel,
+              cenc: route !== 'avplay:cbcs', cbcs: nativeHdrUsable(), clearHdr: clearHdrUsable() });
           }
           // Multiview: the first feed's offer gives the clock, licence and commentary; the player builds the grid.
           // How it plays (mvEngine) needs the playing offer's HEVC heights: a resumed multiview hasn't read them yet.
@@ -2606,13 +2624,9 @@
           stream.multiFeed = feedsCtx.feeds.length > 1;
           stream.capsRoute = route;
           stream.cencAvplay = !!stream.cenc && route === 'avplay:cenc';
-          if (stream.licenseUrl) stream.capsPath = stream.hdrEncrypted ? 'avplay:hdr' :
-            (stream.cenc ? (stream.cencAvplay || stream.grid ? 'avplay:cenc' : 'shaka:cenc') : 'avplay:cbcs');
           // Encrypted HDR adds the 5.1 commentary where there is one (hdr.js), unless this video's start with it failed
           // or this TV has learned that it doesn't play it ('avplay:ac3').
-          if (stream.hdrEncrypted) stream.noSurround = !!feedsCtx.noSurround || (typeof Caps !== 'undefined' && Caps.avoided('avplay:ac3'));
-          if (stream.hlsAes) stream.capsPath = 'shaka:hlsaes';   // learned per TV like the DRM paths
-          if (stream.grid) stream.capsPath = mvWayOf(stream);   // a multiview learns its own way
+          if (stream.hdrEncrypted) stream.noSurround = isOff(SURROUND) || Caps.avoided(SURROUND);
           // Live HDR plays on the official live DASH timeline (the helper swaps in the HLG video).
           var timeline = stream.hdrEncrypted && stream.live ? stream.widevineManifestUrl : stream.url;
           // A start or a switch that loads: the feeds in one master, if built within 2 s (the feed list started the
@@ -2620,10 +2634,15 @@
           // 4K HDR on Shaka: player_tm (AES-128) or clear HDR (F1's weeks-old replays: the player_tm answer is clear
           // CMAF then, and the usual offer plays). SDR: F1's web answer (clear CMAF HLS) with the feeds visited so far.
           // Encrypted HDR (AVPlay), DRM and older replays switch as before.
-          var hdrComboable = stream.hlsAes || (stream.hdr && !stream.hdrEncrypted && !stream.licenseUrl);
-          var built$ = mv || stream.comboSwitch || opts.noCombo || !comboWanted() ? null :
+          // A combined master plays on Shaka, the way its feeds' kind has there (js/ways.js): F1's Tiledmedia offer or
+          // clear 4K HDR (from the Tiledmedia answer), unprotected SDR (the web answers). Only while that way is open:
+          // a feed that Shaka failed and AVPlay took over doesn't come back to Shaka through it.
+          var kindWay = Ways.preferred(Object.assign({}, stream, { multiFeed: true }));
+          var hdrComboable = kindWay === 'shaka:hlsaes' || kindWay === 'shaka:hdr';
+          var comboWay = hdrComboable || kindWay === 'shaka:clear' ? kindWay : null;
+          var built$ = mv || stream.comboSwitch || opts.noCombo || !comboWanted() || !comboWay || !wayOpen(comboWay) ? null :
             hdrComboable ? comboReady() : webComboable(stream) && stream.multiFeed && feedsCtx === ctx ? webCombo(ctx, i) : null;
-          var combo$ = built$ ? Promise.race([built$, new Promise(function (r) { setTimeout(function () { r(null); }, 2000); })]) : Promise.resolve(null);
+          var combo$ = built$ ? Promise.race([built$, new Promise(function (r) { setTimeout(function () { r(null); }, WAIT.comboBuild); })]) : Promise.resolve(null);
           // An instant switch keeps the clock it has: every feed of the master shares it.
           var info$ = stream.comboSwitch && stream.info ? Promise.resolve(stream.info) : F1Api.streamInfo(timeline);
           return Promise.all([info$.then(function (info) { stream.info = info; }, function () {}), combo$.then(function (c) {
@@ -2637,12 +2656,14 @@
         .then(function () {
           // Superseded by a newer request, or the viewer left the player while it loaded.
           if (feedsCtx !== ctx || exits !== playerExits || feedsCtx.index !== i || queuedFeed || screen !== 'player') return;
+          // The way it plays (js/ways.js): what Player.choose runs and Caps learns, once the combined master is known.
+          stream.capsPath = wayFor(stream, route);
           // Keys in the variant playlist: not playable here; the catch below falls back to SDR.
-          if (stream.hdr && stream.info && stream.info.encrypted && !stream.hdrEncrypted && !stream.hlsAes) throw new Error('encrypted HDR stream');
+          if (stream.capsPath === 'shaka:hdr' && stream.info && stream.info.encrypted) throw new Error('encrypted HDR stream');
           // Live HDR plays natively on the official live timeline (HdrStream.live), or as F1's Tiledmedia HLS on Shaka.
-          if (stream.hdr && stream.live && !stream.hdrEncrypted && !stream.hlsAes) throw new Error('HDR: live needs the native path');
+          if (stream.capsPath === 'shaka:hdr' && stream.live) throw new Error('HDR: live needs the native path');
           $('osd-feed').textContent = feedLabel(stream);
-          if (from) from.kind = Player.switchKind ? Player.switchKind(stream) : 'swap';
+          if (from) from.kind = Player.switchKind(stream);
           var start = startPosition(stream.info, opts, from);
           stream.askedStart = start;   // a retry of a start that never played (AVPlay reports 0) asks for it again
           // Where the lead decided the start (not a requested moment, a live point or the stream's own edge).
@@ -2652,7 +2673,7 @@
           // (it starts `delay` before its edge, hence the extra info.delay). Shaka cenc keeps the
           // requested position and seeks the DVR window itself (shaka_SDR, ba4275d).
           var info = stream.info;
-          if (start != null && info && info.dynamic && info.epochAtZero > 1e9 && stream.licenseUrl && (!stream.cenc || stream.cencAvplay)) {
+          if (start != null && info && info.dynamic && info.epochAtZero > 1e9 && stream.licenseUrl && Ways.engine(stream.capsPath) === 'avplay') {
             var shift = Date.now() / 1000 - (info.epochAtZero + start) - info.delay;
             // A viewer at LIVE stays there: AVPlay's own live point (~33 s behind real time, ~8 s behind the edge) is
             // where the old feed was. Shifting by the lead instead started each switch a segment-rounded 2-9 s later,
@@ -2697,7 +2718,7 @@
           // reason to give up on HDR for this video.
           if (feedsCtx !== ctx || exits !== playerExits || (e && e.message === 'cancelled')) return;
           diag('play.failed', { error: e, stream: diagStream(stream), switching: !!from, retry: !!opts.retry,
-            hdrRetry: !!opts.hdrRetry, afterMs: Date.now() - askedAt }, 'error');
+            afterMs: Date.now() - askedAt }, 'error');
           // That trial failed (an engine row only if an engine was asked to load); whether the attempt does follows below.
           dplay('failed', trial, e);
           // A failed switch leaves the previous feed playing: it is still the current one (not
@@ -2706,144 +2727,8 @@
             feedsCtx.index = feedsCtx.playing != null ? feedsCtx.playing : from.index;
             $('osd-feed').textContent = feedLabel(from.stream);
           }
-          // A combined master that didn't load: this feed's own master instead, and the usual switches for this video
-          // (nothing held against the way of playing yet: the retry tells).
-          if (stream && stream.combo && !stream.comboSwitch && !mv) {
-            feedsCtx.comboOff = true;
-            diag('play.fallback', { to: 'feed-own-master', why: String((e && e.message) || e).slice(0, 120) });
-            var own = recovering(from ? hereNow(from, opts) : sameMoment(from, opts));
-            own.noCombo = true;
-            if (answer) own.reuse = answer;
-            if (!queuedFeed && screen === 'player') playFeed(i, own);
-            return;
-          }
-          // An instant switch in the combined master that didn't show the new feed: the usual switch instead (nothing
-          // held against the way of playing: it plays), and the usual switches for the rest of this video.
-          if (stream && stream.comboSwitch && e && e.code === 'COMBO') {
-            feedsCtx.comboOff = true;
-            diag('play.fallback', { to: 'switch-usual', why: String(e.message || '').slice(0, 120) });
-            var usual = recovering(hereNow(from, opts));
-            usual.noCombo = true;
-            var kept = ownAnswer(feedsCtx, i);
-            if (kept) usual.reuse = kept;
-            if (!queuedFeed && screen === 'player') playFeed(i, usual);
-            return;
-          }
-          // A multiview that failed before a player had it (its offers, player_tm's preparation) or that the helper couldn't
-          // build (feeds that differ, a refused segment): the feeds' fault, no way's. Its kind is off for this video, nothing
-          // learned on the TV (Las Vegas, an onboard with other breaks, 2026-11-24).
-          var mvOn = !!(mv && feedsCtx.multiview === mv);
-          if (mvOn && (!stream || !stream.grid || !stream.capsPath || gridBuildFailure(e))) {
-            mvKindOff(stream && stream.grid ? mvKindFor(stream.grid.engine, stream) : mvKindFor(mv.engine, Player.stream()));
-            if (stream && stream.grid) stream.capsPath = null;
-          }
-          playbackFailed(stream, unclearFailure(Player.errorInfo(e), e && e.message) || !!(stream && stream.unclearCause));
-          // An SDR engine failed before starting. Try the next path at the requested moment;
-          // native cenc still goes through the helper, as in PR #3.
-          if (!mv && stream && !stream.hdr && stream.capsPath && sdrPath() !== stream.capsRoute &&
-              !(e && e.code === 'PLAYER_STUCK')) {
-            if (!queuedFeed && screen === 'player') playFeed(i, recovering(sameMoment(from, opts)));
-            return;
-          }
-          // AVPlay's preparation hung (player.js PREPARE_MS): one more try opens over it, as BACK and trying again
-          // did (Mexico 2026 multiview). Another hang, or a player that won't open again, needs the app restarted;
-          // what played last is saved (saveWatching), so it comes back at that moment.
-          // (A multiview with another way to play goes there instead, below.) A start with the 5.1 commentary that failed
-          // isn't the multiview's: the same one again in stereo (below).
-          var mvNext = mvOn && !(stream && stream.surround) && mvAgain();
-          if (e && (e.code === 'PREPARE_TIMEOUT' || e.code === 'PLAYER_STUCK') && !mvNext) {
-            if (e.code === 'PLAYER_STUCK' || feedsCtx.prepareRetried) {
-              avplayStuck = true;
-              // A multiview: its big feed alone, which Shaka plays (a single 4K HDR or SDR replay feed doesn't need
-              // AVPlay), rather than a dead screen (Las Vegas Big + 2 after Shaka playback, 2026-11-24).
-              if (mv && feedsCtx.multiview === mv) {
-                feedsCtx.multiview = null;
-                diag('play.fallback', { to: 'one-feed', why: 'avplay stuck' });
-                toast('Multiview didn\'t start: the TV\'s video player is stuck. Playing one feed (restart the app for multiview).', 10000);
-                var alone = recovering(sameMoment(from, opts));
-                alone.retrying = true;   // keeps the message above
-                if (!queuedFeed && screen === 'player') playFeed(i, alone);
-                return;
-              }
-              dplay('gaveUp', e, null, trial);
-              return toast('The TV\'s video player is stuck. Restart the app to continue where you were.', 20000);
-            }
-            feedsCtx.prepareRetried = true;
-            toast((mv ? 'Multiview' : 'The video') + ' didn\'t start, trying again…', 4000);
-            var again = recovering(sameMoment(from, opts));
-            again.retrying = true;   // keeps the message above
-            if (!queuedFeed && screen === 'player') playFeed(i, again);
-            return;
-          }
-          // The retry of this load: the moment it asked for, or for a switch the outgoing feed's moment carried on, and
-          // a pause pressed while it loaded.
-          var retryOpts = function (extra) {
-            var recovery = Object.assign({}, opts, extra, { recover: true });
-            if (from) recovery.switchPaused = switchPause != null ? switchPause : from.paused;
-            // Native preparation replaces the outgoing player. Its failed stream reports zero,
-            // so retain the outgoing moment rather than deriving a new target from that zero.
-            if (atLive) recovery.atLive = true;
-            else if (from && recovery.startAt == null && recovery.liveAt == null) {
-              var ahead = from.paused ? 0 : (Date.now() - from.at) / 1000 + leadOf(from);
-              if (from.wall) recovery.liveAt = from.wall + ahead;
-              else recovery.startAt = from.pos + ahead;
-            }
-            return recovery;
-          };
-          // A multiview that failed one way: the same multiview the next way (mvAgain). A hung AVPlay preparation counts
-          // as above (twice, or a player that won't open: stuck until the app restarts).
-          if (mvNext) {
-            if (e && (e.code === 'PREPARE_TIMEOUT' || e.code === 'PLAYER_STUCK')) {
-              if (e.code === 'PLAYER_STUCK' || feedsCtx.prepareRetried) avplayStuck = true;
-              feedsCtx.prepareRetried = true;
-            }
-            diag('play.fallback', { to: 'multiview-next', from: (stream && stream.capsPath) || null, why: String((e && (e.code || e.message)) || e).slice(0, 120) });
-            var other = retryOpts({});
-            other.retrying = true;
-            toast('Multiview didn\'t start, trying again…', 4000);
-            if (!queuedFeed && screen === 'player') playFeed(i, other);
-            return;
-          }
-          // A start with the 5.1 commentary failed (held against the 5.1 above): the same HDR, multiview included, in stereo.
-          // F1's Tiledmedia offer failed: today's 4K HDR route (a player_tm multiview's feeds are that offer too: above).
-          if (stream && (stream.surround || (stream.hlsAes && !mvOn))) {
-            diag('play.fallback', { to: stream.hlsAes ? 'hdr-usual' : 'hdr-stereo' });
-            if (!queuedFeed && screen === 'player') playFeed(i, retryOpts({}));
-            return;
-          }
-          // Multiview failed: the big feed alone (a failed switch leaves the previous video playing).
-          if (mv && feedsCtx.multiview === mv) {
-            feedsCtx.multiview = null;
-            toast('Multiview didn\'t work (' + ((e && e.message) || e) + ').', 8000);
-            if (from && Player.stream() === from.stream) { dplay('gaveUp', e, null, trial); return; }
-            if (!queuedFeed && screen === 'player') playFeed(i, recovering(sameMoment(from, opts)));
-            return;
-          }
-          var hdrFailure = stream && stream.hdr && !feedsCtx.hdrFailed;
-          if (hdrFailure || (stream && stream.cenc && !feedsCtx.cencFailed)) {
-            if (hdrFailure) {
-              feedsCtx.hdrFailures = (feedsCtx.hdrFailures || 0) + 1;
-              // The video's first failure (a CDN or licence blip, typically) gets HDR again at once; after
-              // that, SDR for now. An offer this app turned down (unusable keys, an unsupported layout)
-              // would fail the same way.
-              var refused = /^encrypted HDR stream$|^HDR: (?!media request failed)/.test((e && e.message) || '');
-              if (refused || opts.hdrRetry || feedsCtx.hdrFailures > 1) feedsCtx.hdrFailed = true;
-            } else {
-              feedsCtx.cencFailed = true;   // this video plays the usual cbcs stream on AVPlay from now on
-            }
-            diag('play.fallback', { to: hdrFailure ? (feedsCtx.hdrFailed ? 'sdr' : 'hdr-again') : 'cbcs',
-              hdrFailures: feedsCtx.hdrFailures || 0 });
-            // Queue the retry behind this load; a newer feed request still wins.
-            if (!queuedFeed && screen === 'player') playFeed(i, retryOpts(hdrFailure ? { hdrRetry: true } : {}));
-            return;
-          }
-          if (F1Api.isNotStarted(e) && feedsCtx.playing == null) {
-            dplay('gaveUp', e, { cancelled: true }, trial);
-            stopPlayer();
-            return toast(feedsCtx.title + (feedsCtx.start ? ' starts ' + when(feedsCtx.start) + '.' : ' hasn\'t started yet.'), 8000);
-          }
-          if (!(from && Player.stream() === from.stream)) dplay('gaveUp', e, null, trial);   // a failed switch: the old feed still plays
-          toast('Could not play: ' + (e.message || e), 8000);
+          recover({ phase: 'load', stream: stream, error: e, opts: opts, from: from, index: i, multiview: mv, trial: trial,
+            answer: answer, unclear: !!(stream && stream.unclearCause) });
         });
     }, function (e) {
       // The session could not be checked (no network): say so instead of doing nothing.
@@ -2923,46 +2808,17 @@
     return engines.indexOf('hevc') >= 0 ? 'hevc' : engines.indexOf('h264') >= 0 ? 'h264' : 'none';
   }
 
-  /**
-   * After a failed switch to a combined master's feed: the moment the player is at now (the outgoing feed, or the
-   * same player, played on; every feed shares the clock), paused as the viewer wants it now (keys during the switch).
-   */
-  function hereNow(from, opts) {
-    var pos = Player.position(), wall = pos > 0 ? Player.wallClock(pos) : null;
-    if (!(pos > 0)) return sameMoment(from, opts);
-    var o = { switching: true, switchPaused: switchPause != null ? switchPause : from.paused };
-    if (wall) o.liveAt = wall; else o.startAt = pos;
-    return o;
-  }
-
-  /** A combined master's load (not an instant switch) that doesn't settle in 20 s fails: the feed's own master then. */
+  /** A combined master's load (not an instant switch) that doesn't settle in time fails: the feed's own master then. */
   function comboBound(loading, stream) {
     if (!stream || !stream.combo || stream.comboSwitch) return loading;
     return new Promise(function (resolve, reject) {
       var timer = setTimeout(function () {
-        var e = new Error('COMBO: the combined master did not load in 20 s');
+        var e = new Error('COMBO: the combined master did not load in ' + WAIT.comboLoad / 1000 + ' s');
         e.code = 'COMBO_LOAD';
         reject(e);
-      }, 20000);
+      }, WAIT.comboLoad);
       loading.then(function (x) { clearTimeout(timer); resolve(x); }, function (e) { clearTimeout(timer); reject(e); });
     });
-  }
-
-  function sameMoment(from, opts) {
-    var o = {};
-    if (from && from.atLive) {
-      o.atLive = true;   // the live point again, not a moment taken from the old feed
-      o.switching = true;
-      o.switchPaused = false;
-    } else if (from) {
-      var late = from.paused ? 0 : (Date.now() - from.at) / 1000;
-      if (from.wall) o.liveAt = from.wall + late; else o.startAt = from.pos + late;
-      o.switching = true;
-      o.switchPaused = from.paused;
-    } else {
-      ['startAt', 'liveAt', 'fallbackAt', 'fromStart', 'atLive'].forEach(function (k) { if (opts[k] != null) o[k] = opts[k]; });
-    }
-    return o;
   }
 
   /**
@@ -2974,61 +2830,177 @@
    */
   function watchStart(stream, opts, wait) {
     var from = Player.position(), frames = Player.decodedFrames(), ctx = feedsCtx, armed = Date.now();
-    var budget = stream.hdr ? 25000 : 15000;
+    var budget = stream.hdr ? WAIT.startHdr : WAIT.start;
     setTimeout(function () {
       // A newer load or another video has taken over; it has its own watch.
       if (feedsCtx !== ctx || loadingFeed) return;
       if (screen !== 'player' || Player.stream() !== stream || stream.retried) return;
       // Paused by the viewer (not the element's own pause while a frozen start loads again, which must still be watched).
-      if (Player.isViewerPaused ? Player.isViewerPaused() : Player.isPaused()) return;
+      if (Player.isViewerPaused()) return;
       // Moved either way (the viewer may have jumped back), with pictures decoded meanwhile: it plays.
       if (Math.abs(Player.position() - from) > 0.5 && decodedSince(frames) !== 0) return;
       // The player loaded a frozen start again meanwhile (player.js reloadIfFrozen): that load gets the usual time from
       // when it began (at least 5 s more), once, before the start counts as failed.
-      if (!stream.reloadWatched && Player.reloadedSince && Player.reloadedSince(armed)) {
+      if (!stream.reloadWatched && Player.reloadedSince(armed)) {
         stream.reloadWatched = true;
         return watchStart(stream, opts, Math.max(5000, Player.reloadedAt() + budget - Date.now()));
       }
       diag('play.no-start', { stream: diagStream(stream), waitedMs: wait || budget, position: from, retry: !!opts.retry });
-      // On Shaka, nothing buffered means no data arrived (the network or the CDN): that says nothing about the path.
+      // On Shaka, nothing buffered means no data arrived (the network or the CDN): that says nothing about the way.
       // Data without a picture does (the first-HDR freeze, a decoder that refuses). AVPlay doesn't tell: it counts.
       var noData = Player.engineName() === 'shaka' && Player.bufferedEnd() - Player.position() < 1;
-      // A combined master (js/combo.js): its own fault until the feed's own master fails too. Not held against the way
-      // of playing, and never the last try (the feed's own master comes next).
-      var comboBack = !!(stream.combo && !stream.grid);
-      if (!comboBack) playbackFailed(stream, noData || unclearFailure(null) || !!stream.unclearCause);
-      // A multiview is never the last try: another way or its big feed alone follows.
-      var last = !comboBack && opts.retry && !stream.hdr && !stream.grid && (!stream.capsPath || sdrPath() === stream.capsRoute);
-      dplay('failed', null, null, { noProgress: true, final: last });
-      if (last) return;
-      toast('The video didn\'t start, trying again…', 3000);
-      // Through playFeed so it queues behind any other load instead of racing it.
-      // AVPlay reports no position until it plays: 0 is no moment of the stream, so the retry repeats the request.
-      // A start that never played (AVPlay reports 0) retries at the position it asked for.
-      if (!(from > 0) && (stream.surround || stream.hlsAes || comboBack) && stream.askedStart > 0) from = stream.askedStart;
-      var wall = from > 0 ? Player.wallClock(from) : null;
-      // A multiview (playbackFailed noted its way): the same multiview the next way, else its big feed alone. With the 5.1
-      // commentary: the same one in stereo.
-      if (stream.grid && !stream.surround) { if (!mvAgain()) feedsCtx.multiview = null; }
-      // A combined master (js/combo.js): this feed's own master next, the usual switches for this video.
-      else if (stream.combo) feedsCtx.comboOff = true;
-      else if (stream.surround || stream.hlsAes) { /* playbackFailed turned the 5.1 or the Tiledmedia offer off: HDR again */ }
-      else if (stream.hdr) { feedsCtx.hdrFailed = true; feedsCtx.hdrFailures = (feedsCtx.hdrFailures || 0) + 1; }
-      else if (stream.cenc) feedsCtx.cencFailed = true;
-      var again = {};
-      Object.keys(opts || {}).forEach(function (k) { if (k !== 'switching') again[k] = opts[k]; });   // a fresh load
-      again.retry = true;
-      if (Player.isLive() && wall) again = { liveAt: wall, retry: true };
-      // The usual HDR offer after the Tiledmedia one is another package: the same moment by its clock, else position.
-      else if (!Player.isLive() && from && stream.hlsAes && wall) again = { liveAt: wall, fallbackAt: from, retry: true };
-      else if (!Player.isLive() && from) again = { startAt: from, retry: true };
-      if (comboBack) {
-        again.noCombo = true;
-        var kept = ownAnswer(feedsCtx, feedsCtx.index);
-        if (kept) again.reuse = kept;
-      }
-      playFeed(feedsCtx.index, again);
+      recover({ phase: 'start', stream: stream, opts: opts, index: feedsCtx.index, multiview: feedsCtx.multiview,
+        cause: noData || stream.unclearCause || Failure.cause(null, null, '') === 'transient' ? 'transient' : 'way' });
     }, wait || budget);
+  }
+
+  /**
+   * After a failed attempt, the same for every stream and every moment it can fail (phase 'load': the load failed,
+   * 'start': it never started playing, 'play': it failed while playing): what failed is held against it (noteFailure),
+   * then the same feed plays the next way at the same moment (retryFrom), or, with no way left, the viewer is told.
+   * The next way is whatever the request then picks: everything that failed for this video is off (feedsCtx.off).
+   *   c: { phase, stream (missing when the offer request failed), error, or known (the engine's { code, platform }) and
+   *        message, or cause; unclear (a network error seen while it loaded); opts (the failed load's), from (its
+   *        switch snapshot), index (its feed), multiview (the one it played), trial (diagnostics), answer (this load's
+   *        own offer: a combined master's fallback plays it without a second request) }
+   */
+  var RECOVERIES = 6;
+  function recover(c) {
+    var stream = c.stream, opts = c.opts || {}, from = c.from || null, i = c.index;
+    var cause = c.cause || failureCause(c.error, c.known || (c.error ? Player.errorInfo(c.error) : null), c.message);
+    if (cause === 'cancelled') return;
+    if (c.unclear && (cause === 'way' || cause === 'unsure')) cause = 'transient';
+    var mv = c.multiview, mvOn = !!(mv && feedsCtx.multiview === mv);
+    if (stream) stream.failed = true;   // gone: never the "old feed" a later switch goes on from (oldFeedPlays)
+    var oldPlays = oldFeedPlays(from);
+    var what = String((c.error && (c.error.message || c.error)) || c.message || '');
+    var final = function (yes) {
+      if (c.phase === 'start') dplay('failed', null, null, { noProgress: true, final: yes });
+      else if (c.phase === 'play') dplay('failed', null, c.known ? { diag: c.known } : null, { runtime: true, final: yes });
+      if (yes) dplay('gaveUp', c.error, null, c.trial);
+    };
+    // F1: this session hasn't started yet.
+    if (cause === 'notStarted' && feedsCtx.playing == null) {
+      dplay('gaveUp', c.error, { cancelled: true }, c.trial);
+      stopPlayer();
+      return toast(feedsCtx.title + (feedsCtx.start ? ' starts ' + when(feedsCtx.start) + '.' : ' hasn\'t started yet.'), 8000);
+    }
+    // AVPlay's preparation hung: one more try opens over it (as BACK and trying again did, Mexico 2026). Another hang, or
+    // a player that won't open again, leaves AVPlay stuck until the app restarts: its ways are closed (wayOpen), and what
+    // played last is saved (saveWatching), so it comes back at that moment.
+    var stuckNow = false;
+    if (cause === 'stuck') {
+      if ((c.error && c.error.code === 'PLAYER_STUCK') || feedsCtx.prepareRetried) stuckNow = avplayStuck = true;
+      feedsCtx.prepareRetried = true;
+    }
+    // A multiview that failed before a player had it (its offers, player_tm's preparation): no way to hold it against;
+    // its kind is off for this video, unless the cause was transient (then one more try, as for a way).
+    var blamed;
+    if (mvOn && (!stream || !stream.grid || !stream.capsPath)) {
+      var kind = stream && stream.grid ? mvKindFor(stream.grid.engine, stream) : mvKindFor(mv.engine, Player.stream());
+      feedsCtx.again = feedsCtx.again || {};
+      if ((cause === 'transient' || cause === 'unsure' || (cause === 'stuck' && !stuckNow)) && !feedsCtx.again['mv:' + kind]) {
+        feedsCtx.again['mv:' + kind] = true;
+        blamed = 'again';
+      } else { mvKindOff(kind); blamed = kind; }
+    } else blamed = noteFailure(stream, cause);
+    // What follows: 'retry' (this feed, the next way, or the same once more), 'alone' (a multiview's big feed),
+    // 'stay' (a failed switch: the old feed plays on), 'back' (a failed switch whose old feed native preparation
+    // replaced: that feed again, at the moment), 'stop' (nothing left).
+    var same = blamed === 'again' || blamed === SURROUND || blamed === 'combo';
+    var next = mvOn ? (same || mvAgain() ? 'retry' : oldPlays ? 'stay' : 'alone') :
+      same || (blamed && hasNextWay(stream)) ? 'retry' : oldPlays ? 'stay' : 'stop';
+    // However F1 answers, retries end: after RECOVERIES in a row without anything playing, the viewer is told.
+    feedsCtx.recoveries = (feedsCtx.recoveries || 0) + 1;
+    if (next !== 'stop' && next !== 'stay' && feedsCtx.recoveries > RECOVERIES) next = oldPlays ? 'stay' : mvOn ? 'alone' : 'stop';
+    if (next === 'alone' && feedsCtx.recoveries > RECOVERIES + 1) next = 'stop';
+    if (next === 'stop' && from && from.index != null && from.index !== i && from.stream && !from.stream.failed &&
+        feedsCtx.recoveries <= RECOVERIES) next = 'back';
+    diag('play.fallback', { phase: c.phase, cause: cause, blamed: blamed || null, to: next, why: what.slice(0, 120) });
+    final(next === 'stop' || next === 'stay' || next === 'back');
+    var verb = c.phase === 'play' ? ' stopped' : ' didn\'t start';
+    // Told only when the viewer saw something go wrong: playback that stopped, a start that showed nothing for 15-25 s,
+    // a hung preparation (20-30 s). A load that fails at once is retried quietly: "Switching to…" (or the spinner) is up,
+    // and during a switch the old feed plays on.
+    var noticed = c.phase !== 'load' || cause === 'stuck';
+    if (next === 'stop' || next === 'stay') {
+      if (mvOn) feedsCtx.multiview = null;
+      if (stuckNow && !mvOn) return toast('The TV\'s video player is stuck. Restart the app to continue where you were.', 20000);
+      if (mvOn) return toast('Multiview didn\'t work' + (what ? ' (' + what + ')' : '') + '.', 8000);
+      return toast(c.phase === 'start' ? 'The video didn\'t start.' : 'Could not play' + (what ? ': ' + what : '.'), 8000);
+    }
+    if (next === 'back') {
+      if (mvOn) feedsCtx.multiview = null;
+      var gone = feedsCtx.feeds[i];
+      toast((mvOn ? 'Multiview didn\'t work' : 'Could not play ' + (gone ? gone.full || gone.title : 'that feed')) + (what ? ' (' + what + ')' : '') + '.', 8000);
+      // The switch gave up (above); playing the old feed again is an attempt of its own for the diagnostics.
+      var back = retryFrom('load', null, {}, from);
+      delete back.recover; delete back.retry;
+      if (!queuedFeed && screen === 'player') playFeed(from.index, back);
+      return;
+    }
+    if (next === 'alone') {
+      feedsCtx.multiview = null;
+      toast(stuckNow ? 'Multiview didn\'t start: the TV\'s video player is stuck. Playing one feed (restart the app for multiview).' :
+        'Multiview didn\'t work' + (what ? ' (' + what + ')' : '') + '.', stuckNow ? 10000 : 8000);
+    } else if (noticed) toast((mvOn ? 'Multiview' : 'The video') + verb + ', trying again…', 4000);
+    var again = retryFrom(c.phase, stream, opts, from);
+    again.retrying = true;   // the message above stays (no "Switching to…")
+    if (blamed === 'combo') {
+      // The feed's own master, already had (no second PLAY); the usual switches for the rest of this video.
+      again.noCombo = true;
+      var kept = c.answer || ownAnswer(feedsCtx, i);
+      if (kept) again.reuse = kept;
+    }
+    if (!queuedFeed && screen === 'player') playFeed(i, again);
+  }
+
+  /** Whether a failed switch's old feed still plays: Shaka switches beside it; a stream that failed doesn't count. */
+  function oldFeedPlays(from) {
+    var s = from && from.stream;
+    return !!(s && !s.failed && Player.stream() === s && Player.engineName());
+  }
+
+  /**
+   * Where a retry starts, the same for every failure, paused as the viewer last chose:
+   *  - after a failed start or playback, the moment the stream reached, by the wall clock (every package of a video
+   *    shares it, live too), by its position where there is none; at LIVE, LIVE;
+   *  - else the moment the failed load asked for, if it named one;
+   *  - else, for a failed switch, from its old feed: while that plays, as any switch (loadFeed: its moment and the
+   *    switch lead); when native preparation replaced it, the moment it would be at now, with the lead;
+   *  - else where the failed load started (its askedStart: a resume position, say), by the clock where it has one.
+   * Only a failed load retries as a switch; after a start or playback failure it is a fresh load.
+   */
+  function retryFrom(phase, stream, opts, from) {
+    var o = { recover: true, retry: true };
+    if (phase === 'load' && opts.switching) o.switching = true;
+    var pause = switchPause != null ? switchPause : from ? from.paused : null;
+    if (pause != null && o.switching) o.switchPaused = pause;
+    var pos = phase !== 'load' && stream && Player.stream() === stream ? Player.position() : 0;
+    if (pos > 0) {
+      // At LIVE, playing: LIVE again. Paused there, the moment it is paused at (the edge moves on meanwhile).
+      if (Player.isLive() && !Player.isPaused() && nearLive(pos)) { o.atLive = true; return o; }
+      var wall = Player.wallClock(pos);
+      if (wall) { o.liveAt = wall; if (!Player.isLive()) o.fallbackAt = pos; }
+      else if (!Player.isLive()) o.startAt = pos;
+      return o;   // live without a clock: its live point
+    }
+    var named = false;
+    ['startAt', 'liveAt', 'fallbackAt', 'fromStart', 'atLive'].forEach(function (k) { if (opts[k] != null) { o[k] = opts[k]; named = true; } });
+    if (named) return o;
+    if (oldFeedPlays(from)) return o;
+    if (from) {
+      if (from.atLive) { o.atLive = true; return o; }
+      var ahead = from.paused ? 0 : (Date.now() - from.at) / 1000 + leadOf(from);
+      if (from.wall) o.liveAt = from.wall + ahead; else o.startAt = from.pos + ahead;
+      return o;
+    }
+    var asked = stream && stream.askedStart;
+    if (asked > 0) {
+      var at = Player.wallClock(asked, stream.info);
+      if (at) { o.liveAt = at; o.fallbackAt = asked; } else o.startAt = asked;
+    }
+    return o;
   }
 
   /**
@@ -3121,12 +3093,14 @@
 
   // The live player itself runs ~25-50 s behind real time; within this margin counts as live.
   var LIVE_MARGIN = 12;   // live plays ~29 s behind real time: 4 s behind the edge (wall clock minus the 25 s delay)
+  /** A live position "at LIVE": within LIVE_MARGIN of the window's end (`r`: the range, the player's by default). */
+  function nearLive(pos, r) { return (r || Player.range()).end - pos < LIVE_MARGIN; }
 
   /** Label for a position: offset or behind-live time, plus the real clock time when known. */
   function posLabel(pos, r, live) {
     var wall = Player.wallClock(pos);
     var main;
-    if (live) main = r.end - pos < LIVE_MARGIN ? 'LIVE' : '−' + fmtTime(r.end - pos);
+    if (live) main = nearLive(pos, r) ? 'LIVE' : '−' + fmtTime(r.end - pos);
     else main = fmtTime(pos - r.start);
     return { main: main, clock: wall ? hhmmss(wall * 1000) : '' };
   }
@@ -3156,7 +3130,7 @@
     var pct = function (p) { return Math.max(0, Math.min(100, 100 * (p - r.start) / span)) + '%'; };
     $('osd-progress').style.width = pct(pos);
     $('osd-buffer').style.width = pct(Player.bufferedEnd());
-    var behind = live && r.end - pos >= LIVE_MARGIN;
+    var behind = live && !nearLive(pos, r);
     $('osd-live').classList.toggle('hidden', !live);
     $('osd-live').classList.toggle('behind', behind);
     $('osd-live').classList.toggle('focused', liveFocus);
@@ -3226,8 +3200,8 @@
       scrub = null;
       // Only a jump forward can land "at live"; a jump back from live is a real rewind.
       var back = p < Player.position() - 3;
-      var toLive = !back && Player.range().end - p < LIVE_MARGIN;
-      if (toLive && behindLive() < LIVE_MARGIN) return updateOsd(); // already live: nothing to do
+      var toLive = !back && nearLive(p);
+      if (toLive && nearLive(Player.position())) return updateOsd(); // already live: nothing to do
       return goLive(toLive ? null : Player.wallClock(p));
     }
     pending = { pos: p, info: scrub.info, since: Date.now() };
@@ -3341,7 +3315,7 @@
 
   /** Stops playback and clears the player's overlays, staying on the player screen. */
   function leavePlayer() {
-    if (typeof Caps !== 'undefined') Caps.crashEnd();
+    Caps.crashEnd();
     playerExits++;
     feedLoadSeq++;
     clearTimeout(feedLoadTimer);
@@ -3415,7 +3389,7 @@
     if (liveFocus) {
       liveFocus = false;
       if (key === K.ENTER) {
-        if (behindLive() > LIVE_MARGIN) return goLive(null);
+        if (Player.isLive() && !nearLive(Player.position())) return goLive(null);
         if (Player.isPaused()) togglePause();
         updateOsd();
         return toast('You\'re watching live.', 2000);
@@ -3603,7 +3577,7 @@
   function panelOptions() {
     var tracks = Player.tracks();
     return {
-      goLive: behindLive() > LIVE_MARGIN,
+      goLive: Player.isLive() && !nearLive(Player.position()),
       timing: !!feedsCtx && Timing.supported(feedsCtx.timingMeta),
       audio: tracks.audio.map(function (a) { return a.lang; }).filter(Boolean),
       text: tracks.text.map(function (t) { return t.lang; }).filter(Boolean),
@@ -4328,7 +4302,7 @@
       settings: { hdr: Settings.get('hdr'), audio: Settings.get('audio'), subtitles: Settings.get('subtitles'), timing: Settings.get('timing') } };
     if (feedsCtx) {
       o.video = { contentId: feedsCtx.contentId, live: !!feedsCtx.live, feeds: feedsCtx.feeds.length, index: feedsCtx.index,
-        playing: feedsCtx.playing, hdrFailed: !!feedsCtx.hdrFailed, hdrFailures: feedsCtx.hdrFailures || 0, cencFailed: !!feedsCtx.cencFailed };
+        playing: feedsCtx.playing, off: Object.keys(feedsCtx.off || {}) };
     }
     return o;
   }
@@ -4354,45 +4328,14 @@
 
     Player.on('error', function (msg, info) {
       diag('player.error', { message: msg, code: info, stream: diagStream(Player.stream()) }, 'error');
-      toast(msg, 8000);
       $('spinner').classList.add('hidden');
       // A network or licence-server error while loading: remembered for the load catch/start watch, which count the
       // failure once native preparation settles (its timeout or open error would otherwise take the blame).
       var cur = Player.stream();
-      if (cur && unclearFailure(info, msg)) cur.unclearCause = true;
-      // Loading errors are handled by the load catch/start watch, once native preparation settles.
+      if (cur && failureCause(null, info, msg) === 'transient') cur.unclearCause = true;
+      // Loading errors are handled (and told) by the load catch/start watch, once native preparation settles.
       if (screen !== 'player' || loadingFeed) return;
-      var s = Player.stream();
-      // A combined master (js/combo.js) that failed while playing: this feed's own master, the usual switches from now;
-      // held against the way of playing only if that fails too.
-      var ownMaster = !!(s && s.combo && !s.grid);
-      if (ownMaster) feedsCtx.comboOff = true;
-      else playbackFailed(s, unclearFailure(info, msg));
-      // A multiview always has something next: another way, or its big feed alone.
-      var fallback = ownMaster || !!(s && s.capsPath && (s.grid || s.surround || s.hlsAes || s.hdr || sdrPath() !== s.capsRoute));
-      // A failure while playing (the load's own catch or start watch records the others); final when nothing follows.
-      dplay('failed', null, info ? { diag: info } : null, { runtime: true, final: !fallback });
-      if (fallback) {
-        // With the 5.1 or the Tiledmedia offer, or from a combined master: HDR again first, without them.
-        if (s.hdr && !s.surround && !s.hlsAes && !ownMaster && !s.grid) feedsCtx.hdrFailed = true;
-        // A multiview (playbackFailed noted its way): the next way, else its big feed alone.
-        if (s.grid && !s.surround && !mvAgain()) feedsCtx.multiview = null;
-        if (ownMaster) diag('play.fallback', { to: 'feed-own-master', runtime: true });
-        // The position, or before it played the one it was asked to start at.
-        var pos = Player.position() > 0 ? Player.position() : (s.askedStart > 0 ? s.askedStart : 0);
-        var wall = pos > 0 ? Player.wallClock(pos) : null;
-        // The same HDR replay without the 5.1 shares this timeline: its position needs no clock lookup. Another
-        // package (after the Tiledmedia offer), and live (a new time shift), by the clock, its position if that can't be placed.
-        // Live with no known moment (it failed before its first position): the live point, never position 0.
-        var retry = recovering(wall && (!s.surround || s.live) ? { liveAt: wall, fallbackAt: pos || null } :
-          s.live && !(pos > 0) ? {} : { startAt: pos });
-        if (ownMaster) {
-          retry.noCombo = true;
-          var kept = ownAnswer(feedsCtx, feedsCtx.index);
-          if (kept) retry.reuse = kept;
-        }
-        playFeed(feedsCtx.index, retry);
-      }
+      recover({ phase: 'play', stream: cur, known: info, message: msg, opts: {}, index: feedsCtx.index, multiview: feedsCtx.multiview });
     });
     // During a jump the pending-seek logic owns the spinner (it waits a moment before showing it).
     var stallSince = 0;   // buffering while playing (not while loading or jumping), for the diagnostics log
@@ -4412,7 +4355,7 @@
     Player.on('ended', function () {
       var s = Player.stream();
       if (s) s.capsEnded = true;
-      if (typeof Caps !== 'undefined') Caps.crashEnd();
+      Caps.crashEnd();
       if (screen !== 'player' || upNext) return;   // the "Next" / "Broadcast ended" card is counting down already
       if (!offerNextPart(stopPlayer)) stopPlayer();
     });

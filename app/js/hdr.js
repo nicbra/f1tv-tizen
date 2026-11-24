@@ -1,7 +1,13 @@
 /* Encrypted HLG (replays and live) over native DASH. No decryption or licence handling here. */
 var HdrStream = (function () {
   var LOCAL = 'http://127.0.0.1:18765';
-  function fail(why) { throw new Error('HDR: ' + why); }
+  // An HDR answer or feeds this app can't use ('content'), or a media request that failed ('transient'): js/failure.js.
+  function fail(why, cause) {
+    var e = new Error('HDR: ' + why);
+    e.failure = cause || 'content';
+    e.diag = { code: e.failure === 'transient' ? 'NETWORK_ERROR' : 'UNSUPPORTED', platform: null };
+    throw e;
+  }
   function xml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); }
   function attr(s, name) { var m = new RegExp('(?:^|\\s)' + name + '="([^"]*)"').exec(s); return m ? m[1] : ''; }
   function attrs(s) {
@@ -113,7 +119,7 @@ var HdrStream = (function () {
     var controller = typeof AbortController === 'function' ? new AbortController() : null;
     function get(url, bytes, range) {
       return fetch(url, { signal: controller ? controller.signal : undefined, headers: range ? { Range: 'bytes=0-65535' } : {} }).then(function (r) {
-        if (!r.ok) return fail('media request failed (' + r.status + ')');
+        if (!r.ok) return fail('media request failed (' + r.status + ')', 'transient');
         return bytes ? r.arrayBuffer().then(function (b) { return new Uint8Array(b); }) :
           r.text().then(function (body) { return { body: body, url: r.url || url }; });
       });
@@ -121,7 +127,7 @@ var HdrStream = (function () {
     var over = false;
     function deadline(work) {
       return new Promise(function (resolve, reject) {
-        var timer = setTimeout(function () { over = true; if (controller) controller.abort(); reject(new Error('HDR preparation timed out')); }, ms || 12000);
+        var timer = setTimeout(function () { over = true; if (controller) controller.abort(); var late = new Error('HDR preparation timed out'); late.failure = 'transient'; late.diag = { code: 'NETWORK_ERROR', platform: null }; reject(late); }, ms || 12000);
         work.then(function (value) { clearTimeout(timer); resolve(value); }, function (e) { clearTimeout(timer); over = true; if (controller) controller.abort(); reject(e); });
       });
     }

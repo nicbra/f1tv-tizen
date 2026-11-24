@@ -333,12 +333,12 @@ test('script errors: category, file and line only, once each', async () => {
   t.win.error(err);
   t.win.error(err);
   t.win.error({ message: 'boom', filename: 'file:///opt/x/evil.js', lineno: 0, error: null });
-  t.win.unhandledrejection({ reason: { secret: 'abc' } });
+  t.win.unhandledrejection({ reason: { secret: 'secret-xyz' } });   // not hex: random ids can't contain it
   await t.run(300000);
   const rows = t.sent.flatMap((s) => s.body.events).filter((e) => e.name === 'js.error').map((e) => e.fields);
   assert.deepEqual(rows, [{ error_category: 'type_error', source_file: 'player.js', line: 120 },
     { error_category: 'uncaught_error', source_file: 'other' }, { error_category: 'unhandled_rejection', source_file: 'unknown' }]);
-  assert.doesNotMatch(JSON.stringify(t.sent), /Cannot read|boom|abc|127\.0\.0\.1/);
+  assert.doesNotMatch(JSON.stringify(t.sent), /Cannot read|boom|secret-xyz|127\.0\.0\.1/);
 });
 
 test('start-up, the suspected crash, account and caps: once, and caps only when it changes', async () => {
@@ -424,7 +424,7 @@ test('crash reports wait for an unreachable server (backing off to an hour), acr
   assert.equal(ids.size, 1, 'the same report each time');
   // A restart: the stored crash goes once the server answers, with the same id.
   const t2 = load({ store, answer: ok, now: t.clock.now });
-  await t2.run(3600000 + 60000);
+  await t2.run(73 * 60000);   // the stored retry time: up to an hour +20 % after the last try (randomDelay)
   assert.equal(t2.sent.length, 1);
   assert.equal(t2.sent[0].body.crashes[0].event_id, [...ids][0]);
   assert.equal(store['f1tv.diag.crashes'], undefined);

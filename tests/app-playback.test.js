@@ -26,7 +26,8 @@ function playback(load, capable = true, opts = {}) {
       play: async (id, channel, o) => {
         requests.push({ id, channel, hdr: o.hdr, cenc: o.cenc, tm: o.tm });
         offers.push(o);
-        const hdr = o.hdr && !(opts.authorizedHdr && o.cbcs === false);
+        // As api.js: an HDR answer whose way is closed (o.cbcs / o.clearHdr false) isn't used; the normal one is.
+        const hdr = o.hdr && !(opts.authorizedHdr ? o.cbcs === false : o.clearHdr === false);
         const drm = opts.protected ? { licenseUrl: 'https://lic/wv' } : {};
         if (opts.gate) await opts.gate(id);
         if (o.cenc && !hdr && !opts.declineCenc) return { url: 'https://cdn/cast.mpd', cenc: true, channel, ...drm };
@@ -43,13 +44,17 @@ function playback(load, capable = true, opts = {}) {
       load: (s, p) => start(s, p, false), switchTo: (s, p) => start(s, p, true),
       position: () => opts.position ? opts.position(current) : 120, decodedFrames: () => null, wallClock: () => null, isLive: () => false, isPaused: () => paused, togglePause: () => { paused = !paused; },
       range: () => ({ start: 0, end: 600 }), bufferedEnd: () => 150, errorInfo: (e) => (e && e.info) || { code: 'OTHER', platform: null },
+      isViewerPaused: () => paused, reloadedSince: () => false, reloadedAt: () => 0, switchKind: () => 'swap', audioChannels: () => null,
       tracks: () => ({ audio: [], text: [] })
     }
   });
-  if (opts.caps) {
-    vm.runInContext(readFileSync('app/js/caps.js', 'utf8'), context);
-    for (const path of opts.caps) { context.Caps.failed(path); context.Caps.failed(path); }
-  }
+  // What a failure means and the ways of playing (js/failure.js, js/ways.js): always loaded before app.js, as in index.html.
+  vm.runInContext(readFileSync('app/js/failure.js', 'utf8'), context);
+  vm.runInContext(readFileSync('app/js/ways.js', 'utf8'), context);
+  context.Player.errorInfo = (e) => (e && e.info) || context.Failure.info(e);
+  // Caps, as on the TV (index.html loads it before app.js); opts.caps: ways this TV has ruled out.
+  vm.runInContext(readFileSync('app/js/caps.js', 'utf8'), context);
+  for (const path of opts.caps || []) { context.Caps.failed(path); context.Caps.failed(path); }
   // Expose the playback entry points without booting the browse/login screens.
   const source = readFileSync('app/js/app.js', 'utf8').replace("window.addEventListener('load', boot);", `
     ensureSession = function () { return Promise.resolve(true); };
@@ -79,11 +84,10 @@ test('HDR load and switch failures retry the same feed in SDR with the same star
     if (switching) { h.app.play(0, {}); await settle(); await settle(); }
     h.app.play(1, { switching, startAt: 87 });
     for (let i = 0; i < 5; i++) await settle();
-    assert.equal(ctx.hdrFailed, true);
-    assert.deepEqual(h.requests.slice(-2), [
-      { id: '42', channel: 'car', hdr: true, cenc: false, tm: true }, { id: '42', channel: 'car', hdr: false, cenc: false, tm: false }
-    ]);
-    assert.deepEqual(h.loads.slice(-2).map((l) => [l.position, l.switching]), [[87, switching], [87, switching]]);
+    // The clear 4K HDR way is off for this video (the retry declines it: api.js clearHdr), the feed plays SDR.
+    assert.equal(ctx.off['shaka:hdr'], true);
+    assert.equal(h.offers.at(-1).clearHdr, false);
+    assert.deepEqual(h.loads.slice(-2).map((l) => [!!l.stream.hdr, l.position, l.switching]), [[true, 87, switching], [false, 87, switching]]);
     assert.doesNotMatch(h.nodes.toast?.textContent || '', /Could not play/);
     h.app.set(video({ contentId: 'next' }));
     h.app.play(0, {});
@@ -102,7 +106,7 @@ test('a late HDR rejection does not disable HDR for the next video', async () =>
   h.app.set(next);
   reject(new Error('HDR failed'));
   await settle();
-  assert.equal(next.hdrFailed, undefined);
+  assert.equal(next.off, undefined, 'nothing failed for that video');
   assert.equal(h.requests.length, 1);
 });
 
@@ -117,7 +121,7 @@ test('stopping a video while it loads is not an error and keeps HDR for it', asy
   // Shaka rejects the load that unload() interrupted.
   reject(new Error('Shaka Error 7000'));
   await settle();
-  assert.equal(ctx.hdrFailed, undefined);
+  assert.equal(ctx.off, undefined);
   assert.equal(h.nodes.toast?.textContent, undefined);
   assert.equal(h.requests.length, 1);
   h.app.play(0, {});
@@ -138,8 +142,9 @@ test('an HDR stream that has not started after 25 s is retried in SDR, and the O
   assert.equal(h.timers.some((t) => t.ms === 15000), false);
   h.timers.find((t) => t.ms === 25000).fn();
   await settle();
-  assert.equal(ctx.hdrFailed, true);
-  assert.equal(h.requests.at(-1).hdr, false);
+  assert.equal(ctx.off['shaka:hdr'], true);
+  assert.equal(h.offers.at(-1).clearHdr, false);
+  assert.equal(!!h.loads.at(-1).stream.hdr, false);
   h.app.update();
   assert.equal(h.nodes['osd-feed'].textContent, 'Main');
 });
@@ -165,8 +170,9 @@ test('an HDR stream with keys in its variant playlist is never loaded; the feed 
   h.app.set(ctx);
   h.app.play(0, {});
   for (let i = 0; i < 5; i++) await settle();
-  assert.equal(ctx.hdrFailed, true);
-  assert.deepEqual(h.requests.map((r) => r.hdr), [true, false]);
+  // The clear HDR answer had keys: this video's offer (content), so the clear 4K HDR way is off and the retry declines it.
+  assert.equal(ctx.off['shaka:hdr'], true);
+  assert.equal(h.offers.at(-1).clearHdr, false);
   assert.deepEqual(h.loads.map((l) => !!l.stream.hdr), [false]);
 });
 
@@ -184,7 +190,7 @@ test('a video\'s start watch does nothing once another video is loading', async 
   watch.fn();   // the first video's watch fires while the next one's play request is pending
   release();
   for (let i = 0; i < 3; i++) await settle();
-  assert.equal(next.hdrFailed, undefined);
+  assert.equal(next.off, undefined, 'nothing failed for that video');
   assert.deepEqual(h.requests.map((r) => r.id), ['42', 'next']);
 });
 
@@ -194,10 +200,11 @@ test('authorized CBCS HDR loads, and native preparation that fails twice recover
   const h=playback(async stream=>{if(fail&&stream.hdr)throw new Error('Could not open stream: PLAYER_ERROR_CONNECTION_FAILED');},true,{encryptedHdr:true,authorizedHdr:true});
   const ctx=video();h.app.set(ctx);h.app.play(0,{startAt:600});
   for(let i=0;i<8;i++)await settle();
-  assert.deepEqual(h.requests.map(r=>r.hdr),fail?[true,true,false]:[true]);
+  // CONNECTION_FAILED is unsure (a blip or the way): one more try in HDR, then native HDR is off and SDR plays.
+  assert.deepEqual(h.offers.map(o=>o.cbcs),fail?[true,true,false]:[true]);
   assert.equal(!!h.loads.at(-1).stream.hdr,!fail);
   assert.equal(h.loads.at(-1).position,600);
-  assert.equal(!!ctx.hdrFailed,fail);
+  assert.equal(!!(ctx.off&&ctx.off['avplay:hdr']),fail);
  }
 });
 
@@ -226,30 +233,32 @@ test('one failed native HDR start is retried in HDR at once, and plays HDR', asy
   assert.deepEqual(h.requests.map((r) => r.hdr), [true, true]);
   assert.equal(h.loads.at(-1).stream.hdr, true);
   assert.equal(h.loads.at(-1).position, 600);
-  assert.equal(!!ctx.hdrFailed, false);
+  assert.equal(!!(ctx.off && ctx.off['avplay:hdr']), false);
 });
 
-test('after falling back to SDR, the next feed switch tries HDR again, until HDR has failed three times', async () => {
+test('native 4K HDR that fails twice is off for the rest of the video (feed switches stay SDR); the next video asks again', async () => {
   const h = playback(async (stream) => { if (stream.hdr) throw new Error('Could not open stream: PLAYER_ERROR_CONNECTION_FAILED'); },
     true, { encryptedHdr: true, authorizedHdr: true });
   const ctx = video(); h.app.set(ctx); h.app.play(0, {});
   for (let i = 0; i < 8; i++) await settle();
-  assert.deepEqual(h.requests.map((r) => r.hdr), [true, true, false]);   // retried once, then SDR
+  assert.deepEqual(h.offers.map((o) => o.cbcs), [true, true, false]);   // one more try, then SDR
   h.app.play(1, { switching: true });
   for (let i = 0; i < 8; i++) await settle();
-  assert.deepEqual(h.requests.slice(3).map((r) => r.hdr), [true, false]);   // third failure: SDR, no immediate retry
-  assert.equal(ctx.hdrFailures, 3);
-  h.app.play(0, { switching: true });
-  for (let i = 0; i < 8; i++) await settle();
-  assert.deepEqual(h.requests.slice(5).map((r) => r.hdr), [false]);   // given up for this video
+  assert.deepEqual(h.offers.slice(3).map((o) => o.cbcs), [false]);   // the switch: SDR at once, no failure first
+  assert.ok(h.loads.slice(-1).every((l) => !l.stream.hdr));
+  const asked = h.offers.length;
+  h.app.set(video({ contentId: 'next' })); h.app.play(0, {});
+  for (let i = 0; i < 3; i++) await settle();
+  assert.equal(h.offers[asked].cbcs, true, 'another video tries native 4K HDR again');
 });
 
 test('an HDR offer the app turns down is not retried', async () => {
   const h = playback(null, true, { encryptedHdr: true });
   const ctx = video(); h.app.set(ctx); h.app.play(0, {});
   for (let i = 0; i < 8; i++) await settle();
-  assert.deepEqual(h.requests.map((r) => r.hdr), [true, false]);
-  assert.equal(ctx.hdrFailed, true);
+  assert.deepEqual(h.offers.map((o) => o.clearHdr), [true, false]);
+  assert.equal(ctx.off['shaka:hdr'], true);
+  assert.deepEqual(h.loads.map((l) => !!l.stream.hdr), [false]);
 });
 
 test('live sessions ask for HDR too, and time a live HDR stream on the official live DASH', async () => {
@@ -276,7 +285,7 @@ test('replays ask for the cenc stream when the browser can decrypt it; a failed 
   const ctx = video(); h.app.set(ctx); h.app.play(0, { startAt: 600 });
   for (let i = 0; i < 8; i++) await settle();
   assert.deepEqual(h.requests.map((r) => r.cenc), [true, false]);
-  assert.equal(ctx.cencFailed, true);
+  assert.equal(ctx.off['shaka:cenc'], true);
   assert.equal(h.loads.at(-1).position, 600);
   assert.equal(h.loads.at(-1).stream.cenc, undefined);
 });

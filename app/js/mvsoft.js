@@ -21,10 +21,14 @@ var MvSoftware = (function () {
     try { if (typeof Diag !== 'undefined' && Diag.note) Diag.note(kind, data, 'warn'); } catch (e) { /* no log */ }
   }
 
-  /** An error with its cause for the diagnostics upload (others count as decoding failures). */
+  /**
+   * An error with its code for the diagnostics upload and its cause for the recovery (js/failure.js): the network is
+   * transient; the helper refusing these feeds, or no H.264 to decode, is this video's; others count as decoding failures.
+   */
   function failure(message, code) {
     var e = new Error(message);
     e.diag = { code: code, platform: null };
+    e.failure = code === 'NETWORK_ERROR' ? 'transient' : code === 'HELPER_ERROR' || code === 'UNSUPPORTED' ? 'content' : 'way';
     return e;
   }
 

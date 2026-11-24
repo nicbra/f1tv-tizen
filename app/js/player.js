@@ -15,47 +15,8 @@ var Player = (function () {
 
   function emit(name, arg, extra) { if (listeners[name]) listeners[name](arg, extra); }
 
-  // AVPlay's error types the diagnostics contract keeps as they are (others: AVPLAY_ERROR without a platform code).
-  var AV_ERRORS = { PLAYER_ERROR_CONNECTION_FAILED: 'NETWORK_ERROR', PLAYER_ERROR_NOT_SUPPORTED_FORMAT: 'UNSUPPORTED',
-    PLAYER_ERROR_NOT_SUPPORTED_FILE: 'UNSUPPORTED', PLAYER_ERROR_INVALID_STATE: 'AVPLAY_ERROR', PLAYER_ERROR_INVALID_OPERATION: 'AVPLAY_ERROR',
-    PLAYER_ERROR_INVALID_PARAMETER: 'AVPLAY_ERROR', PLAYER_ERROR_NO_SUCH_FILE: 'AVPLAY_ERROR', PLAYER_ERROR_SEEK_FAILED: 'AVPLAY_ERROR',
-    PLAYER_ERROR_NONE: 'AVPLAY_ERROR' };
-
-  function avError(type) {
-    var t = String(type == null ? '' : type).trim();
-    return AV_ERRORS[t] ? { code: AV_ERRORS[t], platform: t } : { code: 'AVPLAY_ERROR', platform: null };
-  }
-
-  // Shaka's error categories (shaka.util.Error.Category): NETWORK 1, DRM 6; the rest is SHAKA_ERROR.
-  var SHAKA_CODES = { 1: 'NETWORK_ERROR', 6: 'DRM_ERROR' };
-
-  /**
-   * A stable error code and the engine's own identifier for a playback failure, taken from the error itself, never
-   * from display text: { code: 'SHAKA_ERROR' | 'AVPLAY_ERROR' | 'DRM_ERROR' | ..., platform: '6007' | 'PLAYER_ERROR_...' | null }.
-   * Errors this app throws carry their own (`e.diag`); the HDR/helper ones are recognised by their fixed messages.
-   */
-  function errorInfo(e) {
-    if (!e) return { code: 'UNKNOWN', platform: null };
-    if (e.diag && e.diag.code) return e.diag;
-    if (e.code === 'PREPARE_TIMEOUT' || e.code === 'PLAYER_STUCK') return { code: e.code, platform: null };
-    if (typeof e.code === 'number' && typeof e.category === 'number') {
-      // 4032: CONTENT_UNSUPPORTED_BY_BROWSER (no playable variant); 3016 with media error 3: MEDIA_ERR_DECODE.
-      var shaka = e.code === 4032 ? 'UNSUPPORTED' : e.code === 3016 && e.data && e.data[0] === 3 ? 'DECODE_ERROR'
-        : SHAKA_CODES[e.category] || 'SHAKA_ERROR';
-      return { code: shaka, platform: e.code >= 0 && e.code % 1 === 0 ? String(e.code) : null };
-    }
-    if (typeof e === 'string' && /^PLAYER_ERROR_[A-Z_]+$/.test(e.trim())) return avError(e);
-    if (e.name && /^PLAYER_ERROR_[A-Z_]+$/.test(e.name)) return avError(e.name);
-    // An HTTP answer (F1's API): a server failure is a network problem; a refusal (4xx) is something else.
-    if (typeof e.status === 'number') return { code: e.status >= 500 ? 'NETWORK_ERROR' : 'OTHER', platform: null };
-    // This app's own fixed messages (never text from a server).
-    var m = String(e.message || '');
-    if (/^encrypted HDR stream$|^HDR: (?!media request failed)/.test(m)) return { code: 'UNSUPPORTED', platform: null };
-    if (/^HDR: media request failed|^HDR preparation timed out/.test(m)) return { code: 'NETWORK_ERROR', platform: null };
-    if (/^helper did not answer$|^Stream helper service did not start$|^Could not prepare (HDR manifest|multiview)$/.test(m)) return { code: 'HELPER_ERROR', platform: null };
-    if (e instanceof TypeError && /fetch|network/i.test(m)) return { code: 'NETWORK_ERROR', platform: null };
-    return { code: 'OTHER', platform: null };
-  }
+  /** A stable code for a failure (js/failure.js): kept here for the diagnostics and older callers. */
+  function errorInfo(e) { return Failure.info(e); }
 
   // Shaka reports two-letter languages, AVPlay three-letter ones; settings may hold either. Team radio
   // is "tea" in the replays' HLS and "teamradio" on AVPlay.
@@ -1339,28 +1300,26 @@ var Player = (function () {
       if (captions) { captions.stop(); captions = null; }
       // An H.264 multiview (grid.engine 'h264') plays the big feed's own stream here, in the grid rect; its small
       // feeds are the app's (js/mvsoft.js).
-      if (s.grid && s.grid.engine !== 'h264') {
-        var gridPrefs = { audio: audioPref(s), text: lang3(Settings.get('subtitles')) };
-        var gridReady = s.info && s.info.dynamic ? StreamProxy.gridLive(s, s.startDelay, gridPrefs) :
-          StreamProxy.gridManifest(s.grid.streams, s.grid.layout, { audio: gridPrefs.audio, text: gridPrefs.text, surround: !s.noSurround },
-            startTime, s.grid.audioPos || 0);
-        return gridReady.then(function (prepared) {
+      // The helper's manifest for a grid or encrypted 4K HDR: opened unless the stream changed meanwhile, with the 5.1
+      // commentaries in it (the app learns per TV whether they play) and the subtitles the app shows itself.
+      function openPrepared(ready) {
+        return ready.then(function (prepared) {
           if (stream !== s) throw new Error('cancelled');
-          s.grid.id = prepared.id;   // for rearranging it later without reloading
-          s.surround = prepared.surround || 0;   // 5.1 commentaries in it (the app learns per TV whether they play)
-          captions = subtitleReader(prepared.subtitles);
-          return open(s, prepared.url);
-        });
-      }
-      if (s.hdrEncrypted) {
-        var prefs = { audio: audioPref(s), text: lang3(Settings.get('subtitles')), surround: !s.noSurround };
-        var prepare = s.info && s.info.dynamic ? StreamProxy.hdrLive(s, s.startDelay, prefs) : StreamProxy.hdrManifest(s, prefs);
-        return prepare.then(function (prepared) {
-          if (stream !== s) throw new Error('cancelled');
+          if (s.grid) s.grid.id = prepared.id;   // for rearranging it later without reloading
           s.surround = prepared.surround || 0;
           captions = subtitleReader(prepared.subtitles);
           return open(s, prepared.url);
         });
+      }
+      var dynamic = s.info && s.info.dynamic, text = lang3(Settings.get('subtitles'));
+      if (s.grid && s.grid.engine !== 'h264') {
+        return openPrepared(dynamic ? StreamProxy.gridLive(s, s.startDelay, { audio: audioPref(s), text: text }) :
+          StreamProxy.gridManifest(s.grid.streams, s.grid.layout, { audio: audioPref(s), text: text, surround: !s.noSurround },
+            startTime, s.grid.audioPos || 0));
+      }
+      if (s.hdrEncrypted) {
+        var prefs = { audio: audioPref(s), text: text, surround: !s.noSurround };
+        return openPrepared(dynamic ? StreamProxy.hdrLive(s, s.startDelay, prefs) : StreamProxy.hdrManifest(s, prefs));
       }
       // Encrypted live DASH goes through the local service, which fixes the audio segments.
       if (s.licenseUrl && /\.mpd(\?|$)/.test(s.url)) {
@@ -1407,7 +1366,7 @@ var Player = (function () {
           // over a Shaka feed playing fine: "Player error: PLAYER_ERROR_GENEREIC", 2026-11-24).
           onerror: function (e) {
             if (engine !== AvEngine) return diagTrail('avplay.late-error', { error: String(e).slice(0, 60) });
-            emit('error', 'Player error: ' + e, avError(e));
+            emit('error', 'Player error: ' + e, Failure.avError(e));
           },
           // The type only: its data is often binary (Tizen 6) and could carry anything.
           onevent: function (type) { diagTrail('avplay.event', { type: type }); },
@@ -1480,7 +1439,7 @@ var Player = (function () {
             answered();
             if (!finish()) return;
             var failure = new Error(stream !== s ? 'cancelled' : 'Could not open stream: ' + e);
-            failure.diag = avError(e && typeof e === 'object' && e.name ? e.name : e);
+            failure.diag = Failure.avError(e && typeof e === 'object' && e.name ? e.name : e);
             reject(failure);
           });
         }
@@ -1818,19 +1777,10 @@ var Player = (function () {
    */
   function choose(stream) {
     if (Player.forceEngine) return engines[Player.forceEngine];
-    // Multiview: the stream helper's stitched HEVC, native only (clear or encrypted).
-    // F1's player_tm feeds stitched by the helper (clear HEVC, AES-128 commentary): Shaka, like a single player_tm feed.
-    // The helper's clear grid: AVPlay or Shaka, as the app learned on this TV (app.js gridPlayer).
-    if (stream.grid) return stream.grid.engine === 'tm' || stream.grid.player === 'shaka' ? ShakaEngine : AvEngine;
-    // Every feed in one master (js/combo.js): feed switches are variant switches in Shaka.
-    if (stream.combo) return ShakaEngine;
-    if (stream.hdrEncrypted && stream.licenseUrl && hasAvPlay()) return AvEngine;
-    // F1's cenc stream (asked as a Chromecast): the browser decrypts it, so Shaka plays it.
-    if (stream.cenc) return stream.cencAvplay && hasAvPlay() ? AvEngine : ShakaEngine;
-    // AVPlay picks SDR variants from HDR playlists; Shaka can be told to prefer HLG.
-    if (stream.hdr) return ShakaEngine;
-    if (!hasAvPlay()) return ShakaEngine;
-    return stream.licenseUrl || !stream.multiFeed ? AvEngine : ShakaEngine;
+    // The way the app chose (stream.capsPath), else the stream's own (js/ways.js preferred): its engine, Shaka where
+    // there is no AVPlay (a browser).
+    var way = stream.capsPath || Ways.preferred(stream);
+    return Ways.engine(way) === 'avplay' && hasAvPlay() ? AvEngine : ShakaEngine;
   }
 
   var current = null;

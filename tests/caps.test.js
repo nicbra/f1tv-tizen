@@ -21,6 +21,7 @@ function boot(store = {}, options = {}) {
     } }
   });
   if (options.version) context.Launcher = { version: options.version };
+  vm.runInContext(readFileSync('app/js/ways.js', 'utf8'), context);   // the ways Caps knows (groups, dependencies)
   const source = readFileSync('app/js/caps.js', 'utf8');
   vm.runInContext(options.source ? options.source(source) : source, context);
   return { caps: context.Caps, store, timers, events, calls, document, at: (time) => { now = time; } };

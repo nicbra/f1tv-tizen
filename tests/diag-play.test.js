@@ -21,6 +21,7 @@ function load({ enabled = true } = {}) {
       event: (name, fields, level, id) => events.push({ name, fields: JSON.parse(JSON.stringify(fields)), level, id }) },
     Player: { engineName: () => player.engine, errorInfo: (e) => (e && e.diag) || { code: 'OTHER', platform: null } }
   });
+  vm.runInContext(readFileSync('app/js/ways.js', 'utf8'), context, { filename: 'ways.js' });
   vm.runInContext(readFileSync('app/js/diag-play.js', 'utf8'), context, { filename: 'diag-play.js' });
   const P = context.DiagPlay;
   const wait = (ms) => { clock.now += ms; };

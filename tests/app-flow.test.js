@@ -27,6 +27,12 @@ function makeDom() {
       this.attrs = {}; this.html = ''; this.listeners = {};
       this.offsetTop = 0; this.offsetHeight = 0; this.offsetWidth = 0; this.clientHeight = 1000;
       this.scrollHeight = 0; this.scrollTop = 0;
+      // A <video> as far as the real player.js reads it (the options.av tests).
+      if (this.tagName === 'VIDEO') {
+        Object.assign(this, { currentTime: 0, paused: true, muted: false, readyState: 0, buffered: { length: 0, end: () => 0 }, textTracks: [],
+          play() { this.paused = false; return Promise.resolve(); }, pause() { this.paused = true; }, load() {},
+          getVideoPlaybackQuality: () => ({ totalVideoFrames: 0, droppedVideoFrames: 0 }), removeAttribute() {} });
+      }
     }
     get classList() {
       const e = this, list = () => e.className.split(/\s+/).filter(Boolean);
@@ -89,7 +95,7 @@ function makeDom() {
   const document = {
     body,
     getElementById: (id) => {
-      if (!byId[id]) { const e = new El('div'); e.id = id; e.className = INITIAL_CLASS[id] || ''; body.appendChild(e); }
+      if (!byId[id]) { const e = new El(id === 'video' ? 'video' : 'div'); e.id = id; e.className = INITIAL_CLASS[id] || ''; body.appendChild(e); }
       return byId[id];
     },
     createElement: (t) => new El(t),
@@ -239,7 +245,7 @@ async function boot(options = {}) {
     // Each returns a promise; tests replace them to hold or fail requests.
     page: (uri) => Promise.resolve(pages[uri] || []),
     video: (id) => Promise.resolve({ metadata: JSON.parse(JSON.stringify(VIDEOS[id])) }),
-    play: options.play || ((id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' })),
+    play: options.play || Object.assign((id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' }), { plain: true }),
     info: options.info || ((url) => {
       // The stream helper's player_tm multiview plays the race's timeline (101).
       const id = /^http:\/\/127\.0\.0\.1:18765\/stitch\//.test(url) ? '101' : /cdn\/(\d+)\//.exec(url)[1];
@@ -303,12 +309,14 @@ async function boot(options = {}) {
     cencCapable: () => !!options.capsRouting && context.Caps.browser('cenc') !== false,
     // Which multiview pictures the TV decodes (all by default): (width, height, hdr) => boolean.
     hevcDecodes: (w, h, hdr) => (options.hevcDecodes ? options.hevcDecodes(w, h, hdr) : true),
-    kind: 'shaka',   // or 'avplay': which engine the stub plays as
+    kind: 'shaka',   // or 'avplay': which engine the stub plays as, for a stream without a way (capsPath)
+    // As player.js choose(): the engine of the way the app chose (js/ways.js), else player.kind.
+    engineFor: (s) => (s && s.capsPath && context.Ways.engine(s.capsPath)) || (options.capsRouting ? (s.cenc && !s.cencAvplay ? 'shaka' : 'avplay') : player.kind),
     load(s, start) {
       player.current = s;
       // As player.js: encrypted HDR reports the 5.1 commentaries it added (player.surround), unless asked for none.
       if (s.hdrEncrypted) s.surround = s.noSurround ? 0 : (player.surround || 0);
-      player.engine = options.capsRouting ? (s.cenc && !s.cencAvplay ? 'shaka' : 'avplay') : player.kind;
+      player.engine = player.engineFor(s);
       player.pos = start || 0;
       player.paused = false;
       if (player.frames != null) player.frames = 0;
@@ -325,7 +333,8 @@ async function boot(options = {}) {
         player.current = s;
         return Promise.resolve();
       }
-      if (player.kind === 'avplay') return player.load(s, start);
+      // AVPlay reopens: the new stream replaces the old one (a failure leaves nothing playing).
+      if (player.engineFor(s) === 'avplay') return player.load(s, start);
       // Shaka: the old feed (its position and pause) stays current until the new one runs.
       const prev = player.current;
       player.current = s;
@@ -350,8 +359,11 @@ async function boot(options = {}) {
     // player.reloadedMs: when the engine loaded a frozen start again (player.js reloadIfFrozen).
     reloadedSince: (t) => (player.reloadedMs || 0) >= t,
     reloadedAt: () => player.reloadedMs || 0,
-    // As player.js for the errors tests make: an error's own `info` ({ code, platform }), else OTHER.
-    errorInfo: (e) => (e && (e.diag || e.info)) || { code: 'OTHER', platform: null },   // as player.js: an error's own diag first
+    // How a feed switch plays (player.js switchKind): 'reopen' (the playing one stops first: the Dolby rule) when the
+    // test says so (player.reopen(stream)), else 'swap' (beside the playing one).
+    switchKind: (s) => (player.reopen && player.reopen(s) ? 'reopen' : 'swap'),
+    // As player.js (js/failure.js), and an error's own `info` ({ code, platform }) for the errors tests make.
+    errorInfo: (e) => (e && e.info) || context.Failure.info(e),
     isLive: () => !!player.engine && !!player.live,
     isPaused: () => !!player.engine && player.paused,
     // player.viewerPaused: the viewer's own pause where it differs from the element's (Shaka, while reloading).
@@ -429,6 +441,9 @@ async function boot(options = {}) {
     // The H.264 multiview's small feeds (js/mvsoft.js): what the app asks of them.
     MvSoftware: mvSoft
   });
+  // What a failure means (js/failure.js): the app and the real player read it, the stub's errorInfo too.
+  vm.runInContext(readFileSync('app/js/failure.js', 'utf8'), context, { filename: 'failure.js' });
+  vm.runInContext(readFileSync('app/js/ways.js', 'utf8'), context, { filename: 'ways.js' });
   vm.runInContext(readFileSync('app/js/caps.js', 'utf8'), context, { filename: 'caps.js' });
   // options.realDiag: the real diagnostics log, recording as on personal TV builds, loaded before the other
   // scripts as in index.html (they register their state with it as they load).
@@ -446,10 +461,20 @@ async function boot(options = {}) {
   }
   if (options.av) {
     class SimpleTextDisplayer { append() {} }
+    // Shaka as far as player.js asks while loading: options.shakaLoad(url, start) decides (none: it can't load).
     class ShakaPlayer {
+      constructor() { (context.shakaLoads = context.shakaLoads || []); }
       attach() { return Promise.resolve(); } resetConfiguration() {} configure() {}
-      load() { return Promise.reject(new Error('no Shaka in this test')); }
+      load(url, start) {
+        context.shakaLoads.push(url);
+        return options.shakaLoad ? options.shakaLoad(url, start) : Promise.reject(new Error('no Shaka in this test'));
+      }
       getNetworkingEngine() { return { registerRequestFilter() {}, registerResponseFilter() {} }; }
+      getBufferedInfo() { return { video: [{ start: 0, end: 10 }] }; }
+      getAudioLanguages() { return []; } getTextLanguages() { return []; } getTextTracks() { return []; } getVariantTracks() { return []; }
+      getManifest() { return { variants: [] }; } getStats() { return { estimatedBandwidth: NaN }; }
+      seekRange() { return { start: 0, end: 7200 }; } isLive() { return false; } getPlaybackRate() { return 1; } trickPlay() {} cancelTrickPlay() {}
+      selectAudioLanguage() {} selectTextLanguage() {} setTextTrackVisibility() {} selectVariantTrack() {} selectTextTrack() {}
       addEventListener() {} unload() { return Promise.resolve(); }
     }
     Object.assign(context, { webapis: { avplay: options.av }, atob, btoa, Uint8Array, MediaSource: { isTypeSupported: () => false },
@@ -899,8 +924,16 @@ test('a failed feed switch leaves the previous feed current', async () => {
   app.player.pos = 3000;
   app.player.hold = deferred();
   await app.press('CH_DOWN');
-  app.player.hold.reject(new Error('Shaka Error 1001'));
+  // Unprotected video: the other engine first (shaka:clear, then avplay:clear), then the viewer is told.
+  let h = app.player.hold;
+  app.player.hold = deferred();
+  h.reject(new Error('Shaka Error 1001'));
+  await app.advance(500);
+  assert.doesNotMatch(app.toast() || '', /trying again/, 'retried quietly: the old feed plays on');
+  assert.equal(app.player.current.capsPath, 'avplay:clear');
+  h = app.player.hold;
   app.player.hold = null;
+  h.reject(new Error('Shaka Error 1001'));
   await app.advance(500);
   assert.match(app.toast(), /Could not play/);
   assert.equal(app.player.current.url, 'https://cdn/101/main.m3u8');
@@ -1067,8 +1100,10 @@ test('a frozen first HDR start that plays after the player\'s own reload stays H
   for (const helps of [true, false]) {
     const plays = [];
     const app = await boot({ hdrCapable: true, play: (id, channel, opts) => {
-      plays.push(!!(opts && opts.hdr));
-      return Promise.resolve(opts && opts.hdr ? { url: 'https://cdn/' + id + '/hdr.m3u8', hdr: true } :
+      // As api.js: the clear HDR answer only while that way is open (opts.clearHdr).
+      const hdr = !!(opts && opts.hdr && opts.clearHdr !== false);
+      plays.push(hdr);
+      return Promise.resolve(hdr ? { url: 'https://cdn/' + id + '/hdr.m3u8', hdr: true } :
         { url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' });
     } });
     app.player.frames = 0;
@@ -2162,9 +2197,8 @@ test('a clear multiview the helper can\'t build (feeds that differ) is no engine
   assert.ok(!paths['shaka:grid'], 'Shaka never tried');
 });
 
-test('a clear multiview whose AVPlay preparation hangs goes to Shaka at once', async () => {
+test('a clear multiview whose feeds can\'t be read (a CDN 503): the same multiview once more, nothing held against it', async () => {
   const app = await premiumHdr({ play: clearHdrOffer });
-  app.player.kind = 'avplay';
   await play(app, 'Race');
   app.player.progress = true;
   await app.advance(1000);
@@ -2172,9 +2206,49 @@ test('a clear multiview whose AVPlay preparation hangs goes to Shaka at once', a
   await showLayout(app, /^Big \+ 2$/);
   const h = app.player.hold;
   app.player.hold = null;
-  h.reject(Object.assign(new Error('The video player did not start'), { code: 'PREPARE_TIMEOUT' }));
+  h.reject(Object.assign(new Error('HDR: media request failed (503)'), { info: { code: 'NETWORK_ERROR', platform: null } }));
   await app.advance(6000);
-  assert.equal(app.player.current.grid.player, 'shaka');
+  assert.ok(app.player.current.grid, 'still the multiview');
+  assert.equal(app.player.current.grid.player, 'avplay', 'the same way once more');
+  await app.advance(3000);
+  const paths = gridPaths(app);
+  assert.equal(paths['avplay:grid'].failed, 0, 'a transient failure is never held against the way');
+  assert.ok(paths['avplay:grid'].ok >= 1);
+});
+
+test('a multiview whose feeds\' offers fail with a server error (503): asked once more, then it plays; nothing held against a way', async () => {
+  let fails = 1;
+  const app = await premiumHdr({ play: (id, channel, opts) => (channel && fails-- > 0 ?
+    Promise.reject(Object.assign(new Error('F1 answered 503'), { status: 503 })) : clearHdrOffer(id, channel, opts)) });
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  await showLayout(app, /^Big \+ 2$/);
+  await app.advance(6000);
+  assert.ok(app.player.current.grid, 'the multiview plays after one more try');
+  const paths = gridPaths(app);
+  assert.ok(!paths['avplay:grid'] || !paths['avplay:grid'].failed, JSON.stringify(paths['avplay:grid']));
+});
+
+test('a clear multiview that AVPlay\'s preparation hangs on: AVPlay once more (as one feed), a second hang goes to Shaka', async () => {
+  const app = await premiumHdr({ play: clearHdrOffer });
+  app.player.kind = 'avplay';
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.hold = deferred();
+  await showLayout(app, /^Big \+ 2$/);
+  const hang = () => Object.assign(new Error('The video player did not start'), { code: 'PREPARE_TIMEOUT' });
+  let h = app.player.hold;
+  app.player.hold = deferred();
+  h.reject(hang());
+  await app.advance(6000);
+  assert.equal(app.player.current.grid.player, 'avplay', 'opened over the hung preparation once');
+  h = app.player.hold;
+  app.player.hold = null;
+  h.reject(hang());
+  await app.advance(6000);
+  assert.equal(app.player.current.grid.player, 'shaka', 'AVPlay stuck: Shaka plays the multiview');
   assert.equal(app.player.current.grid.layout, 'side2');
 });
 
@@ -2504,6 +2578,24 @@ test('Pro and SDR: the feeds visited go into one SDR master from their web answe
   assert.deepEqual(Array.from(app.combos.at(-1).list, (x) => x.index), [0, 1, 2]);
   assert.ok(app.player.current.combo.k === 2 && !app.player.current.comboSwitch);
   assert.equal(app.player.current.onboardSound, true, 'the onboard plays its team radio');
+});
+
+test('a feed AVPlay took over from Shaka: the next switch builds no SDR combined master (it would be Shaka again)', async () => {
+  const asked = [];
+  const app = await boot({ multiview: true, hdrCapable: true, play: webCmaf(asked), combo: comboOf });
+  app.player.hold = deferred();
+  await play(app, 'Race');
+  const h = app.player.hold; app.player.hold = null;
+  h.reject(Object.assign(new Error('Shaka Error 4032'), { info: { code: 'UNSUPPORTED', platform: '4032' } }));
+  await app.advance(1000);
+  assert.equal(app.player.current.capsPath, 'avplay:clear', 'AVPlay took over');
+  app.player.progress = true;
+  await app.advance(1000);
+  await app.press('CH_DOWN');
+  await app.advance(3000);
+  assert.equal(app.combos.length, 0, 'no combined master: Shaka is off for this video');
+  assert.equal(app.player.current.capsPath, 'avplay:clear');
+  assert.equal(app.player.current.feed, 'F1 LIVE');
 });
 
 test('a combined master that doesn\'t load: the feed\'s own master at once, and the usual switches for the video', async () => {
@@ -3271,6 +3363,21 @@ const shakaLive = async () => {
   return app;
 };
 
+test('a switch the player plays as a reopen (the Dolby rule, player.js switchKind) learns its own lead; swaps keep theirs', async () => {
+  const app = await shakaLive();
+  app.player.reopen = () => true;        // the playing slot has 5.1, say: the new feed loads after it stopped
+  app.player.pos = 4500;
+  await app.press('CH_DOWN');
+  await app.advance(500);
+  app.player.pos = 4500 + 6.5 - 2.5;     // 6 s later the new feed shows 2.5 s behind where the old one would be
+  await app.advance(6000);
+  const reopen = await nextLead(app);
+  assert.ok(reopen > 4 && reopen < 5.5, 'reopen lead ' + reopen);
+  app.player.reopen = null;
+  const swap = await nextLead(app);
+  assert.ok(swap > 2.9 && swap < 3.6, 'swap lead ' + swap);
+});
+
 test('a switch the lead did not place teaches it nothing (the target lay past the live edge)', async () => {
   const app = await shakaLive();
   app.player.pos = 4598;                 // the lead puts the target past the window end: the stream's own edge
@@ -3386,6 +3493,10 @@ test('"tomorrow" is the next calendar day, also across the spring clock change',
 async function playLive(app, kind) {
   app.player.kind = kind || 'shaka';
   app.player.live = true;
+  // Live on AVPlay, as F1 sends live: protected DASH (the app plays it natively, 'avplay:cbcs'), unless the test answers.
+  if (kind === 'avplay' && app.net.play.plain) {
+    app.net.play = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.mpd', streamType: 'DASH_WV', licenseUrl: 'https://lic' });
+  }
   await app.pick(/^LIVEPractice 1/);
   await app.advance(100);
   await app.pick(/^INTERNATIONAL/);
@@ -3427,7 +3538,10 @@ test('a jump on a live stream played by AVPlay reopens the stream at that moment
   await app.press('LEFT', 'LEFT', 'ENTER');   // 20 s back
   await app.advance(300);
   assert.equal(app.player.loads.length, 2);
-  assert.equal(Math.round(app.player.loads.at(-1).start), 4480);
+  // Live is protected DASH on AVPlay: the helper shifts the live manifest so its live point lies at 4480 (the edge,
+  // 4600, is 25 s behind the clock): ~95 s, plus the seconds the test ran.
+  const shift = app.player.current.startDelay;
+  assert.ok(shift > 95 && shift < 110, 'shift ' + shift);
 });
 
 test('a live session that has not started yet says when it starts, and stays on the feed list', async () => {
@@ -4052,6 +4166,139 @@ function fakeAvPlay({ liveWindow = '', duration = 0, tracks = [], current = [] }
 }
 
 // Live Practice 1 on the real player.js + AvEngine (fake AVPlay), encrypted DASH through the helper service.
+// ---------- the real player.js: unprotected video plays on the engine that works (ways avplay:clear, shaka:clear) ----------
+
+test('with the real player: an unprotected replay Shaka refuses plays on AVPlay, and Shaka\'s failure is learned', async () => {
+  const av = fakeAvPlay();
+  const refused = () => Promise.reject(Object.assign(new Error('Shaka Error 4032'), { code: 4032, category: 4, data: [] }));
+  const app = await boot({ av, shakaLoad: refused });
+  app.net.play = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' });
+  await play(app, 'Race');
+  await app.advance(3000);
+  assert.ok(app.context.shakaLoads.length >= 1, 'several feeds: Shaka first');
+  assert.equal(app.context.Player.stream().capsPath, 'avplay:clear');
+  assert.equal(app.context.Player.engineName(), 'avplay');
+  assert.ok(opens(av).some((u) => /main\.m3u8/.test(u)), 'AVPlay opened the same feed');
+  assert.equal(app.context.Caps.report().paths['shaka:clear'].failed, 1);
+});
+
+test('with the real player: an unprotected replay AVPlay refuses (issue #6) plays on Shaka', async () => {
+  const av = fakeAvPlay();
+  av.prepareAsync = (ok, fail) => { av.calls.push(['prepareAsync']); setImmediate(() => fail('PLAYER_ERROR_NOT_SUPPORTED_FORMAT')); };
+  const app = await boot({ av, shakaLoad: () => Promise.resolve() });
+  app.context.Caps.failed('shaka:clear');
+  app.context.Caps.failed('shaka:clear');   // ruled out on this TV: AVPlay first
+  app.net.play = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' });
+  await play(app, 'Race');
+  await app.advance(3000);
+  assert.ok(av.calls.some((c) => c[0] === 'prepareAsync'), 'AVPlay first');
+  assert.equal(app.context.Player.stream().capsPath, 'shaka:clear', 'the last way of unprotected video (Caps keeps one)');
+  assert.equal(app.context.Player.engineName(), 'shaka');
+  assert.equal(app.context.Caps.report().paths['avplay:clear'].failed, 1);
+});
+
+// ---------- one recovery for every stream (app.js recover): kind x when it fails x why ----------
+
+// F1 as api.js answers: player_tm when asked (opts.tm), encrypted 4K HDR where native cbcs is open (opts.cbcs), clear 4K
+// HDR where that way is open (opts.clearHdr), else SDR: Chromecast cenc when asked, else the web offer.
+const f1Like = (kind) => (id, channel, opts = {}) => {
+  const at = 'https://cdn/' + id + '/' + (channel || 'main');
+  if (kind === 'tm' && opts.tm) return Promise.resolve({ url: at + '/tm.m3u8', streamType: 'HDR_UHD_HLSCK', hdr: true, hlsAes: true });
+  if ((kind === 'tm' || kind === 'native') && opts.hdr && opts.cbcs !== false) {
+    return Promise.resolve({ url: at + '/hdr.m3u8', hdr: true, hdrEncrypted: true, licenseUrl: 'https://lic', widevineManifestUrl: at + '.mpd' });
+  }
+  if (kind === 'clearHdr' && opts.hdr && opts.clearHdr !== false) return Promise.resolve({ url: at + '/hdr.m3u8', hdr: true, streamType: 'HDR_UHD_CMAF' });
+  if (kind === 'cenc') return Promise.resolve({ url: at + (opts.cenc ? '.cenc' : '.cbcs') + '.mpd', streamType: 'DASH_WV', licenseUrl: 'https://lic', cenc: !!opts.cenc });
+  return Promise.resolve({ url: at + '.m3u8', streamType: 'HLS' });
+};
+// Each kind: how it is booted, the way it plays, and the way after a failure held against that one.
+const KINDS = {
+  unprotected: { boot: {}, way: 'shaka:clear', next: 'avplay:clear' },
+  cenc: { boot: { capsRouting: true, settings: { hdr: false } }, way: 'shaka:cenc', next: 'avplay:cbcs' },
+  native: { boot: { hdrCapable: true }, way: 'avplay:hdr', next: 'shaka:clear' },
+  clearHdr: { boot: { hdrCapable: true }, way: 'shaka:hdr', next: 'shaka:clear' },
+  tm: { boot: { hdrCapable: true }, way: 'shaka:hlsaes', next: 'avplay:hdr' }
+};
+// Why it fails: what the load rejects with, or what the player reports while playing.
+const CAUSES = {
+  way: { error: () => Object.assign(new Error('Playback error: PLAYER_ERROR_NOT_SUPPORTED_FORMAT'), { info: { code: 'UNSUPPORTED', platform: 'PLAYER_ERROR_NOT_SUPPORTED_FORMAT' } }),
+    event: ['Playback error 3016', { code: 'DECODE_ERROR', platform: '3016' }] },
+  transient: { error: () => Object.assign(new Error('Shaka Error 1002'), { info: { code: 'NETWORK_ERROR', platform: '1002' } }),
+    event: ['Playback error 1002', { code: 'NETWORK_ERROR', platform: '1002' }] },
+  content: { error: () => Object.assign(new Error('HDR: unsupported media encryption'), { failure: 'content', diag: { code: 'UNSUPPORTED', platform: null } }) }
+};
+
+for (const kind of Object.keys(KINDS)) {
+  for (const phase of ['load', 'start', 'play']) {
+    for (const cause of ['way', 'transient', 'content']) {
+      if (cause === 'content' && phase !== 'load') continue;   // an offer or feeds the app can't use fail at the load
+      test('recovery: ' + kind + ', failing at ' + phase + ' (' + cause + ')', async () => {
+        const k = KINDS[kind];
+        const app = await boot(Object.assign({ play: f1Like(kind) }, k.boot));
+        if (kind === 'cenc') app.context.Caps.browser = () => true;   // the browser's cenc works here
+        if (phase === 'load') app.player.hold = deferred();
+        await play(app, 'Race');
+        await app.advance(100);
+        const failed = app.player.current;
+        assert.equal(failed.capsPath, k.way, 'plays ' + k.way);
+        if (phase === 'load') {
+          const h = app.player.hold; app.player.hold = null; h.reject(CAUSES[cause].error());
+          await app.advance(1000);
+        } else if (phase === 'start') {
+          // No picture: data without frames is the way's; nothing buffered on Shaka is the network's.
+          app.player.buffered = cause === 'transient' ? 0 : 10;
+          if (cause === 'transient' && app.player.engine !== 'shaka') return;   // AVPlay doesn't tell the network apart
+          await app.advance(failed.hdr ? 25500 : 15500);   // the start watch: 25 s for 4K HDR, else 15 s
+          app.player.buffered = null;
+        } else {
+          app.player.progress = true;
+          await app.advance(3000);
+          app.player.listeners.error(...CAUSES[cause].event);
+          await app.advance(1000);
+        }
+        const next = app.player.current, paths = app.context.Caps.report().paths, p = paths[k.way] || {};
+        assert.notEqual(next, failed, 'something plays next');
+        assert.equal(next.capsPath, cause === 'transient' ? k.way : k.next, 'then ' + next.capsPath);
+        assert.equal(p.failed || 0, cause === 'way' ? 1 : 0, 'held against ' + k.way + ' on this TV: ' + JSON.stringify(p));
+        assert.equal(p.unclear || 0, cause === 'transient' ? 1 : 0, 'unclear: ' + JSON.stringify(p));
+        // Told only where the viewer saw something go wrong; a failed load is retried quietly.
+        if (phase === 'load') assert.doesNotMatch(app.toast() || '', /trying again/);
+        else assert.match(app.toast() || '', phase === 'play' ? /stopped, trying again/ : /didn't start, trying again/);
+      });
+    }
+  }
+}
+
+test('a video that never starts on any way says so (it used to leave a black screen with no message)', async () => {
+  const app = await boot({ play: f1Like('unprotected') });
+  await play(app, 'Race');
+  app.player.progress = false;
+  await app.advance(15500);
+  assert.match(app.toast(), /didn't start, trying again/);
+  assert.equal(app.player.current.capsPath, 'avplay:clear');
+  await app.advance(15500);
+  assert.match(app.toast(), /^The video didn't start\.$/);
+  assert.equal(app.player.loads.length, 2, 'no more tries: both ways failed for this video');
+  await app.advance(60000);
+  assert.equal(app.player.loads.length, 2);
+});
+
+test('retries end: however F1 answers, a chain of failures stops after a few tries with a message', async () => {
+  // An answer that always comes back as the same unprotected stream whatever is asked, failing every time.
+  const app = await boot({ play: (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' }) });
+  app.player.hold = deferred();
+  await play(app, 'Race');
+  let n = 0;
+  while (app.player.hold && n++ < 20) {
+    const h = app.player.hold; app.player.hold = deferred();
+    h.reject(Object.assign(new Error('Shaka Error 1002'), { info: { code: 'NETWORK_ERROR', platform: '1002' } }));
+    await app.advance(1000);
+    if (/^Could not play/.test(app.toast() || '')) break;
+  }
+  assert.ok(n < 10, 'stopped after ' + n + ' tries');
+  assert.match(app.toast(), /^Could not play/);
+});
+
 async function liveReal(opts = {}) {
   const av = fakeAvPlay(opts.av);
   const app = await boot({ av, settings: opts.settings });
@@ -4301,29 +4548,67 @@ test('native cbcs error learns a failure, clears the marker and falls back to ce
   assert.equal(app.player.current.cencAvplay, true);
 });
 
-test('network and licence-server failures fall back for the video but are not held against the path', async () => {
+test('network and licence-server failures get the same way once more, then fall back; never held against the way', async () => {
   const offers = [];
   const app = await boot({ capsRouting: true, settings: { hdr: false }, play: protectedOffers(offers) });
   await playLive(app);
   assert.equal(app.player.engine, 'shaka');
+  const paths = () => app.context.Caps.report().paths;
+  const fail = async (msg, info) => { app.player.listeners.error(msg, info); await app.advance(1000); };
+  await fail('Playback error 1002', { code: 'NETWORK_ERROR', platform: '1002' });
+  assert.equal(app.player.current.capsPath, 'shaka:cenc', 'one more try of the same way');
+  assert.match(app.toast(), /trying again/);
+  await fail('Playback error 1002', { code: 'NETWORK_ERROR', platform: '1002' });
+  assert.equal(app.player.current.capsPath, 'avplay:cbcs', 'then the next way');
+  assert.equal(paths()['shaka:cenc'].failed, 0);
+  assert.equal(paths()['shaka:cenc'].unclear, 2);
+  // AVPlay's licence request (player.js 'License: ...') failing is the licence server's, not the way's.
+  app.player.progress = true; await app.advance(2000);
+  app.player.progress = false;
+  await fail('License: Failed to fetch', { code: 'DRM_ERROR', platform: null });
+  await fail('License: Failed to fetch', { code: 'DRM_ERROR', platform: null });
+  assert.equal(paths()['avplay:cbcs'].failed, 0);
+  assert.equal(paths()['avplay:cbcs'].unclear, 2);
+  assert.equal(app.context.Caps.report().playing, undefined);
+  // AVPlay's CONNECTION_FAILED is a blip or segments it can't read: one more try, and that one failing counts.
+  assert.equal(app.player.current.capsPath, 'avplay:cenc');
+  const lost = ['Player error: PLAYER_ERROR_CONNECTION_FAILED', { code: 'NETWORK_ERROR', platform: 'PLAYER_ERROR_CONNECTION_FAILED' }];
+  await fail(...lost);
+  assert.equal(app.player.current.capsPath, 'avplay:cenc');
+  assert.equal(paths()['avplay:cenc'].failed, 0);
+  await fail(...lost);
+  assert.equal(paths()['avplay:cenc'].failed, 1);
+});
+
+test('an unprotected stream that fails leaves the protected routes alone (Shaka cenc is asked for again)', async () => {
+  const offers = [];
+  // The first answer is unprotected (a highlights-like clear stream), the next ones protected.
+  let n = 0;
+  const app = await boot({ capsRouting: true, settings: { hdr: false }, play: (id, channel, opts) => (n++ === 0 ?
+    Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' }) : protectedOffers(offers)(id, channel, opts)) });
+  app.context.Caps.browser = () => true;
+  app.player.hold = deferred();
+  await play(app, 'Race');
+  assert.equal(app.player.current.capsPath, 'shaka:clear');
+  const h = app.player.hold; app.player.hold = null;
+  h.reject(Object.assign(new Error('Shaka Error 4032'), { info: { code: 'UNSUPPORTED', platform: '4032' } }));
+  await app.advance(1000);
+  assert.equal(app.player.current.capsPath, 'shaka:cenc', 'the cenc route was not turned off by the clear failure');
+  assert.equal(offers.at(-1).cenc, true);
+});
+
+test('paused just behind LIVE, an error retries at the paused moment, not at LIVE (the edge moves on meanwhile)', async () => {
+  const app = await boot();
+  await playLive(app);                   // Shaka: it starts at the moment asked for
+  app.player.progress = true;
+  await app.advance(2000);
+  app.player.progress = false;
+  app.player.pos = 4596;                 // paused 4 s from the edge (4600)
+  app.player.paused = true;
   app.player.listeners.error('Playback error 1002', { code: 'NETWORK_ERROR', platform: '1002' });
   await app.advance(1000);
-  assert.equal(app.player.current.capsPath, 'avplay:cbcs');
-  const paths = () => app.context.Caps.report().paths;
-  assert.equal(paths()['shaka:cenc'].failed, 0);
-  assert.equal(paths()['shaka:cenc'].unclear, 1);
-  // AVPlay's licence request (player.js 'License: ...') failing is the licence server's, not the path's.
-  app.player.progress = true; await app.advance(2000);
-  app.player.listeners.error('License: Failed to fetch', { code: 'DRM_ERROR', platform: null });
-  await app.advance(1000);
-  assert.equal(paths()['avplay:cbcs'].failed, 0);
-  assert.equal(paths()['avplay:cbcs'].unclear, 1);
-  assert.equal(app.context.Caps.report().playing, undefined);
-  // AVPlay's CONNECTION_FAILED also means segments it can't read: it counts.
-  assert.equal(app.player.current.capsPath, 'avplay:cenc');
-  app.player.listeners.error('Player error: PLAYER_ERROR_CONNECTION_FAILED', { code: 'NETWORK_ERROR', platform: 'PLAYER_ERROR_CONNECTION_FAILED' });
-  await app.advance(1000);
-  assert.equal(paths()['avplay:cenc'].failed, 1);
+  const start = app.player.loads.at(-1).start;
+  assert.ok(start != null && Math.abs(start - 4596) < 1, 'the paused moment, not the live point: ' + start);
 });
 
 test('AVPlay licence errors: a download failure is unclear, a refusal (4xx) or a licence the TV will not install counts', async () => {

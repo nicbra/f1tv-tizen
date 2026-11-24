@@ -456,8 +456,9 @@ var F1Api = (function () {
     var request = opts && opts.hdr
       ? playHdr(contentId, channelId, offers, !!opts.tm, opts.langs, opts.mainChannel).then(function (hdr) {
         // Apple TV is the only 4K HDR offer: clear HLS on some replays, cbcs on others and live.
-        // There is no cenc HDR. Keep clear HDR when the TV has learned to avoid native cbcs.
-        if (!hdr || (hdr.hdrEncrypted && opts.cbcs === false)) return next();
+        // There is no cenc HDR. Keep clear HDR when the TV has learned to avoid native cbcs, and the other way round
+        // (opts.cbcs / opts.clearHdr false: that way of 4K HDR failed for this video or on this TV).
+        if (!hdr || (hdr.hdrEncrypted && opts.cbcs === false) || (!hdr.hdrEncrypted && !hdr.hlsAes && opts.clearHdr === false)) return next();
         if (!hdr.hdrEncrypted) return hdr;
         // Multiview's other feeds: the HDR stream alone, one PLAY session each. The first feed's Widevine
         // offer has the licence and the clock; F1 limits how many streams an account plays at once.

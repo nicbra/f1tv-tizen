@@ -5,6 +5,8 @@ const vm = require('node:vm');
 
 function player() {
   const context = vm.createContext({ localStorage: { getItem: () => null, setItem() {} }, Date, Math, JSON });
+  vm.runInContext(readFileSync('app/js/failure.js', 'utf8'), context);
+  vm.runInContext(readFileSync('app/js/ways.js', 'utf8'), context);
   vm.runInContext(readFileSync('app/js/player.js', 'utf8'), context);
   return context.Player;
 }

@@ -6,9 +6,18 @@ var StreamProxy = (function () {
   // A helper that accepts the connection but never answers (a wedged delegate) must not hang the player or the app's
   // start. Chromium 47 has no AbortController: each step races a timer, and a late answer is ignored.
   var PING_MS = 8000, LAUNCH_MS = 10000, ENSURE_MS = 20000;
+  // The helper's own failures, with their cause for the recovery (js/failure.js): busy or not started is transient; a
+  // manifest it refused is this video's.
+  function helperError(message, cause) {
+    var e = new Error(message);
+    e.failure = cause;
+    e.diag = { code: 'HELPER_ERROR', platform: null };
+    return e;
+  }
+
   function within(promise, ms, late) {
     return new Promise(function (resolve, reject) {
-      var timer = setTimeout(function () { if (late) late(resolve, reject); else reject(new Error('helper did not answer')); }, ms);
+      var timer = setTimeout(function () { if (late) late(resolve, reject); else reject(helperError('helper did not answer', 'transient')); }, ms);
       promise.then(function (v) { clearTimeout(timer); resolve(v); }, function (e) { clearTimeout(timer); reject(e); });
     });
   }
@@ -51,7 +60,7 @@ var StreamProxy = (function () {
       return within(launch(), LAUNCH_MS, function (resolve) { resolve(); }).then(function () {
         return new Promise(function (resolve, reject) {
           (function wait() {
-            if (left() <= 0) return reject(new Error('Stream helper service did not start'));
+            if (left() <= 0) return reject(helperError('Stream helper service did not start', 'transient'));
             ping(Math.max(1000, Math.min(PING_MS, left()))).then(function (ok) {
               if (ok) return resolve(true);
               setTimeout(wait, 250);
@@ -78,7 +87,7 @@ var StreamProxy = (function () {
     return ensure().then(function () { return HdrStream.build(stream, langs); }).then(function (built) {
       var target = BASE + '/vod/' + Date.now().toString(36) + '-' + (++vodSequence) + '.mpd';
       return fetch(target, { method: 'POST', body: built.mpd }).then(function (r) {
-        if (!r.ok) throw new Error('Could not prepare HDR manifest');
+        if (!r.ok) throw helperError('Could not prepare HDR manifest', 'content');
         return { url: target, subtitles: built.subtitles, surround: built.surround || 0 };
       });
     });
@@ -93,7 +102,7 @@ var StreamProxy = (function () {
     return ensure().then(function () { return HdrStream.live(stream, { surround: !langs || langs.surround !== false }); }).then(function (built) {
       var id = Date.now().toString(36) + '-' + (++vodSequence);
       return fetch(BASE + '/hdr/' + id, { method: 'POST', body: built.adaptation }).then(function (r) {
-        if (!r.ok) throw new Error('Could not prepare HDR manifest');
+        if (!r.ok) throw helperError('Could not prepare HDR manifest', 'content');
         var url = manifest(stream.widevineManifestUrl, shift, { audio: langs && langs.audio }) + '&hdr=' + id + '&notext=1';
         // A first pass through the helper, as AVPlay will make it: it checks the HLG swap, and warms the
         // helper's connection to the CDN (AVPlay gives up after ~5 s; 2026-10-31 Qualifying, right after
@@ -122,7 +131,7 @@ var StreamProxy = (function () {
     return ensure().then(function () { return HdrStream.grid(streams, layout, { id: id, langs: langs, at: at, audio: audio || 0 }); }).then(function (built) {
       var target = BASE + '/vod/' + id + '.mpd';
       return fetch(target, { method: 'POST', body: built.mpd }).then(function (r) {
-        if (!r.ok) throw new Error('Could not prepare multiview');
+        if (!r.ok) throw helperError('Could not prepare multiview', 'content');
         return { url: target, subtitles: built.subtitles, id: id, surround: built.surround || 0 };
       });
     });
@@ -137,7 +146,7 @@ var StreamProxy = (function () {
     var lead = stream.grid.audioPos || 0;
     return ensure().then(function () { return HdrStream.liveGrid(stream.grid.streams, stream.grid.layout, { id: id, langs: langs, audio: lead }); }).then(function (built) {
       return fetch(BASE + '/hdr/' + id, { method: 'POST', body: built.adaptation }).then(function (r) {
-        if (!r.ok) throw new Error('Could not prepare multiview');
+        if (!r.ok) throw helperError('Could not prepare multiview', 'content');
         // The sound feed's official live manifest: the grid follows its clock and numbering (all feeds share them).
         var url = manifest(stream.grid.streams[lead].widevineManifestUrl, shift, { audio: langs && langs.audio }) + '&hdr=' + id + '&notext=1';
         return fetch(url, { cache: 'no-store' }).then(function (check) {

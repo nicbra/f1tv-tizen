@@ -1,7 +1,6 @@
 /* Per-firmware playback evidence. No model/version guesses: the same engine differs between TVs. */
 var Caps = (function () {
   var KEY = 'f1tv.caps', firmware = 'unknown', timer = null;
-  var SDR = ['shaka:cenc', 'avplay:cbcs', 'avplay:cenc'];
   var DAY = 86400000;
   // A path ruled out comes back for one try after a while (a bad evening, F1's servers or a since fixed bug should not
   // turn something off for good): 3 days after failures, 14 after a crash, twice as long after each try that went wrong
@@ -53,8 +52,8 @@ var Caps = (function () {
   }
 
   /**
-   * A failure that says nothing about the path (the network, F1's servers or the licence server: see app.js
-   * unclearFailure): kept as a number, never towards ruling the path out.
+   * A failure that says nothing about the path (the network, F1's servers or the licence server: see
+   * js/failure.js 'transient'): kept as a number, never towards ruling the path out.
    */
   function unclear(path) {
     var p = entry(path);
@@ -136,17 +135,20 @@ var Caps = (function () {
   }
 
   function usable(path) {
-    // HDR is optional and depends on native cbcs, even when cbcs is the only SDR last resort left.
-    if (path === 'avplay:hdr' && avoided('avplay:cbcs')) return false;
+    var way = Ways.get(path);
+    // A way that depends on another (native 4K HDR on native cbcs) is out with it, even when that one is a last resort.
+    if (way && way.needs && avoided(way.needs)) return false;
     if (!avoided(path)) return true;
-    // Keep a last resort even if every SDR path has failed. HDR is optional, never the last resort. Only paths this TV
-    // has: with the browser's cenc refused, an untried Shaka path would otherwise leave no native path usable, and the
-    // app would take the first one even if it crashed (2 crashes) and the other only failed.
-    var sdr = SDR.filter(function (p) { return p !== 'shaka:cenc' || record.browser.cenc !== false; });
-    var best = sdr[0];
-    for (var i = 0; i < sdr.length; i++) {
-      if (!avoided(sdr[i])) return false;
-      if (score(sdr[i]) < score(best)) best = sdr[i];
+    // Keep a last resort of each group (js/ways.js: protected SDR, unprotected video) even if all of it has failed.
+    // Optional ways (4K HDR, 5.1, multiview) are never one. Only ways this TV has: with the browser's cenc refused, an
+    // untried Shaka way would otherwise leave no native way usable, and the app would take the first one even if it
+    // crashed (2 crashes) and the other only failed.
+    if (!way || !way.group) return false;
+    var members = Ways.group(way.group).filter(function (p) { var b = Ways.get(p).browser; return !b || record.browser[b] !== false; });
+    var best = members[0];
+    for (var i = 0; i < members.length; i++) {
+      if (!avoided(members[i])) return false;
+      if (score(members[i]) < score(best)) best = members[i];
     }
     return path === best;
   }

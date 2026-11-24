@@ -16,7 +16,7 @@ BV. I have shamelessly added the F1 logo in the app.
 ## What you get
 
 - Video quality up to 4K 50 Hz in HDR (HLG) on TVs that support it, with F1 TV Premium: replays
-  and live sessions. A short failure is retried in HDR; otherwise the video plays in SDR. You can
+  and live sessions. A short failure is retried in HDR; otherwise that video plays in SDR. You can
   switch 4K HDR off in the settings (your name in the top bar).
 - All of F1 TV's feeds: the main broadcast, F1 Live, an onboard camera for each driver, the
   tracker and the data channel. Switching feeds keeps you at the same moment of the session.
@@ -164,9 +164,11 @@ The app uses plain JavaScript compatible with Chromium 76 (Tizen 6.0). Source fi
 - `js/api.js` handles F1 TV requests; `js/auth.js` handles pairing and token renewal.
 - `js/player.js` uses **Shaka Player** for Chromecast cenc streams (live and replays), clear HDR
   and unencrypted multi-feed replays. **AVPlay** handles encrypted HDR, cbcs fallback and single-feed
-  videos, with native cenc as another fallback. `js/caps.js` remembers playback results and recent
-  native crashes per TV firmware, and probes browser Widevine after startup. Learned failures guide
-  the next choice; `Caps.report()` in DevTools shows the evidence.
+  videos, with native cenc as another fallback. Unencrypted video and multiview can play on either.
+  `js/ways.js` lists these ways of playing; `js/caps.js` remembers how each one did on this TV
+  (playback results, recent native crashes, per firmware) and probes browser Widevine after startup.
+  When a start or playback fails, the app tries the next way at the same moment (`js/failure.js`
+  decides what the failure says about the way); `Caps.report()` in DevTools shows the evidence.
 - `js/timing.js` and `js/timing-worker.js` match timing data to the video's UTC timestamps.
   They use F1's timing archive for replays and SignalR for live sessions.
 - `service/service.js` runs on the TV and fixes an incorrect `senc` sample count in live audio

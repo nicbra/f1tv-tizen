@@ -97,7 +97,7 @@ async function player(av, storage, shakaLoad, globals, manifest) {
     fetch: async () => ({ ok: true }), // the stream helper service answers its ping
     setTimeout, clearTimeout, setInterval, clearInterval, Date, Math, JSON, Promise, encodeURIComponent, URL, TextDecoder
   }, globals));
-  for (const f of ['settings.js', 'proxy.js', 'ttml.js', 'player.js']) vm.runInContext(readFileSync('app/js/' + f, 'utf8'), context);
+  for (const f of ['settings.js', 'failure.js', 'ways.js', 'proxy.js', 'ttml.js', 'player.js']) vm.runInContext(readFileSync('app/js/' + f, 'utf8'), context);
   const second = el();
   const video = Object.assign(el(), { cloneNode: () => second, parentNode: { insertBefore() {} } });
   await context.Player.init(video, el());
