@@ -1133,7 +1133,7 @@
 
   /*
    * Versions that failed a start (the shell keeps them, docs/LAUNCHER.md): into the diagnostics log and the upload (an
-   * event, or an anonymous crash report), once each, then acknowledged. Without either they stay with the shell (the
+   * event with diagnostics on; nothing with them off), once each, then acknowledged. Without either they stay with the shell (the
    * latest twenty).
    */
   function reportFailedStarts() {
@@ -1324,7 +1324,7 @@
     var on = DiagUpload.enabled(), stopped = DiagUpload.stopped(), id = DiagUpload.id(), last = DiagUpload.lastReference();
     var rows = [{ day: 'Diagnostics' },
       { what: 'Send diagnostics', sub: stopped ? 'Stopped: the server didn\'t accept this TV. Turn on to start again with a new ID.'
-        : on ? 'Playback and error data under a random ID. Diagnostics ID ' + id : 'Help fix problems on more TVs. See what is sent.',
+        : on ? 'Playback and error data under an hashed ID. Diagnostics ID ' + id : 'Help fix problems on more TVs. See what is sent.',
         badge: on ? 'On' : stopped ? 'Stopped' : 'Off', badgeCls: on ? 'live' : '',
         run: function (idx) {
           askDiagnostics(on ? 'Diagnostics are on' : 'Send diagnostics?',

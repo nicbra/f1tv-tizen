@@ -7,8 +7,7 @@
  *            none: when ruled out, the app plays without them.
  *   needs    a way it depends on: native 4K HDR is decrypted the same way as native CBCS
  *   browser  the browser protection it needs: a TV whose browser refuses cenc has no Shaka CENC
- *   report   how the diagnostics upload names it (its contract's vocabulary): 'engine' for the engine with clear input
- *            ('shaka:clear' / 'avplay:clear'), 'drm' for the copy-protected grid's DRM; missing: its own name
+ * The diagnostics upload reports each by its name (the log server's `Path` vocabulary has them all).
  */
 var Ways = (function () {
   'use strict';
@@ -20,14 +19,14 @@ var Ways = (function () {
     'avplay:clear': { label: 'AVPlay, unprotected video', engine: 'avplay', group: 'clear' },
     'shaka:clear': { label: 'Shaka, unprotected video', engine: 'shaka', group: 'clear' },
     'avplay:hdr': { label: 'AVPlay, 4K HDR', engine: 'avplay', needs: 'avplay:cbcs' },
-    'shaka:hdr': { label: 'Shaka, unprotected 4K HDR', engine: 'shaka', report: 'engine' },
+    'shaka:hdr': { label: 'Shaka, unprotected 4K HDR', engine: 'shaka' },
     'avplay:ac3': { label: 'AVPlay, 5.1 sound in 4K HDR', engine: 'avplay' },
     'shaka:hlsaes': { label: 'Shaka, 4K HDR (AES-128 HLS)', engine: 'shaka' },
     'shaka:tmgrid': { label: 'Shaka, 4K HDR multiview (AES-128 HLS)', engine: 'shaka', multiview: true },
-    'avplay:grid': { label: 'AVPlay, multiview', engine: 'avplay', multiview: true, report: 'engine' },
-    'shaka:grid': { label: 'Shaka, multiview', engine: 'shaka', multiview: true, report: 'engine' },
-    'avplay:drmgrid': { label: 'AVPlay, copy-protected multiview', engine: 'avplay', multiview: true, report: 'drm' },
-    'mvsoft:h264': { label: 'Software decoding, H.264 multiview', engine: 'avplay', multiview: true, report: 'engine' }
+    'avplay:grid': { label: 'AVPlay, multiview', engine: 'avplay', multiview: true },
+    'shaka:grid': { label: 'Shaka, multiview', engine: 'shaka', multiview: true },
+    'avplay:drmgrid': { label: 'AVPlay, copy-protected multiview', engine: 'avplay', multiview: true },
+    'mvsoft:h264': { label: 'Software decoding, H.264 multiview', engine: 'avplay', multiview: true }
   };
 
   function get(name) { return Object.prototype.hasOwnProperty.call(LIST, name) ? LIST[name] : null; }
@@ -60,16 +59,5 @@ var Ways = (function () {
   /** The engine of a way ('avplay' / 'shaka'), or null for an unknown one. */
   function engine(name) { var w = get(name); return w ? w.engine : null; }
 
-  /**
-   * How the diagnostics upload names the way a stream plays: its own name, or as the contract has it (the engine with
-   * clear input; the copy-protected grid by its DRM). `engineName`: the engine that played it.
-   */
-  function report(name, stream, engineName) {
-    var w = get(name);
-    if (!w || !w.report) return name || null;
-    if (w.report === 'drm') return stream && stream.hdrEncrypted ? 'avplay:hdr' : stream && stream.cenc ? 'avplay:cenc' : 'avplay:cbcs';
-    return stream && stream.licenseUrl ? name : (engineName || w.engine) + ':clear';
-  }
-
-  return { list: function () { return Object.keys(LIST); }, get: get, group: group, engine: engine, preferred: preferred, report: report };
+  return { list: function () { return Object.keys(LIST); }, get: get, group: group, engine: engine, preferred: preferred };
 })();

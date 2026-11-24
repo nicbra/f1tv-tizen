@@ -7,32 +7,32 @@ step with app/js/diag-upload.js and the server's contract. Plain Markdown only: 
 The app is made and tested on one TV. Diagnostics show how it works on other TV models, so problems there can be
 found and fixed.
 
-## Crash reports
+## What every TV sends
 
-Crash reports are always sent, but contain limited information that may not uncover bugs that doesn't crash the app.
-When the app crashes, a script fails or an app update doesn't start, the app sends a short crash report, whether
-diagnostics are on or off:
+Nothing until you have answered the question about diagnostics (yes or no). After that, when the app has been open
+for 15 minutes, it sends one count with only:
 
-- the app version, the TV model, firmware and Tizen version
-- what failed: the script file and line (never the error message), or the update's version and why it didn't start
-- how many times it happened
+- the app version
+- whether diagnostics are on or off
 
-A crash report has no ID, so nothing links it to your TV or to other reports. That is also why it can't be deleted
-on request. Crash reports are deleted from the server after 30 days.
+It has no ID and nothing from the TV, so it can't be linked to your TV or to anything else. The server only adds it
+to a count per day, which shows how many use the app and how many have diagnostics on.
 
 ## Diagnostics
 
 Diagnostics are only sent if you turn it on.
-With diagnostics on, the app also sends small reports under a random ID made for this TV. Account → Diagnostics shows
-the ID.
+With diagnostics on, the app sends small reports under an ID for this TV. The ID is made from the TV's own device ID
+with a one-way hash, so the device ID itself is never sent and can't be worked out from it.
+Account → Diagnostics shows the ID.
 
 - the TV model, firmware and Tizen version, and the app version
 - your F1 TV plan (Access, Pro or Premium) and which kinds of streams F1 offered (HDR, 4K, multiview)
 - which player (AVPlay/Shaka) worked or failed, error codes, start-up and buffering times
 - requests to F1 that failed (which kind of request and the error code), sign-in renewals and live timing that failed
-- script errors (file and line only)
+- crash reports: script errors (file and line only, never the error message), an app that ended unexpectedly, or an
+  app update that didn't start
 
-Crashes are then sent as part of diagnostics, under the ID.
+With diagnostics off, no crash reports are sent.
 
 ## Problem reports
 
@@ -52,4 +52,5 @@ EU/EEA. The server doesn't store IP addresses. Diagnostics are kept 30 days.
 ## Turning it off and deleting
 
 Account → Diagnostics turns diagnostics on or off. **Delete my diagnostics data** there deletes everything sent under
-this TV's ID and turns diagnostics off. Crash reports have no ID, so they stay until they expire after 30 days.
+this TV's ID, crash reports included, and turns diagnostics off. The daily counts have no ID, so there is nothing of
+yours in them to delete.

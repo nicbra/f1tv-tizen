@@ -18,6 +18,7 @@ BV. I have shamelessly added the F1 logo in the app.
 - Video quality up to 4K 50 Hz in HDR (HLG) on TVs that support it, with F1 TV Premium: replays
   and live sessions. A short failure is retried in HDR; otherwise that video plays in SDR. You can
   switch 4K HDR off in the settings (your name in the top bar).
+- Dolby Digital 5.1 surround audio, if your subscription tier gives you that.
 - All of F1 TV's feeds: the main broadcast, F1 Live, an onboard camera for each driver, the
   tracker and the data channel. Switching feeds keeps you at the same moment of the session.
 - Multiview: up to four feeds at once, in sync, as one 4K HDR picture. Choose between different layouts, together with the live timing data.
@@ -135,9 +136,8 @@ against their SHA-256 sums.
 
 ### Does it send anything about me?
 
-Only crash reports, unless you say yes to more. The app asks you once whether to send
-diagnostics to help improve the app, and you can turn that off later.
-The diagnostics data is anonymous and only sent to a server in EU/EEA.
+The app asks you once whether to send diagnostics, to help improve the app, and you can turn that off later.
+Diagnostics are linked to an ID made from your TV and only sent to a server in the EU/EEA.
 Read more about [what the app sends](app/PRIVACY.md) for more details.
 
 ### Does it get around F1 TV's DRM?

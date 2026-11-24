@@ -3,9 +3,11 @@
  * say yes send small structured events: how playback attempts went per engine and path, what F1 offered the account,
  * start-up, script errors, failed requests by operation. No content ids, titles, URLs, tokens or free text.
  *
- * Off by default. While off, nothing is queued and nothing is sent, except anonymous crash reports (below), which
- * every TV sends whatever the viewer answered. Saying yes starts a consent epoch with a fresh queue
+ * Off by default. While off, nothing is queued and nothing is sent: crash reports too go only with diagnostics on (as
+ * events). The one thing every TV sends, once the viewer has answered the question, is an anonymous count of an app
+ * use (countUse below: no ID). Saying yes starts a consent epoch with a fresh queue
  * and session, and the installation secret (kept across off/on, so "Delete my diagnostics data" reaches everything).
+ * Uploads also carry the TV's unit (unit below): a hash of its own device ID, the same after a deletion and a new yes.
  * Nothing is sent under a secret that isn't stored. Deleting moves the secret to a list of pending deletions until the
  * server confirms each; a later yes makes a new one. A server that refuses this TV (401/403) stops everything until the
  * viewer says yes again (a new secret; the old one is deleted like the others).
@@ -34,7 +36,8 @@ var DiagUpload = (function () {
   // The contract's shared values (the server's schemas/vocabulary.v1.json), in one place for this and diag-play.js.
   var VOCAB = {
     layouts: ['off', 'grid2x2', 'grid2x2hd', 'pip', 'pip3', 'pip4', 'side2', 'big3', 'side5', 'side3wide'],
-    paths: ['shaka:cenc', 'shaka:clear', 'avplay:cbcs', 'avplay:cenc', 'avplay:hdr', 'avplay:clear', 'mvsoft:h264'],
+    paths: ['shaka:cenc', 'shaka:clear', 'avplay:cbcs', 'avplay:cenc', 'avplay:hdr', 'avplay:clear', 'mvsoft:h264',
+      'shaka:hdr', 'shaka:hlsaes', 'shaka:tmgrid', 'avplay:grid', 'shaka:grid', 'avplay:drmgrid', 'avplay:ac3'],
     capsPaths: ['shaka:cenc', 'avplay:cbcs', 'avplay:cenc', 'avplay:hdr'],
     codes: ['PREPARE_TIMEOUT', 'PLAYER_STUCK', 'SHAKA_ERROR', 'AVPLAY_ERROR', 'NETWORK_ERROR', 'DRM_ERROR', 'DECODE_ERROR',
       'UNSUPPORTED', 'HELPER_ERROR', 'NO_PROGRESS', 'OTHER', 'UNKNOWN']
@@ -411,7 +414,7 @@ var DiagUpload = (function () {
       var done = false, ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
       if (own) inflight = ctrl;
       var h = { 'Content-Type': 'application/json' };
-      if (auth) h['Authorization'] = 'Bearer ' + auth;   // none for anonymous crash reports
+      if (auth) h['Authorization'] = 'Bearer ' + auth;   // none for the anonymous app-use count
       if (buildPair) { h['X-Diag-Release'] = buildPair.release; h['X-Diag-Bundle'] = buildPair.bundle; }
       var t = setTimeout(function () { if (!done) { done = true; if (ctrl) ctrl.abort(); reject(new Error('timeout')); } }, TIMEOUT_MS);
       fetch(BASE + path, { method: method, headers: h, body: body, signal: ctrl ? ctrl.signal : undefined, credentials: 'omit',
@@ -507,8 +510,10 @@ var DiagUpload = (function () {
   }
 
   function envelope(batch) {
-    return JSON.stringify({ schema_version: 1, batch_id: batch.batch_id, session_id: batch.session_id, mode: 'basic',
-      app: batch.dims.app, device: batch.dims.device, events: batch.events });
+    var body = { schema_version: 1, batch_id: batch.batch_id, session_id: batch.session_id, mode: 'basic',
+      app: batch.dims.app, device: batch.dims.device, events: batch.events };
+    if (unit()) body.unit = unit();
+    return JSON.stringify(body);
   }
 
   function flush() {
@@ -632,8 +637,10 @@ var DiagUpload = (function () {
     var d = dims(), rid = state.report.id, epoch = state.consentAt, crumbs = ring.slice(-100), body;
     // Within the server's size limit: the oldest breadcrumbs go first.
     do {
-      body = JSON.stringify({ schema_version: 1, report_id: rid, app: d.app, device: d.device,
-        data: { description_category: category, settings: reportSettings(), caps: capsProjection(), breadcrumbs: crumbs } });
+      var r = { schema_version: 1, report_id: rid, app: d.app, device: d.device,
+        data: { description_category: category, settings: reportSettings(), caps: capsProjection(), breadcrumbs: crumbs } };
+      if (unit()) r.unit = unit();
+      body = JSON.stringify(r);
     } while (utf8(body) > BODY_BYTES && crumbs.shift());
     return request('POST', '/reports', body, auth, d.build).then(function (r) {
       var current = enabled() && state.consentAt === epoch;
@@ -689,13 +696,10 @@ var DiagUpload = (function () {
     return out;
   }
 
-  /** The first 12 hex digits of the hash the server stores for this TV (none until the viewer says yes). */
+  /** The ID shown for this TV: the first 12 hex digits of its unit (none until the viewer says yes). */
   function id() {
-    var s = secret();
-    if (!s) return null;
-    var b = new Uint8Array(32);
-    for (var i = 0; i < 32; i++) b[i] = parseInt(s.substr(i * 2, 2), 16);
-    return sha256(b).slice(0, 12);
+    var u = secret() ? unit() : null;
+    return u ? u.slice(0, 12) : null;
   }
 
   /** Something was sent and may still be on the server (the delete action applies). */
@@ -706,7 +710,7 @@ var DiagUpload = (function () {
 
   /** What the viewer is told before saying yes (and in Settings). Read more shows the details: app/PRIVACY.md. */
   var EXPLANATION = 'You can contribute making this app even better by enabling diagnostics logging.\n'
-    + 'The logged data is anonymous, no account information is being sent.\n'
+    + 'The data is linked to an ID made for this TV, never to your F1 TV account: no account information is sent.\n'
     + 'The logs will be used to diagnose how the app performs on different TV models, and to help uncover bugs that were not visible to the developer.\n'
     + 'The data will only be stored and handled in the EU/EEA.';
 
@@ -812,20 +816,18 @@ var DiagUpload = (function () {
     if (!prev || !(prev.minutes >= 0 && prev.minutes < 10)) return;
     var f = { path: VOCAB.paths.indexOf(prev.path) >= 0 ? prev.path : 'other', minutes_since_marker: prev.minutes };
     if (covers(Date.now() - prev.minutes * 60000)) event('app.abnormal_end_suspected', f, 'warn');
-    else crash('app.abnormal_end_suspected', f);
   }
 
   var LAUNCH_REASONS = { 'page: start timeout': 'start_timeout', 'page: script error': 'script_error',
     'page: load failure': 'load_failure', 'page: helper failure': 'helper_failure' };
 
-  /** A failed start the launcher kept: an event if it came since the viewer said yes, else an anonymous crash report. */
+  /** A failed start the launcher kept: an event if it came since the viewer said yes (nothing otherwise). */
   function launcherFailed(e) {
     try {
       if (!e || !/^[0-9]+\.[0-9]+\.[0-9]+$/.test(String(e.version))) return;
       var reason = LAUNCH_REASONS[e.reason] || (/^service\b/.test(String(e.reason)) ? 'service_error' : 'other');
       var f = { version: String(e.version), reason: reason };
       if (covers(e.at)) event('launcher.failed_start', f, 'warn');
-      else if (Date.now() - e.at < CRASH_AGE) crash('launcher.failed_start', f);   // not stale ones the shell kept
     } catch (err) { /* never in the way */ }
   }
 
@@ -838,7 +840,7 @@ var DiagUpload = (function () {
 
   /**
    * A script error: its category, file and line only (a message could hold a title or a secret). An event with
-   * diagnostics on (once per run each), else an anonymous crash report (repeats counted).
+   * diagnostics on (once per run each); nothing with diagnostics off.
    */
   function jsError(category, file, line) {
     try {
@@ -846,7 +848,7 @@ var DiagUpload = (function () {
       var source = !file ? 'unknown' : SOURCES.indexOf(base) >= 0 ? base : 'other';
       var f = { error_category: category, source_file: source };
       if (line >= 1 && line <= 1000000) f.line = Math.floor(line);
-      if (!enabled()) return crash('js.error', f);
+      if (!enabled()) return;
       var key = category + '|' + source + '|' + (f.line || '');
       if (jsSeen[key]) return;
       jsSeen[key] = true;
@@ -863,107 +865,63 @@ var DiagUpload = (function () {
     window.addEventListener('unhandledrejection', function () { jsError('unhandled_rejection', null, null); });
   } catch (e) { /* no window */ }
 
-  // ---- anonymous crash reports ------------------------------------------------------------------------
-  //
-  // Every TV, whatever the viewer answered: script errors, suspected crashes and failed launcher starts, with the app
-  // version and the TV's model and firmware (POST /crashes). No ID, session, sequence or time from the TV: nothing
-  // links two reports, so there is nothing to delete (the server keeps them 30 days). With diagnostics on, the same
-  // things are events in the queue instead. Repeats of one crash are counted, not sent again; at most 20 different
-  // crashes wait (7 days), and nothing is sent unless there is a crash.
+  // Anonymous crash reports (POST /crashes) were sent by apps before the TV's unit, with diagnostics off too. Now crash
+  // reports go only with diagnostics on, as events; what an older version left waiting is forgotten, never sent.
+  try { localStorage.removeItem('f1tv.diag.crashes'); } catch (e) { /* none */ }
 
-  var CRASH_KEY = 'f1tv.diag.crashes';
-  var CRASH_MAX = 20, CRASH_BATCH = 10, CRASH_AGE = 7 * 24 * 3600000, CRASH_COUNT_MAX = 1000, CRASH_BACKOFF_MAX = 3600000;
-  var crashes = null, crashTimer = null, crashSaveTimer = null, crashSending = false;
+  // ---- the TV's unit and the anonymous app-use count ----------------------------------------------
 
-  function crashStore() {
-    if (!crashes) {
-      var v = load(CRASH_KEY);
-      crashes = v && typeof v === 'object' && Array.isArray(v.items) ? v : { items: [] };
-      // What was in flight when the app closed goes again (the server counts a repeat as a duplicate).
-      crashes.items.forEach(function (c) { c.sending = false; });
+  /**
+   * The TV's unit, sent with every upload (`unit`): SHA-256 of an app-specific prefix and the TV's own device ID
+   * (Samsung's DUID), the first 32 hex digits. Not the device ID itself; the same for this TV after "Delete my
+   * diagnostics data" and a new yes (a new secret), or a reinstall, so the server counts it as one TV. Without a device
+   * ID (a browser, another platform), a random one kept in storage, also across deletion. Not a credential: the secret
+   * stays the only one.
+   */
+  var UNIT_KEY = 'f1tv.diag.unit', unitValue;
+  function unit() {
+    if (unitValue !== undefined) return unitValue;
+    unitValue = null;
+    try {
+      var duid = String(webapis.productinfo.getDuid() || '');
+      if (/^[\x21-\x7E]{8,128}$/.test(duid)) {
+        var text = unescape(encodeURIComponent('f1tv-tizen unit v1:' + duid)), bytes = new Uint8Array(text.length);
+        for (var i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
+        unitValue = sha256(bytes).slice(0, 32);
+      }
+    } catch (e) { /* no device ID */ }
+    if (!unitValue) {
+      var kept = load(UNIT_KEY);
+      if (typeof kept === 'string' && /^[0-9a-f]{32}$/.test(kept)) unitValue = kept;
+      else if (cryptoOk()) {
+        var r = new Uint8Array(16), hex = '';
+        window.crypto.getRandomValues(r);
+        for (var j = 0; j < 16; j++) hex += ('0' + r[j].toString(16)).slice(-2);
+        if (store(UNIT_KEY, hex)) unitValue = hex;
+      }
     }
-    var now = Date.now();
-    crashes.items = crashes.items.filter(function (c) { return c && c.id && c.name && c.dims && now - c.at < CRASH_AGE; });
-    return crashes;
+    return unitValue;
   }
 
-  function saveCrashes() {
-    clearTimeout(crashSaveTimer);
-    crashSaveTimer = null;
-    if (crashes) store(CRASH_KEY, crashes.items.length || crashes.retryAt ? crashes : null);
-  }
-
-  /** A crash for the anonymous report: counted onto a waiting one that is the same, else added (if there is room). */
-  function crash(name, fields) {
+  /**
+   * How many use the app, and the share with diagnostics on: once the viewer has answered the diagnostics question (new
+   * viewers who haven't been asked would skew the share), an app kept open USE_AFTER counts once (POST /starts) with
+   * only the app version and whether diagnostics are on. No ID or unit, nothing from the TV; the server counts per day.
+   * Not from personal builds (DIAG_BUILD.label: the developer's TVs).
+   */
+  var USE_AFTER = 15 * 60000;
+  function countUse() {
     try {
-      if (!BASE || !cryptoOk()) return;
-      var c = crashStore(), d = dims(), key = name + '|' + JSON.stringify(fields) + '|' + dimsKey(d);
-      var same = c.items.filter(function (x) { return x.key === key && !x.sending; })[0];
-      if (same) same.count = Math.min(CRASH_COUNT_MAX, same.count + 1);
-      else if (c.items.length < CRASH_MAX) c.items.push({ id: uuid(), key: key, name: name, fields: fields, count: 1, at: Date.now(), dims: d });
-      else return;
-      if (!crashSaveTimer) crashSaveTimer = setTimeout(saveCrashes, 1000);
-      scheduleCrashes(randomDelay(20000, 40000));
+      if (!BASE || (typeof DIAG_BUILD !== 'undefined' && DIAG_BUILD && DIAG_BUILD.label)) return;
+      setTimeout(function () {
+        try {
+          if (typeof Settings === 'undefined' || !Settings.get('diagnosticsAsked')) return;
+          var v = app().version;
+          var body = JSON.stringify({ schema_version: 1, version: /^[0-9]+\.[0-9]+\.[0-9]+$/.test(v) ? v : 'unknown', diagnostics: enabled() });
+          request('POST', '/starts', body, null, null, false).then(function () {}, function () {});
+        } catch (e) { /* never in the way */ }
+      }, USE_AFTER);
     } catch (e) { /* never in the way */ }
-  }
-
-  function scheduleCrashes(ms) {
-    var c = crashStore();
-    if (!c.items.length) return;
-    // A stored retry time beyond the longest wait came from a clock that was wrong: not waited for.
-    var retryAt = c.retryAt && c.retryAt - Date.now() <= RETRY_AFTER_MAX ? c.retryAt : 0;
-    var at = Math.max(Date.now() + ms, retryAt);
-    if (crashTimer && crashTimer.at <= at) return;   // one already comes sooner
-    clearTimeout(crashTimer && crashTimer.id);
-    crashTimer = { at: at, id: setTimeout(function () { crashTimer = null; sendCrashes(); }, at - Date.now()) };
-  }
-
-  function crashBackoff(retryAfterMs) {
-    var c = crashStore();
-    c.failures = (c.failures || 0) + 1;
-    var ms = Math.min(CRASH_BACKOFF_MAX, BACKOFF_MIN * Math.pow(2, c.failures - 1));
-    ms = randomDelay(ms * 0.8, ms * 1.2);
-    if (retryAfterMs > 0) ms = Math.max(ms, Math.min(RETRY_AFTER_MAX, retryAfterMs));
-    c.retryAt = Date.now() + ms;
-    saveCrashes();
-    scheduleCrashes(0);
-  }
-
-  function sendCrashes() {
-    try {
-      var c = crashStore();
-      if (!BASE || crashSending || !c.items.length) return;
-      if (Date.now() < quietUntil) return scheduleCrashes(quietUntil - Date.now() + randomDelay(2000, 10000));
-      if (c.retryAt && Date.now() < c.retryAt && c.retryAt - Date.now() <= RETRY_AFTER_MAX) return scheduleCrashes(0);
-      // One body has one set of labels: the oldest crash's, and the others collected under the same.
-      var first = c.items[0], d = dimsKey(first.dims);
-      var batch = c.items.filter(function (x) { return dimsKey(x.dims) === d; }).slice(0, CRASH_BATCH);
-      var body = JSON.stringify({ schema_version: 1, app: first.dims.app, device: first.dims.device,
-        crashes: batch.map(function (x) { return { event_id: x.id, name: x.name, event_version: 1, count: x.count, fields: x.fields }; }) });
-      batch.forEach(function (x) { x.sending = true; });
-      crashSending = true;
-      var done = function (keep) {
-        crashSending = false;
-        batch.forEach(function (x) { x.sending = false; });
-        if (!keep) c.items = c.items.filter(function (x) { return batch.indexOf(x) < 0; });
-        saveCrashes();
-      };
-      request('POST', '/crashes', body, null, first.dims.build, false).then(function (r) {
-        var b = r.body, n = function (v) { return typeof v === 'number' && v >= 0 && Math.floor(v) === v; };
-        if (r.status === 200 && b && n(b.stored) && n(b.duplicates) && n(b.dropped) && b.stored + b.duplicates + b.dropped === batch.length) {
-          c.failures = 0;
-          c.retryAt = 0;
-          done(false);
-          scheduleCrashes(randomDelay(15000, 25000));   // the rest, if any
-        } else if (r.status === 400 || r.status === 413 || r.status === 415) {
-          done(false);   // never accepted as it is
-          scheduleCrashes(randomDelay(15000, 25000));
-        } else {
-          done(true);
-          crashBackoff(r.status === 404 ? 3600000 : r.retryAfter);
-        }
-      }, function () { done(true); crashBackoff(0); });
-    } catch (e) { crashSending = false; }
   }
 
   /** The settings a problem report includes, each mapped to the contract's values. */
@@ -988,9 +946,9 @@ var DiagUpload = (function () {
       schedule(randomDelay(10000, 60000));
     }
     if (deletionPending()) retryDeletionLater();
-    if (crashStore().items.length) scheduleCrashes(randomDelay(10000, 60000));
+    countUse();
     // What was collected in the last second goes to storage before the app is hidden or closed.
-    var save = function () { saveQueue(); if (crashSaveTimer) saveCrashes(); };
+    var save = function () { saveQueue(); };
     window.addEventListener('pagehide', save);
     document.addEventListener('visibilitychange', function () { if (document.hidden) save(); });
   } catch (e) { /* never in the way */ }
@@ -1000,12 +958,11 @@ var DiagUpload = (function () {
     available: function () { return !!BASE; }, caps: caps, started: started, launcherFailed: launcherFailed, jsError: jsError, enabled: enabled, setEnabled: setEnabled,
     deleteMyData: deleteMyData, deletionPending: deletionPending, stopped: function () { return !!state.stopped; },
     report: report, lastReference: function () { return state.lastReference || null; }, categories: REPORT_CATEGORIES, id: id,
-    quiet: quiet, covers: covers, flush: flush, flushCrashes: sendCrashes, hasData: hasData, explanation: EXPLANATION, vocab: VOCAB,
+    quiet: quiet, covers: covers, flush: flush, hasData: hasData, explanation: EXPLANATION, vocab: VOCAB, unit: unit,
     // For tests and DevTools.
     sha256: sha256, status: function () {
       return { mode: mode(), queued: queue().length, pending: !!pendingBatch(), failures: state.failures || 0, stopped: state.stopped || null,
-        nextAt: nextAt || null, retryAt: state.retryAt || null, dropped: state.dropped || {}, deletions: deletions().length, id: id(),
-        crashes: { waiting: crashStore().items.length, retryAt: crashStore().retryAt || null, failures: crashStore().failures || 0 } };
+        nextAt: nextAt || null, retryAt: state.retryAt || null, dropped: state.dropped || {}, deletions: deletions().length, id: id() };
     }
   };
 })();

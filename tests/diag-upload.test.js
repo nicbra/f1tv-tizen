@@ -12,8 +12,11 @@ const NOW = Date.UTC(2026, 10, 18, 20);
  * diag-upload.js in a fresh page. `answer(method, url, body, headers)` returns { status, body, retryAfter } or throws
  * (unreachable). Timers run only when the test says (run()); `store` is localStorage, shared between "runs".
  */
-function load({ store = {}, settings = { diagnostics: 'off' }, answer, launcher, caps, now = NOW, f1, refuse, build = { record: false, server: BASE } } = {}) {
-  const sent = [], timers = [], win = {};
+// The TV's own device ID (Samsung's DUID) and the unit the app derives from it.
+const DUID = 'OTDTZMVKX4HAW';
+const unitOf = (duid) => crypto.createHash('sha256').update('f1tv-tizen unit v1:' + duid).digest('hex').slice(0, 32);
+function load({ store = {}, settings = { diagnostics: 'off' }, answer, launcher, caps, now = NOW, f1, refuse, build = { record: false, server: BASE }, duid = DUID } = {}) {
+  const sent = [], uses = [], timers = [], win = {};
   const clock = { now };
   const context = vm.createContext({
     DIAG_BUILD: build,
@@ -27,6 +30,11 @@ function load({ store = {}, settings = { diagnostics: 'off' }, answer, launcher,
     Math, JSON, Promise, Uint8Array, unescape, encodeURIComponent,
     fetch: (url, init) => {
       const body = init.body === undefined ? undefined : JSON.parse(init.body);
+      // The anonymous app-use count (POST /starts) goes to a list of its own: `sent` is the diagnostics traffic.
+      if (/\/starts$/.test(url)) {
+        uses.push({ url, body, headers: init.headers });
+        return Promise.resolve({ status: 200, headers: { get: () => null }, text: async () => '{"status":"counted"}' });
+      }
       sent.push({ method: init.method, url, body, headers: init.headers });
       return Promise.resolve().then(() => {
         const r = (answer || (() => { throw new TypeError('Failed to fetch'); }))(init.method, url, body, init.headers);
@@ -37,7 +45,8 @@ function load({ store = {}, settings = { diagnostics: 'off' }, answer, launcher,
     ...(launcher ? { Launcher: launcher } : {}),
     ...(caps ? { Caps: caps } : {}),
     ...(f1 ? { F1Api: f1 } : {}),
-    webapis: { productinfo: { getRealModel: () => 'QE55Q77AATXXC', getFirmware: () => 'T-NKM2DEUC-2310.0' } },
+    webapis: { productinfo: { getRealModel: () => 'QE55Q77AATXXC', getFirmware: () => 'T-NKM2DEUC-2310.0',
+      getDuid: () => { if (duid == null) throw new Error('no DUID'); return duid; } } },
     tizen: { systeminfo: { getCapability: () => '6.0' }, application: { getCurrentApplication: () => ({ appInfo: { version: '1.4.0' } }) } }
   });
   vm.runInContext(SRC, context, { filename: 'diag-upload.js' });
@@ -55,7 +64,7 @@ function load({ store = {}, settings = { diagnostics: 'off' }, answer, launcher,
     clock.now = until;
   }
   const queue = () => JSON.parse(store['f1tv.diag.queue'] || '[]');
-  return { U, store, settings, sent, run, clock, queue, win };
+  return { U, store, settings, sent, uses, run, clock, queue, win };
 }
 
 /** The server's acknowledgement: counts that add up to the batch (a DELETE gets its own). */
@@ -295,11 +304,32 @@ test('a warning doesn\'t hurry an upload while backing off', async () => {
   assert.ok(t.sent.length <= n + 1, t.sent.length + ' requests');
 });
 
-test('the diagnostics id is the start of the SHA-256 the server keeps for this TV', () => {
-  const t = load();
+test('the TV\'s unit is a hash of its device ID, the same after a deletion and a new yes; the shown ID is its start', async () => {
+  const t = load({ answer: ok });
+  assert.equal(t.U.id(), null, 'no ID before the yes');
   t.U.setEnabled(true);
-  const secret = JSON.parse(t.store['f1tv.diag.secret']);
-  assert.equal(t.U.id(), crypto.createHash('sha256').update(Buffer.from(secret, 'hex')).digest('hex').slice(0, 12));
+  assert.equal(t.U.unit(), unitOf(DUID));
+  assert.notEqual(t.U.unit(), DUID);
+  assert.equal(t.U.id(), unitOf(DUID).slice(0, 12));
+  t.U.event('app.started', { outcome: 'ok' });
+  await t.run(70000);
+  assert.ok(t.sent.length >= 1);
+  assert.ok(t.sent.every((s) => s.body.unit === unitOf(DUID)), 'every batch carries the unit');
+  const firstSecret = t.store['f1tv.diag.secret'];
+  assert.equal(await t.U.deleteMyData(), 'deleted');
+  t.U.setEnabled(true);
+  assert.notEqual(t.store['f1tv.diag.secret'], firstSecret, 'a new secret');
+  assert.equal(t.U.id(), unitOf(DUID).slice(0, 12), 'the same TV');
+});
+
+test('without a device ID the unit is random, kept in storage (also across a deletion)', async () => {
+  const store = {};
+  const t = load({ answer: ok, duid: null, store });
+  t.U.setEnabled(true);
+  const u = t.U.unit();
+  assert.match(u, /^[0-9a-f]{32}$/);
+  await t.U.deleteMyData();
+  assert.equal(load({ duid: null, store }).U.unit(), u);
 });
 
 test('tier comes from F1\'s entitlement words; anything else is other or unknown', () => {
@@ -372,82 +402,27 @@ test('start-up, the suspected crash, account and caps: once, and caps only when 
 test('failed launcher starts: only those since the viewer said yes, with a mapped reason', async () => {
   const t = load({ answer: ok });
   t.U.setEnabled(true);
-  t.U.launcherFailed({ id: 1, at: NOW - 60000, version: '1.3.0', reason: 'page: start timeout' });
-  t.U.launcherFailed({ id: 0, at: NOW - 8 * 24 * 3600000, version: '1.2.0', reason: 'page: start timeout' });   // too old to send
+  t.U.launcherFailed({ id: 1, at: NOW - 60000, version: '1.3.0', reason: 'page: start timeout' });   // before the yes: not sent
   t.U.launcherFailed({ id: 2, at: NOW + 1, version: '1.4.0', reason: 'page: script error' });
   t.U.launcherFailed({ id: 3, at: NOW + 2, version: '1.4.0', reason: 'service: crashed at /x/y' });
   await t.run(60000);
   const rows = t.sent.filter((s) => /events$/.test(s.url)).flatMap((s) => s.body.events)
     .filter((e) => e.name === 'launcher.failed_start').map((e) => e.fields);
   assert.deepEqual(rows, [{ version: '1.4.0', reason: 'script_error' }, { version: '1.4.0', reason: 'service_error' }]);
-  // The one from before the yes: an anonymous crash report.
-  const crash = t.sent.filter((s) => /crashes$/.test(s.url)).flatMap((s) => s.body.crashes);
-  assert.deepEqual(crash.map((c) => [c.name, c.fields]), [['launcher.failed_start', { version: '1.3.0', reason: 'start_timeout' }]]);
+  assert.ok(!t.sent.some((s) => /crashes$/.test(s.url)), 'no anonymous crash reports');
 });
 
-test('crash reports go out anonymously with diagnostics off: no ID, session or time; repeats counted', async () => {
-  const launcher = { version: '1.4.0', archiveSha512: 'a'.repeat(128) };
-  const t = load({ answer: ok, launcher });
-  for (let i = 0; i < 3; i++) t.win.error({ message: 'x', filename: 'file:///a/js/app.js?v=1', lineno: 3, error: new TypeError('x') });
+test('with diagnostics off nothing goes out, crashes included; crash reports waiting from an older version are forgotten', async () => {
+  const caps = { report: () => ({}), usable: () => true, previousRun: () => ({ path: 'avplay:hdr', minutes: 2 }) };
+  const store = { 'f1tv.diag.crashes': JSON.stringify({ items: [{ id: 'x', name: 'js.error', fields: {}, count: 1, at: NOW, dims: {} }] }) };
+  const t = load({ answer: ok, caps, store });
+  assert.equal(store['f1tv.diag.crashes'], undefined, 'forgotten, never sent');
+  t.win.error({ message: 'x', filename: 'file:///a/js/app.js', lineno: 3, error: new TypeError('x') });
   t.win.unhandledrejection({});
-  await t.run(10000);
-  assert.deepEqual(t.sent, [], 'not at once');
-  await t.run(60000);
-  assert.equal(t.sent.length, 1);
-  const { url, method, headers, body } = t.sent[0];
-  assert.equal(method, 'POST');
-  assert.equal(url, BASE + '/crashes');
-  assert.equal(headers.Authorization, undefined);
-  assert.equal(headers['X-Diag-Release'], '1.4.0');
-  assert.equal(headers['X-Diag-Bundle'], 'a'.repeat(128));
-  assert.deepEqual(Object.keys(body).sort(), ['app', 'crashes', 'device', 'schema_version']);
-  assert.deepEqual(body.device, { model: 'QE55Q77AATXXC', firmware: 'T-NKM2DEUC-2310.0', tizen_version: '6.0' });
-  assert.deepEqual(body.crashes.map((c) => Object.keys(c).sort()), [0, 1].map(() => ['count', 'event_id', 'event_version', 'fields', 'name']));
-  assert.deepEqual(body.crashes.map((c) => [c.name, c.count, c.fields]), [
-    ['js.error', 3, { error_category: 'type_error', source_file: 'app.js', line: 3 }],
-    ['js.error', 1, { error_category: 'unhandled_rejection', source_file: 'unknown' }]]);
-  assert.equal(t.store['f1tv.diag.crashes'], undefined, 'acknowledged: nothing waits');
-  assert.equal(t.store['f1tv.diag.secret'], undefined);
-  assert.equal(t.U.id(), null);
-  await t.run(3600000);
-  assert.equal(t.sent.length, 1, 'nothing more without a crash');
-});
-
-test('crash reports wait for an unreachable server (backing off to an hour), across restarts, and go once', async () => {
-  const store = {};
-  const t = load({ store });
-  t.win.error({ message: 'x', filename: 'file:///a/js/player.js', lineno: 9, error: new RangeError('x') });
-  await t.run(10 * 3600000);
-  // 1, 2, 4, ... 32 minutes, then hourly (±20 %): about 15 tries in 10 hours.
-  assert.ok(t.sent.length >= 10 && t.sent.length <= 20, String(t.sent.length));
-  const ids = new Set(t.sent.map((s) => s.body.crashes[0].event_id));
-  assert.equal(ids.size, 1, 'the same report each time');
-  // A restart: the stored crash goes once the server answers, with the same id.
-  const t2 = load({ store, answer: ok, now: t.clock.now });
-  await t2.run(73 * 60000);   // the stored retry time: up to an hour +20 % after the last try (randomDelay)
-  assert.equal(t2.sent.length, 1);
-  assert.equal(t2.sent[0].body.crashes[0].event_id, [...ids][0]);
-  assert.equal(store['f1tv.diag.crashes'], undefined);
-});
-
-test('crash reports: at most 20 different ones wait; a refused body is dropped, a 404 waits an hour', async () => {
-  let status = 404;
-  const t = load({ answer: (m, u, b) => {
-    if (status === 400) { status = 200; return { status: 400 }; }   // once
-    return status === 200 ? ok(m, u, b) : { status };
-  } });
-  for (let i = 1; i <= 25; i++) t.win.error({ message: 'x', filename: 'file:///a/js/app.js', lineno: i, error: new Error('x') });
-  await t.run(60000);
-  assert.equal(t.sent.length, 1);
-  assert.equal(t.sent[0].body.crashes.length, 10, 'ten per body');
-  await t.run(45 * 60000);
-  assert.equal(t.sent.length, 1, 'a 404 waits about an hour');
-  status = 400;
-  await t.run(3600000);
-  const sentLines = t.sent.slice(2).flatMap((s) => s.body.crashes.map((c) => c.fields.line));
-  assert.equal(sentLines.length, 10, 'the 400 batch is gone, the other ten went');
-  assert.equal(Math.max(...t.sent.flatMap((s) => s.body.crashes.map((c) => c.fields.line))), 20, 'only 20 were kept');
-  assert.equal(t.store['f1tv.diag.crashes'], undefined);
+  t.U.started('ok', 1000);
+  t.U.launcherFailed({ id: 1, at: NOW, version: '1.4.0', reason: 'page: script error' });
+  await t.run(3 * 3600000);
+  assert.deepEqual(t.sent, []);
 });
 
 test('with diagnostics on, script errors are events (once each), not crash reports', async () => {
@@ -460,26 +435,17 @@ test('with diagnostics on, script errors are events (once each), not crash repor
   assert.equal(t.sent.flatMap((s) => s.body.events).filter((e) => e.name === 'js.error').length, 1);
 });
 
-test('a crash before the yes (the heartbeat from the last run) is an anonymous report, also with diagnostics off', async () => {
+test('the suspected crash (the heartbeat from the last run) goes as an event under the TV\'s ID, only with diagnostics on', async () => {
   const caps = { report: () => ({}), usable: () => true, previousRun: () => ({ path: 'avplay:hdr', minutes: 2 }) };
-  const t = load({ answer: ok, caps });
+  const t = load({ answer: ok, caps, now: NOW - 600000 });
+  t.U.setEnabled(true);
+  t.clock.now = NOW;
   t.U.started('ok', 1000);
   t.U.started('ok', 1000);
-  await t.run(60000);
-  assert.equal(t.sent.length, 1);
-  assert.deepEqual(t.sent[0].body.crashes.map((c) => [c.name, c.count, c.fields]),
-    [['app.abnormal_end_suspected', 1, { path: 'avplay:hdr', minutes_since_marker: 2 }]]);
-});
-
-test('crash reports wait while a video starts', async () => {
-  const t = load({ answer: ok });
-  t.win.error({ message: 'x', filename: 'file:///a/js/app.js', lineno: 3, error: new TypeError('x') });
-  await t.run(19000);
-  t.U.quiet(60000);
-  await t.run(55000);
-  assert.deepEqual(t.sent, []);
-  await t.run(20000);
-  assert.equal(t.sent.length, 1);
+  await t.run(70000);
+  const rows = t.sent.flatMap((s) => s.body.events || []).filter((e) => e.name === 'app.abnormal_end_suspected');
+  assert.deepEqual(rows.map((e) => e.fields), [{ path: 'avplay:hdr', minutes_since_marker: 2 }]);
+  assert.ok(t.sent.every((s) => s.body.unit === unitOf(DUID) && s.headers.Authorization));
 });
 
 test('a problem report: category, mapped settings, caps and this session\'s events; the reference comes back', async () => {
@@ -490,26 +456,31 @@ test('a problem report: category, mapped settings, caps and this session\'s even
   t.U.event('app.started', { outcome: 'ok' });
   assert.equal(await t.U.report('buffering'), 'R-7KQ2-M9XD');
   const r = t.sent.find((s) => /reports$/.test(s.url)).body;
-  assert.deepEqual(Object.keys(r).sort(), ['app', 'data', 'device', 'report_id', 'schema_version']);
+  assert.deepEqual(Object.keys(r).sort(), ['app', 'data', 'device', 'report_id', 'schema_version', 'unit']);
+  assert.equal(r.unit, unitOf(DUID));
   assert.equal(r.data.description_category, 'buffering');
   assert.deepEqual(r.data.settings, { hdr: true, multiview_layout: 'side2', timing: false, spoiler_free: false, audio: 'eng', subtitles: true, update_checks: true });
   assert.deepEqual(r.data.breadcrumbs.map((e) => e.name), ['account.status', 'app.started']);
 });
 
 test('the server comes from the build: any build with a valid URL; without one nothing is sent or offered', async () => {
-  for (const [build, want] of [[{ record: true, label: 'tv-dev', server: 'http://10.0.0.49:8787/diag/v1' }, 'http://10.0.0.49:8787/diag/v1/crashes'],
-    [{ record: false, server: BASE }, BASE + '/crashes'],
+  for (const [build, want] of [[{ record: true, label: 'tv-dev', server: 'http://10.0.0.49:8787/diag/v1' }, 'http://10.0.0.49:8787/diag/v1/events'],
+    [{ record: false, server: BASE }, BASE + '/events'],
     [{ record: true, label: 'tv-dev', server: 'javascript:alert(1)' }, undefined],
     [{ record: false, server: BASE + '/' }, undefined],
     [{ record: false }, undefined]]) {
-    const sent = [], settings = { diagnostics: 'off' };
-    const ctx = vm.createContext({ DIAG_BUILD: build, window: { addEventListener: () => {}, crypto: { getRandomValues: (a) => crypto.randomFillSync(a) } },
-      localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} }, Settings: { get: (k) => settings[k], set: (k, v) => { settings[k] = v; } },
+    const sent = [], settings = { diagnostics: 'off' }, mem = {};
+    const storage = { getItem: (k) => (k in mem ? mem[k] : null), setItem: (k, v) => { mem[k] = String(v); }, removeItem: (k) => { delete mem[k]; } };
+    const ctx = vm.createContext({ DIAG_BUILD: build, window: { addEventListener: () => {}, crypto: { getRandomValues: (a) => crypto.randomFillSync(a) }, localStorage: storage },
+      localStorage: storage,
+      Settings: { get: (k) => settings[k], set: (k, v) => { settings[k] = v; } },
       setTimeout: () => 1, clearTimeout: () => {}, Date, Math, JSON, Promise, Uint8Array, unescape, encodeURIComponent,
       fetch: (url) => { sent.push(url); return Promise.reject(new TypeError('Failed to fetch')); } });
     vm.runInContext(SRC, ctx);
-    ctx.DiagUpload.jsError('other', null, null);
-    ctx.DiagUpload.flushCrashes();
+    // With a server, the yes sends the events (without one, nothing at all).
+    ctx.DiagUpload.setEnabled(true);
+    ctx.DiagUpload.event('app.started', { outcome: 'ok' });
+    ctx.DiagUpload.flush();
     for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
     assert.equal(sent[0], want, JSON.stringify(build));
     assert.equal(ctx.DiagUpload.available(), !!want);
@@ -522,4 +493,31 @@ test('the server comes from the build: any build with a valid URL; without one n
       assert.deepEqual(sent, []);
     }
   }
+});
+
+test('an app open 15 minutes counts once, anonymously: the version and whether diagnostics are on, nothing else', async () => {
+  const t = load({ answer: ok, settings: { diagnostics: 'off', diagnosticsAsked: true } });
+  await t.run(14 * 60000);
+  assert.deepEqual(t.uses, [], 'not before 15 minutes (an app closed again counts nothing)');
+  await t.run(2 * 60000);
+  assert.equal(t.uses.length, 1);
+  assert.equal(t.uses[0].url, BASE + '/starts');
+  assert.deepEqual(t.uses[0].body, { schema_version: 1, version: '1.4.0', diagnostics: false });
+  assert.equal(t.uses[0].headers.Authorization, undefined, 'no secret');
+  assert.deepEqual(t.sent, [], 'and nothing else with diagnostics off');
+  await t.run(3 * 3600000);
+  assert.equal(t.uses.length, 1, 'once per run');
+});
+
+test('the app-use count waits for the answer to the diagnostics question, says when it is yes, and skips personal builds', async () => {
+  const unasked = load({ answer: ok, settings: { diagnostics: 'off' } });
+  await unasked.run(20 * 60000);
+  assert.deepEqual(unasked.uses, [], 'a new viewer not asked yet would skew the share');
+  const yes = load({ answer: ok });
+  yes.U.setEnabled(true);   // the answer: yes (sets diagnosticsAsked)
+  await yes.run(16 * 60000);
+  assert.deepEqual(yes.uses.map((u) => [u.body.diagnostics, u.body.unit]), [[true, undefined]]);
+  const personal = load({ answer: ok, settings: { diagnostics: 'off', diagnosticsAsked: true }, build: { record: true, label: 'tv-dev', server: BASE } });
+  await personal.run(20 * 60000);
+  assert.deepEqual(personal.uses, []);
 });

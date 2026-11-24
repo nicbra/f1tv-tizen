@@ -254,7 +254,7 @@ test('a new consent epoch forgets the attempt under way', () => {
   assert.equal(t.events.length, n, 'no summary from before');
 });
 
-test('a multiview\'s own Caps ways report as before: the engine with clear input, or the DRM of a copy-protected grid', () => {
+test('each way of playing is reported by its own name (multiview grids, clear 4K HDR, H.264 multiview\'s big feed)', () => {
   const paths = [];
   for (const [engine, stream] of [
     ['avplay', { capsPath: 'avplay:grid', grid: { layout: 'big3' } }],
@@ -270,5 +270,5 @@ test('a multiview\'s own Caps ways report as before: the engine with clear input
     t.P.failed(null, null, { noProgress: true, final: true });
     paths.push(t.events[0].fields.path);
   }
-  assert.deepEqual(paths, ['avplay:clear', 'shaka:clear', 'avplay:clear', 'avplay:hdr']);
+  assert.deepEqual(paths, ['avplay:grid', 'shaka:grid', 'mvsoft:h264', 'avplay:drmgrid']);
 });
