@@ -1591,9 +1591,6 @@
 
   var loadingFeed = false;   // a playFeed load is running
   var feedTarget = null;     // the feed that load is for (set at once: feedsCtx.index follows only after the session check)
-  // AVPlay's preparation hung twice this session: it stays stuck until the app restarts (Shaka still plays). The
-  // multiviews it plays (the helper's grids, H.264's big feed) are left out until then.
-  var avplayStuck = false;
   var feedLoadSeq = 0;       // only the current load may release the queue
   var feedLoadTimer = null;  // bounds how long a load can hold the queue
   var playerExits = 0;       // counts leavePlayer calls: a load that outlives one was abandoned by the viewer
@@ -1645,11 +1642,18 @@
   function isOff(key) { return !!(feedsCtx && feedsCtx.off && feedsCtx.off[key]); }
   function setOff(key) { if (!key) return; feedsCtx.off = feedsCtx.off || {}; feedsCtx.off[key] = true; }
 
-  /** A way this video may still try: not off for it, not ruled out on this TV, not on AVPlay while it is stuck. */
-  function wayOpen(way) {
-    if (avplayStuck && /^(avplay|mvsoft):/.test(way)) return false;   // H.264 multiview's big feed plays on AVPlay
-    return !isOff(way) && pathUsable(way);
-  }
+  /**
+   * A way this video may still try: not off for it, not ruled out on this TV, its engine able to play in this app run
+   * (Player.engineOpen: AVPlay after two hung preparations, Shaka after the H.264 multiview's software decoding).
+   */
+  function wayOpen(way) { return engineUp(way) && !isOff(way) && pathUsable(way); }
+
+  /** The way's engine can still play until the app restarts (H.264 multiview's big feed plays on AVPlay: js/ways.js). */
+  function engineUp(way) { return Player.engineOpen(Ways.engine(way)); }
+
+  /** Some engine can still play in this app run: AVPlay stuck and Shaka lost too leave only a restart. */
+  function engineLeft() { return Player.engineOpen('avplay') || Player.engineOpen('shaka'); }
+  var RESTART_STUCK = 'The TV\'s video player is stuck. Restart the app to continue where you were.';
 
   /**
    * Tizen 6/QE55Q77A: browser cenc works, browser cbcs doesn't, AVPlay cbcs works. Tizen 5 (PR #3):
@@ -1663,31 +1667,34 @@
       if (wayOpen(paths[i])) return paths[i];
     }
     // Exhausted the preferred paths: still try an untried one, even if old evidence was bad.
-    for (var j = 0; j < paths.length; j++) if (!isOff(paths[j]) && !(avplayStuck && Ways.engine(paths[j]) === 'avplay')) return paths[j];
+    for (var j = 0; j < paths.length; j++) if (!isOff(paths[j]) && engineUp(paths[j])) return paths[j];
     return paths[paths.length - 1];
   }
 
   /**
    * The way a stream plays (js/ways.js): what Player.choose runs and Caps learns. Its own kind's way (Ways.preferred:
    * F1's Chromecast cenc by the route asked for, F1 may answer cbcs to a cenc request), a multiview by its kind
-   * (MV_WAYS), unprotected video by the engines still open (clearWay).
+   * (MV_WAYS), unprotected video by the engines still open (clearWay; `played`: a failed switch going back to its old
+   * feed keeps the way that feed played on).
    */
-  function wayFor(stream, route) {
+  function wayFor(stream, route, played) {
     if (stream.grid) return mvWayOf(stream);
     var way = Ways.preferred(stream);
-    return Ways.get(way).group === 'clear' ? clearWay(stream) : way;
+    return Ways.get(way).group === 'clear' ? clearWay(stream, played) : way;
   }
 
   /**
    * Unprotected video (highlights, Race in 30, older replays): its preferred engine first, then the other; a combined
-   * master is Shaka's alone. The first way still open, else the first not failed for this video, else null: none left.
+   * master is Shaka's alone. The way the feed just played on (`played`, while its engine is open), else the first way
+   * still open, else the first not failed for this video, else null: none left.
    */
-  function clearWay(stream) {
+  function clearWay(stream, played) {
     var first = Ways.preferred(stream);
     var order = stream.combo ? [first] : [first].concat(Ways.group('clear').filter(function (w) { return w !== first; }));
+    if (played && order.indexOf(played) >= 0 && engineUp(played)) return played;
     var open = order.filter(wayOpen);
     if (open.length) return open[0];
-    var left = order.filter(function (w) { return !isOff(w) && !(avplayStuck && Ways.engine(w) === 'avplay'); });
+    var left = order.filter(function (w) { return !isOff(w) && engineUp(w); });
     return left[0] || null;
   }
 
@@ -1695,7 +1702,7 @@
   function hasNextWay(stream) {
     if (stream.hlsAes || stream.hdr) return true;   // the usual 4K HDR, else SDR
     var way = Ways.get(stream.capsPath);
-    if (way && way.group === 'sdr') return !isOff(sdrPath()) && !(avplayStuck && Ways.engine(sdrPath()) === 'avplay');
+    if (way && way.group === 'sdr') return !isOff(sdrPath()) && engineUp(sdrPath());
     if (way && way.group === 'clear') return !!clearWay(stream);
     return false;
   }
@@ -1918,7 +1925,9 @@
     var way = mvWays('clear')[0];
     if (way) return way.split(':')[0];
     // None, and the multiview comes anyway (a resumed one: mvEngine unread): one that didn't fail for this video.
-    return isOff('shaka:grid') ? 'avplay' : isOff('avplay:grid') || avplayStuck ? 'shaka' : GRID_FIRST;
+    var order = GRID_FIRST === 'shaka' ? ['shaka', 'avplay'] : ['avplay', 'shaka'];
+    var left = order.filter(function (e) { return !isOff(e + ':grid'); });
+    return left.filter(Player.engineOpen)[0] || left[0] || GRID_FIRST;
   }
 
   /** The feeds failed, not a way (see above): the kind is off for this video, nothing learned on the TV. */
@@ -1959,12 +1968,13 @@
     if (Player.stream() === stream) Caps.crashEnd(true);
     var unclear = cause === 'transient' || cause === 'stuck';
     feedsCtx.again = feedsCtx.again || {};
-    if ((unclear || cause === 'unsure') && !feedsCtx.again[way] && !(cause === 'stuck' && avplayStuck)) {
+    if ((unclear || cause === 'unsure') && !feedsCtx.again[way] && !(cause === 'stuck' && !engineUp(way))) {
       feedsCtx.again[way] = true;
       Caps.failed(way, true);
       return 'again';
     }
-    if (cause !== 'content') Caps.failed(way, unclear);
+    // Its engine can't play in this app run (Player.engineLost): that says nothing about the way on this TV.
+    if (cause !== 'content' && (engineUp(way) || cause === 'stuck')) Caps.failed(way, unclear);
     setOff(way);
     if (cause === 'content' && stream.grid) mvKindOff(mvKindFor(stream.grid.engine, stream));
     // A protected SDR way: the server may decline the cenc offer and return cbcs, so the route asked for is off too
@@ -2544,6 +2554,8 @@
     if (!opts.recover) feedsCtx.recoveries = 0;   // the viewer's own request: retries count from here
     var f = feedsCtx.feeds[i], mv = feedsCtx.multiview;
     mvSoftStop();   // an H.264 multiview's small feeds belong to what played
+    // Neither engine can play until the app restarts (Player.engineLost): nothing to load, the viewer is told.
+    if (!engineLeft()) { toast(RESTART_STUCK, 20000); return Promise.resolve(); }
     var playing = screen === 'player' && Player.engineName();
     var from = opts.switching && playing ? { wall: Player.wallClock(Player.position()), at: Date.now(),
       pos: Player.position(), paused: Player.isPaused(), index: feedsCtx.index, stream: Player.stream(), keyAt: lastKeyAt } : null;
@@ -2657,7 +2669,13 @@
           // Superseded by a newer request, or the viewer left the player while it loaded.
           if (feedsCtx !== ctx || exits !== playerExits || feedsCtx.index !== i || queuedFeed || screen !== 'player') return;
           // The way it plays (js/ways.js): what Player.choose runs and Caps learns, once the combined master is known.
-          stream.capsPath = wayFor(stream, route);
+          stream.capsPath = wayFor(stream, route, opts.played);
+          // No way left for this video (each failed already), or its engine can't play until the app restarts: no
+          // player opens (Player.choose would run the stream's default engine); recovery decides what follows.
+          if (!stream.capsPath || !engineUp(stream.capsPath)) {
+            throw new Error(Player.engineOpen('avplay') && Player.engineOpen('shaka') ? 'no way left to play it on this TV' :
+              'restart the app to play it');
+          }
           // Keys in the variant playlist: not playable here; the catch below falls back to SDR.
           if (stream.capsPath === 'shaka:hdr' && stream.info && stream.info.encrypted) throw new Error('encrypted HDR stream');
           // Live HDR plays natively on the official live timeline (HdrStream.live), or as F1's Tiledmedia HLS on Shaka.
@@ -2890,7 +2908,7 @@
     // played last is saved (saveWatching), so it comes back at that moment.
     var stuckNow = false;
     if (cause === 'stuck') {
-      if ((c.error && c.error.code === 'PLAYER_STUCK') || feedsCtx.prepareRetried) stuckNow = avplayStuck = true;
+      if ((c.error && c.error.code === 'PLAYER_STUCK') || feedsCtx.prepareRetried) { stuckNow = true; Player.engineLost('avplay'); }
       feedsCtx.prepareRetried = true;
     }
     // A multiview that failed before a player had it (its offers, player_tm's preparation): no way to hold it against;
@@ -2916,6 +2934,8 @@
     if (next === 'alone' && feedsCtx.recoveries > RECOVERIES + 1) next = 'stop';
     if (next === 'stop' && from && from.index != null && from.index !== i && from.stream && !from.stream.failed &&
         feedsCtx.recoveries <= RECOVERIES) next = 'back';
+    // Nothing can open another player until the app restarts (AVPlay stuck, Shaka lost after the H.264 multiview).
+    if (!engineLeft() && next !== 'stay') next = 'stop';
     diag('play.fallback', { phase: c.phase, cause: cause, blamed: blamed || null, to: next, why: what.slice(0, 120) });
     final(next === 'stop' || next === 'stay' || next === 'back');
     var verb = c.phase === 'play' ? ' stopped' : ' didn\'t start';
@@ -2925,7 +2945,7 @@
     var noticed = c.phase !== 'load' || cause === 'stuck';
     if (next === 'stop' || next === 'stay') {
       if (mvOn) feedsCtx.multiview = null;
-      if (stuckNow && !mvOn) return toast('The TV\'s video player is stuck. Restart the app to continue where you were.', 20000);
+      if ((stuckNow && !mvOn) || !engineLeft()) return toast(RESTART_STUCK, 20000);
       if (mvOn) return toast('Multiview didn\'t work' + (what ? ' (' + what + ')' : '') + '.', 8000);
       return toast(c.phase === 'start' ? 'The video didn\'t start.' : 'Could not play' + (what ? ': ' + what : '.'), 8000);
     }
@@ -2936,6 +2956,7 @@
       // The switch gave up (above); playing the old feed again is an attempt of its own for the diagnostics.
       var back = retryFrom('load', null, {}, from);
       delete back.recover; delete back.retry;
+      back.played = from.stream && from.stream.capsPath;   // the way it played on, though the switch failed on it too
       if (!queuedFeed && screen === 'player') playFeed(from.index, back);
       return;
     }
@@ -3806,7 +3827,9 @@
 
     // H.264 streams (no HEVC to tile): the small feeds come from Samsung's software decoder (js/mvsoft.js).
     if (names.some(function (n) { return n !== 'off' && mvEngine(n) === 'h264'; })) {
-      box.appendChild(el('div', 'panel-note', 'Multiview for H.264 streams is experimental. HEVC was not introduced in F1TV until 2025.'));
+      // Its software decoding leaves the browser's player unusable until the app restarts (Player.engineLost).
+      box.appendChild(el('div', 'panel-note', 'Multiview for H.264 streams is experimental. HEVC was not introduced in F1TV until 2025. ' +
+        'Once used, some videos play in HD instead of 4K HDR, and feed switches are slower, until the app is restarted.'));
     }
     box.appendChild(el('div', 'panel-head', 'Layout'));
     var strip = el('div', 'mv-thumbs'), row = null;

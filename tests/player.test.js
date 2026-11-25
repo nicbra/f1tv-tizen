@@ -3,8 +3,8 @@ const { readFileSync } = require('node:fs');
 const { test } = require('node:test');
 const vm = require('node:vm');
 
-function player() {
-  const context = vm.createContext({ localStorage: { getItem: () => null, setItem() {} }, Date, Math, JSON });
+function player(sessionStorage) {
+  const context = vm.createContext({ localStorage: { getItem: () => null, setItem() {} }, Date, Math, JSON, ...(sessionStorage ? { sessionStorage } : {}) });
   vm.runInContext(readFileSync('app/js/failure.js', 'utf8'), context);
   vm.runInContext(readFileSync('app/js/ways.js', 'utf8'), context);
   vm.runInContext(readFileSync('app/js/player.js', 'utf8'), context);
@@ -12,6 +12,35 @@ function player() {
 }
 
 const T0 = Date.parse('2026-10-11T11:55:00Z') / 1000;
+
+/** A page's sessionStorage: kept over a page reload (a new Player on the same store), empty after an app restart. */
+function session() {
+  const m = new Map();
+  return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)) };
+}
+
+test('a lost engine stays lost for this app run; a loss a page reload keeps is still there after one, an app restart clears both', () => {
+  const store = session();
+  const P = player(store);
+  assert.equal(P.engineOpen('shaka'), true);
+  assert.equal(P.engineOpen('avplay'), true);
+  P.engineLost('avplay');            // AVPlay's hang: this page only
+  P.engineLost('shaka', true);       // MediaSource after EMSS: a reload doesn't bring it back
+  assert.equal(P.engineOpen('avplay'), false);
+  assert.equal(P.engineOpen('shaka'), false);
+  const reloaded = player(store);
+  assert.equal(reloaded.engineOpen('shaka'), false);
+  assert.equal(reloaded.engineOpen('avplay'), true);
+  const restarted = player(session());
+  assert.equal(restarted.engineOpen('shaka'), true);
+  // Without sessionStorage (or one that throws), the loss holds for the page.
+  const bare = player();
+  bare.engineLost('shaka', true);
+  assert.equal(bare.engineOpen('shaka'), false);
+  const broken = player({ getItem() { throw new Error('denied'); }, setItem() { throw new Error('denied'); } });
+  broken.engineLost('shaka', true);
+  assert.equal(broken.engineOpen('shaka'), false);
+});
 
 test('wallClock maps a DASH position to Unix time through the stream time base', () => {
   const P = player();

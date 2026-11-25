@@ -59,7 +59,11 @@ async function player(av, storage, shakaLoad, globals, manifest) {
   }
   class ShakaPlayer {
     constructor() { this.responseFilters = []; (context.shakaPlayers = context.shakaPlayers || []).push(this); }
-    attach() { return Promise.resolve(); }
+    // As on the TV once the MediaSource is lost (context.mseGone): an attach that sets one up never finishes.
+    attach(video, initMediaSource) {
+      (context.attaches = context.attaches || []).push(initMediaSource);
+      return context.mseGone && initMediaSource !== false ? new Promise(() => {}) : Promise.resolve();
+    }
     resetConfiguration() { this.abrFactory = null; }
     configure(config, value) { configs.push(config); if (config === 'abrFactory') this.abrFactory = value; }
     async load(url, start) {
@@ -117,6 +121,19 @@ const LIVE = { url: 'https://ott-video-cf.formula1.com/v2/x/Main/index.mpd?start
 const REPLAY = { url: 'https://ott-video-cf.formula1.com/v2/x/vod/index.mpd', licenseUrl: 'https://f1tv.formula1.com/lic',
   licenseHeaders: {}, live: false, multiFeed: false, info: { dynamic: false, windowStart: 0, windowEnd: 6163, epochAtZero: 1792867000, segDur: 5.76 } };
 const names = (av) => av.calls.map((c) => c[0]);
+
+test('with Shaka lost before a page reload, the player starts without setting up a MediaSource (it never opens); otherwise as usual', async () => {
+  const kept = { 'f1tv.engines.lost': JSON.stringify({ shaka: true }) };
+  const sessionStorage = { getItem: (k) => (k in kept ? kept[k] : null), setItem: (k, v) => { kept[k] = String(v); } };
+  const lost = await Promise.race([player(fakeAvPlay(), {}, null, { sessionStorage, mseGone: true }),
+    new Promise((ok) => setTimeout(() => ok(null), 500))]);
+  assert.ok(lost, 'Player.init finished');
+  assert.deepEqual(lost.context.attaches, [false, false]);
+  assert.equal(lost.engineOpen('shaka'), false);
+  assert.equal(lost.engineOpen('avplay'), true);
+  const usual = await player(fakeAvPlay(), {}, null, { sessionStorage: { getItem: () => null, setItem() {} } });
+  assert.deepEqual(usual.context.attaches, [true, true]);
+});
 
 test('encrypted DASH plays on AVPlay through the stream helper, with the preferred commentary', async () => {
   const av = fakeAvPlay();

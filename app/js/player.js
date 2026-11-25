@@ -282,7 +282,9 @@ var Player = (function () {
     function makeSlot(video) {
       var player = new shaka.Player();
       var slot = { p: player, v: video, hdr: false };
-      return player.attach(video).then(function () {
+      // Attaching sets up a MediaSource and waits for it to open: one lost for this app run (engineLost, after a page
+      // reload too) never opens, and the app's start waited on the splash for ever.
+      return player.attach(video, engineOpen('shaka')).then(function () {
         player.getNetworkingEngine().registerRequestFilter(function (type, request, context) {
           var types = shaka.net.NetworkingEngine.RequestType;
           // Which slot and stream a segment download is for (Ahead.abortFor cancels the outgoing stream's at a switch).
@@ -1737,6 +1739,26 @@ var Player = (function () {
     return typeof webapis !== 'undefined' && !!webapis.avplay;
   }
 
+  /*
+   * Engines that can't play again until the app restarts: the app leaves their ways out (app.js wayOpen) and learns
+   * nothing from them meanwhile. AVPlay: its preparation hung twice (app.js recover). Shaka: once Samsung's EMSS (the
+   * H.264 multiview's small feeds, js/mvsoft.js) had a source, the browser's MediaSource never opens again in this app
+   * process: a new one fails at once (MEDIA_ERR_SRC_NOT_SUPPORTED), a page reload keeps that, an app restart clears it
+   * (QE55Q77A, Tizen 6, 2026-11-25; any EMSS mode, also a source destroyed unused). sessionStorage lives exactly as long
+   * (kept over a reload, empty after a restart), so such a loss is kept there.
+   */
+  var LOST_KEY = 'f1tv.engines.lost';
+  function lostKept() {
+    try { return JSON.parse(sessionStorage.getItem(LOST_KEY) || '{}') || {}; } catch (e) { return {}; }
+  }
+  var lost = lostKept();
+  function engineLost(name, overReload) {
+    lost[name] = true;
+    if (!overReload) return;
+    try { var kept = lostKept(); kept[name] = true; sessionStorage.setItem(LOST_KEY, JSON.stringify(kept)); } catch (e) { /* this page only */ }
+  }
+  function engineOpen(name) { return !lost[name]; }
+
   function init(videoEl, avEl) {
     els.video = videoEl;
     els.av = avEl;
@@ -1948,6 +1970,10 @@ var Player = (function () {
 
   return {
     init: init,
+    /** Whether an engine ('avplay' / 'shaka') can still play in this app run (see engineLost). */
+    engineOpen: engineOpen,
+    /** An engine can't play until the app restarts; overReload: a page reload doesn't help either (kept for it). */
+    engineLost: engineLost,
     hdrCapable: hdrCapable,
     hevcDecodes: hevcDecodes,
     cencCapable: function () { return typeof Caps !== 'undefined' && Caps.browser('cenc') !== false; },

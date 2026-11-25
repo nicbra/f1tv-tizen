@@ -310,6 +310,10 @@ async function boot(options = {}) {
     // Which multiview pictures the TV decodes (all by default): (width, height, hdr) => boolean.
     hevcDecodes: (w, h, hdr) => (options.hevcDecodes ? options.hevcDecodes(w, h, hdr) : true),
     kind: 'shaka',   // or 'avplay': which engine the stub plays as, for a stream without a way (capsPath)
+    // Engines that can't play until the app restarts (player.js engineLost): AVPlay's hangs, Shaka after EMSS.
+    lost: {},
+    engineOpen: (name) => !player.lost[name],
+    engineLost: (name) => { player.lost[name] = true; },
     // As player.js choose(): the engine of the way the app chose (js/ways.js), else player.kind.
     engineFor: (s) => (s && s.capsPath && context.Ways.engine(s.capsPath)) || (options.capsRouting ? (s.cenc && !s.cencAvplay ? 'shaka' : 'avplay') : player.kind),
     load(s, start) {
@@ -938,10 +942,14 @@ test('a failed feed switch leaves the previous feed current', async () => {
   assert.match(app.toast(), /Could not play/);
   assert.equal(app.player.current.url, 'https://cdn/101/main.m3u8');
   assert.match(app.$('osd-feed').textContent, /^INTERNATIONAL/);
-  // The next switch goes on from INTERNATIONAL, to F1 LIVE again.
+  assert.equal(app.player.current.capsPath, 'shaka:clear', 'back on the way it played on, though the switch failed on it');
+  // Once it plays again its way is open again: the next switch goes on from INTERNATIONAL, to F1 LIVE on it.
+  app.player.progress = true;
+  await app.advance(3000);
   await app.press('CH_DOWN');
   await app.advance(500);
   assert.equal(app.player.loads.at(-1).url, 'https://cdn/101/1033.m3u8');
+  assert.equal(app.player.current.capsPath, 'shaka:clear');
 });
 
 test('a start that hangs in AVPlay is tried once more at the same moment, then the viewer is told to restart', async () => {
@@ -969,7 +977,9 @@ test('a start that hangs in AVPlay is tried once more at the same moment, then t
 
 test('a multiview whose AVPlay hangs twice plays its big feed alone (Shaka still plays), not a dead screen', async () => {
   const hung = () => Object.assign(new Error('The video player did not start'), { code: 'PREPARE_TIMEOUT' });
-  const app = await premiumHdr({ play: premiumOffer });
+  // This TV: browser cenc plays on Shaka (the stub's probe would say no after 10 s).
+  const app = await premiumHdr({ play: premiumOffer, capsRouting: true });
+  app.context.Caps.browser = () => true;
   app.player.kind = 'avplay';
   await play(app, 'Race');
   app.player.progress = true;
@@ -994,6 +1004,51 @@ test('a multiview whose AVPlay hangs twice plays its big feed alone (Shaka still
   assert.match(app.toast(), /Playing one feed/);
   assert.ok(app.player.current && !app.player.current.grid, 'one feed plays');
   assert.equal(app.player.current.feed, 'INTERNATIONAL');
+  // Not native 4K HDR or cbcs: AVPlay is stuck until the app restarts; the protected SDR plays on Shaka.
+  assert.equal(app.player.current.capsPath, 'shaka:cenc');
+});
+
+test('with Shaka lost (after the H.264 multiview), a multiview whose AVPlay hangs twice tells the viewer to restart, no load on Shaka', async () => {
+  const hung = () => Object.assign(new Error('The video player did not start'), { code: 'PREPARE_TIMEOUT' });
+  const app = await premiumHdr({ play: premiumOffer });
+  app.player.kind = 'avplay';
+  app.player.lost.shaka = true;
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.hold = deferred();
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(5000);
+  assert.ok(app.player.current.grid, 'the multiview is loading');
+  assert.equal(app.context.Ways.engine(app.player.current.capsPath), 'avplay');
+  const first = app.player.hold;
+  app.player.hold = deferred();
+  first.reject(hung());
+  await app.advance(500);
+  assert.match(app.toast(), /didn't start, trying again/);
+  await app.advance(5000);
+  const second = app.player.hold;
+  app.player.hold = null;
+  const loads = app.player.loads.length;
+  second.reject(hung());
+  await app.advance(5000);
+  assert.match(app.toast(), /Restart the app/);
+  assert.equal(app.player.loads.length, loads, 'nothing more opens: neither engine can play until the app restarts');
+});
+
+test('with neither engine able to play until the app restarts, a new video opens no player and the viewer is told to restart', async () => {
+  const app = await boot();
+  app.player.lost.avplay = true;
+  app.player.lost.shaka = true;
+  await app.pick(/^Race/);
+  await app.advance(100);
+  await app.pick(/^INTERNATIONAL/);
+  await app.advance(1000);
+  assert.match(app.toast(), /video player is stuck\. Restart the app/);
+  assert.equal(app.player.loads.length, 0);
 });
 
 test('after a hung start that recovered, a later hang gets its retry again', async () => {
@@ -1283,7 +1338,10 @@ test('watch options change commentary and subtitles, and pick a feed', async () 
 // An HDR TV unless options say otherwise; the account's tier plays no part.
 const premiumHdr = (options) => boot(Object.assign({ multiview: true, hdrCapable: true }, options));
 
-const premiumOffer = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '/hdr.m3u8', hdr: true, hdrEncrypted: true, licenseUrl: 'https://lic' });
+// As api.js: the encrypted 4K HDR answer isn't used when its native way is closed (opts.cbcs false); the SDR one is.
+const premiumOffer = (id, channel, opts) => Promise.resolve(opts && opts.cbcs === false ?
+  { url: 'https://cdn/' + id + '/' + (channel || 'main') + (opts.cenc ? '.mpd' : '.m3u8'), licenseUrl: 'https://lic', cenc: !!opts.cenc } :
+  { url: 'https://cdn/' + id + '/' + (channel || 'main') + '/hdr.m3u8', hdr: true, hdrEncrypted: true, licenseUrl: 'https://lic' });
 
 test('the player bar says 5.1 while surround audio plays (F1 shows in 4K HDR), and nothing more for stereo', async () => {
   const app = await premiumHdr({ play: premiumOffer });

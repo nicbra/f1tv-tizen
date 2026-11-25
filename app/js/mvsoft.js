@@ -152,6 +152,8 @@ var MvSoftware = (function () {
       live();
       track = CmafDash.videoTrack(initBytes);
       run.timescale = track.timescale;
+      // From here on the browser's MediaSource (Shaka) won't open again until the app restarts (Player.engineLost).
+      if (typeof Player !== 'undefined' && Player.engineLost) Player.engineLost('shaka', true);
       var src = run.src = new api.ElementaryMediaStreamSource('latency-mode-normal', 'rendering-mode-video-texture');
       var v = run.video = document.createElement('video');
       v.muted = true;

@@ -14,7 +14,7 @@ function harness(mediaFails) {
   }
   canvas = makeCanvas();
   class Source {
-    constructor() { Source.instances.push(this); }
+    constructor() { Source.instances.push(this); events.push('create source'); }
     addVideoTrack(o) { this.trackOptions = o; return { trackId: 1, sessionId: 2 }; }
     open() { return Promise.resolve(); }
     destroy() { events.push('destroy source'); }
@@ -49,7 +49,8 @@ function harness(mediaFails) {
     },
     setTimeout: (fn, ms) => { const id = ++serial; timers.set(id, { fn, ms, interval: false }); return id; },
     setInterval: (fn, ms) => { const id = ++serial; timers.set(id, { fn, ms, interval: true }); return id; },
-    clearInterval: id => timers.delete(id), Diag: { note: (kind) => events.push(kind) }
+    clearInterval: id => timers.delete(id), Diag: { note: (kind) => events.push(kind) },
+    Player: { engineLost: (name, overReload) => events.push('lost ' + name + (overReload ? ' over reload' : '')) }
   };
   ctx.window.HTMLCanvasElement.prototype.transferControlToOffscreen = function () {};
   vm.createContext(ctx); vm.runInContext(fs.readFileSync(path.join(__dirname, '../app/js/mvsoft.js'), 'utf8'), ctx);
@@ -111,4 +112,15 @@ test('a segment playlist without segments is reported too, not a start clock of 
   await h.api.start(h.opts());
   assert.ok(h.errors.some((m) => /without segments/.test(m)), String(h.errors));
   assert.equal(h.workers.length, 0);
+});
+
+// Once an EMSS source exists, the browser's MediaSource won't open again until the app restarts (QE55Q77A): Shaka is
+// lost for the app run (and over a page reload) before the source is made; a start that fails earlier loses nothing.
+test('the first EMSS source marks Shaka lost until the app restarts, before it is created; a start failing before that does not', async () => {
+  const h = harness(); await h.api.start(h.opts());
+  assert.ok(h.events.includes('lost shaka over reload'), String(h.events));
+  assert.ok(h.events.indexOf('lost shaka over reload') < h.events.indexOf('create source'));
+  const stopped = h.api.stop(); h.workers[0].ack(); await stopped;
+  const early = harness(true); await early.api.start(early.opts());
+  assert.ok(!early.events.some((e) => /^lost /.test(e)), String(early.events));
 });

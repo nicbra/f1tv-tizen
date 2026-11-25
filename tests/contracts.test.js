@@ -75,7 +75,7 @@ test('the fake players offer every Player function app.js calls (no call is left
 });
 
 // What loadFeed, the start watch and the recovery call (app-playback's harness plays feeds, nothing else).
-const PLAYBACK = new Set(['audioChannels', 'bufferedEnd', 'cencCapable', 'decodedFrames', 'engineName', 'errorInfo', 'hdrCapable',
+const PLAYBACK = new Set(['audioChannels', 'bufferedEnd', 'cencCapable', 'decodedFrames', 'engineLost', 'engineName', 'engineOpen', 'errorInfo', 'hdrCapable',
   'isLive', 'isPaused', 'isViewerPaused', 'load', 'position', 'range', 'reloadedSince', 'stream', 'switchKind', 'switchTo',
   'togglePause', 'unload', 'wallClock']);
 

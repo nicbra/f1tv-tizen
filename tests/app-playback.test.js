@@ -45,7 +45,8 @@ function playback(load, capable = true, opts = {}) {
       position: () => opts.position ? opts.position(current) : 120, decodedFrames: () => null, wallClock: () => null, isLive: () => false, isPaused: () => paused, togglePause: () => { paused = !paused; },
       range: () => ({ start: 0, end: 600 }), bufferedEnd: () => 150, errorInfo: (e) => (e && e.info) || { code: 'OTHER', platform: null },
       isViewerPaused: () => paused, reloadedSince: () => false, reloadedAt: () => 0, switchKind: () => 'swap', audioChannels: () => null,
-      tracks: () => ({ audio: [], text: [] })
+      tracks: () => ({ audio: [], text: [] }),
+      engineOpen: (name) => !(opts.lost || []).includes(name), engineLost: (name) => { (opts.lost = opts.lost || []).push(name); }
     }
   });
   // What a failure means and the ways of playing (js/failure.js, js/ways.js): always loaded before app.js, as in index.html.
@@ -357,6 +358,55 @@ test('this TV keeps clear HDR on Shaka, encrypted HDR on AVPlay, and cenc replay
     assert.equal(h.context.Player.engineName(), kind === 'encrypted' ? 'avplay' : 'shaka');
     assert.equal(!!s.cenc, kind === 'sdr');
   }
+});
+
+test('with Shaka lost until restart (after the H.264 multiview), every kind plays an AVPlay way and nothing asks for Shaka', async () => {
+  for (const kind of ['clear', 'encrypted', 'sdr']) {
+    for (const live of [false, true]) {
+      const h = playback(null, true, { caps: [], cencCapable: true, protected: kind === 'sdr', lost: ['shaka'],
+        authorizedHdr: kind === 'encrypted', settings: { hdr: kind !== 'sdr' } });
+      h.app.set(video({ live })); h.app.play(0, {});
+      for (let i = 0; i < 4; i++) await settle();
+      const s = h.loads.at(-1).stream;
+      assert.equal(h.loads.length, 1, kind + (live ? ' live' : ''));
+      assert.equal(h.context.Ways.engine(s.capsPath), 'avplay', kind + ' ' + s.capsPath);
+      assert.equal(h.requests[0].tm, false);           // player_tm plays on Shaka
+      assert.equal(h.offers[0].clearHdr, false);       // clear 4K HDR too: the API keeps the normal answer
+      assert.equal(h.requests[0].cenc, false);         // browser cenc too
+      assert.equal(!!s.hdr, kind === 'encrypted');
+    }
+  }
+});
+
+test('a failure on an engine lost meanwhile counts nothing against its way on this TV; the video plays on AVPlay', async () => {
+  let h;
+  h = playback(async (stream) => {
+    if (stream.capsPath === 'shaka:hdr') { h.context.Player.engineLost('shaka', true); throw new Error('Shaka Error 3016'); }
+  }, true, { caps: [] });
+  const ctx = video();
+  h.app.set(ctx); h.app.play(0, { startAt: 87 });
+  for (let i = 0; i < 8; i++) await settle();
+  assert.deepEqual(h.loads.map((l) => l.stream.capsPath), ['shaka:hdr', 'avplay:clear']);
+  assert.equal(h.loads[1].position, 87);
+  assert.equal(ctx.off['shaka:hdr'], true);
+  assert.equal(h.context.Caps.report().paths['shaka:hdr'], undefined, 'nothing learned');
+  assert.doesNotMatch(h.nodes.toast?.textContent || '', /Could not play/);
+});
+
+test('with Shaka lost and the unprotected video failed on AVPlay, another feed opens no player: the viewer is told to restart', async () => {
+  const h = playback(async (stream) => { if (stream.capsPath === 'avplay:clear') throw new Error('decoder refused'); },
+    true, { caps: [], lost: ['shaka'], settings: { hdr: false } });
+  const ctx = video();
+  h.app.set(ctx); h.app.play(0, {});
+  for (let i = 0; i < 8; i++) await settle();
+  assert.deepEqual(h.loads.map((l) => l.stream.capsPath), ['avplay:clear']);
+  assert.equal(ctx.off['avplay:clear'], true);
+  h.app.play(1, {});
+  for (let i = 0; i < 8; i++) await settle();
+  // No load without a way (Player.choose would run Shaka, the multi-feed default) and none on a lost engine.
+  assert.deepEqual(h.loads.map((l) => l.stream.capsPath), ['avplay:clear']);
+  assert.match(h.nodes.toast?.textContent || '', /restart the app/i);
+  assert.equal(h.context.Caps.report().paths['shaka:clear'], undefined, 'nothing learned about Shaka');
 });
 
 test('clear HDR replays remain available when native HDR is avoided; live asks only F1\'s Tiledmedia offer for HDR', async () => {
