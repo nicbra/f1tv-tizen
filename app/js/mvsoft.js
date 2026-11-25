@@ -32,6 +32,14 @@ var MvSoftware = (function () {
     return e;
   }
 
+  /** The stream helper refused (answer r): HELPER_ERROR, with where it failed for the diagnostics (Failure.helperSite). */
+  function helperFailure(r, text) {
+    var e = failure('helper: ' + text, 'HELPER_ERROR'), h = r && r.headers;
+    var site = h && h.get && typeof Failure !== 'undefined' ? Failure.helperSite(function (k) { return h.get(k); }) : null;
+    if (site) e.diag.site = site;
+    return e;
+  }
+
   /** Whether this TV can play it: Samsung's EMSS with side-thread pictures, and worker canvases for the frames. */
   function supported() {
     var w = typeof window !== 'undefined' ? window : {};
@@ -87,13 +95,13 @@ var MvSoftware = (function () {
 
   function post(body) {
     return fetch(LOCAL + '/stitch/' + ID, { method: 'POST', body: JSON.stringify(body) }).then(function (r) {
-      return r.text().then(function (text) { if (r.status !== 201) throw failure('helper: ' + text.slice(0, 160), 'HELPER_ERROR'); return JSON.parse(text); });
+      return r.text().then(function (text) { if (r.status !== 201) throw helperFailure(r, text.slice(0, 160)); return JSON.parse(text); });
     });
   }
 
   function bytes(url) {
     return fetch(url).then(function (r) {
-      if (!r.ok) return r.text().then(function (t) { throw failure('helper: HTTP ' + r.status + ' ' + t.slice(0, 120), 'HELPER_ERROR'); });
+      if (!r.ok) return r.text().then(function (t) { throw helperFailure(r, 'HTTP ' + r.status + ' ' + t.slice(0, 120)); });
       return r.arrayBuffer();
     }).then(function (b) { return new Uint8Array(b); });
   }

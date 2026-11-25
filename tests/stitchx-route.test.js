@@ -68,3 +68,19 @@ test('ADTS: every frame is checked, an unknown or changed sample rate is refused
   assert.throws(() => ts.audio(packed(frame(3), frame(4))), /ADTS configuration changed/);
   assert.throws(() => ts.audio(packed(frame(3, 2), frame(3, 1))), /ADTS configuration changed/);
 });
+
+test('a segment the route cannot build answers 422 with where it failed, for the app\'s diagnostics (issue #6)', () => {
+  const route = require('../app/service/stitchx/helper-route.js');
+  const sent = [];
+  const r = route({
+    fetchAll: (urls, cb) => cb(null, urls.map(() => Buffer.from('not a transport stream'))),
+    send: (res, status, body, type, extra) => sent.push({ status, body: String(body), extra }),
+    toBuf: (t) => t, f1Cdn: () => true, port: 0,
+    failureSite: (e) => ({ 'X-Error-Category': e instanceof TypeError ? 'type_error' : 'other', 'X-Error-Source': 'tsdemux.js' })
+  });
+  const s = { kind: 'h264x', feeds: [[{ url: 'https://f1.example/a/0.ts', start: 0, duration: 3.84 }]], cache: [], pending: {}, init: null };
+  r.get({}, s, '0.m4s', 'g');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].status, 422);
+  assert.equal(sent[0].extra['X-Error-Source'], 'tsdemux.js');
+});

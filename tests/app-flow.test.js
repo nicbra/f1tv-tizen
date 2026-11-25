@@ -940,6 +940,7 @@ test('a failed feed switch leaves the previous feed current', async () => {
   h.reject(new Error('Shaka Error 1001'));
   await app.advance(500);
   assert.match(app.toast(), /Could not play/);
+  assert.doesNotMatch(app.toast(), /Shaka|Error|1001/, 'no technical cause on the TV');
   assert.equal(app.player.current.url, 'https://cdn/101/main.m3u8');
   assert.match(app.$('osd-feed').textContent, /^INTERNATIONAL/);
   assert.equal(app.player.current.capsPath, 'shaka:clear', 'back on the way it played on, though the switch failed on it');
@@ -1337,6 +1338,12 @@ test('watch options change commentary and subtitles, and pick a feed', async () 
 
 // An HDR TV unless options say otherwise; the account's tier plays no part.
 const premiumHdr = (options) => boot(Object.assign({ multiview: true, hdrCapable: true }, options));
+
+/**
+ * The technical reasons of the app's fallbacks, from its own local log (realDiag): the TV shows none of them (only what
+ * was written for the viewer); the diagnostics have them.
+ */
+const fallbackWhy = (app) => JSON.parse(app.context.localStorage.getItem('f1tv.diag') || '[]').filter((e) => e.k === 'play.fallback').map((e) => e.d.why);
 
 // As api.js: the encrypted 4K HDR answer isn't used when its native way is closed (opts.cbcs false); the SDR one is.
 const premiumOffer = (id, channel, opts) => Promise.resolve(opts && opts.cbcs === false ?
@@ -1739,7 +1746,7 @@ test('in a multiview, the timing data moves from the tower into the space the la
 });
 
 test('a multiview without HEVC offers to stitch falls back to the big feed alone', async () => {
-  const app = await premiumHdr();
+  const app = await premiumHdr({ realDiag: true });
   await play(app, 'Race');
   // DRM DASH (as F1's normal offer for some replays and live): nothing the helper can stitch.
   app.net.play = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.mpd', licenseUrl: 'https://lic' });
@@ -1750,7 +1757,8 @@ test('a multiview without HEVC offers to stitch falls back to the big feed alone
   await app.advance(3000);
   assert.ok(!app.player.current.grid);
   assert.match(app.player.current.url, /\/main\./);   // the big feed still plays
-  assert.match(app.$('toast').textContent, /Multiview didn't work \(no matching multiview stream for/);
+  assert.equal(app.$('toast').textContent, 'Multiview didn\'t work.', 'no technical reason on the TV');
+  assert.ok(fallbackWhy(app).some((w) => /^no matching multiview stream for/.test(w)), 'the diagnostics have it');
 });
 
 test('a multiview from clear SDR offers (as Pro gets), also on a TV without HDR: the SDR HEVC, and no HDR asked for', async () => {
@@ -1830,7 +1838,7 @@ test('an H.264 replay (no HEVC) offers the layouts with a big feed: AVPlay shows
 });
 
 test('H.264 multiview: small feeds that fail start once more, then the big feed plays alone', async () => {
-  const app = await premiumHdr({ heights: () => [], mvSoftware: true });
+  const app = await premiumHdr({ heights: () => [], mvSoftware: true, realDiag: true });
   await play(app, 'Race');
   app.net.play = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '.m3u8', streamType: 'HLS' });
   await app.press('UP');
@@ -1846,7 +1854,8 @@ test('H.264 multiview: small feeds that fail start once more, then the big feed 
   assert.ok(app.player.current.grid, 'still the multiview');
   app.mvSoft.starts[1].onError(new Error('helper: no such segment'));
   await app.advance(3000);
-  assert.match(app.$('toast').textContent, /Multiview didn't work \(helper: no such segment\)/);
+  assert.equal(app.$('toast').textContent, 'Multiview didn\'t work.');
+  assert.ok(fallbackWhy(app).includes('helper: no such segment'));
   assert.ok(!app.player.current.grid, 'the big feed alone');
   assert.match(app.player.current.url, /\/main\.m3u8$/);
   assert.equal(app.mvSoft.starts.length, 2);
@@ -1905,8 +1914,26 @@ test('an H.264 replay offers no multiview on a TV without Samsung\'s software de
   assert.ok(!/Multiview/.test(app.$('panel-list').textContent));
 });
 
+test('a multiview refused for a reason written for the viewer says it (the request limit); a technical one doesn\'t', async () => {
+  for (const forViewer of [true, false]) {
+    const app = await premiumHdr();
+    await play(app, 'Race');
+    const refusal = Object.assign(new Error(forViewer ? 'F1 TV is limiting video requests from this network for a few minutes. Try again in 3 min.'
+      : 'HDR: grid helper: Cannot read property \'s\' of undefined'), { status: 429, forViewer });
+    app.net.play = (id, channel) => (channel ? Promise.reject(refusal) : premiumOffer(id, channel));
+    await app.press('UP');
+    await app.pick(/^Multiview/, ['UP']);
+    await app.pick(/^Big \+ 2$/, ['RIGHT']);
+    await app.pick(/^Show multiview/, ['DOWN']);
+    await app.advance(3000);
+    assert.ok(!app.player.current.grid);
+    if (forViewer) assert.match(app.toast(), /^Multiview didn't work: F1 TV is limiting video requests from this network for a few minutes\. Try again in 3 min\.$/);
+    else assert.equal(app.toast(), 'Multiview didn\'t work.');
+  }
+});
+
 test('a multiview mixing HDR and SDR offers falls back to the big feed alone', async () => {
-  const app = await premiumHdr();
+  const app = await premiumHdr({ realDiag: true });
   await play(app, 'Race');
   app.net.play = (id, channel) => channel ? Promise.resolve({ url: 'https://cdn/' + id + '/' + channel + '.m3u8' }) : premiumOffer(id, channel);
   await app.press('UP');
@@ -1915,7 +1942,8 @@ test('a multiview mixing HDR and SDR offers falls back to the big feed alone', a
   await app.pick(/^Show multiview/, ['DOWN']);
   await app.advance(3000);
   assert.ok(!app.player.current.grid);
-  assert.match(app.$('toast').textContent, /no matching multiview stream for/);
+  assert.equal(app.$('toast').textContent, 'Multiview didn\'t work.');
+  assert.ok(fallbackWhy(app).some((w) => /^no matching multiview stream for/.test(w)));
 });
 
 test('after a restart an H.264 multiview comes back as one (its engine waits for the offer\'s HEVC heights)', async () => {
@@ -3274,7 +3302,8 @@ test('two quick switches where the second fails leave the playing feed current',
   app.player.pos = 3000;
   const first = deferred();
   let n = 0;
-  app.net.play = (id, ch) => (++n === 1 ? first.promise : Promise.reject(new Error('Not available')));
+  // F1's own refusal (api.js marks it forViewer) is shown; a technical failure isn't (below).
+  app.net.play = (id, ch) => (++n === 1 ? first.promise : Promise.reject(Object.assign(new Error('Not available'), { forViewer: true })));
   await app.press('CH_DOWN');                // to F1 LIVE: waits
   await app.press('CH_DOWN');                // on to the onboard: queued, then fails
   first.resolve({ url: 'https://cdn/101/1033.m3u8', streamType: 'HLS' });

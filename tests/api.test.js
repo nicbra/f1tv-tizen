@@ -62,6 +62,21 @@ test('login fetches the entitlement and location with the subscription token', a
   assert.equal(calls[1].init.headers.entitlementtoken, 'ENT');
 });
 
+test('F1\'s own refusals may be shown on the TV (forViewer), also inside a 200 answer; bare HTTP statuses may not', async () => {
+  const shown = async (h, call) => { try { await call(h.F1Api); } catch (e) { return [e.message, e.forViewer]; } return null; };
+  const auth = (h) => { h.F1Api.state.ascendon = 'ASC'; h.F1Api.state.entitlement = 'ENT'; return h; };
+  assert.deepEqual(await shown(api(() => ({ status: 403, body: { resultObj: { message: 'Not entitled' } } })), (F) => F.http('https://f1tv.formula1.com/x')),
+    ['Not entitled', true]);
+  assert.deepEqual(await shown(api(() => ({ status: 502, body: '<html>bad gateway</html>' })), (F) => F.http('https://f1tv.formula1.com/x')),
+    ['HTTP 502', false]);
+  // PLAY answering 200 with F1's message and no stream, on every platform.
+  assert.deepEqual(await shown(auth(api(() => ({ body: { message: 'Not available in your region' } }))), (F) => F.play('1000010403')),
+    ['Not available in your region', true]);
+  assert.deepEqual(await shown(auth(api(() => ({ body: {} }))), (F) => F.play('1000010403')), ['No stream returned', false]);
+  assert.deepEqual(await shown(api(() => ({ body: { resultObj: { message: 'Device limit reached' } } })), (F) => F.login('ASC')),
+    ['Device limit reached', true]);
+});
+
 test('a 200 answer without an entitlement token fails sign-in with the API message, not a TypeError', async () => {
   const fault = api(() => ({ body: { resultObj: { message: 'Device limit reached' } } }));
   await assert.rejects(fault.F1Api.login('ASC'), /Device limit reached/);

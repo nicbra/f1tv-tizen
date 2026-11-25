@@ -29,7 +29,7 @@ function load({ enabled = true } = {}) {
   function plays(t, stream, ms = 1000, from = 0) {
     P.loading(t, stream); wait(ms); P.loaded(t, stream, from); wait(600); P.tick(from + 0.6, false, false);
   }
-  return { P, events, wait, player, plays, names: () => events.map((e) => e.name) };
+  return { P, events, wait, player, plays, context, names: () => events.map((e) => e.name) };
 }
 
 const OFFER = { web: 'wv_dash', hdr: 'hdr_hls', cenc: 'wv_cenc_dash', chosen: 'hdr', max_height: 2160, hevc: true, multiview: 'hevc' };
@@ -271,4 +271,48 @@ test('each way of playing is reported by its own name (multiview grids, clear 4K
     paths.push(t.events[0].fields.path);
   }
   assert.deepEqual(paths, ['avplay:grid', 'shaka:grid', 'mvsoft:h264', 'avplay:drmgrid']);
+});
+
+test('a failure says where it happened (kind, file, line, the helper\'s Node), never its message (issue #6)', () => {
+  const failOnce = (err) => {
+    const t = load();
+    const tr = t.P.request({ layout: 'big3', feeds: 4, content: 'replay', tier: 'premium' });
+    t.P.loading(tr, { capsPath: 'avplay:grid', grid: {} }); t.wait(500);
+    t.P.failed(tr, err, { final: true });
+    return t;
+  };
+  const site = (f) => [f.error_code, f.error_category, f.error_source, f.error_line, f.helper_node];
+  // A grid the helper refused (hdr.js helperFail, from its X-Error-* headers).
+  let t = failOnce({ message: 'HDR: grid helper: Cannot read property \'s\' of undefined',
+    diag: { code: 'HELPER_ERROR', platform: null, site: { category: 'type_error', source: 'stitch.js', line: '207', node: '4.4.3' } } });
+  assert.deepEqual(t.events.map((e) => site(e.fields)), [['HELPER_ERROR', 'type_error', 'stitch.js', 207, '4.4.3'],
+    ['HELPER_ERROR', 'type_error', 'stitch.js', 207, '4.4.3']]);
+  assert.doesNotMatch(JSON.stringify(t.events), /property|undefined|grid helper/);
+  // A helper segment Shaka couldn't get while playing: the player hands recovery only Failure.info of Shaka's error
+  // (player.js 'error' event), and app.js passes that on as { diag } (runtime): the site must survive both.
+  const F = (() => { const c = vm.createContext({}); vm.runInContext(readFileSync('app/js/failure.js', 'utf8'), c); return c.Failure; })();
+  const shakaErr = (headers) => ({ severity: 2, category: 1, code: 1001, data: ['http://127.0.0.1:8098/stitch/g/3.m4s', 422, 'no tfdt', headers, 1] });
+  t = load();
+  const tr = t.P.request({ layout: 'grid2x2', feeds: 4, content: 'replay', tier: 'premium' });
+  t.plays(tr, { capsPath: 'shaka:grid', grid: {} });
+  t.P.failed(null, { diag: F.info(shakaErr({ 'x-error-category': 'type_error', 'x-error-source': 'stitch.js', 'x-error-line': '207',
+    'x-helper-node': '4.4.3', 'content-type': 'text/plain' })) }, { runtime: true });
+  t.P.leave();
+  const summary = t.events.find((e) => e.name === 'playback.summary').fields;
+  assert.deepEqual(site(summary), ['NETWORK_ERROR', 'type_error', 'stitch.js', 207, '4.4.3']);
+  assert.equal(summary.platform_code, '1001');
+  // Odd values from the headers are dropped or named 'other', never passed on.
+  t = failOnce({ diag: F.info(shakaErr({ 'x-error-category': 'weird', 'x-error-source': 'evil/../../x.js', 'x-error-line': '99999999',
+    'x-helper-node': 'v4.4.3; rm' })) });
+  assert.deepEqual(site(t.events[0].fields), ['NETWORK_ERROR', 'other', 'other', undefined, undefined]);
+  // Shaka's errors from other hosts carry no site.
+  assert.equal(F.info(shakaErr({ 'content-type': 'text/html' })).site, undefined);
+  // An exception in the app: its first frame past the app's own fail()/make(); no helper version.
+  t = load();
+  const appErr = vm.runInContext('function fail(m) { throw new TypeError(m); }\nfunction load() {\n  fail("x is undefined"); }\ntry { load(); } catch (e) { e; }',
+    t.context, { filename: 'file:///opt/usr/apps/F1TVtizen1/res/wgt/js/app.js' });
+  const tr2 = t.P.request({ layout: null, feeds: 1, content: 'replay', tier: 'pro' });
+  t.P.loading(tr2, cenc); t.wait(500); t.P.failed(tr2, appErr, { final: true });
+  assert.deepEqual(site(t.events[0].fields), ['OTHER', 'type_error', 'app.js', 3, undefined]);
+  assert.doesNotMatch(JSON.stringify(t.events), /x is undefined|opt\/usr/);
 });

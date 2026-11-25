@@ -8,6 +8,18 @@ var HdrStream = (function () {
     e.diag = { code: e.failure === 'transient' ? 'NETWORK_ERROR' : 'UNSUPPORTED', platform: null };
     throw e;
   }
+  /**
+   * A grid the stream helper couldn't build (its answer r, text txt): HELPER_ERROR, with where it failed
+   * (Failure.helperSite from its headers) for the diagnostics upload only, never on screen.
+   */
+  function helperFail(r, txt) {
+    var e = new Error('HDR: grid helper: ' + txt), h = r && r.headers;
+    e.failure = 'content';
+    e.diag = { code: 'HELPER_ERROR', platform: null };
+    var site = h && h.get && typeof Failure !== 'undefined' ? Failure.helperSite(function (k) { return h.get(k); }) : null;
+    if (site) e.diag.site = site;
+    throw e;
+  }
   function xml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); }
   function attr(s, name) { var m = new RegExp('(?:^|\\s)' + name + '="([^"]*)"').exec(s); return m ? m[1] : ''; }
   function attrs(s) {
@@ -495,7 +507,7 @@ var HdrStream = (function () {
           return Promise.all([encrypted ? (want51 ? surround(feeds[lead].master, feeds[lead].masterUrl, source.epoch, until) : []) : audioTracks(io, feeds[lead], opts.langs || {}),
             encrypted ? source.subtitles : subtitleTracks(io, feeds[lead], base),
             fetch(LOCAL + '/stitch/' + id, { method: 'POST', body: JSON.stringify(body) }).then(function (r) {
-              return r.text().then(function (text) { if (!r.ok) return fail('grid helper: ' + text); return JSON.parse(text); });
+              return r.text().then(function (text) { if (!r.ok) return helperFail(r, text); return JSON.parse(text); });
             })]).then(function (done) {
             var audio = done[0], subtitles = done[1], info = done[2];
             var track = { type: 'video', id: 'grid', hdr: range === 'HLG', width: info.width, height: info.height, codecs: info.codecs,
@@ -629,7 +641,7 @@ var HdrStream = (function () {
             feeds: feeds.map(function (f) { return { init: f.init, media: f.media, absolute: true }; }) };
           return fetch(LOCAL + '/stitch/' + id, { method: 'POST', body: JSON.stringify(body) }).then(function (r) {
             return r.text().then(function (txt) {
-              if (!r.ok) return fail('grid helper: ' + txt);
+              if (!r.ok) return helperFail(r, txt);
               var info = JSON.parse(txt), local = LOCAL + '/stitch/' + id;
               var rep = '<Representation id="grid" bandwidth="' + feeds.reduce(function (n, f) { return n + f.bandwidth; }, 0) + '" codecs="' + xml(info.codecs) +
                 '" width="' + info.width + '" height="' + info.height + '"><SegmentTemplate timescale="' + clock.timescale + '" presentationTimeOffset="' + clock.offset +
@@ -788,7 +800,7 @@ var HdrStream = (function () {
         if (io.expired()) return fail('player_tm preparation timed out');
         return fetch(LOCAL + '/stitch/' + id, { method: 'POST', body: JSON.stringify(body), signal: io.signal }).then(function (r) {
           return r.text().then(function (txt) {
-            if (!r.ok) return fail('grid helper: ' + txt);
+            if (!r.ok) return helperFail(r, txt);
             var info = JSON.parse(txt);
             return { url: LOCAL + '/stitch/' + id + '/master.m3u8', width: info.width, height: info.height, start: start, live: live };
           });
@@ -879,9 +891,9 @@ var HdrStream = (function () {
         });
       }
       return fetch(LOCAL + '/stitch/' + opts.id + (opts.prepareOnly ? '/prepare' : '/layout'), { method: 'POST', body: JSON.stringify(body) }).then(function (r) {
-        if (opts.prepareOnly) return r.ok ? null : r.text().then(function (txt) { return fail('grid helper: ' + txt); });
+        if (opts.prepareOnly) return r.ok ? null : r.text().then(function (txt) { return helperFail(r, txt); });
         return r.text().then(function (txt) {
-          if (!r.ok) return fail('grid helper: ' + txt);
+          if (!r.ok) return helperFail(r, txt);
           var info = JSON.parse(txt);
           // Replays: where (seconds) the segment the helper prepared first begins.
           if (!live) info.start = probeStart;

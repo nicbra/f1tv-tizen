@@ -44,7 +44,11 @@ var Failure = (function () {
       // 4032: CONTENT_UNSUPPORTED_BY_BROWSER (no playable variant); 3016 with media error 3: MEDIA_ERR_DECODE.
       var shaka = e.code === 4032 ? 'UNSUPPORTED' : e.code === 3016 && e.data && e.data[0] === 3 ? 'DECODE_ERROR'
         : SHAKA_CODES[e.category] || 'SHAKA_ERROR';
-      return { code: shaka, platform: e.code >= 0 && e.code % 1 === 0 ? String(e.code) : null };
+      var out = { code: shaka, platform: e.code >= 0 && e.code % 1 === 0 ? String(e.code) : null };
+      // A helper segment it couldn't get (BAD_HTTP_STATUS: [uri, status, text, headers, ...], names lower-cased).
+      var h = e.data && e.data[3], site = h && typeof h === 'object' ? helperSite(function (k) { return h[k.toLowerCase()] || h[k] || null; }) : null;
+      if (site) out.site = site;
+      return out;
     }
     if (typeof e === 'string' && /^PLAYER_ERROR_[A-Z_]+$/.test(e.trim())) return avError(e);
     if (e.name && /^PLAYER_ERROR_[A-Z_]+$/.test(e.name)) return avError(e.name);
@@ -92,5 +96,17 @@ var Failure = (function () {
     return 'way';
   }
 
-  return { info: info, make: make, cause: cause, avError: avError };
+  /**
+   * Where the stream helper failed, from the headers of its answer (service.js failureSite: X-Error-Category, -Source,
+   * -Line and X-Helper-Node), for the diagnostics upload only (js/diag-play.js), never on screen. get(name): a header's
+   * value or null. Null when the helper sent none.
+   */
+  function helperSite(get) {
+    try {
+      var category = get('X-Error-Category');
+      return category ? { category: category, source: get('X-Error-Source'), line: get('X-Error-Line'), node: get('X-Helper-Node') } : null;
+    } catch (e) { return null; }
+  }
+
+  return { info: info, make: make, cause: cause, avError: avError, helperSite: helperSite };
 })();

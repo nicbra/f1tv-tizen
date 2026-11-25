@@ -45,11 +45,40 @@ var DiagPlay = (function () {
     info = info || { code: 'UNKNOWN', platform: null };
     var code = CODES.indexOf(info.code) >= 0 ? info.code : 'OTHER';
     var platform = typeof info.platform === 'string' && /^[A-Z0-9_]{1,64}$/.test(info.platform) ? info.platform : null;
-    return { error_code: code, platform_code: platform };
+    var out = { error_code: code, platform_code: platform }, site = null;
+    try { site = siteOf(err, info); } catch (e) { /* none */ }
+    if (site) Object.keys(site).forEach(function (k) { out[k] = site[k]; });
+    return out;
+  }
+
+  var FAILURE_CATEGORIES = ['type_error', 'reference_error', 'range_error', 'syntax_error', 'other'];
+
+  /**
+   * Where a failure happened: its kind, file (the contract's sources) and line, and the stream helper's Node version when
+   * the helper failed; never a message or a stack. From the helper's report (Failure.helperSite: a grid it refused, a
+   * segment it couldn't build, at the load or while playing), else an exception's first frame past the app's fail/make.
+   */
+  function siteOf(err, info) {
+    var V = vocab(), s = info && info.site;   // the helper's own report (js/failure.js helperSite)
+    if (!s && err instanceof Error && err.stack) {
+      var at = String(err.stack).split('\n').slice(1).filter(function (l) { return !/\bat (?:[\w$.]*\.)?(?:fail|make|helperFail) \(/.test(l); })
+        .map(function (l) { return /([^\/\\\s(]+\.(?:js|html)):(\d+):\d+/.exec(l); }).filter(Boolean)[0];
+      if (at) s = { category: V.categories[err.name] || 'other', source: at[1], line: at[2] };
+    }
+    if (!s) return null;
+    var base = String(s.source || '').split(/[?#]/)[0].split('/').pop(), line = parseInt(s.line, 10);
+    var out = { error_category: FAILURE_CATEGORIES.indexOf(s.category) >= 0 ? s.category : 'other',
+      error_source: !base ? 'unknown' : V.sources.indexOf(base) >= 0 ? base : 'other' };
+    if (line >= 1 && line <= 1000000) out.error_line = line;
+    var node = /^v?(\d{1,2}\.\d{1,3}\.\d{1,3})$/.exec(String(s.node || ''));
+    if (node) out.helper_node = node[1];
+    return out;
   }
 
   function withCodes(fields, codes) {
-    if (codes) { fields.error_code = codes.error_code; if (codes.platform_code) fields.platform_code = codes.platform_code; }
+    if (!codes) return fields;
+    fields.error_code = codes.error_code;
+    ['platform_code', 'error_category', 'error_source', 'error_line', 'helper_node'].forEach(function (k) { if (codes[k] != null) fields[k] = codes[k]; });
     return fields;
   }
 

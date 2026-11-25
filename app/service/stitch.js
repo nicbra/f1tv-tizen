@@ -7,14 +7,33 @@ function w16(b, o, v) { b[o] = (v >>> 8) & 255; b[o + 1] = v & 255; }
 function w32(b, o, v) { b[o] = (v >>> 24) & 255; b[o + 1] = (v >>> 16) & 255; b[o + 2] = (v >>> 8) & 255; b[o + 3] = v & 255; }
 function fourcc(b, o) { return String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]); }
 
+/*
+ * Old Node on TVs (Tizen 6 runs Node 12; Tizen 5.5's helper fails exactly as Node 4 does, issue #6): before 4.5 there
+ * is no Buffer.alloc, and Buffer.from is Uint8Array.from (throws for hex or a string); 'latin1' needs 6.4; in Node 4
+ * (not 8) Buffer.prototype.set is the old one-byte setter (`buf.set(offset, value)`), so `buf.set(bytes, at)` copies
+ * nothing: every grid came out zeroed. So bytes are copied with put, made with alloc / bytes / fromHex / fromLatin1.
+ */
 function alloc(n) { return typeof Buffer !== 'undefined' ? (Buffer.alloc ? Buffer.alloc(n) : new Buffer(n).fill(0)) : new Uint8Array(n); }
+function put(dst, src, at) { Uint8Array.prototype.set.call(dst, src, at || 0); }
 function concat(list) {
   var n = 0, i; for (i = 0; i < list.length; i++) n += list[i].length;
   var out = alloc(n), p = 0;
-  for (i = 0; i < list.length; i++) { out.set(list[i], p); p += list[i].length; }
+  for (i = 0; i < list.length; i++) { put(out, list[i], p); p += list[i].length; }
   return out;
 }
-function bytes(arr) { var b = alloc(arr.length); b.set(arr); return b; }
+function bytes(arr) { var b = alloc(arr.length); put(b, arr); return b; }
+/** Hex (an optional 0x first) as bytes, up to the first pair that isn't hex, as Buffer.from(hex, 'hex') reads it. */
+function fromHex(hex) {
+  var s = String(hex).replace(/^0x/i, ''), out = [];
+  for (var i = 0; i + 1 < s.length && /^[0-9a-f]{2}$/i.test(s.substr(i, 2)); i += 2) out.push(parseInt(s.substr(i, 2), 16));
+  return bytes(out);
+}
+/** A string's characters as bytes (the low 8 bits of each), as Buffer.from(s, 'latin1'). */
+function fromLatin1(s) {
+  var out = alloc(s.length);
+  for (var i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 255;
+  return out;
+}
 
 /** The boxes in [s, e): { type, s (start), e (end), d (payload start) }. */
 function boxes(b, s, e) {
@@ -36,7 +55,7 @@ function box(type, payload) {
   var out = alloc(8 + payload.length);
   w32(out, 0, out.length);
   for (var i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
-  out.set(payload, 8);
+  put(out, payload, 8);
   return out;
 }
 
@@ -216,6 +235,7 @@ function buildSegment(A, sizes, subs, mdatData) {
 }
 
 module.exports = { fragment: fragment,
-  u16: u16, u32: u32, w16: w16, w32: w32, alloc: alloc, concat: concat, bytes: bytes, boxes: boxes, child: child, box: box,
+  u16: u16, u32: u32, w16: w16, w32: w32, alloc: alloc, put: put, concat: concat, bytes: bytes, fromHex: fromHex,
+  fromLatin1: fromLatin1, boxes: boxes, child: child, box: box,
   Reader: Reader, Writer: Writer, buildSegment: buildSegment, spliceHeader: spliceHeader, HEADER_WINDOW: HEADER_WINDOW,
   escape: escape, unescape: unescape };

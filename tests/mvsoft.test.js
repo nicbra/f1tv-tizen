@@ -3,7 +3,7 @@ const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), vm = require('node:vm'), path = require('node:path');
 const flush = async () => { for (let i = 0; i < 80; i++) await Promise.resolve(); };
 function harness(mediaFails) {
-  const events = [], timers = new Map(), workers = [], posts = [], errors = [];
+  const events = [], timers = new Map(), workers = [], posts = [], errors = [], failures = [];
   let serial = 0, position = 0, canvas;
   const parent = { insertBefore() {}, replaceChild(fresh, old) { assert.equal(old, canvas); canvas = fresh; fresh.parentNode = parent; events.push('replace canvas'); } };
   function makeCanvas() {
@@ -41,10 +41,14 @@ function harness(mediaFails) {
       set src(v) { this._src = v; queueMicrotask(() => { if (Source.instances.at(-1).onsourceopenpending) Source.instances.at(-1).onsourceopenpending(); }); },
       play() { this.paused = false; return Promise.resolve(); }, pause() { this.paused = true; }, removeAttribute() {}, load() {}, remove() {} }) },
     fetch: async (url, options) => {
+      if (options && options.method === 'POST' && mediaFails === 'helper') {
+        const site = { 'X-Error-Category': 'type_error', 'X-Error-Source': 'stitchx.js', 'X-Error-Line': '88', 'X-Helper-Node': '4.4.3' };
+        return { status: 422, text: async () => 'Cannot read property \'nal\' of undefined', headers: { get: (k) => site[k] || null } };
+      }
       if (options && options.method === 'POST') { posts.push(JSON.parse(options.body)); return { status: 201, text: async () => JSON.stringify({ segments: 100, visibleRows: 540, feedTag: { row: 544, values: [32, 96, 160] } }) }; }
       if (/\.m4s$|init\.mp4$/.test(url)) return { ok: true, arrayBuffer: async () => new ArrayBuffer(1) };
       if (mediaFails === 'empty' && !/master/.test(url)) return { ok: true, url, text: async () => '#EXTM3U\n' };
-      if (mediaFails && !/master/.test(url)) return { ok: false, status: 503, text: async () => 'gone' };
+      if (mediaFails === true && !/master/.test(url)) return { ok: false, status: 503, text: async () => 'gone' };
       return { ok: true, url, text: async () => /master/.test(url) ? '#EXT-X-STREAM-INF:RESOLUTION=960x540,CODECS="avc1.4d401f"\nmedia.m3u8' : '#EXTINF:3.84,\na.ts\n'.repeat(100) };
     },
     setTimeout: (fn, ms) => { const id = ++serial; timers.set(id, { fn, ms, interval: false }); return id; },
@@ -53,11 +57,13 @@ function harness(mediaFails) {
     Player: { engineLost: (name, overReload) => events.push('lost ' + name + (overReload ? ' over reload' : '')) }
   };
   ctx.window.HTMLCanvasElement.prototype.transferControlToOffscreen = function () {};
-  vm.createContext(ctx); vm.runInContext(fs.readFileSync(path.join(__dirname, '../app/js/mvsoft.js'), 'utf8'), ctx);
+  vm.createContext(ctx);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../app/js/failure.js'), 'utf8'), ctx);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../app/js/mvsoft.js'), 'utf8'), ctx);
   const opts = () => ({ streams: [1, 2, 3].map(() => ({ url: 'http://cdn/master.m3u8' })),
     rects: [0, 1, 2].map(k => ({ left: 1280, top: k * 360, width: 640, height: 360 })), canvas,
-    clock: { position: () => position, playing: () => true }, onError: e => errors.push(e.message) });
-  return { api: ctx.MvSoftware, opts, workers, posts, events, errors, Source,
+    clock: { position: () => position, playing: () => true }, onError: e => { errors.push(e.message); failures.push(e); } });
+  return { api: ctx.MvSoftware, opts, workers, posts, events, errors, failures, Source,
     expire: async ms => { for (const [id, t] of [...timers]) if (!t.interval && t.ms === ms) { timers.delete(id); t.fn(); } await flush(); } };
 }
 
@@ -123,4 +129,13 @@ test('the first EMSS source marks Shaka lost until the app restarts, before it i
   const stopped = h.api.stop(); h.workers[0].ack(); await stopped;
   const early = harness(true); await early.api.start(early.opts());
   assert.ok(!early.events.some((e) => /^lost /.test(e)), String(early.events));
+});
+
+test('a helper refusal is HELPER_ERROR with where the helper failed, for the diagnostics only (issue #6)', async () => {
+  const h = harness('helper');
+  await h.api.start(h.opts());
+  const e = h.failures.at(-1);
+  assert.ok(e, 'reported');
+  assert.equal(e.diag.code, 'HELPER_ERROR');
+  assert.deepEqual({ ...e.diag.site }, { category: 'type_error', source: 'stitchx.js', line: '88', node: '4.4.3' });
 });

@@ -287,13 +287,19 @@ function rewriteManifest(mpd, manifestUrl) {
   return mpd.replace(/(<AdaptationSet\b[^>]*contentType="audio"[^>]*>)/g, '$1<BaseURL>' + proxied + '</BaseURL>');
 }
 
-function send(res, status, body, type) {
-  res.writeHead(status, {
+/** extra: more headers, readable by the app's page too (a failure's site: failureSite). */
+function send(res, status, body, type, extra) {
+  var headers = {
     'Content-Type': type || 'text/plain',
     'Content-Length': body.length,
     'Access-Control-Allow-Origin': '*',
     'Cache-Control': 'no-store'
-  });
+  };
+  if (extra) {
+    Object.keys(extra).forEach(function (k) { headers[k] = extra[k]; });
+    headers['Access-Control-Expose-Headers'] = Object.keys(extra).join(', ');
+  }
+  res.writeHead(status, headers);
   res.end(body);
 }
 
@@ -406,9 +412,9 @@ function hevcSegmentUrl(feed, n) {
  * (the HLS master the app made, served as master.m3u8: its video variant is video.m3u8, its sound and subtitles F1's).
  */
 function hevcGridPost(res, id, body) {
-  buildGrid(body, function (status, err, grid) {
+  buildGrid(body, function (status, err, grid, site) {
     res.f1 = { probe: +body.probe || 0, ts: !!(grid && grid.ts) };
-    if (err) return send(res, status, toBuf(err));
+    if (err) return send(res, status, toBuf(err), null, site);
     stitches[id] = grid;
     var ids = Object.keys(stitches);
     if (ids.length > 2) delete stitches[ids[0]];
@@ -426,8 +432,8 @@ function hevcRegridPost(res, id, body) {
   var old = stitches[id];
   if (!old || old.kind !== 'hevc') return send(res, 404, toBuf('no such grid'));
   if (!!body.live !== old.live) return send(res, 400, toBuf('live and replay grids differ'));
-  buildGrid(body, function (status, err, grid) {
-    if (err) return send(res, status, toBuf(err));
+  buildGrid(body, function (status, err, grid, site) {
+    if (err) return send(res, status, toBuf(err), null, site);
     // The licence AVPlay has is for the running grid's key.
     if (grid.cfg.enc !== old.cfg.enc) return send(res, 422, toBuf('the new feeds are encrypted differently'));
     // The player keeps the running grid's manifest: shorter replay feeds would leave its last segments missing.
@@ -441,6 +447,22 @@ function hevcRegridPost(res, id, body) {
     send(res, 200, toBuf(JSON.stringify(grid.info)), 'application/json');
     warmNext(grid, grid.cache[0].number);
   });
+}
+
+/**
+ * Where a grid or segment build failed, for the app's diagnostics only (never shown on the TV): the error's kind, the
+ * file and line that threw it (past fail()) and this helper's Node version (issue #6: an old Node on Tizen 5.5 broke
+ * every grid). Sent as response headers next to the plain message.
+ */
+var CATEGORIES = { TypeError: 'type_error', ReferenceError: 'reference_error', RangeError: 'range_error', SyntaxError: 'syntax_error' };
+function failureSite(e) {
+  var at = String(e && e.stack || '').split('\n').slice(1).filter(function (l) { return !/\bat fail\b/.test(l); })
+    .map(function (l) { return /([^\/\\\s(]+\.js):(\d+):\d+/.exec(l); }).filter(Boolean)[0];
+  var node = typeof process !== 'undefined' && process.version ? String(process.version).replace(/^v/, '') : '';
+  var h = { 'X-Error-Category': CATEGORIES[e && e.name] || 'other' };
+  if (at) { h['X-Error-Source'] = at[1]; h['X-Error-Line'] = at[2]; }
+  if (node) h['X-Helper-Node'] = node;
+  return h;
 }
 
 /** Fetches the feeds' init and probe segments, prepares the grid and stitches the probe; cb(status, error, grid). */
@@ -495,7 +517,7 @@ function buildGrid(body, cb) {
       cb(200, null, { kind: 'hevc', live: live, ts: ts, feeds: feeds, count: count, init: g.init, cfg: g.cfg, cache: [{ number: probe, body: warm }],
         pending: {}, at: Date.now(), ua: ua, playlist: ts ? body.playlist : null, master: ts ? body.master : null, asked: probe,
         info: { width: g.width, height: g.height, codecs: g.codecs } });
-    } catch (e) { cb(422, String(e && e.message || e)); }
+    } catch (e) { cb(422, String(e && e.message || e), null, failureSite(e)); }
   }, 2, ua, live || ts);
 }
 
@@ -511,7 +533,8 @@ var stitches = {};   // id -> { kind, feeds, count, init, cfg, cache, at } (and 
 if (!Object.assign) Object.assign = function (t) { for (var i = 1; i < arguments.length; i++) { var o = arguments[i]; if (o) for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) t[k] = o[k]; } return t; };
 if (!Array.prototype.fill) Array.prototype.fill = function (v) { for (var i = 0; i < this.length; i++) this[i] = v; return this; };
 var stitchx = null, stitchxError = null;
-try { stitchx = require('./stitchx/helper-route.js')({ fetchAll: fetchAll, send: send, toBuf: toBuf, f1Cdn: f1Cdn, port: PORT, stitches: stitches }); }
+try { stitchx = require('./stitchx/helper-route.js')({ fetchAll: fetchAll, send: send, toBuf: toBuf, f1Cdn: f1Cdn, port: PORT, stitches: stitches,
+  failureSite: failureSite }); }
 catch (e) { stitchxError = String(e && e.message || e); console.log('stitchx unavailable: ' + stitchxError); }
 
 /**
@@ -614,7 +637,7 @@ function stitchRequest(req, res, u) {
   s.asked = number;   // where the player is: the background fetches follow it (a seek back included)
   segmentFor(s, number, function (status, body, timing) {
     res.f1 = timing;
-    send(res, status, body, status === 200 ? 'video/mp4' : 'text/plain');
+    send(res, status, body, status === 200 ? 'video/mp4' : 'text/plain', status === 200 ? null : timing && timing.site);
   });
 }
 
@@ -705,7 +728,7 @@ function segmentFor(s, number, cb) {
       }
       out = stitchHevc.gridSegment(segs, s.cfg);
     }
-    catch (e) { return answer(422, toBuf(String(e && e.message || e))); }
+    catch (e) { timing.site = failureSite(e); return answer(422, toBuf(String(e && e.message || e))); }
     timing.stitchMs = Date.now() - t1;
     timing.mb = Math.round(out.length / 1e5) / 10;
     s.cache.push({ number: number, body: out });

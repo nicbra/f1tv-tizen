@@ -67,9 +67,9 @@ module.exports = function (deps) {
     }
     if (Object.keys(s.pending).length >= MAX_BUILDS) return cb(503, 'busy');
     var waiting = s.pending[n] = [cb], t0 = Date.now();
-    function answer(status, body) {
+    function answer(status, body, site) {
       delete s.pending[n];
-      waiting.forEach(function (w) { try { w(status, body); } catch (e) { /* one waiter's failure stays its own */ } });
+      waiting.forEach(function (w) { try { w(status, body, site); } catch (e) { /* one waiter's failure stays its own */ } });
     }
     deps.fetchAll(segmentUrls(s, n), function (err, bytes) {
       if (err) return answer(502, String(err));
@@ -79,7 +79,7 @@ module.exports = function (deps) {
           feeds: s.feeds.length, audio: s.audio ? { feed: s.audio.feed, separate: !!s.audioList } : null, init: !s.init });
         if (r.init && !s.init) s.init = r.init;
         entry = { number: n, video: r.video, audio: r.audio, ms: Date.now() - t0, info: r.info };
-      } catch (e) { return answer(422, String(e && e.message || e)); }
+      } catch (e) { return answer(422, String(e && e.message || e), siteOf(e)); }
       s.cache.push(entry);
       if (s.cache.length > 4) s.cache.shift();
       answer(200, entry);
@@ -133,20 +133,20 @@ module.exports = function (deps) {
 
   function post(res, id, raw) {
     var body = checkBody(raw), answered = false;
-    function reply(status, text, type) { if (answered) return; answered = true; deps.send(res, status, deps.toBuf(text), type); }
+    function reply(status, text, type, site) { if (answered) return; answered = true; deps.send(res, status, deps.toBuf(text), type, site); }
     if (!body) return reply(400, 'need { kind: "h264x", feeds: [{ playlist }] x 1-4, interleave: true, audio: { feed, playlist } | null }');
-    try { loadTables(); } catch (e) { return reply(500, 'StitchX tables: ' + e); }
+    try { loadTables(); } catch (e) { return reply(500, 'StitchX tables: ' + e, null, siteOf(e)); }
     var feeds = body.playlists, urls = feeds.slice(), audio = body.audio, ua = body.ua;
     if (audio && audio.playlist) urls.push(audio.playlist);
     if (!urls.every(deps.f1Cdn)) return reply(400, 'need F1 media');
     deps.fetchAll(urls, function (err, texts) {
       if (err) return reply(502, String(err));
-      try { accept(texts); } catch (e) { reply(500, String(e && e.message || e)); }
+      try { accept(texts); } catch (e) { reply(500, String(e && e.message || e), null, siteOf(e)); }
     }, 0, ua, false);
     function accept(texts) {
       var lists;
       try { lists = texts.map(function (b, i) { return parsePlaylist(b.toString('utf8'), urls[i]); }); }
-      catch (e) { return reply(422, String(e && e.message || e)); }
+      catch (e) { return reply(422, String(e && e.message || e), null, siteOf(e)); }
       // Every segment from F1's media too (a playlist may name other hosts).
       if (!lists.every(function (l) { return l.every(function (x) { return deps.f1Cdn(x.url); }); })) return reply(422, 'segments outside F1 media');
       var feedLists = lists.slice(0, feeds.length), audioList = audio && audio.playlist ? lists[feeds.length] : null;
@@ -165,8 +165,8 @@ module.exports = function (deps) {
       var s = { kind: 'h264x', feeds: feedLists, audio: audio, audioList: audioList, level: body.level, maxDpb: body.maxDpb, dropB: body.dropB, reorder: body.reorder, feedTag: body.feedTag, targetFps: body.targetFps, decodeOrder: body.decodeOrder, spread: body.spread,
         cache: [], pending: {}, init: null, at: Date.now(), ua: ua };
       var probe = Math.min(count - 1, body.probe);
-      build(s, probe, function (status, got) {
-        if (status !== 200) return reply(status, String(got));
+      build(s, probe, function (status, got, site) {
+        if (status !== 200) return reply(status, String(got), null, site);
         deps.stitches[id] = s;
         var ids = Object.keys(deps.stitches);
         if (ids.length > 2) delete deps.stitches[ids[0]];
@@ -188,8 +188,8 @@ module.exports = function (deps) {
     if (!m) return deps.send(res, 404, deps.toBuf('not found'));
     var n = parseInt(m[2], 10);
     if (!(n >= 0 && n < s.feeds[0].length)) return deps.send(res, 404, deps.toBuf('no such segment'));
-    build(s, n, function (status, got) {
-      if (status !== 200) return deps.send(res, status, deps.toBuf(String(got)));
+    build(s, n, function (status, got, site) {
+      if (status !== 200) return deps.send(res, status, deps.toBuf(String(got)), null, site);
       var b = m[1] ? got.audio : got.video;
       if (!b) return deps.send(res, 404, deps.toBuf('no sound'));
       res.f1 = { segment: n, stitchMs: got.ms };
@@ -198,7 +198,16 @@ module.exports = function (deps) {
     });
   }
 
-  function toBuffer(u8) { return Buffer.from ? Buffer.from(u8.buffer, u8.byteOffset, u8.length) : new Buffer(u8); }
+  // A Buffer of a Uint8Array's bytes for the response, on old TVs' Node too: before 4.5 Buffer.from is Uint8Array.from
+  // (a copy instead), and before 5.10 Buffer.from(arrayBuffer, offset, length) ignores offset and length (the whole
+  // buffer came out): the view of the whole buffer, then Buffer's own slice.
+  /** Where an exception came from, as headers for the app's diagnostics (service.js failureSite), when the helper has it. */
+  function siteOf(e) { return deps.failureSite ? deps.failureSite(e) : null; }
+
+  function toBuffer(u8) {
+    if (!Buffer.from || Buffer.from === Uint8Array.from) return new Buffer(u8);
+    return Buffer.from(u8.buffer).slice(u8.byteOffset, u8.byteOffset + u8.length);
+  }
 
   return { post: post, get: get, parsePlaylist: parsePlaylist };
 };

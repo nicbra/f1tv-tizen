@@ -63,6 +63,16 @@ var F1Api = (function () {
     return Math.max(0, Math.min(ms, 60 * 60 * 1000));
   }
 
+  /**
+   * F1's own message (an entitlement or region refusal, also inside an HTTP 200 answer) or this app's plain one, which
+   * the TV may show (app.js recover: forViewer); else `technical` (its own words, for the diagnostics only).
+   */
+  function viewerError(message, technical) {
+    var e = new Error(message || technical);
+    e.forViewer = !!message;
+    return e;
+  }
+
   function http(url, opts) {
     opts = opts || {};
     if (isPlay(url) && monotonic() < playBlockedUntil) {
@@ -71,6 +81,7 @@ var F1Api = (function () {
       waiting.status = 429;
       waiting.blocked = true;
       waiting.local = true;   // nothing was asked: no HTTP result for the diagnostics
+      waiting.forViewer = true;   // the TV shows this message (app.js recover); others only go to the diagnostics
       return Promise.reject(waiting);
     }
     return fetch(url, {
@@ -90,6 +101,8 @@ var F1Api = (function () {
           var err = new Error(msg);
           err.status = res.status;
           err.data = data;
+          // F1's own message (an entitlement or region refusal) is written for the viewer; 'HTTP 403' isn't.
+          err.forViewer = msg !== 'HTTP ' + res.status;
           // An HTML 403 is CloudFront's per-IP block ("Request blocked"), not an F1 TV answer.
           var blocked = !json && (res.status === 429 || (res.status === 403 && /Request blocked/i.test(text)));
           diag('api.http', { url: url, status: res.status, message: msg, blocked: blocked });
@@ -148,7 +161,7 @@ var F1Api = (function () {
     return http(url, { headers: { ascendontoken: state.ascendon }, op: 'entitlement' }).then(function (data) {
       // HTTP 200 can still carry a fault or an empty resultObj; say so rather than fail on undefined.
       var token = data && data.resultObj && data.resultObj.entitlementToken;
-      if (!token) throw new Error((data && data.resultObj && data.resultObj.message) || 'no entitlement token');
+      if (!token) throw viewerError(data && data.resultObj && data.resultObj.message, 'no entitlement token');
       state.entitlement = token;
       return state.entitlement;
     });
@@ -192,7 +205,7 @@ var F1Api = (function () {
     var url = [BASE, state.videoApi, loginStatus(), LANG, PAGE_PLATFORM, 'ALL/CONTENT/VIDEO', contentId, l.entitlement, l.groupId].join('/');
     return http(url, { headers: authHeaders(), op: 'content_detail' }).then(function (data) {
       var c = data && data.resultObj && data.resultObj.containers;
-      if (!c || !c.length) throw new Error('Video not found');
+      if (!c || !c.length) throw viewerError('Video not found');
       return c[0];
     });
   }
@@ -206,7 +219,7 @@ var F1Api = (function () {
     return http(url, { headers: headers }).then(function (data) {
       var r = data && data.resultObj;
       if (!r || !r.url) {
-        throw new Error((data && data.message) || 'No stream returned');
+        throw viewerError(data && data.message, 'No stream returned');
       }
       r.platform = platform;
       return r;
@@ -435,7 +448,7 @@ var F1Api = (function () {
       if (i >= PLAY_PLATFORMS.length) {
         // Every platform failed: one failed operation (a session that hasn't started yet isn't one).
         if (!isNotStarted(firstErr)) failed('playback_offer', lastErr && lastErr.status, i - 1);
-        return Promise.reject(firstErr || new Error('Playback unavailable'));
+        return Promise.reject(firstErr || viewerError('Playback unavailable'));
       }
       var platform = PLAY_PLATFORMS[i++];
       var ask = playOn(platform, contentId, channelId);

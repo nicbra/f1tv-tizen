@@ -40,7 +40,16 @@ var DiagUpload = (function () {
       'shaka:hdr', 'shaka:hlsaes', 'shaka:tmgrid', 'avplay:grid', 'shaka:grid', 'avplay:drmgrid', 'avplay:ac3'],
     capsPaths: ['shaka:cenc', 'avplay:cbcs', 'avplay:cenc', 'avplay:hdr'],
     codes: ['PREPARE_TIMEOUT', 'PLAYER_STUCK', 'SHAKA_ERROR', 'AVPLAY_ERROR', 'NETWORK_ERROR', 'DRM_ERROR', 'DECODE_ERROR',
-      'UNSUPPORTED', 'HELPER_ERROR', 'NO_PROGRESS', 'OTHER', 'UNKNOWN']
+      'UNSUPPORTED', 'HELPER_ERROR', 'NO_PROGRESS', 'OTHER', 'UNKNOWN'],
+    // The files a script error or a failure's site may name (js.error, the playback events' error_source): the app's,
+    // the stream helper's (app/service/) and the shell's; anything else is 'other'.
+    sources: ['index.html', 'boot.html', 'api.js', 'app.js', 'auth.js', 'caps.js', 'cmaf.js', 'diag.js', 'diag-build.js',
+      'diag-upload.js', 'diag-play.js', 'focus.js', 'hdr.js', 'keys.js', 'layouts.js', 'mvsoft.js', 'mvsoft-worker.js', 'player.js',
+      'proxy.js', 'settings.js', 'stats.js', 'timing.js', 'timing-worker.js', 'ttml.js', 'updates.js', 'upnext.js',
+      'shaka-player.compiled.js', 'qrcode.js', 'boot.js', 'common.js', 'config.js', 'updater.js', 'service.js', 'launcher-build.js',
+      'builtin.js', 'nacl-fast.js', 'combo.js', 'failure.js', 'ways.js', 'markdown.js', 'ts-offload.js', 'ts-worker.js',
+      'stitch.js', 'stitch-hevc.js', 'tm-ts.js', 'helper-route.js', 'stitchx.js', 'tsdemux.js', 'fmp4.js', 'dash.js', 'segment.js'],
+    categories: { TypeError: 'type_error', ReferenceError: 'reference_error', RangeError: 'range_error', SyntaxError: 'syntax_error' }
   };
 
   var session = null, sequence = 0, sending = false, sendGen = 0, inflight = null, timer = null, nextAt = 0, quietUntil = 0, ring = [];
@@ -831,11 +840,7 @@ var DiagUpload = (function () {
     } catch (err) { /* never in the way */ }
   }
 
-  var SOURCES = ['index.html', 'boot.html', 'api.js', 'app.js', 'auth.js', 'caps.js', 'cmaf.js', 'diag.js', 'diag-build.js',
-    'diag-upload.js', 'diag-play.js', 'focus.js', 'hdr.js', 'keys.js', 'layouts.js', 'mvsoft.js', 'mvsoft-worker.js', 'player.js', 'proxy.js',
-    'settings.js', 'stats.js', 'timing.js', 'timing-worker.js', 'ttml.js', 'updates.js', 'upnext.js', 'shaka-player.compiled.js',
-    'qrcode.js', 'boot.js', 'common.js', 'config.js', 'updater.js', 'service.js', 'launcher-build.js', 'builtin.js', 'nacl-fast.js'];
-  var CATEGORIES = { TypeError: 'type_error', ReferenceError: 'reference_error', RangeError: 'range_error', SyntaxError: 'syntax_error' };
+  var SOURCES = VOCAB.sources, CATEGORIES = VOCAB.categories;
   var jsSeen = {};
 
   /**

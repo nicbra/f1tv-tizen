@@ -1371,7 +1371,7 @@
               // The answer can come after the viewer moved on: then a toast (Diagnostics keeps the reference).
               if (screen === 'list' && listSerial === here && !dialog) ask('Report sent', text, [{ label: 'Close', value: true }]);
               else toast('Report sent. Reference: ' + ref, 15000);
-            }, function (e) { toast('The report could not be sent: ' + e.message, 6000); });
+            }, function () { toast('The report could not be sent. Try again later.', 6000); });
           });
         } };
       }) }, 0);
@@ -2361,7 +2361,7 @@
       if (e && e.message === 'cancelled') return;
       if (Player.stream() !== s || feedsCtx !== ctx || exits !== playerExits || screen !== 'player') return;
       dplay('failed', trial, e);
-      toast('Reloading the multiview (' + ((e && e.message) || e) + ')', 4000);
+      toast('Reloading the multiview…', 4000);
       reload(true);
     });
   }
@@ -2673,8 +2673,8 @@
           // No way left for this video (each failed already), or its engine can't play until the app restarts: no
           // player opens (Player.choose would run the stream's default engine); recovery decides what follows.
           if (!stream.capsPath || !engineUp(stream.capsPath)) {
-            throw new Error(Player.engineOpen('avplay') && Player.engineOpen('shaka') ? 'no way left to play it on this TV' :
-              'restart the app to play it');
+            if (Player.engineOpen('avplay') && Player.engineOpen('shaka')) throw new Error('no way left to play it on this TV');
+            throw Object.assign(new Error('restart the app to play it'), { forViewer: true });   // shown on the TV
           }
           // Keys in the variant playlist: not playable here; the catch below falls back to SDR.
           if (stream.capsPath === 'shaka:hdr' && stream.info && stream.info.encrypted) throw new Error('encrypted HDR stream');
@@ -2752,7 +2752,7 @@
       // The session could not be checked (no network): say so instead of doing nothing.
       if (feedsCtx === ctx && exits === playerExits && seq === navSeq) {
         dplay('gaveUp', { diag: { code: 'NETWORK_ERROR', platform: null } }, null, trial);
-        toast('Could not reach F1 TV: ' + (e.message || e), 8000);
+        toast('Could not reach F1 TV. Check the TV\'s internet connection.', 8000);
       }
       diag('play.session-check-failed', { error: e });
     });
@@ -2892,6 +2892,9 @@
     if (stream) stream.failed = true;   // gone: never the "old feed" a later switch goes on from (oldFeedPlays)
     var oldPlays = oldFeedPlays(from);
     var what = String((c.error && (c.error.message || c.error)) || c.message || '');
+    // On the TV only what was written for the viewer (F1's own refusal, the request limit: api.js forViewer); the
+    // technical cause goes to the diagnostics (play.fallback here, the upload's error fields), never on screen.
+    var told = c.error && c.error.forViewer ? ': ' + String(c.error.message) : '';
     var final = function (yes) {
       if (c.phase === 'start') dplay('failed', null, null, { noProgress: true, final: yes });
       else if (c.phase === 'play') dplay('failed', null, c.known ? { diag: c.known } : null, { runtime: true, final: yes });
@@ -2946,13 +2949,13 @@
     if (next === 'stop' || next === 'stay') {
       if (mvOn) feedsCtx.multiview = null;
       if ((stuckNow && !mvOn) || !engineLeft()) return toast(RESTART_STUCK, 20000);
-      if (mvOn) return toast('Multiview didn\'t work' + (what ? ' (' + what + ')' : '') + '.', 8000);
-      return toast(c.phase === 'start' ? 'The video didn\'t start.' : 'Could not play' + (what ? ': ' + what : '.'), 8000);
+      if (mvOn) return toast('Multiview didn\'t work' + (told || '.'), 8000);
+      return toast(c.phase === 'start' ? 'The video didn\'t start.' : 'Could not play' + (told || '.'), 8000);
     }
     if (next === 'back') {
       if (mvOn) feedsCtx.multiview = null;
       var gone = feedsCtx.feeds[i];
-      toast((mvOn ? 'Multiview didn\'t work' : 'Could not play ' + (gone ? gone.full || gone.title : 'that feed')) + (what ? ' (' + what + ')' : '') + '.', 8000);
+      toast((mvOn ? 'Multiview didn\'t work' : 'Could not play ' + (gone ? gone.full || gone.title : 'that feed')) + (told || '.'), 8000);
       // The switch gave up (above); playing the old feed again is an attempt of its own for the diagnostics.
       var back = retryFrom('load', null, {}, from);
       delete back.recover; delete back.retry;
@@ -2963,7 +2966,7 @@
     if (next === 'alone') {
       feedsCtx.multiview = null;
       toast(stuckNow ? 'Multiview didn\'t start: the TV\'s video player is stuck. Playing one feed (restart the app for multiview).' :
-        'Multiview didn\'t work' + (what ? ' (' + what + ')' : '') + '.', stuckNow ? 10000 : 8000);
+        'Multiview didn\'t work' + (told || '.'), stuckNow ? 10000 : 8000);
     } else if (noticed) toast((mvOn ? 'Multiview' : 'The video') + verb + ', trying again…', 4000);
     var again = retryFrom(c.phase, stream, opts, from);
     again.retrying = true;   // the message above stays (no "Switching to…")

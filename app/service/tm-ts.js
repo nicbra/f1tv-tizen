@@ -2,7 +2,8 @@
  * F1's player_tm feeds (HDR_UHD_HLSCK) for the multiview stitcher: MPEG-TS segments, whole-segment AES-128-CBC with
  * the key and IV the playlist names, HEVC with in-band VPS/SPS/PPS (hev1). This turns a segment into the CMAF-style
  * fMP4 fragment stitch-hevc.js reads (and an init segment from its parameter sets), so the grid is built exactly as
- * for the CMAF offers: player_tm is the same encode, repackaged (research, 2026-11-22). Node 12 (the TV's), ES5.
+ * for the CMAF offers: player_tm is the same encode, repackaged (research, 2026-11-22). ES5, and Node 4's Buffer
+ * (Tizen 5.5): bytes through stitch.js (alloc, bytes, fromHex), never Buffer.from or buf.set.
  *
  * Every feed of a session has the same segment numbers, timestamps, key and IV (Las Vegas 2026), so a grid's
  * segment n is the feeds' segments n, as with CMAF.
@@ -28,7 +29,7 @@ function decrypt(data, key, iv) {
 /** The IV of a segment: the playlist's IV= (hex), else its media sequence number as a 128-bit big-endian value. */
 function ivFor(hex, number) {
   if (hex) {
-    var b = Buffer.from(String(hex).replace(/^0x/i, ''), 'hex');
+    var b = h.fromHex(hex);
     if (b.length !== 16) fail('IV is not 16 bytes');
     return b;
   }
@@ -137,7 +138,7 @@ function fullBox(type, version, flags, payload) {
 function u32b(v) { var b = alloc(4); w32(b, 0, v); return b; }
 function u16b(v) { var b = alloc(2); w16(b, 0, v); return b; }
 function u64b(v) { var b = alloc(8); w32(b, 0, Math.floor(v / 4294967296)); w32(b, 4, v % 4294967296); return b; }
-function str(s) { return Buffer.from(s, 'latin1'); }
+function str(s) { return h.fromLatin1(s); }
 
 /** The first VPS, SPS and PPS of a segment's access units (escaped, NAL header included). */
 function paramSetsOf(aus) {
@@ -163,7 +164,7 @@ function hvcC(p, s) {
     body.push(0x80 | a[0], 0, 1, a[1].length >> 8, a[1].length & 255);
     for (var i = 0; i < a[1].length; i++) body.push(a[1][i]);
   });
-  return box('hvcC', Buffer.from(head.concat(body)));
+  return box('hvcC', h.bytes(head.concat(body)));
 }
 
 /** An init segment (ftyp + moov, one hev1 track on the TS clock) for the parameter sets of `aus`. */
@@ -178,7 +179,7 @@ function init(aus) {
   var hdlr = fullBox('hdlr', 0, 0, concat([u32b(0), str('vide'), alloc(12), str('video\0')]));
   var dinf = box('dinf', fullBox('dref', 0, 0, concat([u32b(1), fullBox('url ', 0, 1, alloc(0))])));
   // HLG, BT.2020 (F1's player_tm video); the stitched picture copies this.
-  var colr = box('colr', concat([str('nclx'), u16b(9), u16b(18), u16b(9), Buffer.from([0])]));
+  var colr = box('colr', concat([str('nclx'), u16b(9), u16b(18), u16b(9), h.bytes([0])]));
   var entry = box('hev1', concat([alloc(6), u16b(1), alloc(16), u16b(w), u16b(ht), u32b(0x480000), u32b(0x480000), u32b(0), u16b(1),
     alloc(32), u16b(0x18), u16b(0xffff), hvcC(p, s), colr]));
   var stbl = box('stbl', concat([fullBox('stsd', 0, 0, concat([u32b(1), entry])), fullBox('stts', 0, 0, u32b(0)), fullBox('stsc', 0, 0, u32b(0)),
@@ -214,7 +215,7 @@ function fragment(aus, seq) {
  * number; base: an earlier DTS of the feed (unwrapping), or null. Returns { segment, aus, firstDts }.
  */
 function convert(raw, feed, number, base) {
-  var key = Buffer.from(String(feed.key || ''), 'hex');
+  var key = h.fromHex(feed.key || '');
   if (key.length !== 16) fail('need a 16-byte key');
   var aus = videoAccessUnits(decrypt(raw, key, ivFor(feed.iv, number)), base);
   return { segment: fragment(aus, number), aus: aus, firstDts: aus[0].dts };

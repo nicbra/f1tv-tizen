@@ -154,8 +154,7 @@ for that TV; see [If something goes wrong](#if-something-goes-wrong).
 ### Why do I need a computer?
 
 Samsung TVs only install apps from Samsung's store, except in Developer Mode, where a computer
-on the same network installs them. The app can't update itself either, so updates also go
-through the installer.
+on the same network installs them.
 
 ## How it works
 

@@ -241,7 +241,8 @@ function helper(routes, gate) {
   };
   const modules = { http: lib, https: lib, url, './stitch': st, './stitch-hevc': hv };
   const module = { exports: {} };
-  const context = vm.createContext({ require: (name) => modules[name], module, Buffer, Uint8Array, console, Date, setTimeout, clearTimeout });
+  const context = vm.createContext({ require: (name) => modules[name], module, Buffer, Uint8Array, console, Date, setTimeout, clearTimeout,
+    process: { version: 'v4.4.3' } });
   vm.runInContext(readFileSync(path.join(__dirname, '../app/service/service.js'), 'utf8'), context);
   return { s: context, requested };
 }
@@ -250,7 +251,7 @@ function call(s, method, p, body) {
   return new Promise((resolve) => {
     const req = new EventEmitter();
     Object.assign(req, { url: p, method });
-    const res = { writeHead(status) { this.status = status; }, end(b) { resolve({ status: this.status, body: b }); } };
+    const res = { writeHead(status, headers) { this.status = status; this.headers = headers; }, end(b) { resolve({ status: this.status, body: b, headers: this.headers }); } };
     s.handle(req, res);
     setImmediate(() => { if (body != null) req.emit('data', Buffer.from(body)); req.emit('end'); });
   });
@@ -287,7 +288,15 @@ test('the helper builds a grid from the feeds, serves its init and segments, and
 
 test('the helper refuses grids it cannot build, and rearranging one it does not have', async () => {
   const { s } = helper(cdnRoutes());
-  assert.equal((await call(s, 'POST', '/stitch/g2', JSON.stringify({ kind: 'hevc', layout: 'grid2x2', feeds: feedsOf([0, 1]) }))).status, 422);
+  const refused = await call(s, 'POST', '/stitch/g2', JSON.stringify({ kind: 'hevc', layout: 'grid2x2', feeds: feedsOf([0, 1]) }));
+  assert.equal(refused.status, 422);
+  // Where it failed, for the app's diagnostics only (issue #6): headers the page may read, the message left plain.
+  assert.doesNotMatch(String(refused.body), /\[|node/);
+  assert.equal(refused.headers['X-Error-Category'], 'type_error');
+  assert.equal(refused.headers['X-Error-Source'], 'stitch-hevc.js');
+  assert.match(refused.headers['X-Error-Line'], /^\d+$/);
+  assert.equal(refused.headers['X-Helper-Node'], '4.4.3');
+  assert.match(refused.headers['Access-Control-Expose-Headers'], /X-Error-Source/);
   const offCdn = feedsOf([0, 1, 2, 3]).map((f) => Object.assign({}, f, { init: 'https://example.com/init.mp4' }));
   assert.equal((await call(s, 'POST', '/stitch/g3', JSON.stringify({ kind: 'hevc', layout: 'grid2x2', feeds: offCdn }))).status, 400);
   assert.equal((await call(s, 'POST', '/stitch/none/layout', JSON.stringify({ kind: 'hevc', layout: 'grid2x2', feeds: feedsOf([0, 1, 2, 3]) }))).status, 404);
