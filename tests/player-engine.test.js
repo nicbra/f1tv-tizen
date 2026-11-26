@@ -524,6 +524,35 @@ test('a preparation that never answers fails the load in time, and AVPlay is nev
   assert.deepEqual(names(av).filter((n) => n === 'stop' || n === 'close'), ['stop', 'close']);
 });
 
+test('a preparation AVPlay has gone silent on is given up after 8 s; one still reporting its buffering is not', async () => {
+  for (const talking of [false, true]) {
+    const av = fakeAvPlay();
+    av.prepareAsync = () => { av.calls.push(['prepareAsync']); };
+    let now = 1e12;
+    const ticks = [];
+    class FakeDate extends Date { static now() { return now; } }
+    const P = await player(av, undefined, undefined, { Date: FakeDate, setTimeout: () => 0, clearTimeout: () => {},
+      setInterval: (fn, ms) => { ticks.push({ fn, ms }); return ticks.length; }, clearInterval: (id) => { if (ticks[id - 1]) ticks[id - 1].off = true; } });
+    let failed = null;
+    P.load(Object.assign({}, REPLAY), null).catch((e) => { failed = e; });
+    for (let k = 0; k < 5; k++) await new Promise(setImmediate);
+    const watch = ticks.find((t) => t.ms === 1000);
+    assert.ok(watch, 'a watch while it prepares');
+    av.listener.onevent('PLAYER_MSG_NONE');   // as on the TV: a few events right after the open, then quiet
+    for (let sec = 1; sec <= 12 && !watch.off; sec++) {
+      now += 1000;
+      if (talking) av.listener.onbufferingprogress(sec * 8);
+      watch.fn();
+    }
+    await new Promise(setImmediate);
+    if (talking) assert.equal(failed, null, 'still preparing');
+    else {
+      assert.equal(failed && failed.code, 'PREPARE_TIMEOUT');
+      assert.ok(watch.off, 'given up after 8 s of silence');
+    }
+  }
+});
+
 test('a second unload while AVPlay still prepares waits for the first, and the player is closed once', async () => {
   const av = fakeAvPlay();
   let answer;

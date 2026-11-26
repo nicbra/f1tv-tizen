@@ -4592,10 +4592,13 @@ test('live SDR starts on Shaka cenc; a start-watch failure falls back to native 
   app.context.document.hidden = true;
   app.context.document.listeners.visibilitychange.forEach((fn) => fn());
   assert.equal(app.context.Caps.report().playing, undefined);
+  assert.equal(app.context.Player.isPaused(), true, 'paused while another app is in front');
   await app.advance(1000);
   assert.equal(app.context.Caps.report().playing, undefined);
   app.context.document.hidden = false;
+  app.context.document.listeners.visibilitychange.forEach((fn) => fn());
   await app.advance(1000);
+  assert.equal(app.context.Player.isPaused(), false, 'plays on when back');
   assert.equal(app.context.Caps.report().playing.path, 'avplay:cbcs');
   app.windowListeners.beforeunload();
   assert.equal(app.context.Caps.report().playing, undefined);
@@ -5233,4 +5236,75 @@ test('an unreachable diagnostics server changes nothing for the viewer', async (
   assert.equal(app.screen(), 'player');
   assert.ok(app.uploads.length >= 1);
   assert.doesNotMatch(app.toast() || '', /diagnostic|server/i);
+});
+
+/* ---------------------------------------------------------------- the app hidden (another app, the TV's standby) */
+
+async function awayApp() {
+  const app = await boot({ capsRouting: true });
+  app.player.kind = 'avplay';
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(3000);   // it plays: the way counts a good start
+  app.player.progress = false;
+  const hide = (h) => { app.context.document.hidden = h; app.context.document.listeners.visibilitychange.forEach((fn) => fn()); };
+  return { app, hide, way: app.player.current.capsPath, failed: () => (app.context.Caps.report().paths[app.player.current.capsPath] || {}).failed || 0 };
+}
+
+test('another app in front pauses what plays (its sound went on behind it); back soon, it plays on', async () => {
+  const { app, hide } = await awayApp();
+  const loads = app.player.loads.length;
+  hide(true);
+  assert.equal(app.player.paused, true);
+  await app.advance(60000);
+  hide(false);
+  await app.advance(200);
+  assert.equal(app.player.paused, false);
+  assert.equal(app.player.loads.length, loads, 'nothing loaded again');
+});
+
+test('away a long time (the TV switched itself off), the feed loads again at its moment, not counted as a failure', async () => {
+  const { app, hide, way, failed } = await awayApp();
+  const loads = app.player.loads.length, before = failed();
+  app.player.pos = 2500;
+  hide(true);
+  await app.advance(2 * 3600 * 1000);
+  hide(false);
+  await app.advance(500);
+  assert.equal(app.player.loads.length, loads + 1, 'loaded again');
+  assert.equal(Math.round(app.player.loads.at(-1).start), 2500);
+  assert.equal(app.player.current.capsPath, way, 'the same way of playing');
+  assert.equal(app.player.paused, false);
+  assert.equal(failed(), before);
+});
+
+test('paused by the viewer and away a long time: still paused when back, loaded again when it plays', async () => {
+  const { app, hide } = await awayApp();
+  await app.press('PAUSE');
+  const loads = app.player.loads.length;
+  app.player.pos = 2600;
+  hide(true);
+  await app.advance(3600 * 1000);
+  hide(false);
+  await app.advance(500);
+  assert.equal(app.player.paused, true);
+  assert.equal(app.player.loads.length, loads);
+  await app.press('PLAY');
+  await app.advance(500);
+  assert.equal(app.player.loads.length, loads + 1);
+  assert.equal(Math.round(app.player.loads.at(-1).start), 2600);
+});
+
+test('an error just after the app is back is not held against the way: the same way once more', async () => {
+  const { app, hide, way, failed } = await awayApp();
+  const loads = app.player.loads.length, before = failed();
+  hide(true);
+  await app.advance(5 * 60000);
+  hide(false);
+  await app.advance(1000);
+  app.player.listeners.error('Player error: PLAYER_ERROR_NOT_SUPPORTED_FORMAT', { code: 'UNSUPPORTED', platform: 'PLAYER_ERROR_NOT_SUPPORTED_FORMAT' });
+  await app.advance(1000);
+  assert.ok(app.player.loads.length > loads, 'tried again');
+  assert.equal(app.player.current.capsPath, way);
+  assert.equal(failed(), before, 'not counted on the TV');
 });

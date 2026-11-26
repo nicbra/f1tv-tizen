@@ -1197,8 +1197,11 @@ var Player = (function () {
      * while it prepares has crashed or frozen the player, so a preparation that takes longer than this is left
      * alone (`stuck`): its open fails with code PREPARE_TIMEOUT, and the next open goes over it, as BACK and trying
      * again did. Each open has its own generation, so a late answer from an earlier one changes nothing.
+     * A hung preparation goes quiet: in every one logged (2026-11-24/26) AVPlay's events stopped 1-2 s after the open
+     * and nothing came until the timeout. So one that has heard nothing from AVPlay (events, buffering and its
+     * progress, the clock) for PREPARE_SILENT_MS is given up as hung too, without waiting for the full time.
      */
-    var PREPARE_MS = { grid: 20000, other: 30000 };
+    var PREPARE_MS = { grid: 20000, other: 30000 }, PREPARE_SILENT_MS = 8000;
     var openGen = 0, stuck = null;
 
     function b64ToBytes(b64) {
@@ -1359,20 +1362,26 @@ var Player = (function () {
         }
         openedAt = Date.now();
         quietUntil = openedAt + 6000;
+        // When AVPlay last said anything (the hung preparation's sign is silence), and its longest silence so far.
+        var heardAt = openedAt, silence = 0;
+        function heard() { var t = Date.now(); silence = Math.max(silence, t - heardAt); heardAt = t; }
         av.setListener({
-          onbufferingstart: function () { emit('buffering', true); bufferingStarted(s); },
-          onbufferingcomplete: function () { emit('buffering', false); clearTimeout(stallTimer); },
-          oncurrentplaytime: function (ms) { posMs = ms; noteSmooth(s); },
+          onbufferingstart: function () { heard(); emit('buffering', true); bufferingStarted(s); },
+          onbufferingprogress: function () { heard(); },
+          onbufferingcomplete: function () { heard(); emit('buffering', false); clearTimeout(stallTimer); },
+          oncurrentplaytime: function (ms) { heard(); posMs = ms; noteSmooth(s); },
           onstreamcompleted: function () { emit('ended'); },
           // Not after another engine took over (a preparation that hung and was given up still reports, seconds later,
           // over a Shaka feed playing fine: "Player error: PLAYER_ERROR_GENEREIC", 2026-11-24).
           onerror: function (e) {
+            heard();
             if (engine !== AvEngine) return diagTrail('avplay.late-error', { error: String(e).slice(0, 60) });
             emit('error', 'Player error: ' + e, Failure.avError(e));
           },
           // The type only: its data is often binary (Tizen 6) and could carry anything.
-          onevent: function (type) { diagTrail('avplay.event', { type: type }); },
+          onevent: function (type) { heard(); diagTrail('avplay.event', { type: type }); },
           onsubtitlechange: function (duration, text) {
+            heard();
             text = String(text || '').replace(/\u0000/g, '').trim();
             // At each segment boundary AVPlay sends the new segment's earlier lines again (F1 repeats
             // cues across segments), which flashed old lines: show a line once.
@@ -1382,7 +1391,7 @@ var Player = (function () {
             if (text) recentLines[text] = now;
             emit('subtitle', { text: text, ms: +duration || 3000 });
           },
-          ondrmevent: onDrm
+          ondrmevent: function () { heard(); return onDrm.apply(this, arguments); }
         });
         if (s.licenseUrl) {
           var properties = { AppSession: 'f1tv-' + Date.now() };
@@ -1405,18 +1414,22 @@ var Player = (function () {
           if (finished) return false;
           finished = true;
           clearTimeout(timer);
+          clearInterval(quiet);
           return true;
         }
-        var timer = setTimeout(function () {
+        function hung(silent) {
           if (!finish()) return;
           stuck = { gen: g };
           // Whoever waits for this preparation goes on (unload() then leaves AVPlay alone: see `stuck`).
           settle();
           if (preparing === mine) preparing = null;
+          diagTrail('avplay.hung', { afterMs: Date.now() - openedAt, silent: silent });
           var e = new Error('The video player did not start');
           e.code = 'PREPARE_TIMEOUT';
           reject(e);
-        }, s.grid ? PREPARE_MS.grid : PREPARE_MS.other);
+        }
+        var timer = setTimeout(function () { hung(false); }, s.grid ? PREPARE_MS.grid : PREPARE_MS.other);
+        var quiet = setInterval(function () { if (Date.now() - heardAt >= PREPARE_SILENT_MS) hung(true); }, 1000);
         function prepare() {
           if (finished) return answered();   // the seek answered after this open gave up: don't prepare now
           if (stream !== s) { answered(); finish(); return reject(new Error('cancelled')); }
@@ -1427,6 +1440,8 @@ var Player = (function () {
             if (stream !== s) return reject(new Error('cancelled'));
             stuck = null;   // AVPlay prepares again: an earlier stuck preparation no longer holds it
             started = true;
+            heard();
+            diagTrail('avplay.prepared', { ms: Date.now() - openedAt, silence: silence, grid: !!s.grid });
             var d = av.getDuration();
             live = s.info ? s.info.dynamic : (!!s.live || !d || d <= 0);
             selectAudio(wantedAudio(s));

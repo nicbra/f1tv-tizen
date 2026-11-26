@@ -65,19 +65,21 @@ var Caps = (function () {
 
   // A heartbeat left from the last run means it ended while protected video played on AVPlay: a crash (the app
   // vanishes, issue #1), a kill or a power cut. Counted only when the app is started again within 10 minutes (after a
-  // power cut the TV is usually off for longer); one alone never rules out a path (see avoided).
+  // power cut the TV is usually off for longer); one alone never rules out a path (see avoided). Not when this start
+  // is another app version: an update (installed or downloaded) replaced the app that played.
+  var version = '';
+  try { version = String((typeof Launcher !== 'undefined' && Launcher.version) || tizen.application.getCurrentApplication().appInfo.version || ''); }
+  catch (e) { /* desktop or unavailable: no version, nothing forgotten */ }
   var marker = record.playing, previous = null;
   delete record.playing;
-  if (marker && marker.path && Date.now() >= marker.at && Date.now() - marker.at < 10 * 60000) {
+  if (marker && marker.path && Date.now() >= marker.at && Date.now() - marker.at < 10 * 60000 &&
+      !(version && record.appVersion && record.appVersion !== version)) {
     count(marker.path, 'crashed');
     previous = { path: marker.path, minutes: Math.floor((Date.now() - marker.at) / 60000) };
   }
 
   // A new app version (an installed package or a downloaded bundle, rollbacks too) forgets the failures: they may have
   // been the app's. Crashes stay (the TV's own player is the usual cause) unless the release lists the path in FIXED.
-  var version = '';
-  try { version = String((typeof Launcher !== 'undefined' && Launcher.version) || tizen.application.getCurrentApplication().appInfo.version || ''); }
-  catch (e) { /* desktop or unavailable: no version, nothing forgotten */ }
   if (version && record.appVersion !== version) {
     Object.keys(record.paths).forEach(function (k) {
       var p = record.paths[k];

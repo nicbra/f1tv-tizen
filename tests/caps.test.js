@@ -59,6 +59,17 @@ test('a recent native heartbeat is counted once at next launch; stale/future mar
   }
 });
 
+test('a heartbeat found by another app version is no crash: an update replaced the app that played', () => {
+  const h = boot({}, { version: '1.2.0' }); h.caps.crashStart('mvsoft:h264');
+  const updated = boot(h.store, { version: '1.3.0', now: 160000 });
+  assert.equal(updated.caps.report().paths['mvsoft:h264']?.crashed || 0, 0);
+  assert.equal(updated.caps.previousRun(), null);
+  assert.equal(updated.caps.report().playing, undefined);
+  // the same version: a crash (or a kill) as before
+  const again = boot({}, { version: '1.3.0' }); again.caps.crashStart('mvsoft:h264');
+  assert.equal(boot(again.store, { version: '1.3.0', now: 160000 }).caps.report().paths['mvsoft:h264'].crashed, 1);
+});
+
 test('crash heartbeat refreshes every five seconds, preserving its start, and replaces the old path', () => {
   const h = boot(); h.caps.crashStart('avplay:cbcs'); h.at(180000);
   h.timers.forEach((t) => { if (t.interval) { assert.equal(t.ms, 5000); t.fn(); } });

@@ -2747,7 +2747,7 @@
             $('osd-feed').textContent = feedLabel(from.stream);
           }
           recover({ phase: 'load', stream: stream, error: e, opts: opts, from: from, index: i, multiview: mv, trial: trial,
-            answer: answer, unclear: !!(stream && stream.unclearCause) });
+            answer: answer, unclear: !!(stream && stream.unclearCause) || backRecently() });
         });
     }, function (e) {
       // The session could not be checked (no network): say so instead of doing nothing.
@@ -3386,8 +3386,49 @@
     $('playback-feedback').classList.remove('visible');
   }
 
+  /*
+   * The app hidden (another app in front, the TV's standby or its own auto-off): what plays is paused (its sound went
+   * on behind the other app); the H.264 multiview's small feeds stop with its clock. Back within AWAY_RELOAD_MS it plays
+   * on, unless the viewer had paused it. Away longer, the player's old session may not go on (2026-11-26: AVPlay after
+   * 2 h, PLAYER_ERROR_NOT_SUPPORTED_FORMAT, counted against the multiview): the feed (or multiview) loads again at its
+   * moment, live at LIVE; one the viewer had paused loads when it plays again. Failures in the first BACK_UNCLEAR_MS
+   * back are unclear: not held against the way of playing.
+   */
+  var AWAY_RELOAD_MS = 10 * 60000, BACK_UNCLEAR_MS = 20000, away = null, backAt = 0;
+  function onVisibility() {
+    if (document.hidden) {
+      if (away || screen !== 'player' || !Player.engineName()) return;
+      away = { at: Date.now(), stream: Player.stream(), paused: Player.isPaused() };
+      if (!away.paused) Player.togglePause();
+      saveWatching();
+      return;
+    }
+    var a = away;
+    away = null;
+    if (!a) return;
+    backAt = Date.now();
+    if (screen !== 'player' || !Player.engineName() || Player.stream() !== a.stream) return;
+    if (Date.now() - a.at >= AWAY_RELOAD_MS) {
+      if (a.paused) { feedsCtx.stale = true; return; }
+      return reloadHere(Date.now() - a.at);
+    }
+    if (!a.paused && Player.isPaused()) Player.togglePause();
+  }
+  function backRecently() { return backAt > 0 && Date.now() - backAt < BACK_UNCLEAR_MS; }
+
+  /** The playing feed (or multiview) loaded again where it is (live: at LIVE), not as a retry of a failure. */
+  function reloadHere(awayMs) {
+    var live = Player.isLive(), o = live ? { atLive: true } : retryFrom('play', Player.stream(), {}, null);
+    delete o.recover; delete o.retry;
+    feedsCtx.stale = false;
+    diag('app.back-reload', { awayMin: Math.round(awayMs / 60000), live: live, multiview: !!feedsCtx.multiview });
+    if (!queuedFeed && screen === 'player') playFeed(feedsCtx.index, o);
+  }
+
   function togglePause() {
     if (!Player.engineName()) return;
+    // Paused before the app was away a long time: its session is loaded again instead (onVisibility).
+    if (feedsCtx && feedsCtx.stale && Player.isPaused()) return reloadHere(0);
     Player.togglePause();
     var feedback = $('playback-feedback');
     hidePlaybackFeedback();
@@ -4348,6 +4389,7 @@
     Keys.register();
     document.addEventListener('keydown', onKey);
     document.addEventListener('visibilitychange', applyDownloadedUpdate);
+    document.addEventListener('visibilitychange', onVisibility);
     setInterval(applyDownloadedUpdate, 1000);
     tickClock();
     setInterval(tickClock, 15000);
@@ -4362,7 +4404,8 @@
       if (cur && failureCause(null, info, msg) === 'transient') cur.unclearCause = true;
       // Loading errors are handled (and told) by the load catch/start watch, once native preparation settles.
       if (screen !== 'player' || loadingFeed) return;
-      recover({ phase: 'play', stream: cur, known: info, message: msg, opts: {}, index: feedsCtx.index, multiview: feedsCtx.multiview });
+      recover({ phase: 'play', stream: cur, known: info, message: msg, opts: {}, index: feedsCtx.index, multiview: feedsCtx.multiview,
+        unclear: backRecently() });
     });
     // During a jump the pending-seek logic owns the spinner (it waits a moment before showing it).
     var stallSince = 0;   // buffering while playing (not while loading or jumping), for the diagnostics log
