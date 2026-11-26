@@ -5283,7 +5283,8 @@ async function awayApp() {
   await app.advance(3000);   // it plays: the way counts a good start
   app.player.progress = false;
   const hide = (h) => { app.context.document.hidden = h; app.context.document.listeners.visibilitychange.forEach((fn) => fn()); };
-  return { app, hide, way: app.player.current.capsPath, failed: () => (app.context.Caps.report().paths[app.player.current.capsPath] || {}).failed || 0 };
+  const way = app.player.current.capsPath;
+  return { app, hide, way, failed: () => (app.context.Caps.report().paths[way] || {}).failed || 0 };
 }
 
 test('another app in front pauses what plays (its sound went on behind it); back soon, it plays on', async () => {
@@ -5343,3 +5344,78 @@ test('an error just after the app is back is not held against the way: the same 
   assert.equal(app.player.current.capsPath, way);
   assert.equal(failed(), before, 'not counted on the TV');
 });
+
+test('a feed switch that finishes while the app is hidden stays paused, and plays when the app is back', async () => {
+  const { app, hide } = await awayApp();
+  app.player.hold = deferred();
+  await app.press('CH_DOWN');
+  await app.advance(300);
+  const held = app.player.hold;
+  hide(true);
+  app.player.hold = null;
+  held.resolve();
+  await app.advance(500);
+  assert.equal(app.player.paused, true, 'not playing behind the other app');
+  hide(false);
+  await app.advance(300);
+  assert.equal(app.player.paused, false);
+});
+
+test('away a long time from a live stream behind live: back at its moment, not at LIVE; at LIVE: LIVE', async () => {
+  for (const [pos, atLive] of [[2000, false], [4598, true]]) {
+    const app = await boot({ capsRouting: true });
+    await playLive(app, 'avplay');
+    app.player.progress = true;
+    await app.advance(3000);
+    app.player.progress = false;
+    app.player.pos = pos;
+    const hide = (h) => { app.context.document.hidden = h; app.context.document.listeners.visibilitychange.forEach((fn) => fn()); };
+    const loads = app.player.loads.length;
+    hide(true);
+    await app.advance(3600 * 1000);
+    hide(false);
+    await app.advance(800);
+    assert.equal(app.player.loads.length, loads + 1, 'loaded again');
+    // (a live load's moment is its delay behind live: 2600 s behind + the hour away)
+    const delay = app.player.current.startDelay || 0;
+    if (atLive) assert.ok(!(delay > 0), 'at LIVE: ' + delay);
+    else assert.ok(Math.abs(delay - 6200) < 60, 'its moment, not LIVE: ' + delay);
+  }
+});
+
+test('the leeway after coming back is for the video that was away only', async () => {
+  const { app, hide, failed } = await awayApp();
+  hide(true);
+  await app.advance(60000);
+  hide(false);
+  await app.advance(500);
+  await app.press('BACK');
+  await app.advance(500);
+  if (app.screen() === 'feeds') await app.press('BACK');
+  await app.advance(500);
+  await play(app, 'Race');
+  app.player.progress = true;
+  await app.advance(3000);
+  const before = failed();
+  app.player.listeners.error('Player error: PLAYER_ERROR_NOT_SUPPORTED_FORMAT', { code: 'UNSUPPORTED', platform: 'PLAYER_ERROR_NOT_SUPPORTED_FORMAT' });
+  await app.advance(1000);
+  assert.ok(failed() > before, 'another video\'s failure counts as usual');
+});
+
+test('a sound change in a clear 4K HDR multiview asks the new sound feed\'s full offer, not the video-only player_tm one', async () => {
+  const offers = [];
+  const tmClear = (id, channel) => ({ url: 'https://tm/' + id + '/' + (channel || 'main') + '/hdr.m3u8', hdr: true, streamType: 'HDR_UHD_CMAF', licenseUrl: '', fromTm: true });
+  const app = await premiumHdr({ play: (id, channel, opts) => { offers.push([channel, !!(opts && opts.hdrOnly)]); return clearHdrOffer(id, channel); }, tmClear });
+  const grid = await playingBig2(app);
+  assert.ok(grid.streams.some((x) => x.fromTm), 'the other feeds from the player_tm answer');
+  offers.length = 0;
+  await app.press('UP');
+  await app.moveTo(/^Sound from/, ['UP', 'DOWN']);
+  await app.press('RIGHT');
+  await app.advance(7000);
+  const g = app.player.current.grid;
+  assert.equal(g.audio, grid.slots[1]);
+  assert.ok(offers.some((o) => o[1] === false), 'the new sound feed\'s full offer: ' + JSON.stringify(offers));
+  assert.ok(!g.streams[g.slots.indexOf(g.audio)].fromTm, 'its own offer leads');
+});
+

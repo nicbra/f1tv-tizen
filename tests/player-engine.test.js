@@ -553,6 +553,52 @@ test('a preparation AVPlay has gone silent on is given up after 8 s; one still r
   }
 });
 
+test('the silence watch: the seek before preparing counts as an answer; a player that never said anything waits the full time', async () => {
+  // A slow seek (answered at 7.5 s), then a preparation that takes 2 s more: not hung.
+  {
+    const av = fakeAvPlay();
+    let seekOk = null, prepOk = null;
+    av.seekTo = (ms, ok) => { av.calls.push(['seekTo', ms]); seekOk = ok; };
+    av.prepareAsync = (ok) => { av.calls.push(['prepareAsync']); prepOk = ok; };
+    let now = 1e12;
+    const ticks = [];
+    class FakeDate extends Date { static now() { return now; } }
+    const P = await player(av, undefined, undefined, { Date: FakeDate, setTimeout: () => 0, clearTimeout: () => {},
+      setInterval: (fn, ms) => { ticks.push({ fn, ms }); return ticks.length; }, clearInterval: (id) => { if (ticks[id - 1]) ticks[id - 1].off = true; } });
+    let failed = null;
+    const done = P.load(Object.assign({}, REPLAY), 1800).catch((e) => { failed = e; });
+    for (let k = 0; k < 5; k++) await new Promise(setImmediate);
+    const watch = ticks.find((t) => t.ms === 1000);
+    av.listener.onevent('PLAYER_MSG_NONE');
+    for (let sec = 1; sec <= 7; sec++) { now += 1000; watch.fn(); }
+    now += 500; seekOk();
+    for (let k = 0; k < 3; k++) await new Promise(setImmediate);
+    for (let sec = 1; sec <= 2; sec++) { now += 1000; watch.fn(); }
+    assert.equal(failed, null, 'not given up while preparing after the seek');
+    prepOk();
+    await done;
+    assert.equal(failed, null);
+    assert.ok(names(av).includes('play'));
+  }
+  // Nothing at all from AVPlay: no early end (the full deadline decides).
+  {
+    const av = fakeAvPlay();
+    av.prepareAsync = () => { av.calls.push(['prepareAsync']); };
+    let now = 1e12;
+    const ticks = [];
+    class FakeDate extends Date { static now() { return now; } }
+    const P = await player(av, undefined, undefined, { Date: FakeDate, setTimeout: () => 0, clearTimeout: () => {},
+      setInterval: (fn, ms) => { ticks.push({ fn, ms }); return ticks.length; }, clearInterval: (id) => { if (ticks[id - 1]) ticks[id - 1].off = true; } });
+    let failed = null;
+    P.load(Object.assign({}, REPLAY), null).catch((e) => { failed = e; });
+    for (let k = 0; k < 5; k++) await new Promise(setImmediate);
+    const watch = ticks.find((t) => t.ms === 1000);
+    for (let sec = 1; sec <= 15; sec++) { now += 1000; watch.fn(); }
+    await new Promise(setImmediate);
+    assert.equal(failed, null);
+  }
+});
+
 test('a second unload while AVPlay still prepares waits for the first, and the player is closed once', async () => {
   const av = fakeAvPlay();
   let answer;
@@ -577,7 +623,7 @@ test('a multiview gets 20 s to prepare, other streams 30 s', async () => {
     const av = fakeAvPlay();
     av.prepareAsync = () => {};
     const timers = [];
-    const P = await player(av, undefined, undefined, { setTimeout: (fn, t) => { timers.push(t); return 0; }, clearTimeout: () => {} });
+    const P = await player(av, undefined, undefined, { setTimeout: (fn, t) => { timers.push(t); return 0; }, clearTimeout: () => {}, setInterval: () => 0, clearInterval: () => {} });
     const s = Object.assign({}, REPLAY);
     if (grid) {
       s.grid = { streams: [], layout: 'grid2x2', slots: [0, 1, 2, 3] };

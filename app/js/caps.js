@@ -66,7 +66,8 @@ var Caps = (function () {
   // A heartbeat left from the last run means it ended while protected video played on AVPlay: a crash (the app
   // vanishes, issue #1), a kill or a power cut. Counted only when the app is started again within 10 minutes (after a
   // power cut the TV is usually off for longer); one alone never rules out a path (see avoided). Not when this start
-  // is another app version: an update (installed or downloaded) replaced the app that played.
+  // is another app version: an update (installed or downloaded) replaced the app that played. (A real crash in the
+  // same 10 minutes as an update goes uncounted then: much rarer than updates cutting playback off.)
   var version = '';
   try { version = String((typeof Launcher !== 'undefined' && Launcher.version) || tizen.application.getCurrentApplication().appInfo.version || ''); }
   catch (e) { /* desktop or unavailable: no version, nothing forgotten */ }

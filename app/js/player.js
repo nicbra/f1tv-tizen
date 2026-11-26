@@ -1199,7 +1199,9 @@ var Player = (function () {
      * again did. Each open has its own generation, so a late answer from an earlier one changes nothing.
      * A hung preparation goes quiet: in every one logged (2026-11-24/26) AVPlay's events stopped 1-2 s after the open
      * and nothing came until the timeout. So one that has heard nothing from AVPlay (events, buffering and its
-     * progress, the clock) for PREPARE_SILENT_MS is given up as hung too, without waiting for the full time.
+     * progress, the clock, the answer to the seek before preparing) for PREPARE_SILENT_MS after it spoke at all is given
+     * up as hung too, without waiting for the full time; one that never said anything waits for the full time (a
+     * second hang closes AVPlay until restart: the early end is only for the silence seen in real hangs).
      */
     var PREPARE_MS = { grid: 20000, other: 30000 }, PREPARE_SILENT_MS = 8000;
     var openGen = 0, stuck = null;
@@ -1363,8 +1365,8 @@ var Player = (function () {
         openedAt = Date.now();
         quietUntil = openedAt + 6000;
         // When AVPlay last said anything (the hung preparation's sign is silence), and its longest silence so far.
-        var heardAt = openedAt, silence = 0;
-        function heard() { var t = Date.now(); silence = Math.max(silence, t - heardAt); heardAt = t; }
+        var heardAt = openedAt, silence = 0, spoke = false;
+        function heard() { var t = Date.now(); silence = Math.max(silence, t - heardAt); heardAt = t; spoke = true; }
         av.setListener({
           onbufferingstart: function () { heard(); emit('buffering', true); bufferingStarted(s); },
           onbufferingprogress: function () { heard(); },
@@ -1429,10 +1431,11 @@ var Player = (function () {
           reject(e);
         }
         var timer = setTimeout(function () { hung(false); }, s.grid ? PREPARE_MS.grid : PREPARE_MS.other);
-        var quiet = setInterval(function () { if (Date.now() - heardAt >= PREPARE_SILENT_MS) hung(true); }, 1000);
+        var quiet = setInterval(function () { if (spoke && Date.now() - heardAt >= PREPARE_SILENT_MS) hung(true); }, 1000);
         function prepare() {
           if (finished) return answered();   // the seek answered after this open gave up: don't prepare now
           if (stream !== s) { answered(); finish(); return reject(new Error('cancelled')); }
+          heardAt = Date.now();   // its own time from here (after the seek)
           av.prepareAsync(function () {
             answered();
             if (!finish()) return;   // too late: this open has failed, and a retry may have the player
@@ -1465,7 +1468,7 @@ var Player = (function () {
         if (!seekFirst) return prepare();
         posMs = startAt * 1000;
         try {
-          av.seekTo(Math.round(startAt * 1000), prepare, function () { seekFirst = false; prepare(); });
+          av.seekTo(Math.round(startAt * 1000), function () { heard(); prepare(); }, function () { heard(); seekFirst = false; prepare(); });
         } catch (e) { seekFirst = false; prepare(); }
       });
     }

@@ -844,6 +844,16 @@ test('tmClearOffer: a multiview feed\'s clear 4K HDR from the kept Tiledmedia an
   assert.equal(await sdr.F1Api.tmClearOffer('42', '1003'), null);
 });
 
+test('tmClearOffer: a master that never comes gives up after 4 s (the usual request then)', async () => {
+  const clear = TM_MASTER.replace(TM_KEY, '');
+  const base = tmRoute({ type: 'HDR_UHD_CMAF', master: clear });
+  const { F1Api } = signedIn((url, init) => url.startsWith('https://cdn/tm/1003/') ? new Promise(() => {}) : base(url, init));
+  await F1Api.prefetchTm('42', '1025');
+  const t0 = Date.now();
+  assert.equal(await F1Api.tmClearOffer('42', '1003'), null);
+  assert.ok(Date.now() - t0 >= 3900 && Date.now() - t0 < 6000, (Date.now() - t0) + ' ms');
+});
+
 test('a 4K HDR start reads its HLS master once: the HDR check\'s copy serves streamInfo', async () => {
   const { F1Api, calls } = signedIn(tmRoute());
   const stream = await F1Api.play('42', '1033', { hdr: true, tm: true });

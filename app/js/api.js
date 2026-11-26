@@ -267,6 +267,7 @@ var F1Api = (function () {
   /** F1's Tiledmedia answers (playTm), per sign-in and video, the last few: every feed of the video, kept TM_KEEP ms. */
   var tmAnswers = [];
   var TM_KEEP = 30 * 60 * 1000;
+  var TM_CLEAR_WAIT = 4000;   // tmClearOffer: its master's check at most this long
   var tmAsking = {};   // requests under way, per sign-in and video (a prefetch and a start share one)
 
   /**
@@ -882,11 +883,13 @@ var F1Api = (function () {
       if (!who || !a || a.refused || a.streamType !== 'HDR_UHD_CMAF') return Promise.resolve(null);
       var ch = channelId != null ? String(channelId) : a.main, url = ch && a.feeds[ch];
       if (!url || !/\.m3u8(\?|$)/.test(url)) return Promise.resolve(null);
-      return fetch(url).then(function (res) { return res.ok ? res.text() : ''; }).then(function (master) {
+      var check = fetch(url).then(function (res) { return res.ok ? res.text() : ''; }).then(function (master) {
         if (state.ascendon !== who || !/^#EXTM3U\s/.test(master) || hasKeys(master) || !/VIDEO-RANGE=HLG/.test(master)) return null;
         return { url: url, streamType: a.streamType, platform: 'BIG_SCREEN_HLS', licenseUrl: '', hdr: true, fromTm: true,
           licenseHeaders: { ascendontoken: who, entitlementtoken: a.entitlementToken || state.entitlement, 'x-f1-device-info': DEVICE_INFO } };
       }, function () { return null; });
+      // A master that never comes must not hold the multiview: the usual request then (as HDR_WAIT does for that one).
+      return Promise.race([check, new Promise(function (resolve) { setTimeout(function () { resolve(null); }, TM_CLEAR_WAIT); })]);
     },
     /**
      * The Tiledmedia answer for a multiview (asked if not kept): { streamType, feeds, main, keyHeaders } (the headers

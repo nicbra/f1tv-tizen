@@ -1614,6 +1614,7 @@
       feedLoadTimer = null;
       loadingFeed = false;
       feedTarget = null;
+      holdWhileAway();   // (finished behind another app: paused until the app is back)
       if (queuedFeed) { var q = queuedFeed; queuedFeed = null; playFeed(q[0], q[1]); }
     }
     feedLoadTimer = setTimeout(done, WAIT.feedLoad);
@@ -2226,7 +2227,7 @@
     var reusable = function (idx) {
       var o = have[idx];
       return !!o && Date.now() - (o.offeredAt || 0) < 30 * 60 * 1000 && o.offeredWho === F1Api.state.ascendon &&
-        (idx !== sound || !o.hdrEncrypted || !!o.widevineManifestUrl);
+        (idx !== sound || ((!o.hdrEncrypted || !!o.widevineManifestUrl) && !o.fromTm));   // (its full offer: commentary, licence)
     };
     var reused = 0;
     return mv.slots.reduce(function (chain, idx) {
@@ -3403,44 +3404,48 @@
    * on behind the other app); the H.264 multiview's small feeds stop with its clock. Back within AWAY_RELOAD_MS it plays
    * on, unless the viewer had paused it. Away longer, the player's old session may not go on (2026-11-26: AVPlay after
    * 2 h, PLAYER_ERROR_NOT_SUPPORTED_FORMAT, counted against the multiview): the feed (or multiview) loads again at its
-   * moment, live at LIVE; one the viewer had paused loads when it plays again. Failures in the first BACK_UNCLEAR_MS
-   * back are unclear: not held against the way of playing.
+   * moment (at LIVE if it was there); one the viewer had paused loads when it plays again. A load or feed switch that
+   * finishes while away is paused too (holdWhileAway). Failures in the first BACK_UNCLEAR_MS back are unclear (not held
+   * against the way of playing), for the video that was away only.
    */
-  var AWAY_RELOAD_MS = 10 * 60000, BACK_UNCLEAR_MS = 20000, away = null, backAt = 0;
+  var AWAY_RELOAD_MS = 10 * 60000, BACK_UNCLEAR_MS = 20000, away = null, backAt = 0, backCtx = null;
   function onVisibility() {
     if (document.hidden) {
-      if (away || screen !== 'player' || !Player.engineName()) return;
-      away = { at: Date.now(), stream: Player.stream(), paused: Player.isPaused() };
-      if (!away.paused) Player.togglePause();
+      if (away || screen !== 'player' || !feedsCtx) return;
+      var on = !!Player.engineName();
+      away = { at: Date.now(), ctx: feedsCtx, paused: on && Player.isPaused(), atLive: on && Player.isLive() && nearLive(Player.position()) };
+      holdWhileAway();
       saveWatching();
       return;
     }
     var a = away;
     away = null;
-    if (!a) return;
+    if (!a || screen !== 'player' || feedsCtx !== a.ctx || !Player.engineName()) return;
     backAt = Date.now();
-    if (screen !== 'player' || !Player.engineName() || Player.stream() !== a.stream) return;
+    backCtx = a.ctx;
     if (Date.now() - a.at >= AWAY_RELOAD_MS) {
-      if (a.paused) { feedsCtx.stale = true; return; }
-      return reloadHere(Date.now() - a.at);
+      if (a.paused) { feedsCtx.stale = a; return; }
+      return reloadHere(a);
     }
     if (!a.paused && Player.isPaused()) Player.togglePause();
   }
-  function backRecently() { return backAt > 0 && Date.now() - backAt < BACK_UNCLEAR_MS; }
+  /** While away: what plays (a load that finished meanwhile too) is paused; the viewer's own choice is kept in `away`. */
+  function holdWhileAway() { if (away && Player.engineName() && !Player.isPaused()) Player.togglePause(); }
+  function backRecently() { return backAt > 0 && backCtx === feedsCtx && Date.now() - backAt < BACK_UNCLEAR_MS; }
 
-  /** The playing feed (or multiview) loaded again where it is (live: at LIVE), not as a retry of a failure. */
-  function reloadHere(awayMs) {
-    var live = Player.isLive(), o = live ? { atLive: true } : retryFrom('play', Player.stream(), {}, null);
+  /** The playing feed (or multiview) loaded again where it is (at LIVE if it was there), not as a retry of a failure. */
+  function reloadHere(a) {
+    var o = a.atLive ? { atLive: true } : retryFrom('play', Player.stream(), {}, null);
     delete o.recover; delete o.retry;
-    feedsCtx.stale = false;
-    diag('app.back-reload', { awayMin: Math.round(awayMs / 60000), live: live, multiview: !!feedsCtx.multiview });
+    feedsCtx.stale = null;
+    diag('app.back-reload', { awayMin: Math.round((Date.now() - a.at) / 60000), atLive: !!a.atLive, multiview: !!feedsCtx.multiview });
     if (!queuedFeed && screen === 'player') playFeed(feedsCtx.index, o);
   }
 
   function togglePause() {
     if (!Player.engineName()) return;
     // Paused before the app was away a long time: its session is loaded again instead (onVisibility).
-    if (feedsCtx && feedsCtx.stale && Player.isPaused()) return reloadHere(0);
+    if (feedsCtx && feedsCtx.stale && Player.isPaused()) return reloadHere(feedsCtx.stale);
     Player.togglePause();
     var feedback = $('playback-feedback');
     hidePlaybackFeedback();
