@@ -507,6 +507,8 @@ async function boot(options = {}) {
   });
   // F1's Tiledmedia answer for the video (options.tm), as api.js keeps it.
   if (options.tm) Object.assign(api, { tmKnown: () => options.tm, tmAnswer: async () => options.tm });
+  // A feed's clear 4K HDR from that answer (api.js tmClearOffer): options.tmClear(id, channel) -> offer or null.
+  if (options.tmClear) api.tmClearOffer = async (id, channel) => options.tmClear(id, channel);
   if (options.releases || options.launcherResult) vm.runInContext(readFileSync('app/js/updates.js', 'utf8'), context, { filename: 'updates.js' });
   vm.runInContext(readFileSync('app/js/app.js', 'utf8'), context, { filename: 'app.js' });
   if (windowListeners.load) windowListeners.load();
@@ -2441,6 +2443,39 @@ test('after both engines failed for a video, it offers no multiview; the next st
   await again.press('UP');
   assert.ok(multiviewRow(again), 'the next video tries again');
   assert.equal(gridPaths(again)['avplay:grid'].failed, 1, 'Caps kept');
+});
+
+test('a clear 4K HDR player_tm answer gives a multiview its feeds without a PLAY each: only the sound feed is asked', async () => {
+  const asked = [];
+  const tmClear = (id, channel) => ({ url: 'https://tm/' + id + '/' + (channel || 'main') + '/hdr.m3u8', hdr: true, streamType: 'HDR_UHD_CMAF', licenseUrl: '', fromTm: true });
+  const app = await premiumHdr({ play: (id, channel, opts) => { asked.push({ channel, opts }); return clearHdrOffer(id, channel); }, tmClear });
+  await play(app, 'Race');
+  await app.advance(1000);
+  const before = asked.length;
+  await showLayout(app, /^Big \+ 2$/);
+  const g = app.player.current.grid;
+  assert.ok(g && g.engine === 'hevc', JSON.stringify(g && g.engine));
+  const now = asked.slice(before);
+  assert.equal(now.length, 1, 'one PLAY: ' + JSON.stringify(now));
+  assert.ok(now[0].opts && !now[0].opts.hdrOnly, 'the sound feed with its full offer');
+  assert.equal(g.streams.filter((x) => x.fromTm).length, 2);
+});
+
+test('player_tm feeds that don\'t match the sound feed\'s own offer (encrypted there): every feed asked the usual way', async () => {
+  const asked = [];
+  const tmClear = (id, channel) => ({ url: 'https://tm/' + id + '/' + (channel || 'main') + '/hdr.m3u8', hdr: true, streamType: 'HDR_UHD_CMAF', licenseUrl: '', fromTm: true });
+  const encrypted = (id, channel) => Promise.resolve({ url: 'https://cdn/' + id + '/' + (channel || 'main') + '/hdr.m3u8', hdr: true, hdrEncrypted: true,
+    streamType: 'HDR_UHD_CMAFFP', licenseUrl: 'https://la/' + id, widevineManifestUrl: 'https://cdn/' + id + '/wv.mpd' });
+  const app = await premiumHdr({ play: (id, channel, opts) => { asked.push({ channel, opts }); return encrypted(id, channel); }, tmClear });
+  await play(app, 'Race');
+  await app.advance(1000);
+  const before = asked.length;
+  await showLayout(app, /^Big \+ 2$/);
+  await app.advance(2000);
+  const g = app.player.current.grid;
+  assert.ok(g, 'a multiview');
+  assert.equal(g.streams.filter((x) => x.fromTm).length, 0);
+  assert.ok(asked.length - before >= 3, 'asked anew: ' + (asked.length - before));
 });
 
 test('a player_tm answer in CMAF (weeks-old replays) makes no player_tm multiview: the usual one, nothing held against it', async () => {

@@ -870,6 +870,25 @@ var F1Api = (function () {
       return a && !a.refused && /^HDR_/.test(a.streamType) ? a : null;
     },
     /**
+     * A multiview feed's clear 4K HDR from the Tiledmedia answer already kept for the video: no PLAY request (a grid of
+     * four asked them one by one, ~9 s). Where F1 gave clear CMAF HLG there (HDR_UHD_CMAF) its masters are the same
+     * package as each feed's own HDR offer (2026-11-26: F1 LIVE line for line, onboards the same variants) except that
+     * onboards carry team radio only, so this is for the feeds whose sound isn't used. Resolves an offer as play()'s
+     * with hdrOnly, or null (not kept, another kind, keys in the master, no HLG): then the usual request.
+     */
+    tmClearOffer: function (contentId, channelId) {
+      var who = state.ascendon, key = who + '|' + String(contentId);
+      var a = tmAnswers.filter(function (x) { return x.key === key && Date.now() < x.until; })[0];
+      if (!who || !a || a.refused || a.streamType !== 'HDR_UHD_CMAF') return Promise.resolve(null);
+      var ch = channelId != null ? String(channelId) : a.main, url = ch && a.feeds[ch];
+      if (!url || !/\.m3u8(\?|$)/.test(url)) return Promise.resolve(null);
+      return fetch(url).then(function (res) { return res.ok ? res.text() : ''; }).then(function (master) {
+        if (state.ascendon !== who || !/^#EXTM3U\s/.test(master) || hasKeys(master) || !/VIDEO-RANGE=HLG/.test(master)) return null;
+        return { url: url, streamType: a.streamType, platform: 'BIG_SCREEN_HLS', licenseUrl: '', hdr: true, fromTm: true,
+          licenseHeaders: { ascendontoken: who, entitlementtoken: a.entitlementToken || state.entitlement, 'x-f1-device-info': DEVICE_INFO } };
+      }, function () { return null; });
+    },
+    /**
      * The Tiledmedia answer for a multiview (asked if not kept): { streamType, feeds, main, keyHeaders } (the headers
      * Shaka sends with the playlists' key requests), or null when F1 gives no HDR in it.
      */

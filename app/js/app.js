@@ -2232,12 +2232,20 @@
     return mv.slots.reduce(function (chain, idx) {
       return chain.then(function () {
         if (reusable(idx)) { reused++; return have[idx]; }
-        return (asked++ ? new Promise(function (r) { setTimeout(r, 800); }) : Promise.resolve()).then(function () {
+        // Feeds whose sound isn't used: from F1's Tiledmedia answer when it is clear 4K HDR (no PLAY: a grid of four took
+        // ~9 s asking them one by one). It counts as kept: offers that don't match are asked anew (below).
+        var kept = idx !== sound && !mv.fresh && mv.engine !== 'h264' && hdrWanted() && F1Api.tmClearOffer ?
+          F1Api.tmClearOffer(feedsCtx.contentId, feedsCtx.feeds[idx].channelId) : Promise.resolve(null);
+        return kept.then(function (o) {
+          if (o) { reused++; o.offeredAt = Date.now(); o.offeredWho = F1Api.state.ascendon; return o; }
+          return ask();
+        });
+        function ask() { return (asked++ ? new Promise(function (r) { setTimeout(r, 800); }) : Promise.resolve()).then(function () {
           // The sound's feed gets the full offer (licence, commentary, the clock); the others their HDR video alone.
           // H.264: the usual offers (there is no HDR or HEVC to ask for).
           return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, mv.engine === 'h264' ? {} : { hdr: hdrWanted(), hdrOnly: idx !== sound, cbcs: nativeHdrUsable() })
             .then(function (s) { s.offeredAt = Date.now(); s.offeredWho = F1Api.state.ascendon; return s; });
-        });
+        }); }
       }).then(function (s) {
         mvCheck(s, list[0], idx);
         list.push(s);
@@ -2273,8 +2281,12 @@
     return mv.slots.reduce(function (chain, idx) {
       return chain.then(function () {
         if (have[idx]) { list.push(have[idx]); return null; }
-        return new Promise(function (r) { setTimeout(r, 800); }).then(function () {
-          return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, { hdr: !!g.streams[0].hdr, hdrOnly: true, cbcs: nativeHdrUsable() });
+        // Clear 4K HDR: from F1's Tiledmedia answer where it has it (no PLAY, as mvStreams); else one PLAY each.
+        var clear = g.streams[0].hdr && !g.streams[0].hdrEncrypted && F1Api.tmClearOffer;
+        return (clear ? F1Api.tmClearOffer(feedsCtx.contentId, feedsCtx.feeds[idx].channelId) : Promise.resolve(null)).then(function (o) {
+          return o || new Promise(function (r) { setTimeout(r, 800); }).then(function () {
+            return F1Api.play(feedsCtx.contentId, feedsCtx.feeds[idx].channelId, { hdr: !!g.streams[0].hdr, hdrOnly: true, cbcs: nativeHdrUsable() });
+          });
         }).then(function (x) {
           mvCheck(x, g.streams[0], idx);
           have[idx] = x;

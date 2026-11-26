@@ -820,6 +820,30 @@ test('prefetchTm asks the Tiledmedia answer ahead, so the start and feed switche
   assert.equal(plays(calls).length, 1);
 });
 
+test('tmClearOffer: a multiview feed\'s clear 4K HDR from the kept Tiledmedia answer, without a PLAY; else null', async () => {
+  const clear = TM_MASTER.replace(TM_KEY, '');
+  const { F1Api, calls } = signedIn(tmRoute({ type: 'HDR_UHD_CMAF', master: clear }));
+  assert.equal(await F1Api.tmClearOffer('42', '1003'), null, 'nothing kept yet: the usual request');
+  await F1Api.prefetchTm('42', '1025');
+  const n = plays(calls).length;
+  const o = await F1Api.tmClearOffer('42', '1003');
+  assert.equal(o.url, 'https://cdn/tm/1003/master.m3u8');
+  assert.equal(o.hdr, true); assert.equal(o.licenseUrl, ''); assert.equal(o.streamType, 'HDR_UHD_CMAF');
+  assert.equal((await F1Api.tmClearOffer('42', null)).url, 'https://cdn/tm/1025/master.m3u8', 'no channel id: the main feed');
+  assert.equal(plays(calls).length, n, 'no PLAY');
+  assert.equal(await F1Api.tmClearOffer('42', '9999'), null, 'a feed not in the answer');
+  // Another kind (AES-128 TS, or keys in the master), or no HLG: null.
+  const ts = signedIn(tmRoute({ type: 'HDR_UHD_HLSCK', master: clear }));
+  await ts.F1Api.prefetchTm('42', '1025');
+  assert.equal(await ts.F1Api.tmClearOffer('42', '1003'), null);
+  const keyed = signedIn(tmRoute({ type: 'HDR_UHD_CMAF' }));
+  await keyed.F1Api.prefetchTm('42', '1025');
+  assert.equal(await keyed.F1Api.tmClearOffer('42', '1003'), null);
+  const sdr = signedIn(tmRoute({ type: 'HDR_UHD_CMAF', master: clear.replace('VIDEO-RANGE=HLG', 'VIDEO-RANGE=SDR') }));
+  await sdr.F1Api.prefetchTm('42', '1025');
+  assert.equal(await sdr.F1Api.tmClearOffer('42', '1003'), null);
+});
+
 test('a 4K HDR start reads its HLS master once: the HDR check\'s copy serves streamInfo', async () => {
   const { F1Api, calls } = signedIn(tmRoute());
   const stream = await F1Api.play('42', '1033', { hdr: true, tm: true });
