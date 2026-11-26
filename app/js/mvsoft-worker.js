@@ -1,10 +1,24 @@
-// H.264 onboards: classify the helper's extra marker row on the GPU, then update
-// only that feed's rectangle in the visible, retained canvas. No ImageBitmap copies.
+// H.264 onboards: classify the helper's extra marker row on the GPU, then update only that feed's rectangle in a
+// staged texture, copied to the visible canvas once the last picture of its moment is in. No ImageBitmap copies.
 // Never request OES_EGL_image_external or EXT_disjoint_timer_query on this TV.
 var running = true;
+// The pictures that show together, per segment in display order (mvsoft.js, from the helper's timestamps): 1 after the
+// last picture of a moment, where the canvas is shown. A picture taken before its segment's list arrived (messages
+// come in only between steps) shows by count (every `feeds` pictures) and its entry is skipped once the list is here.
+var moments = [], momentAt = 0, unlisted = 0;
+function nextMoment() {
+  while (moments.length && momentAt >= moments[0].length) { moments.shift(); momentAt = 0; }
+  return moments.length ? moments[0][momentAt++] : -1;
+}
+function endsMoment(fallback) {
+  var c = nextMoment();
+  if (c < 0) { unlisted++; return fallback; }
+  return c === 1;
+}
 onmessage = function (e) {
   var m = e.data;
   if (m.stop) { running = false; return; }
+  if (m.moments) { moments.push(m.moments); while (unlisted > 0 && nextMoment() >= 0) unlisted--; return; }
   if (!m.start) return;
   var T = self.tizentvwasm.SideThreadElementaryMediaTrack, id = m.trackId;
   var canvas = m.canvas, W = m.width, H = m.height, tag = m.feedTag;
@@ -42,7 +56,10 @@ onmessage = function (e) {
   }
   try {
     if (!canvas || !tag || m.feeds < 1 || m.feeds > 3) throw new Error('missing canvas or unsupported feed marker');
-    gl = canvas.getContext('webgl', { alpha: false, antialias: false, depth: false, stencil: false, preserveDrawingBuffer: true });
+    // One feed: each picture is a moment of its own and covers the canvas, so it is drawn straight onto it (kept as it
+    // is when a picture draws nothing). Several: their pictures are staged first (below).
+    var direct = m.feeds === 1;
+    gl = canvas.getContext('webgl', { alpha: false, antialias: false, depth: false, stencil: false, preserveDrawingBuffer: direct });
     if (!gl) throw new Error('WebGL unavailable');
     T.setWebGLRenderingContext(id, gl);
     var EXT = '#extension GL_OES_EGL_image_external : require\nprecision highp float;\n';
@@ -76,18 +93,27 @@ onmessage = function (e) {
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     gl.disable(gl.BLEND); gl.disable(gl.DITHER);
-    function counter() {
-      var t = gl.createTexture(); gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, t);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    function target(w, h, unit) {
+      var t = gl.createTexture(); gl.activeTexture(unit); gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       var f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, f);
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
-      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('incomplete marker framebuffer');
-      gl.viewport(0, 0, 1, 1); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('incomplete framebuffer');
+      gl.viewport(0, 0, w, h); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
       return { t: t, f: f };
     }
-    counters = [counter(), counter()];
+    counters = [target(1, 1, gl.TEXTURE1), target(1, 1, gl.TEXTURE1)];
+    // Several feeds: their pictures go here and reach the canvas once their moment is complete: a step may end between
+    // them (it yields every 25 ms so a stop gets through), and the canvas is shown whenever a step ends.
+    var staged = null, show = null;
+    if (!direct) {
+      staged = target(canvas.width, canvas.height, gl.TEXTURE2);
+      show = program(VS, 'precision mediump float; uniform sampler2D s; uniform vec2 size;' +
+        'void main(){gl_FragColor=vec4(texture2D(s,gl_FragCoord.xy/size).rgb,1.0);}', ['s', 'size']);
+      gl.useProgram(show.p); gl.uniform1i(show.s, 2); gl.uniform2f(show.size, canvas.width, canvas.height);
+    }
     var rects = new Float32Array(12);
     m.rects.forEach(function (r, k) { rects.set([r[0], 1 - r[1] - r[3], r[2], r[3]], 4 * k); });
     gl.useProgram(count.p); gl.uniform1i(count.s, 0); gl.uniform1i(count.prev, 1); gl.uniform2f(count.uv, 8 / W, (tag.row + 8) / H);
@@ -116,12 +142,16 @@ onmessage = function (e) {
           var dst = counters[stats.pulled % 2], prev = counters[(stats.pulled + 1) % 2];
           gl.bindFramebuffer(gl.FRAMEBUFFER, dst.f); gl.viewport(0, 0, 1, 1); gl.useProgram(count.p);
           gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, prev.t); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-          gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, canvas.width, canvas.height); gl.useProgram(route.p);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, direct ? null : staged.f); gl.viewport(0, 0, canvas.width, canvas.height); gl.useProgram(route.p);
           gl.bindTexture(gl.TEXTURE_2D, dst.t); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
           stats.pulled++;
         } finally { T.recyclePictureSync(id, pic); pictureOutstanding = false; }
         stats.drawMs += performance.now() - got;
-        if (stats.pulled % m.feeds === 0) { stats.frames++; break; }
+        if (endsMoment(stats.pulled % m.feeds === 0)) {
+          if (!direct) { gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.useProgram(show.p); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); }
+          stats.frames++;
+          break;
+        }
       }
       if (performance.now() - lastReport > 500) { report(); lastReport = performance.now(); }
       yieldAt = performance.now(); channel.port2.postMessage(0);

@@ -6,8 +6,8 @@
  *   var route = require('./stitchx/helper-route.js')({ fetchAll: fetchAll, send: send, toBuf: toBuf, f1Cdn: f1Cdn, port: PORT,
  *     stitches: stitches });
  *   route.post(res, id, body)  body: { kind: 'h264x', feeds: [{ playlist }], interleave: true,
- *     feedTag: true, spread: true, decodeOrder: 'unlock', reorder: 4, maxDpb: 9, level: 51,
- *     targetFps: [number per feed], dropB: [bool per feed], audio: null, probe: segment index }
+ *     feedTag: true, decodeOrder: 'unlock', reorder: 4, maxDpb: 9, level: 51,
+ *     dropB: [bool per feed], audio: null, probe: segment index }
  *     feeds' playlists: media playlists of one rung and resolution, segments aligned (F1's are)
  *     Optional audio also works with interleaved video; mvsoft.js plays sound separately and sends null.
  *     audio.playlist: the sound's own media playlist (segments aligned with the feeds'); without it, AAC muxed in the
@@ -75,7 +75,7 @@ module.exports = function (deps) {
       if (err) return answer(502, String(err));
       var entry;
       try {
-        var r = StitchSegment.build(bytes, { segment: n, start: s.feeds[0][n].start, delay: DELAY, level: s.level, maxDpb: s.maxDpb, dropB: s.dropB, reorder: s.reorder, feedTag: s.feedTag, targetFps: s.targetFps, decodeOrder: s.decodeOrder, spread: s.spread,
+        var r = StitchSegment.build(bytes, { segment: n, start: s.feeds[0][n].start, delay: DELAY, level: s.level, maxDpb: s.maxDpb, dropB: s.dropB, reorder: s.reorder, feedTag: s.feedTag, decodeOrder: s.decodeOrder,
           feeds: s.feeds.length, audio: s.audio ? { feed: s.audio.feed, separate: !!s.audioList } : null, init: !s.init });
         if (r.init && !s.init) s.init = r.init;
         entry = { number: n, video: r.video, audio: r.audio, ms: Date.now() - t0, info: r.info };
@@ -113,9 +113,8 @@ module.exports = function (deps) {
     var reorder = body.reorder == null ? null : Math.floor(+body.reorder);
     if (reorder !== null && !(reorder >= 0 && reorder <= 16)) return null;
     if (body.decodeOrder != null && body.decodeOrder !== 'head' && body.decodeOrder !== 'unlock') return null;
-    if (body.targetFps != null && (!Array.isArray(body.targetFps) || body.targetFps.length !== n || !body.targetFps.every(function (x) { return x === null || (typeof x === 'number' && isFinite(x) && x > 0 && x <= 50); }))) return null;
     return { playlists: body.feeds.map(function (f) { return f.playlist; }), audio: audio,
-      spread: !!body.spread, feedTag: !!body.feedTag, targetFps: body.targetFps || null, decodeOrder: body.decodeOrder || null, dropB: Array.isArray(body.dropB) ? body.dropB.slice(0, n).map(function (x) { return !!x; }) : null, reorder: reorder,
+      feedTag: !!body.feedTag, decodeOrder: body.decodeOrder || null, dropB: Array.isArray(body.dropB) ? body.dropB.slice(0, n).map(function (x) { return !!x; }) : null, reorder: reorder,
       level: level >= 40 && level <= 52 ? level : null, maxDpb: maxDpb, probe: isFinite(probe) && probe > 0 ? probe : 0,
       ua: typeof body.ua === 'string' ? body.ua.slice(0, 300) : null };
   }
@@ -162,7 +161,7 @@ module.exports = function (deps) {
       if (!aligned) return reply(422, 'the feeds\' segments are not aligned');
       feedLists = feedLists.map(function (l) { return l.slice(0, count); });
       if (audioList) audioList = audioList.slice(0, count);
-      var s = { kind: 'h264x', feeds: feedLists, audio: audio, audioList: audioList, level: body.level, maxDpb: body.maxDpb, dropB: body.dropB, reorder: body.reorder, feedTag: body.feedTag, targetFps: body.targetFps, decodeOrder: body.decodeOrder, spread: body.spread,
+      var s = { kind: 'h264x', feeds: feedLists, audio: audio, audioList: audioList, level: body.level, maxDpb: body.maxDpb, dropB: body.dropB, reorder: body.reorder, feedTag: body.feedTag, decodeOrder: body.decodeOrder,
         cache: [], pending: {}, init: null, at: Date.now(), ua: ua };
       var probe = Math.min(count - 1, body.probe);
       build(s, probe, function (status, got, site) {

@@ -71,7 +71,7 @@ test('every element id the app looks up exists on the page', () => {
 });
 
 test('all app scripts compile', () => {
-  for (const f of readdirSync('app/js')) new vm.Script(read('app/js/' + f), { filename: f });
+  for (const f of readdirSync('app/js').filter((n) => n.endsWith('.js'))) new vm.Script(read('app/js/' + f), { filename: f });
   new vm.Script(read('app/service/service.js'), { filename: 'service.js' });
 });
 

@@ -633,49 +633,16 @@
     return pics;
   }
 
-  // Choose exactly `budget` pictures, retaining every reference. Dynamic programming minimizes squared distance
-  // from an even presentation grid. A simple "keep every nth B" would cluster retained B pictures around scene cuts.
-  // This only selects pictures; their original POC, timing and references remain intact.
-  function budgetFrames(frames, budget) {
-    var refs = frames.filter(function (f) { return f.ref; }).length;
-    if (refs > budget) throw new Error('targetFps budget ' + budget + ' is below ' + refs + ' reference pictures');
-    if (budget >= frames.length) return frames;
-    var sorted = frames.slice().sort(function (a, b) { return a.T - b.T; }), N = sorted.length;
-    var costs = [0], choices = [], i, j;
-    for (j = 1; j <= budget; j++) costs[j] = Infinity;
-    for (i = 0; i < N; i++) {
-      var next = [], take = [];
-      for (j = 0; j <= budget; j++) {
-        var skipCost = sorted[i].ref ? Infinity : costs[j];
-        var target = budget > 1 ? sorted[0].T + (sorted[N - 1].T - sorted[0].T) * (j - 1) / (budget - 1) : sorted[0].T;
-        var delta = sorted[i].T - target, takeCost = j ? costs[j - 1] + delta * delta : Infinity;
-        take[j] = takeCost < skipCost;
-        next[j] = take[j] ? takeCost : skipCost;
-      }
-      choices.push(take); costs = next;
-    }
-    var keep = {}, count = budget;
-    for (i = N - 1; i >= 0; i--) if (choices[i][count]) { keep[sorted[i].T] = true; count--; }
-    if (count || !isFinite(costs[budget])) throw new Error('targetFps: no reference-safe selection');
-    return frames.filter(function (f) { return keep[f.T]; });
-  }
-
-  // opts: { segment, fixedLevel, maxDpb, reorder, dropB, targetFps, feedTag, decodeOrder }.
+  // opts: { segment, fixedLevel, maxDpb, reorder, dropB, feedTag, decodeOrder }.
   // Returns { aus, pictures, sps, info }; picture j's feed is pictures[j].feed. dropB[k] leaves out feed k's
-  // non-reference frames (F1's B frames: nothing predicts from them, so the rest decodes the same).
+  // non-reference frames (F1's B frames: nothing predicts from them, so the rest decodes the same). F1's references
+  // are every third frame (I B B P), so what is left stays evenly spaced in time: 16.7 of 50 frames a second.
   function interleaveSegment(feedAus, opts) {
     opts = opts || {};
     var feeds = feedAus.map(analyse), base = feeds[0];
     var segFrames = Math.max.apply(null, feeds.map(function (f) { return f.frames.length; }));
     var seconds = segFrames * (base.frameDur || 1800) / 90000;
-    if (opts.targetFps && (!Array.isArray(opts.targetFps) || opts.targetFps.length !== feeds.length)) throw new Error('targetFps: one rate per feed required');
     feeds.forEach(function (f, k) { if (opts.dropB && opts.dropB[k]) f.frames = f.frames.filter(function (fr) { return fr.ref; }); });
-    feeds.forEach(function (f, k) {
-      if (!opts.targetFps || opts.targetFps[k] == null) return;
-      var rate = opts.targetFps[k];
-      if (typeof rate !== 'number' || !isFinite(rate) || rate <= 0 || rate > 90000 / base.frameDur) throw new Error('targetFps: invalid rate for feed ' + k);
-      f.frames = budgetFrames(f.frames, Math.floor(rate * seconds + 0.000001));
-    });
     feeds.forEach(function (f, k) {
       if (f.sps.widthMbs !== base.sps.widthMbs || f.sps.heightMbs !== base.sps.heightMbs) throw new Error('feed ' + k + ': other size');
       if (f.sps.raw && base.sps.raw && f.sps.direct8x8 !== base.sps.direct8x8) throw new Error('feed ' + k + ': direct_8x8_inference differs');
@@ -754,20 +721,19 @@
       feedTag: tagRows ? { row: H * 16, rows: 16, values: tagValues.slice(0, n) } : null } };
   }
 
-  // Sample timing for interleaved fMP4 packaging, in 90 kHz ticks. Each feed's picture is offset within its frame.
-  // With spread, pictures in display order sit on an even grid across the segment. Grid points are multiples of
-  // 8 ticks plus the feed number, so PTS modulo 8 identifies the feed. Durations tile the presentation timeline;
-  // decode times add those durations in decode order.
+  // Sample timing for interleaved fMP4 packaging, in 90 kHz ticks. Each picture shows at its own frame's time (so a feed
+  // whose frames were left out still moves evenly), each feed offset within the frame by k/n of it. PTS modulo 8 is the
+  // picture's feed, + 4 on the last picture of its moment (frame time): the renderer shows the pictures of a moment
+  // together. Durations tile the presentation timeline; decode times add those durations in decode order.
   function samples(st, o) {
     var pics = st.pictures, n = pics.length, segDur = o.frames * o.frameDur;
+    if (st.interleaved > 4) throw new Error('samples: at most 4 feeds');
     var pts = pics.map(function (p) { return o.start + p.T * o.frameDur + Math.round(p.d * (o.frameDur / st.interleaved)) + o.delay; });
-    if (o.spread) {
-      if (st.interleaved > 8) throw new Error('spread: at most 8 feeds');
-      var step = segDur / n;
-      var shown = pts.map(function (t, j) { return j; }).sort(function (a, b) { return pts[a] - pts[b]; });
-      shown.forEach(function (j, i) { pts[j] = Math.floor((o.start + o.delay + i * step) / 8) * 8 + pics[j].feed; });
-    }
     var order = pts.map(function (t, j) { return j; }).sort(function (a, b) { return pts[a] - pts[b]; });
+    order.forEach(function (j, i) {
+      var next = i + 1 < n ? pics[order[i + 1]] : null, last = !next || next.T !== pics[j].T;
+      pts[j] = Math.floor(pts[j] / 8) * 8 + pics[j].feed + (last ? 4 : 0);
+    });
     var dur = [];
     order.forEach(function (j, i) { dur[j] = (i + 1 < n ? pts[order[i + 1]] : o.start + segDur + o.delay) - pts[j]; });
     var dts = [];

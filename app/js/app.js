@@ -2045,7 +2045,8 @@
    * How a layout plays, or null if it can't. 'hevc': the helper's tiled HEVC picture, when the offer has its feeds'
    * heights (once known) and the TV decodes the picture (F1 codes 270p-720p HEVC inside the same 960x544 cells, so
    * smaller feeds don't make it lighter). 'h264': the offer has no HEVC at all (2018-2024 replays): the big feed plays
-   * on AVPlay and up to three small 540p ones come from one stream decoded in software (MvSoftware, js/mvsoft.js).
+   * on AVPlay and up to three small ones are decoded in software (MvSoftware, js/mvsoft.js: our own decoder, one core
+   * per feed; Samsung's for one small feed).
    */
   function mvEngine(layout) { return mvEngineFor(layout, mvSource, Player.stream()); }
 
@@ -2079,7 +2080,7 @@
     return Player.hevcDecodes(sh.width, sh.height, true);
   }
 
-  /** Layouts the H.264 multiview plays: one big feed (AVPlay) and up to three small 540p ones (software). */
+  /** Layouts the H.264 multiview plays: one big feed (AVPlay) and up to three small ones (software). */
   function mvSoftLayout(l) {
     return l.feeds[0] > 540 && l.feeds.length - 1 <= 3 && l.feeds.slice(1).every(function (h) { return h === 540; });
   }

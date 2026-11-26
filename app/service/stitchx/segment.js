@@ -3,7 +3,7 @@
  * plus init segments when requested. Each video picture carries a whole frame from one feed.
  *
  *   StitchSegment.build(bytes, { segment, start, delay, level, feeds, audio, init, maxDpb, reorder,
- *                                dropB, targetFps, feedTag, decodeOrder, spread })
+ *                                dropB, feedTag, decodeOrder })
  *     bytes: one TS segment (Uint8Array) per feed, then the sound's own segment if audio.separate.
  *     segment: index (fragment sequence number - 1); start: playlist time (s); delay: presentation minus
  *     media time (s, default 0.1); level: fixed H.264 level (default: StitchX.interleaveLevel).
@@ -42,9 +42,9 @@
     // o.maxDpb: the decoder's reference cap (SPS max_num_ref_frames / max_dec_frame_buffering at most this).
     var level = o.level || StitchX.interleaveLevel(base.sps.widthMbs, base.sps.heightMbs + (o.feedTag ? 1 : 0), n, 90000 / (base.frameDur || 1800));
     if (!level) throw new Error('no H.264 level fits ' + n + ' feeds of ' + base.sps.widthMbs * 16 + 'x' + base.sps.heightMbs * 16);
-    var st = StitchX.interleaveSegment(units, { segment: k, fixedLevel: level, maxDpb: o.maxDpb || null, reorder: o.reorder != null ? o.reorder : null, dropB: o.dropB || null, targetFps: o.targetFps || null, feedTag: !!o.feedTag, decodeOrder: o.decodeOrder });
+    var st = StitchX.interleaveSegment(units, { segment: k, fixedLevel: level, maxDpb: o.maxDpb || null, reorder: o.reorder != null ? o.reorder : null, dropB: o.dropB || null, feedTag: !!o.feedTag, decodeOrder: o.decodeOrder });
     var start = Math.round(o.start * TS), frameDur = base.frameDur || 1800, frames = base.frames.length;
-    var samples = StitchX.samples(st, { start: start, frameDur: frameDur, frames: frames, delay: Math.round(delay * TS), spread: !!o.spread });
+    var samples = StitchX.samples(st, { start: start, frameDur: frameDur, frames: frames, delay: Math.round(delay * TS) });
     var out = { video: Fmp4.fragment(k + 1, start, samples), audio: null, info: st.info, duration: frames * frameDur / TS };
     var snd = null;
     if (o.audio) {

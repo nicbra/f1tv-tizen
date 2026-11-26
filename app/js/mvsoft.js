@@ -1,21 +1,32 @@
 /*
  * Multiview for H.264 replays (2018-2024: no HEVC to tile, see layouts.js). The big feed plays on AVPlay (the TV's
- * hardware decoder) like any feed; the small ones come from ONE stream the stream helper interleaves
- * (service/stitchx: their frames one after another, each picture marked with its feed in an extra coded row), decoded
- * by Samsung's own software decoder (EMSS, window.tizentvwasm, decodingMode 'software'). Only one EMSS source plays at
- * a time, and it runs beside AVPlay. A worker (mvsoft-worker.js) draws each picture into its feed's place on a canvas
- * under the multiview mask (#mv-frames draws the rounded corners and names, as for the HEVC grids).
- * Measured on the QE55Q77A (2026-11-09): three 540p feeds at 25 fps each (75 pictures/s) beside a 1080p50 main feed;
- * more pictures per second starve the drawing worker. Research: research/h264 in the astra-h264 worktree.
+ * hardware decoder) like any feed; the small ones are decoded in software and drawn on a canvas under the multiview
+ * mask (#mv-frames draws the rounded corners and names, as for the HEVC grids). Two engines:
+ *   wasm  our own decoder (native/f1dec, js/f1dec.wasm; js/f1dec-simd.wasm where the TV has WebAssembly SIMD), one
+ *         worker per small feed (mvdec-worker.js: it fetches and decodes F1's TS segments itself), drawn by
+ *         mvdraw-worker.js on the big feed's clock. For two or three small feeds: the TV's cores decode in parallel,
+ *         50 fps each. The size is the most lines that fit what this TV's decoders keep up with (learned while they
+ *         play: WASM_BUDGET, f1tv.mvbudget), with the B pictures unfiltered when only that fits: 288p for three and two
+ *         on the QE55Q77A (2026-11-26, Monaco 2021). No helper, no EMSS: the browser's MediaSource stays usable.
+ *   emss  Samsung's software decoder (EMSS, window.tizentvwasm, decodingMode 'software') on ONE stream the stream
+ *         helper interleaves (service/stitchx: the feeds' frames one after another, each picture marked with its feed
+ *         in an extra coded row), drawn by mvsoft-worker.js. For one small feed (picture in picture: 540p at 50 fps),
+ *         and in place of ours when it can't (a stream it refuses: this time; any other failure: until the app
+ *         restarts). Every feed goes through one serial budget (~7 ms a picture plus decoding, ~95 pictures/s in all):
+ *         two or three small feeds show only F1's reference frames (every third: an even 16.7 fps; any other rate
+ *         below 50 moves unevenly, the references must stay), at the rung of the place (640x360: 360p).
+ * Only one EMSS source plays at a time, and it runs beside AVPlay.
  */
 var MvSoftware = (function () {
   'use strict';
-  var LOCAL = 'http://127.0.0.1:18765', ID = 'mvsoft', HEIGHT = 540, DELAY = 0.1;   // DELAY: the helper's pts offset
+  var LOCAL = 'http://127.0.0.1:18765', ID = 'mvsoft', DELAY = 0.1;   // DELAY: the helper's pts offset
   var LEAD = 6;        // seconds ahead of the big feed the small ones start (the helper builds ~1.5 s per segment)
   var QUEUE = 400;     // packets waiting to be appended before the next segment is fetched
   var cur = null;      // the running column
   var stopping = Promise.resolve(true); // serialize decoder/canvas ownership across replacements
   var gen = 0;         // bumped by every start and outside stop: a restart waiting for its stop only goes on if unchanged
+  var wasmOff = false; // our decoder failed in this app run: Samsung's decodes from then on
+  var assets = null;   // Promise of { wasm: ArrayBuffer, demux: source text } for the decoder workers
 
   function note(kind, data) {
     try { if (typeof Diag !== 'undefined' && Diag.note) Diag.note(kind, data, 'warn'); } catch (e) { /* no log */ }
@@ -40,17 +51,82 @@ var MvSoftware = (function () {
     return e;
   }
 
-  /** Whether this TV can play it: Samsung's EMSS with side-thread pictures, and worker canvases for the frames. */
-  function supported() {
-    var w = typeof window !== 'undefined' ? window : {};
-    var api = w.tizentvwasm;
-    return !!(api && api.ElementaryMediaStreamSource && api.SideThreadElementaryMediaTrack && typeof w.OffscreenCanvas === 'function' &&
-      typeof w.HTMLCanvasElement !== 'undefined' && w.HTMLCanvasElement.prototype.transferControlToOffscreen &&
-      typeof w.MessageChannel === 'function' && typeof w.Worker === 'function');
+  /** Worker canvases for the frames, workers and message channels: what both engines need. */
+  function canvasWorkers(w) {
+    return typeof w.OffscreenCanvas === 'function' && typeof w.HTMLCanvasElement !== 'undefined' &&
+      !!w.HTMLCanvasElement.prototype.transferControlToOffscreen && typeof w.MessageChannel === 'function' && typeof w.Worker === 'function';
   }
 
-  /** Pictures per second each small feed gets: ~75 in all fit beside the big feed (three: 25 fps; two: 33; one: 50). */
-  function fpsFor(n) { return n >= 3 ? 25 : n === 2 ? 33 : 50; }
+  /** Samsung's EMSS with side-thread pictures (engine 'emss'). */
+  function emssSupported(w) {
+    var api = w.tizentvwasm;
+    return !!(api && api.ElementaryMediaStreamSource && api.SideThreadElementaryMediaTrack) && canvasWorkers(w);
+  }
+
+  /** Our own decoder (native/f1dec, WebAssembly) in one worker per small feed (engine 'wasm'). */
+  function wasmSupported(w) {
+    return typeof w.WebAssembly === 'object' && typeof w.performance === 'object' && typeof w.performance.timeOrigin === 'number' && canvasWorkers(w);
+  }
+
+  /** Whether this TV can play it, with either engine. */
+  function supported() {
+    var w = typeof window !== 'undefined' ? window : {};
+    return wasmSupported(w) || emssSupported(w);
+  }
+
+  /**
+   * The engine for n small feeds: ours for two or three (one core each), unless it failed in this app run or `forced`
+   * says otherwise; Samsung's for one (it shows one feed at 540p and 50 fps, ours would need more than a core) and
+   * when ours can't.
+   */
+  function engineFor(n, forced) {
+    var w = typeof window !== 'undefined' ? window : {};
+    var ours = !wasmOff && wasmSupported(w), theirs = emssSupported(w);
+    if (forced === 'emss' && theirs) return 'emss';
+    if (ours && (n >= 2 || !theirs)) return 'wasm';
+    return theirs ? 'emss' : ours ? 'wasm' : null;
+  }
+
+  /*
+   * What our decoder keeps up with per small feed, in macroblocks a second: each decodes on one core beside the big
+   * feed's (QE55Q77A, Monaco 2021, 2026-11-26): three at 270p50 (25,500 each) took ~15 ms a picture, CPU 86%; two at
+   * 288p50 (28,800) ~15.5 ms, CPU 75%; 360p50 (46,000) took 24-31 ms a picture, too slow. A 2019 onboard at 30 fps
+   * fits 288p for three, 360p for two.
+   */
+  var WASM_BUDGET = { 1: 46000, 2: 28800, 3: 25500 };
+  var UNFILTERED = 1.13;   // as much more with the B pictures left unfiltered (QE55Q77A, 360p: 59 -> 68 pictures/s)
+
+  /*
+   * What this TV's decoders keep up with, learned while they play (localStorage f1tv.mvbudget, by feed count:
+   * { full, unfiltered } macroblocks a second each): a faster TV gets more lines at its next start, a slower one fewer.
+   */
+  var BUDGET_KEY = 'f1tv.mvbudget', budgets = null;   // kept here; localStorage only carries them to the next app start
+  function learned() {
+    if (!budgets) {
+      try { budgets = JSON.parse(localStorage.getItem(BUDGET_KEY) || 'null'); } catch (e) { budgets = null; }
+      if (!budgets || typeof budgets !== 'object') budgets = {};
+    }
+    return budgets;
+  }
+  function wasmBudget(n) {
+    var l = learned()[n] || {}, base = WASM_BUDGET[n] || WASM_BUDGET[3];
+    var full = l.full > 0 ? l.full : l.unfiltered > 0 ? l.unfiltered / UNFILTERED : base;
+    return { full: full, unfiltered: l.unfiltered > 0 ? l.unfiltered : full * UNFILTERED };
+  }
+  function learn(n, unfiltered, capacity, behind) {
+    var all = learned(), old = wasmBudget(n);
+    // Both from one measurement (they differ by UNFILTERED); a step at most 25% from what was known (one busy minute
+    // doesn't halve it), within sane bounds; decoders that fell behind are believed at once.
+    var full = unfiltered ? capacity / UNFILTERED : capacity;
+    if (!behind) full = Math.max(old.full * 0.75, Math.min(old.full * 1.25, full));
+    full = Math.max(12000, Math.min(200000, full));
+    var l = all[n] = { full: Math.round(full), unfiltered: Math.round(full * UNFILTERED) };
+    try { localStorage.setItem(BUDGET_KEY, JSON.stringify(all)); } catch (e) { /* kept for this app run only */ }
+    return unfiltered ? l.unfiltered : l.full;
+  }
+
+  /** Whether n small feeds show only their reference frames (16.7 fps, even): two or more; one shows every frame. */
+  function refsOnly(n) { return n >= 2; }
 
   function attrs(s) {
     var o = {};
@@ -58,21 +134,45 @@ var MvSoftware = (function () {
     return o;
   }
 
-  /** A small feed's H.264 variant playlist of `height` lines (else the nearest below) from its offer's master playlist. */
-  function variant(url, height) {
+  /**
+   * A feed's H.264 variant playlists from its offer's master playlist: { lines (rows): { url, rate: macroblocks a
+   * second (50 fps where the playlist doesn't say) } }.
+   */
+  function ladder(url) {
     return fetch(url).then(function (r) {
       if (!r.ok) throw failure('feed playlist: HTTP ' + r.status, 'NETWORK_ERROR');
       return r.text().then(function (text) {
-        var lines = text.split(/\r?\n/), best = null;
+        var lines = text.split(/\r?\n/), out = {};
         lines.forEach(function (line, i) {
           if (!/^#EXT-X-STREAM-INF:/.test(line)) return;
           var a = attrs(line.slice(18)), size = /^(\d+)x(\d+)$/.exec(a.RESOLUTION || ''), h = size ? +size[2] : 0;
-          if (!/avc1/.test(a.CODECS || '') || !h || h > height || (best && best.h >= h)) return;
-          best = { h: h, url: new URL((lines[i + 1] || '').trim(), r.url).toString() };
+          var fps = parseFloat(a['FRAME-RATE']) || 50;
+          if (/avc1/.test(a.CODECS || '') && h && !out[h]) {
+            var mbs = Math.ceil(+size[1] / 16) * Math.ceil(h / 16);
+            out[h] = { url: new URL((lines[i + 1] || '').trim(), r.url).toString(), rate: mbs * fps, mbs: mbs, fps: fps };
+          }
         });
-        if (!best) throw failure('no H.264 variant', 'UNSUPPORTED');
-        return best.url;
+        return out;
       });
+    });
+  }
+
+  /**
+   * The small feeds' playlists, all of one size (the helper interleaves one size only): the fewest lines that every
+   * feed has and that fill `rows` screen lines (within `budget`), else the most lines they all have. { rows, playlists }
+   */
+  function rungs(streams, rows, budget) {
+    return Promise.all(streams.map(function (s) { return ladder(s.url); })).then(function (ladders) {
+      var shared = Object.keys(ladders[0]).map(Number).filter(function (h) { return ladders.every(function (l) { return l[h]; }); });
+      if (!shared.length) throw failure('no H.264 size every feed has', 'UNSUPPORTED');
+      // budget: macroblocks a second the decoder keeps up with (none within it: the smallest there is)
+      var fit = budget ? shared.filter(function (h) { return ladders.every(function (l) { return l[h].rate <= budget; }); }) : shared;
+      if (!fit.length) fit = [Math.min.apply(null, shared)];
+      var filling = fit.filter(function (h) { return h >= rows; });
+      var h = filling.length ? Math.min.apply(null, filling) : Math.max.apply(null, fit);
+      return { rows: h, playlists: ladders.map(function (l) { return l[h].url; }),
+        rate: Math.max.apply(null, ladders.map(function (l) { return l[h].rate; })), mbs: Math.max.apply(null, ladders.map(function (l) { return l[h].mbs; })),
+        least: h === Math.min.apply(null, shared) };
     });
   }
 
@@ -127,9 +227,11 @@ var MvSoftware = (function () {
   }
 
   function begin(opts) {
-    var run = cur = { opts: opts, stopped: false, queue: [], appended: 0, src: null, video: null, worker: null, timers: [],
+    var engine = engineFor(opts.streams.length, opts.engine);
+    if (engine === 'wasm') return beginWasm(opts);
+    var run = cur = { engine: 'emss', opts: opts, stopped: false, queue: [], appended: 0, src: null, video: null, worker: null, timers: [],
       stats: null, drift: null, at: null };
-    var n = opts.streams.length, fps = fpsFor(n), api = window.tizentvwasm, info, track, segStarts, first;
+    var n = opts.streams.length, refs = refsOnly(n), api = window.tizentvwasm, info, track, segStarts, first, rows;
     var box = bounds(opts.rects);
     // The canvas is a whole number of pixels: the places are given relative to that.
     box = { left: Math.round(box.left), top: Math.round(box.top), width: Math.round(box.width), height: Math.round(box.height) };
@@ -137,10 +239,13 @@ var MvSoftware = (function () {
     box.height = Math.min(box.height, 1080 - box.top);
     run.key = key(opts.rects);
     var live = function () { if (run.stopped || cur !== run) throw new Error('cancelled'); };
+    var place = Math.round(Math.max.apply(null, opts.rects.map(function (r) { return r.height; })));
     return StreamProxy.ensure().then(function () {
-      return Promise.all(opts.streams.map(function (s) { return variant(s.url, HEIGHT); }));
-    }).then(function (playlists) {
+      return rungs(opts.streams, place);
+    }).then(function (r) {
       live();
+      rows = r.rows;
+      var playlists = r.playlists;
       return starts(playlists[0]).then(function (s) {
         segStarts = s;
         // The first segment that starts LEAD seconds ahead of the big feed: the small feeds join it there.
@@ -148,8 +253,8 @@ var MvSoftware = (function () {
         first = 0;
         while (first + 1 < segStarts.length && segStarts[first] < want) first++;
         return post({ kind: 'h264x', feeds: playlists.map(function (p) { return { playlist: p }; }), audio: null, interleave: true,
-          dropB: playlists.map(function () { return false; }), targetFps: playlists.map(function () { return fps; }), feedTag: true,
-          spread: true, decodeOrder: 'unlock', reorder: 4, maxDpb: 9, level: 51, probe: first });
+          dropB: playlists.map(function () { return refs; }), feedTag: true, decodeOrder: 'unlock', reorder: 4, maxDpb: 9, level: 51,
+          probe: first });
       });
     }).then(function (i) {
       live();
@@ -229,11 +334,214 @@ var MvSoftware = (function () {
       run.video.play().catch(function (e) { fail(run, e); });
       run.timers.push(setInterval(function () { follow(run); }, 250));
       feedSegments(run);
-      note('mv.h264.start', { feeds: n, fps: fps, segment: first });
+      note('mv.h264.start', { feeds: n, rows: rows, frames: refs ? 'references' : 'all', segment: first });
     }).catch(function (e) {
       if (e && e.message === 'cancelled') return;
       fail(run, e);
     });
+  }
+
+  /* ---------------------------------------------------------------- engine 'wasm' */
+
+  /** A file of the running bundle (a downloaded one is checked against its signed manifest, shell/boot.js). */
+  function bundleFile(relative) {
+    return new Promise(function (resolve, reject) {
+      if (typeof Launcher !== 'undefined' && Launcher.file) {
+        return Launcher.file(relative, function (err, bytes) { if (err) reject(err); else resolve(bytes); });
+      }
+      var x = new XMLHttpRequest();
+      x.open('GET', relative);
+      x.responseType = 'arraybuffer';
+      x.onload = function () { if (x.status === 200 || (x.status === 0 && x.response)) resolve(new Uint8Array(x.response)); else reject(new Error('HTTP ' + x.status)); };
+      x.onerror = function () { reject(new Error(relative + ' not readable')); };
+      x.send();
+    });
+  }
+
+  /** Whether this TV's WebAssembly has SIMD (Chromium 91+): a module of one SIMD instruction validates. */
+  var SIMD_PROBE = [0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11];
+  function hasSimd() {
+    try { return WebAssembly.validate(new Uint8Array(SIMD_PROBE)); } catch (e) { return false; }
+  }
+
+  /**
+   * The decoder (js/f1dec-simd.wasm where the TV has WebAssembly SIMD: ~25% quicker; else js/f1dec.wasm) and the TS
+   * demuxer's source for the decoder workers, read once.
+   */
+  function loadAssets() {
+    if (!assets) {
+      var simd = hasSimd();
+      assets = Promise.all([bundleFile(simd ? 'js/f1dec-simd.wasm' : 'js/f1dec.wasm'), bundleFile('service/stitchx/tsdemux.js')]).then(function (got) {
+        return { wasm: got[0], demux: new TextDecoder('utf-8').decode(got[1]), simd: simd };
+      });
+      assets.catch(function () { assets = null; });
+    }
+    return assets;
+  }
+
+  /** A media playlist's segments: [{ url, start (s, from the playlist's start), duration }]. */
+  function segmentsOf(url) {
+    return fetch(url).then(function (r) {
+      if (!r.ok) throw failure('segment playlist ' + r.status, 'NETWORK_ERROR');
+      return r.text().then(function (text) {
+        var out = [], t = 0, d = 0;
+        text.split(/\r?\n/).forEach(function (line) {
+          line = line.trim();
+          var m = /^#EXTINF:([\d.]+)/.exec(line);
+          if (m) { d = parseFloat(m[1]); return; }
+          if (!line || line[0] === '#' || !(d > 0 && isFinite(d))) return;
+          out.push({ url: new URL(line, r.url).toString(), start: t, duration: d });
+          t += d; d = 0;
+        });
+        if (!out.length) throw new Error('segment playlist without segments');
+        return out;
+      });
+    });
+  }
+
+  function workerFor(name) { return typeof Launcher !== 'undefined' ? Launcher.worker(name) : new Worker(name); }
+
+  /**
+   * Engine 'wasm': each small feed decoded by our own decoder in a worker of its own (mvdec-worker.js: the TV's cores
+   * work in parallel, Samsung's software decoder took ~7 ms of one serial budget per picture), drawn by
+   * mvdraw-worker.js on the big feed's clock. No helper, no EMSS: the browser's MediaSource stays usable.
+   */
+  function beginWasm(opts) {
+    var run = cur = { engine: 'wasm', opts: opts, stopped: false, timers: [], workers: [], draw: null, stats: null, decStats: [],
+      drift: null, at: null };
+    var n = opts.streams.length, box = bounds(opts.rects), rows;
+    box = { left: Math.round(box.left), top: Math.round(box.top), width: Math.round(box.width), height: Math.round(box.height) };
+    box.width = Math.min(box.width, 1920 - box.left);
+    box.height = Math.min(box.height, 1080 - box.top);
+    run.key = key(opts.rects);
+    var live = function () { if (run.stopped || cur !== run) throw new Error('cancelled'); };
+    var place = Math.round(Math.max.apply(null, opts.rects.map(function (r) { return r.height; })));
+    var lists, asset, budget = wasmBudget(n);
+    // The most lines that fit with the B pictures unfiltered; filtered too when that fits as well.
+    return Promise.all([loadAssets(), rungs(opts.streams, place, budget.unfiltered)]).then(function (got) {
+      live();
+      asset = got[0];
+      rows = got[1].rows;
+      run.rung = { rate: got[1].rate, mbs: got[1].mbs, unfiltered: got[1].rate > budget.full, least: got[1].least };
+      return Promise.all(got[1].playlists.map(segmentsOf));
+    }).then(function (l) {
+      live();
+      lists = l;
+      var old = opts.canvas, c = old.cloneNode(false);
+      old.parentNode.replaceChild(c, old);
+      opts = run.opts = Object.assign({}, opts, { canvas: c });
+      c.width = box.width; c.height = box.height;
+      c.style.left = box.left + 'px'; c.style.top = box.top + 'px';
+      c.style.width = box.width + 'px'; c.style.height = box.height + 'px';
+      var offscreen = c.transferControlToOffscreen();
+      var rects = opts.rects.map(function (r) { return [(r.left - box.left) / box.width, (r.top - box.top) / box.height, r.width / box.width, r.height / box.height]; });
+      var draw = run.draw = workerFor('js/mvdraw-worker.js'), ports = [], ready = [];
+      ready.push(new Promise(function (ok, no) {
+        draw.onmessage = function (e) {
+          var d = e.data;
+          if (d.ready) ok();
+          if (d.error) { no(new Error('draw: ' + d.error)); fail(run, new Error('draw: ' + d.error)); }
+          if (d.stats) run.stats = d.stats;
+          if (d.shown && !run.shown && cur === run && !run.stopped) {
+            run.shown = true;
+            c.classList.remove('hidden');
+            if (opts.onShown) opts.onShown();
+          }
+        };
+      }));
+      for (var k = 0; k < n; k++) {
+        var ch = new MessageChannel(), w = workerFor('js/mvdec-worker.js');
+        ports.push(ch.port2);
+        run.workers.push(w);
+        (function (k, w) {
+          ready.push(new Promise(function (ok, no) {
+            w.onmessage = function (e) {
+              var d = e.data;
+              if (d.ready) ok();
+              if (d.stats) run.decStats[k] = d.stats;
+              if (d.error) {
+                var err = d.network ? failure('decoder ' + k + ': ' + d.error, 'NETWORK_ERROR') : new Error('decoder ' + k + ': ' + d.error);
+                err.unsupported = !!d.unsupported;
+                no(err); fail(run, err);
+              }
+            };
+            w.onerror = function (e) { fail(run, new Error('decoder ' + k + ': ' + (e.message || 'error'))); };
+          }));
+          w.postMessage({ op: 'init', wasm: asset.wasm, demux: asset.demux, feed: k, port: ch.port1, unfiltered: run.rung.unfiltered }, [ch.port1]);
+        })(k, w);
+      }
+      draw.onerror = function (e) { fail(run, new Error('draw: ' + (e.message || 'error'))); };
+      draw.postMessage({ start: true, canvas: offscreen, rects: rects, ports: ports }, [offscreen].concat(ports));
+      return Promise.race([Promise.all(ready), wait(10000).then(function () { throw new Error('workers did not start'); })]);
+    }).then(function () {
+      live();
+      // From the segment the big feed is in: the decoders catch up on reference frames, B frames come once in time.
+      var pos = opts.clock.position();
+      lists.forEach(function (list, k) {
+        var from = 0;
+        while (from + 1 < list.length && list[from + 1].start <= pos) from++;
+        run.workers[k].postMessage({ op: 'play', segments: list, from: from });
+      });
+      // The big feed's exact position is a synchronous call into AVPlay (3-12 ms on this TV, the page waits; asked every
+      // 50 ms it held the page ~14% of the time): asked twice a second and whenever it pauses or plays again. The
+      // drawing worker runs the clock on in between (AVPlay's clock stays within a few ms of that).
+      var last = null;
+      run.timers.push(setInterval(function () {
+        if (run.stopped) return;
+        var t = performance.timeOrigin + performance.now(), playing = opts.clock.playing();
+        if (!last || playing !== last.playing || t - last.t >= CLOCK_EVERY) {
+          var p = opts.clock.position();
+          // A jump (a seek): the decoders start over where the big feed is.
+          if (last && Math.abs(p - (last.p + (last.playing ? (t - last.t) / 1000 : 0))) > 2) return restart(run, 'jump');
+          last = { p: p, t: t, playing: playing };
+          run.draw.postMessage({ clock: { pos: p, at: t, playing: playing, rate: 1 } });
+        }
+        run.drift = run.stats ? run.stats.drift : null;
+      }, 50));
+      run.timers.push(setInterval(function () {
+        run.workers.forEach(function (w) { w.postMessage({ op: 'stats' }); });
+        measure(run);
+      }, 1000));
+      note('mv.h264.start', { feeds: n, rows: rows, engine: 'wasm', frames: 'all', unfiltered: run.rung.unfiltered, simd: asset.simd });
+    }).catch(function (e) {
+      if (e && e.message === 'cancelled') return;
+      fail(run, e);
+    });
+  }
+
+  /**
+   * Engine 'wasm' learns what this TV's decoders keep up with: over 10 s windows (from 8 s after the first picture, the
+   * big feed playing) the slowest decoder's time per picture gives the macroblocks a second it could take, kept with
+   * 15% to spare. Decoders that fall behind (more than one picture in ten left out) start over at a size that fits.
+   */
+  var WARMUP = 8, WINDOW = 10, CLOCK_EVERY = 500;
+  function measure(run) {
+    if (run.stopped || run.decStats.length !== run.workers.length) return;
+    var w = run.window, t = Date.now() / 1000;
+    // Only while it plays: a pause (or the first picture not yet shown) starts the warm-up over.
+    if (!run.shown || !run.opts.clock.playing()) { run.shownAt = null; run.window = null; return; }
+    var sum = function (k) { return run.decStats.map(function (d) { return d[k] || 0; }); };
+    if (run.shownAt == null) run.shownAt = t;
+    if (t - run.shownAt < WARMUP) return;
+    if (!w) { run.window = { t: t, decoded: sum('decoded'), ms: sum('decodeMs'), skipped: sum('skipped') }; return; }
+    if (t - w.t < WINDOW) return;
+    var decoded = sum('decoded'), ms = sum('decodeMs'), skipped = sum('skipped'), worst = 0, late = 0, enough = true;
+    // Every decoder needs a real sample (a stalled one says nothing about the others' speed): a third of 25 fps.
+    decoded.forEach(function (n, k) {
+      var d = n - w.decoded[k], gone = skipped[k] - w.skipped[k], per = d > 0 ? (ms[k] - w.ms[k]) / d : 0;
+      if (d + gone < (t - w.t) * 8) enough = false;
+      worst = Math.max(worst, per);
+      late = Math.max(late, gone / Math.max(1, d + gone));
+    });
+    run.window = { t: t, decoded: decoded, ms: ms, skipped: skipped };
+    if (!enough || !(worst > 0)) return;
+    var n = run.workers.length, capacity = 0.85 * run.rung.mbs * 1000 / worst, kept = learn(n, run.rung.unfiltered, capacity, late > 0.1);
+    run.learned = { msPerPicture: Math.round(worst * 10) / 10, capacity: Math.round(capacity), kept: kept, late: Math.round(late * 100) };
+    // (at the smallest size there is nothing smaller to start over with)
+    if (late > 0.1 && run.rung.rate > kept && !run.rung.least) {
+      note('mv.h264.budget', { feeds: n, rate: run.rung.rate, kept: kept, late: Math.round(late * 100) });
+      restart(run, 'too slow for this size');
+    }
   }
 
   /** Waits for the big feed to reach `t`; resolves true if it jumped instead (more than 2 s back, or past `t`). */
@@ -251,6 +559,17 @@ var MvSoftware = (function () {
     });
   }
 
+  /**
+   * Which of a segment's pictures (CmafDash samples) end a moment, in display order: the helper marks them in the PTS
+   * (modulo 8, + 4 on the last picture of a frame time). 1 where the worker shows the canvas, else 0.
+   */
+  function moments(list, timescale) {
+    var ticks = list.map(function (s) { return Math.round(s.pts * timescale); }).sort(function (a, b) { return a - b; });
+    var out = new Uint8Array(ticks.length);
+    ticks.forEach(function (t, i) { out[i] = t % 8 >= 4 ? 1 : 0; });
+    return out;
+  }
+
   /** Fetches the next interleaved segment and queues its packets (times from the first segment's start). */
   function fetchSegment(run) {
     var k = run.next;
@@ -258,6 +577,8 @@ var MvSoftware = (function () {
       if (run.stopped) return;
       var list = CmafDash.samples(b, run.timescale);
       if (!list.length) throw new Error('segment ' + k + ': no pictures');
+      // Before its packets go in: the worker meets these pictures only after the ones already queued.
+      run.worker.postMessage({ moments: moments(list, run.timescale) });
       if (run.base === null) run.base = Math.min.apply(null, list.map(function (s) { return s.dts; }));
       list.forEach(function (s) {
         run.queue.push({ packet: { pts: s.pts - run.base, dts: s.dts - run.base, duration: s.duration, isKeyFrame: s.key, isEncrypted: false,
@@ -321,7 +642,14 @@ var MvSoftware = (function () {
 
   function fail(run, e) {
     if (run.stopped || cur !== run) return;
-    note('mv.h264.failed', { error: String(e && e.message || e).slice(0, 200) });
+    note('mv.h264.failed', { error: String(e && e.message || e).slice(0, 200), engine: run.engine });
+    // (a network failure isn't the decoder's: the app starts the feeds again, as for Samsung's)
+    if (run.engine === 'wasm' && emssSupported(window) && !(e && e.failure === 'transient')) {
+      // Our decoder: Samsung's takes over (fewer pictures a second, but it plays). For a stream ours doesn't decode
+      // (CAVLC, 8x8 transforms) only this time; any other failure for the rest of the app run.
+      if (!(e && e.unsupported)) wasmOff = true;
+      return restart(run, e && e.unsupported ? 'wasm unsupported' : 'wasm failed', Object.assign({}, run.opts, { engine: 'emss' }));
+    }
     var cb = run.opts.onError;
     stop();
     if (cb) cb(e);
@@ -359,6 +687,13 @@ var MvSoftware = (function () {
     run.stopped = true;
     run.timers.forEach(clearInterval);
     run.opts.canvas.classList.add('hidden');
+    if (run.engine === 'wasm') {
+      // Nothing of the TV's media is borrowed: the workers can just end.
+      run.workers.forEach(function (x) { try { x.terminate(); } catch (e) { /* gone */ } });
+      if (run.draw) try { run.draw.terminate(); } catch (e) { /* gone */ }
+      stopping = Promise.resolve(true);
+      return stopping;
+    }
     var w = run.worker, done = Promise.resolve(true), keep = null, cleaned = false;
     function cleanup() {
       if (cleaned) return;
@@ -394,12 +729,13 @@ var MvSoftware = (function () {
 
   return {
     supported: supported,
-    fpsFor: fpsFor,
     start: start,
     stop: stop,
     place: place,
     running: function () { return !!cur; },
     /** What the column does now (diagnostics, the tests): { stats from the worker, drift to the big feed (s) }. */
-    status: function () { return cur ? { stats: cur.stats, drift: cur.drift, appended: cur.appended } : null; }
+    status: function () {
+      return cur ? { engine: cur.engine, stats: cur.stats, drift: cur.drift, appended: cur.appended, decoders: cur.decStats, rung: cur.rung, learned: cur.learned } : null;
+    }
   };
 })();
