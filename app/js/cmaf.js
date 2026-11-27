@@ -230,9 +230,11 @@
     var profile = inferred.every(function (t) { return !!t; }) ? 'isoff-live' : 'isoff-main';
     var groups = [];
     tracks.forEach(function (t, i) {
+      // One set per kind of sound too: a language's stereo AAC and its AC-3 5.1 are two choices, not two qualities.
+      var family = function (c) { return String(c || '').split('.')[0]; };
       var group = groups.filter(function (g) {
         return g[0].t.type === t.type && g[0].t.hdr === t.hdr && g[0].t.language === t.language &&
-          JSON.stringify(g[0].t.protection) === JSON.stringify(t.protection);
+          JSON.stringify(g[0].t.protection) === JSON.stringify(t.protection) && (t.type !== 'audio' || family(g[0].t.codecs) === family(t.codecs));
       })[0];
       if (!group) { group = []; groups.push(group); }
       group.push({ t: t, inferred: inferred[i] });
@@ -245,8 +247,10 @@
         if (video && t.hdr) adaptation += '<EssentialProperty schemeIdUri="urn:mpeg:mpegB:cicp:TransferCharacteristics" value="18"/>';
         return adaptation + group.map(function (entry) {
           var t = entry.t;
+          // (its channels where known: Shaka picks 5.1 by them, preferredAudioChannelCount; AVPlay names them)
+          var channels = !video && t.channels > 0 ? '<AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="' + t.channels + '"/>' : '';
           return '<Representation id="' + xml(t.id) + '" bandwidth="' + t.bandwidth + '" codecs="' + xml(t.codecs) + '"' +
-            (video ? ' width="' + t.width + '" height="' + t.height + '"' : '') + '>' + addressing(t, entry.inferred) + '</Representation>';
+            (video ? ' width="' + t.width + '" height="' + t.height + '"' : '') + '>' + channels + addressing(t, entry.inferred) + '</Representation>';
         }).join('') + '</AdaptationSet>';
       }).join('') + '</Period></MPD>';
   }

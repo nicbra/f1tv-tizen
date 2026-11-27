@@ -1640,6 +1640,15 @@
    * retry). feedsCtx.again: ways that had their one more try after a transient failure (recover).
    */
   var SURROUND = 'avplay:ac3';   // the 5.1 sound in encrypted 4K HDR, learned as a way of its own (js/ways.js)
+  // A 4K HDR multiview on Shaka whose start with the 5.1 failed: the same multiview once more in stereo, for this video
+  // only (Shaka's AC-3 is not AVPlay's: nothing learned on the TV).
+  var GRID51 = 'grid-shaka-51';
+  /** Whether the 5.1 of `stream` is AVPlay's (single-feed encrypted HDR, a multiview on AVPlay), else Shaka's. */
+  function surroundOnAvplay(stream) {
+    if (stream.grid && stream.grid.engine === 'tm') return false;   // player_tm multiviews play on Shaka
+    if (stream.grid && !stream.hdrEncrypted && stream.grid.player) return stream.grid.player === 'avplay';
+    return stream.capsPath ? Ways.engine(stream.capsPath) === 'avplay' : true;
+  }
   function isOff(key) { return !!(feedsCtx && feedsCtx.off && feedsCtx.off[key]); }
   function setOff(key) { if (!key) return; feedsCtx.off = feedsCtx.off || {}; feedsCtx.off[key] = true; }
 
@@ -1964,7 +1973,13 @@
     if (!stream || stream.capsFailed || cause === 'cancelled') return null;
     stream.capsFailed = true;
     if (stream.combo && !stream.grid) { setOff('combo'); return 'combo'; }
-    var way = stream.surround ? SURROUND : stream.capsPath;
+    // A grid on Shaka with its 5.1: stereo once before anything is held against the grid (GRID51), nothing learned.
+    if (stream.surround && stream.grid && !surroundOnAvplay(stream) && !isOff(GRID51) && cause !== 'transient' && cause !== 'content' && cause !== 'stuck') {
+      setOff(GRID51);
+      return GRID51;
+    }
+    // (the 5.1 is AVPlay's way only where AVPlay plays it)
+    var way = stream.surround && surroundOnAvplay(stream) ? SURROUND : stream.capsPath;
     if (!way) return null;
     if (Player.stream() === stream) Caps.crashEnd(true);
     var unclear = cause === 'transient' || cause === 'stuck';
@@ -2000,7 +2015,7 @@
       feedsCtx.recoveries = 0;
       if (feedsCtx.off) delete feedsCtx.off[s.capsPath];
       if (feedsCtx.again) delete feedsCtx.again[s.capsPath];
-      if (s.surround && Player.audioChannels() > 2) Caps.ok(SURROUND);   // only when the 5.1 is what plays
+      if (s.surround && Player.audioChannels() > 2 && surroundOnAvplay(s)) Caps.ok(SURROUND);   // only when AVPlay's 5.1 is what plays
     }
     // A crash while the 5.1 plays counts against the 5.1 first (as a failed start does): the next start leaves it out.
     if (s.capsOk && !s.capsFailed && !s.capsEnded && Player.engineName() === 'avplay' && !Player.isPaused()) {
@@ -2650,9 +2665,11 @@
           stream.multiFeed = feedsCtx.feeds.length > 1;
           stream.capsRoute = route;
           stream.cencAvplay = !!stream.cenc && route === 'avplay:cenc';
-          // Encrypted HDR adds the 5.1 commentary where there is one (hdr.js), unless this video's start with it failed
-          // or this TV has learned that it doesn't play it ('avplay:ac3').
-          if (stream.hdrEncrypted) stream.noSurround = isOff(SURROUND) || Caps.avoided(SURROUND);
+          // Encrypted HDR and 4K HDR multiviews (clear too) add the 5.1 commentary where there is one (hdr.js), unless this
+          // video's start with it failed or this TV has learned that it doesn't play it ('avplay:ac3').
+          if (stream.hdrEncrypted || (stream.grid && stream.hdr)) {
+            stream.noSurround = surroundOnAvplay(stream) ? isOff(SURROUND) || Caps.avoided(SURROUND) : isOff(GRID51);
+          }
           // Live HDR plays on the official live DASH timeline (the helper swaps in the HLG video).
           var timeline = stream.hdrEncrypted && stream.live ? stream.widevineManifestUrl : stream.url;
           // A start or a switch that loads: the feeds in one master, if built within 2 s (the feed list started the
@@ -2942,7 +2959,7 @@
     // What follows: 'retry' (this feed, the next way, or the same once more), 'alone' (a multiview's big feed),
     // 'stay' (a failed switch: the old feed plays on), 'back' (a failed switch whose old feed native preparation
     // replaced: that feed again, at the moment), 'stop' (nothing left).
-    var same = blamed === 'again' || blamed === SURROUND || blamed === 'combo';
+    var same = blamed === 'again' || blamed === SURROUND || blamed === GRID51 || blamed === 'combo';
     var next = mvOn ? (same || mvAgain() ? 'retry' : oldPlays ? 'stay' : 'alone') :
       same || (blamed && hasNextWay(stream)) ? 'retry' : oldPlays ? 'stay' : 'stop';
     // However F1 answers, retries end: after RECOVERIES in a row without anything playing, the viewer is told.

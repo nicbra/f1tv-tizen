@@ -218,7 +218,8 @@ var HdrStream = (function () {
    * reached because of it). Resolves [] when there is none, it doesn't fit or fails, or time is up: stereo plays then.
    * Tracks carry their own key id (`kid`); the caller keeps them only on the video's key.
    */
-  function surround(master, masterUrl, epoch, until) {
+  /** An HLS master's multichannel commentary renditions: the AC-3/E-AC-3 audio groups with more than two channels. */
+  function multichannel(master) {
     var lines = master.split(/\r?\n/), codecs = {};
     lines.forEach(function (line) {
       if (!/^#EXT-X-STREAM-INF:/.test(line)) return;
@@ -226,8 +227,12 @@ var HdrStream = (function () {
         .filter(function (c) { return c === 'ac-3' || c === 'ec-3'; })[0];
       if (a.AUDIO && codec) codecs[a.AUDIO] = codec;
     });
-    var list = lines.filter(function (l) { return /^#EXT-X-MEDIA:/.test(l); }).map(function (l) { return attrs(l.slice(13)); })
-      .filter(function (a) { return a.TYPE === 'AUDIO' && a.URI && codecs[a['GROUP-ID']] && parseInt(a.CHANNELS, 10) > 2; });
+    return { codecs: codecs, list: lines.filter(function (l) { return /^#EXT-X-MEDIA:/.test(l); }).map(function (l) { return attrs(l.slice(13)); })
+      .filter(function (a) { return a.TYPE === 'AUDIO' && a.URI && codecs[a['GROUP-ID']] && parseInt(a.CHANNELS, 10) > 2; }) };
+  }
+
+  function surround(master, masterUrl, epoch, until) {
+    var mc = multichannel(master), codecs = mc.codecs, list = mc.list;
     if (!list.length) return Promise.resolve([]);
     var left = Math.min(until - Date.now(), 6000);   // never more than 6 s of waiting for it
     if (left < 1000) { note('hdr.surround_skipped', { why: 'no time left' }); return Promise.resolve([]); }
@@ -246,7 +251,7 @@ var HdrStream = (function () {
           checkKeys(parsed.keys, own.kid);
           if (Math.abs(timing.baseTime / timing.timescale - epoch) > 0.1) return fail('surround clock differs');
           return { type: 'audio', id: 'mc' + i, language: lang3(a.LANGUAGE) || 'und', codecs: codecs[a['GROUP-ID']],
-            bandwidth: 384000, timing: timing, init: viaHelper(init), kid: own.kid,
+            channels: parseInt(a.CHANNELS, 10) || 6, bandwidth: 384000, timing: timing, init: viaHelper(init), kid: own.kid,
             segments: segments.map(function (s) { return { url: viaHelper(s.url), duration: s.duration }; }) };
         });
       });
@@ -261,7 +266,7 @@ var HdrStream = (function () {
     var length = total(tracks[0].segments);
     // The video sets the length: the 5.1 may end up to 0.5 s sooner (audio frames), but not later (it would lengthen it).
     var usable = multi.filter(function (t) { var d = total(t.segments) - length; return t.kid === key.kid && d <= 0.05 && d >= -0.5; }).map(function (t) {
-      return { type: t.type, id: t.id, language: t.language, codecs: t.codecs, bandwidth: t.bandwidth, timing: t.timing,
+      return { type: t.type, id: t.id, language: t.language, codecs: t.codecs, channels: t.channels, bandwidth: t.bandwidth, timing: t.timing,
         init: t.init, segments: t.segments, protection: key };
     });
     if (usable.length < multi.length) note('hdr.surround_skipped', { why: 'another key or length' });
@@ -465,19 +470,30 @@ var HdrStream = (function () {
         var height = heights[n];
         return get(stream.url).then(function (master) {
           var lines = master.body.split(/\r?\n/), uri = null, a = null;
+          // The first variant of that size and range; for its sound the stereo one where both are listed (the 5.1 is
+          // added on its own, clearSurround). A size listed with AC-3 only takes the stereo group of another size, so the
+          // AC-3 still counts as the grid's 5.1 (not as its stereo).
           lines.forEach(function (line, i) {
-            if (uri || !/^#EXT-X-STREAM-INF:/.test(line)) return;
+            if (!/^#EXT-X-STREAM-INF:/.test(line)) return;
             var x = attrs(line.slice(18)), size = /^(\d+)x(\d+)$/.exec(x.RESOLUTION || '');
-            if (size && +size[2] === height && videoRange(x) === range && /(hev1|hvc1)\./.test(x.CODECS || '')) { uri = (lines[i + 1] || '').trim(); a = x; }
+            if (!(size && +size[2] === height && videoRange(x) === range && /(hev1|hvc1)\./.test(x.CODECS || ''))) return;
+            var stereo = /(^|,)\s*mp4a/.test(x.CODECS || '');
+            if (!uri || (stereo && !/(^|,)\s*mp4a/.test(a.CODECS || ''))) { uri = (lines[i + 1] || '').trim(); a = x; }
           });
           if (!uri) return fail('no ' + height + 'p ' + range + ' HEVC variant');
+          var sound = a;
+          if (!/(^|,)\s*mp4a/.test(a.CODECS || '')) lines.forEach(function (line) {
+            if (sound !== a || !/^#EXT-X-STREAM-INF:/.test(line)) return;
+            var x = attrs(line.slice(18));
+            if (x.AUDIO && /(^|,)\s*mp4a/.test(x.CODECS || '')) sound = x;
+          });
           return get(new URL(uri, master.url).toString()).then(function (response) {
             var parsed = CmafDash.playlist(response.body, { breaks: true });
             var urls = parsed.segments.map(function (s) { return new URL(s.uri, response.url).toString(); });
             return { init: new URL(parsed.init, response.url).toString(), urls: urls, durations: parsed.segments.map(function (s) { return s.duration; }),
               parsed: parsed, playlistUrl: response.url, breaks: parsed.breaks, keys: parsed.keys, bandwidth: +a.BANDWIDTH || 0, codec: (a.CODECS || '').split(',').filter(function (c) { return /^(hev1|hvc1)\./.test(c); })[0],
-              master: master.body, masterUrl: master.url, audioGroup: a.AUDIO,
-              audioCodec: (a.CODECS || '').split(',').filter(function (c) { return /^(mp4a|ac-3|ec-3)/.test(c); })[0] };
+              master: master.body, masterUrl: master.url, audioGroup: sound.AUDIO,
+              audioCodec: (sound.CODECS || '').split(',').filter(function (c) { return /^(mp4a|ac-3|ec-3)/.test(c); })[0] };
           });
         });
       })).then(function (feeds) {
@@ -504,7 +520,12 @@ var HdrStream = (function () {
             return tpl ? { init: f.init, media: tpl.media, startNumber: tpl.startNumber, count: f.urls.length } : { init: f.init, urls: f.urls };
           }) };
           var base = timing.baseTime / timing.timescale;
-          return Promise.all([encrypted ? (want51 ? surround(feeds[lead].master, feeds[lead].masterUrl, source.epoch, until) : []) : audioTracks(io, feeds[lead], opts.langs || {}),
+          // Clear: the sound feed's stereo, and its 5.1 where it has one (optional: stereo without it).
+          var clearAudio = function () {
+            return Promise.all([audioTracks(io, feeds[lead], opts.langs || {}), want51 ? clearSurround(feeds[lead], base, until) : []])
+              .then(function (both) { return { stereo: both[0], multi: both[1] }; });
+          };
+          return Promise.all([encrypted ? (want51 ? surround(feeds[lead].master, feeds[lead].masterUrl, source.epoch, until) : []) : clearAudio(),
             encrypted ? source.subtitles : subtitleTracks(io, feeds[lead], base),
             fetch(LOCAL + '/stitch/' + id, { method: 'POST', body: JSON.stringify(body) }).then(function (r) {
               return r.text().then(function (text) { if (!r.ok) return helperFail(r, text); return JSON.parse(text); });
@@ -516,12 +537,65 @@ var HdrStream = (function () {
               segments: feeds[0].durations.map(function (d, n) { return { url: LOCAL + '/stitch/' + id + '/' + n + '.m4s', duration: d }; }),
               protection: encrypted ? { kid: protection.kid, pssh: psshFor(source, protection.kid) } : null };
             // Encrypted: the official commentary, and the sound feed's 5.1 (F1 LIVE) where it has one.
-            var made = encrypted ? withCommentary([track], audio, track.protection, source, opts.langs) : { mpd: CmafDash.manifest([track].concat(audio)), surround: 0 };
+            var made = encrypted ? withCommentary([track], audio, track.protection, source, opts.langs) : clearWithSurround(track, audio.stereo, audio.multi, opts.langs);
             return { mpd: made.mpd, subtitles: subtitles, width: info.width, height: info.height, surround: made.surround };
           });
         });
       });
     }));
+  }
+
+  /**
+   * Clear HDR multiview: the sound feed's 5.1 commentary (F1 LIVE, F1's shows: AC-3 beside the stereo AAC) as clear
+   * DASH audio tracks, read from its HLS master as the encrypted grid's (surround) but without a key: checked
+   * unencrypted and on the video's clock (`base`, seconds). Optional, within `until` (6 s at most): [] when there is
+   * none or it doesn't fit, then stereo plays.
+   */
+  function clearSurround(feed, base, until) {
+    // (not the group the grid's variant already brings: a master listing its AC-3 variant first)
+    var mc = multichannel(feed.master), list = mc.list.filter(function (a) { return a['GROUP-ID'] !== feed.audioGroup; });
+    if (!list.length) return Promise.resolve([]);
+    var left = Math.min(until - Date.now(), 6000);
+    if (left < 1000) { note('hdr.surround_skipped', { why: 'clear grid: no time left' }); return Promise.resolve([]); }
+    var io = fetcher(left);
+    return io.deadline(Promise.all(list.map(function (a, i) {
+      return Promise.resolve().then(function () { return io.get(new URL(a.URI, feed.masterUrl).toString()); }).then(function (response) {
+        var parsed = CmafDash.playlist(response.body, { breaks: true });
+        if (parsed.keys && parsed.keys.length) return fail('surround encrypted');
+        var init = new URL(parsed.init, response.url).toString();
+        var segments = parsed.segments.map(function (s) { return { url: new URL(s.uri, response.url).toString(), duration: s.duration }; });
+        return Promise.all([io.get(init, true), io.get(segments[0].url, true, true)]).then(function (data) {
+          if (CmafDash.encryption(data[0])) return fail('surround encrypted');
+          var timing = CmafDash.timing(data[0], data[1]);
+          if (Math.abs(timing.baseTime / timing.timescale - base) > 0.1) return fail('surround clock differs');
+          return continuous(io, parsed, response.url, { init: data[0], timing: timing }).then(function () {
+            return { type: 'audio', id: 'mc' + i, language: lang3(a.LANGUAGE) || 'und', codecs: mc.codecs[a['GROUP-ID']],
+              channels: parseInt(a.CHANNELS, 10) || 6, bandwidth: 384000, timing: timing, init: init, segments: segments };
+          });
+        });
+      });
+    }))).catch(function (e) { note('hdr.surround_skipped', { why: 'clear grid: ' + String(e && e.message || e).slice(0, 70) }); return []; });
+  }
+
+  /**
+   * A clear grid's manifest: the video, its stereo commentary, and the 5.1 of the video's length. AVPlay starts on the
+   * first audio track: 5.1 in the chosen language, else the stereo one in it, else 5.1 (as withCommentary). Stereo only
+   * when the 5.1 can't be written. Returns { mpd, surround (count) }.
+   */
+  function clearWithSurround(track, stereo, multi, langs) {
+    var length = total(track.segments);
+    var usable = multi.filter(function (t) { var d = total(t.segments) - length; return d <= 0.05 && d >= -0.5; });
+    if (usable.length < multi.length) note('hdr.surround_skipped', { why: 'clear grid: another length' });
+    var lang = lang3((langs || {}).audio), official = stereo.map(function (t) { return lang3(t.language); });
+    usable.sort(function (x, y) { return (y.language === lang) - (x.language === lang); });
+    var first = usable.length > 0 && (!lang || usable[0].language === lang || official.indexOf(lang) < 0);
+    try {
+      return { mpd: CmafDash.manifest([track].concat(first ? usable.concat(stereo) : stereo.concat(usable))), surround: usable.length };
+    } catch (e) {
+      if (!usable.length) throw e;
+      note('hdr.surround_skipped', { why: 'clear grid manifest: ' + String(e && e.message || e).slice(0, 50) });
+      return { mpd: CmafDash.manifest([track].concat(stereo)), surround: 0 };
+    }
   }
 
   /**
@@ -561,7 +635,8 @@ var HdrStream = (function () {
       if (a.TYPE === 'AUDIO' && a.URI && (!feed.audioGroup || a['GROUP-ID'] === feed.audioGroup)) list.push(a);
     });
     if (!list.length) return fail('no commentary in the HDR stream');
-    list.sort(function (x, y) { return (y.LANGUAGE === langs.audio) - (x.LANGUAGE === langs.audio); });
+    var want = lang3(langs.audio);   // ("de" in a master is the "deu" of the settings)
+    list.sort(function (x, y) { return (lang3(y.LANGUAGE) === want) - (lang3(x.LANGUAGE) === want); });
     return Promise.all(list.map(function (a, i) {
       var url = new URL(a.URI, feed.masterUrl).toString();
       return io.get(url).then(function (response) {
@@ -572,7 +647,7 @@ var HdrStream = (function () {
           var timing = CmafDash.timing(data[0], data[1]);
           return continuous(io, parsed, response.url, { init: data[0], timing: timing }).then(function () {
             return { type: 'audio', id: 'a' + i, language: a.LANGUAGE || 'und', codecs: feed.audioCodec || 'mp4a.40.2', bandwidth: 128000,
-              timing: timing, init: init, segments: segments };
+              channels: parseInt(a.CHANNELS, 10) || 2, timing: timing, init: init, segments: segments };
           });
         });
       });

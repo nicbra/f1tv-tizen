@@ -236,6 +236,93 @@ test('live HDR 5.1 is optional: another clock, another key, none asked or none o
  assert.ok(differs.notes.some(([k,d])=>k==='hdr.surround_skipped'&&/timeline differs/.test(d.why)));
 });
 
+// Clear HDR (weeks-old races, F1's shows): no keys anywhere, the 5.1 group beside the stereo one.
+const clearInit=box('moov',box('trak',box('mdia',Buffer.concat([mdhd,box('minf',box('stbl',box('stsd',Buffer.concat([Buffer.alloc(4),u32(1),box('hvc1',Buffer.alloc(78))]))))]))));
+// As F1 lists them: each quality with stereo AAC first, then the same with AC-3 5.1.
+const clearMaster=['#EXTM3U',
+ '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",CHANNELS="2",NAME="eng",LANGUAGE="eng",URI="a/eng.m3u8"',
+ '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",CHANNELS="2",NAME="deu",LANGUAGE="deu",URI="a/deu.m3u8"',
+ '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="ac3",CHANNELS="6",NAME="eng",LANGUAGE="eng",URI="a/eng51.m3u8"',
+ '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="ac3",CHANNELS="6",NAME="spa",LANGUAGE="spa",URI="a/spa51.m3u8"',
+ '#EXT-X-STREAM-INF:BANDWIDTH=18000000,RESOLUTION=3840x2160,CODECS="hev1.2.4.L153.B0,mp4a.40.2",VIDEO-RANGE=HLG,AUDIO="aac"','v/uhd.m3u8',
+ '#EXT-X-STREAM-INF:BANDWIDTH=18384000,RESOLUTION=3840x2160,CODECS="hev1.2.4.L153.B0,ac-3",VIDEO-RANGE=HLG,AUDIO="ac3"','v/uhd.m3u8',
+ '#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,CODECS="hev1.2.4.L123.B0,mp4a.40.2",VIDEO-RANGE=HLG,AUDIO="aac"','v/hd.m3u8',
+ '#EXT-X-STREAM-INF:BANDWIDTH=6384000,RESOLUTION=1920x1080,CODECS="hev1.2.4.L123.B0,ac-3",VIDEO-RANGE=HLG,AUDIO="ac3"','v/hd.m3u8',''].join('\n');
+const clearPlaylist=playlist.split('\n').filter(l=>!/EXT-X-KEY/.test(l)).join('\n');
+function clearGridAt1080(master){
+ const g=clearGrid({'master.m3u8':master},{duo:{feeds:[1080,2160]}});
+ return g.grid({audio:'eng',text:''});
+}
+function clearGrid(overrides={},layouts){
+ const calls=[];
+ const ctx=vm.createContext({CmafDash,URL,Uint8Array,AbortController,setTimeout,clearTimeout,Date,navigator:{userAgent:'test'},
+  MultiviewLayouts:{layouts:layouts||{duo:{feeds:[2160,1080]}}},
+  fetch:async (url,opts={})=>{calls.push({url,opts});
+   let body=/\/stitch\/g1$/.test(url)?JSON.stringify({width:3840,height:3264,codecs:'hev1.2.4.L153.B0'}):url.endsWith('master.m3u8')?clearMaster:url.includes('.m3u8')?clearPlaylist:url.includes('init.mp4')?clearInit:frag;
+   for(const [k,v] of Object.entries(overrides)) if(url.includes(k)) body=v;
+   return {ok:true,status:201,url,text:async()=>body,arrayBuffer:async()=>Uint8Array.from(body).buffer};}});
+ vm.runInContext(fs.readFileSync('app/js/hdr.js','utf8'),ctx);
+ const feeds=[{url:'https://video.formula1.com/vod/master.m3u8',hdr:true},{url:'https://video.formula1.com/vod/master.m3u8',hdr:true}];
+ return {calls,grid:(langs)=>ctx.HdrStream.grid(feeds,'duo',{id:'g1',langs:langs||{audio:'eng',text:''},audio:0})};
+}
+test('a clear HDR multiview adds the sound feed\'s 5.1 beside its stereo commentary, starting on it in the chosen language',async()=>{
+ const built=await clearGrid().grid({audio:'eng',text:''});
+ assert.equal(built.surround,2);
+ assert.equal(surroundSets(built.mpd).length,2);
+ const first=built.mpd.indexOf('<AdaptationSet contentType="audio"');
+ assert.ok(built.mpd.slice(first,built.mpd.indexOf('</AdaptationSet>',first)).includes('codecs="ac-3"'),'AVPlay starts on the English 5.1');
+ // Each kind of sound in a set of its own (a language's AAC and AC-3 are two choices, not two qualities of one).
+ const sets=built.mpd.split('<AdaptationSet').slice(1).filter(x=>/contentType="audio"/.test(x));
+ assert.ok(sets.every(x=>!(/mp4a/.test(x)&&/ac-3/.test(x))),'no set mixes AAC and AC-3');
+ assert.equal(sets.length,4);
+ assert.ok(/<AdaptationSet contentType="audio"[^>]*lang="deu"/.test(built.mpd),'the stereo commentary stays');
+ // German has no 5.1: its stereo first, the 5.1 still there to choose.
+ const deu=await clearGrid().grid({audio:'deu',text:''});
+ const at=deu.mpd.indexOf('<AdaptationSet contentType="audio"');
+ assert.ok(!deu.mpd.slice(at,deu.mpd.indexOf('</AdaptationSet>',at)).includes('codecs="ac-3"'));
+ assert.equal(deu.surround,2);
+});
+test('a clear HDR multiview whose master lists its AC-3 variant first: no 5.1 twice',async()=>{
+ const lines=clearMaster.split('\n'), i=lines.findIndex(l=>/AUDIO="aac"/.test(l)&&/3840x2160/.test(l));
+ const swapped=lines.slice(); [swapped[i],swapped[i+1],swapped[i+2],swapped[i+3]]=[lines[i+2],lines[i+3],lines[i],lines[i+1]];
+ const built=await clearGrid({'master.m3u8':swapped.join('\n')}).grid({audio:'eng',text:''});
+ assert.equal(surroundSets(built.mpd).length,2,'each 5.1 commentary once');
+ assert.equal(built.surround,2);
+ assert.ok(/lang="deu"[^>]*>(?:(?!<\/AdaptationSet>)[\s\S])*mp4a/.test(built.mpd),'the stereo (German has only that) still there');
+ const none=await clearGrid({'master.m3u8':swapped.join('\n')}).grid({audio:'eng',text:'',surround:false});
+ assert.equal(surroundSets(none.mpd).length,0,'stereo when asked for no 5.1');
+});
+test('a clear HDR multiview whose size is listed with AC-3 only: the stereo from another size, the AC-3 as its 5.1',async()=>{
+ const only=clearMaster.replace(/#EXT-X-STREAM-INF:[^\n]*1920x1080[^\n]*mp4a[^\n]*\nv\/hd\.m3u8\n/,'');
+ assert.ok(!/1920x1080[^\n]*mp4a/.test(only)&&/1920x1080[^\n]*ac-3/.test(only));
+ const lead=await clearGridAt1080(only);   // (the sound feed at the AC-3-only size)
+ assert.equal(lead.surround,2,'the AC-3 counted as 5.1');
+ assert.equal(surroundSets(lead.mpd).length,2,'each 5.1 commentary once');
+ assert.ok(/lang="deu"[^>]*>(?:(?!<\/AdaptationSet>)[\s\S])*mp4a/.test(lead.mpd),'the stereo commentary from the 2160p group');
+});
+test('a clear HDR multiview names the channels of each sound (Shaka picks 5.1 by them), and matches "de" to "deu"',async()=>{
+ const built=await clearGrid().grid({audio:'eng',text:''});
+ const sets=built.mpd.split('<AdaptationSet').slice(1).filter(x=>/contentType="audio"/.test(x));
+ assert.ok(sets.filter(x=>/ac-3/.test(x)).every(x=>/AudioChannelConfiguration[^>]*value="6"/.test(x)));
+ assert.ok(sets.filter(x=>/mp4a/.test(x)).every(x=>/AudioChannelConfiguration[^>]*value="2"/.test(x)));
+ const de=await clearGrid({'master.m3u8':clearMaster.replace('LANGUAGE="deu"','LANGUAGE="de"')}).grid({audio:'deu',text:''});
+ const first=de.mpd.indexOf('<AdaptationSet contentType="audio"');
+ assert.ok(/lang="de"/.test(de.mpd.slice(first,de.mpd.indexOf('>',first))),'German first (no 5.1 in it)');
+});
+test('a clear HDR multiview leaves the 5.1 out when asked for none, encrypted, on another clock, or not offered: stereo plays',async()=>{
+ const other=Buffer.alloc(8);other.writeBigUInt64BE(89669822112000n+50000n*5n);
+ const late=box('moof',box('traf',box('tfdt',Buffer.concat([Buffer.from([1,0,0,0]),other]))));
+ for(const [name,h,langs] of [
+  ['none asked',clearGrid(),{audio:'eng',text:'',surround:false}],
+  ['encrypted',clearGrid({'a/eng51':playlist,'a/spa51':playlist}),null],
+  ['another clock',clearGrid({'a/eng51.m3u8':clearPlaylist.replaceAll('v_10','x_10'),'x_100':late}),null],
+  ['not offered',clearGrid({'master.m3u8':clearMaster.replace(/#EXT-X-MEDIA:[^\n]*GROUP-ID="ac3"[^\n]*\n/g,'').replace(/#EXT-X-STREAM-INF:[^\n]*ac-3[^\n]*\nv\/[a-z]+\.m3u8\n/g,'')}),null]]){
+  const built=await h.grid(langs||undefined);
+  assert.ok(built.surround===0||(name==='another clock'&&built.surround===1),name+': '+built.surround);
+  if(name!=='another clock') assert.equal(surroundSets(built.mpd).length,0,name);
+  assert.ok(/<AdaptationSet contentType="audio"[^>]*lang="eng"[^>]*>(?:(?!<\/AdaptationSet>)[\s\S])*mp4a/.test(built.mpd),name+': stereo plays');
+ }
+});
 test('a clear HDR multiview gets the HLS master\'s WebVTT subtitles, on the video\'s timeline', async () => {
   const ctx = vm.createContext({ URL, CmafDash, setTimeout, clearTimeout, AbortController });
   vm.runInContext(fs.readFileSync('app/js/hdr.js', 'utf8'), ctx);
@@ -285,3 +372,4 @@ test('a multiview of feeds with a discontinuity: built when their timestamps run
  // Feeds whose breaks differ can't share one timeline.
  await assert.rejects(grid({'https://video.formula1.com/vod/v/v_101.m4s?sig=keep&n=2':after,'https://video.formula1.com/vod/v/hd.m3u8':playlist}),/differ in discontinuities/);
 });
+

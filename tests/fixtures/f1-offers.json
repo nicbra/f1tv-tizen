@@ -1,0 +1,3362 @@
+{
+ "about": "Structure of F1 TV offers (2026-11-22 captures: renditions, variants, key methods, encryption scheme, DASH sets), in F1's order. Extracted by a local script from private copies; no addresses, tokens or media.",
+ "offers": {
+  "abudhabi-2021/web-hls-main": {
+   "channel": null,
+   "contentSubtype": "REPLAY",
+   "feed": "main",
+   "format": "hls",
+   "keys": [],
+   "kind": "web",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "YES",
+     "group": "audio_0",
+     "language": "deu",
+     "name": "Deutsch",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "fra",
+     "name": "Francais",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "spa",
+     "name": "Espanol",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "nld",
+     "name": "Nederlands",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "por",
+     "name": "Portugues",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "fx",
+     "name": "FX",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "eng",
+     "name": "English",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "default": "YES",
+     "group": "subtitles",
+     "language": "eng",
+     "name": "English",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "NO",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "fra",
+     "name": "French",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "NO",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "spa",
+     "name": "Spanish",
+     "type": "SUBTITLES"
+    }
+   ],
+   "streamType": "HLS",
+   "variants": [
+    {
+     "audio": "audio_0",
+     "bandwidth": 10991200,
+     "codecs": "avc1.4D402A,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "ts",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 671145,
+     "codecs": "avc1.4D401E,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "ts",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    }
+   ],
+   "year": "2021"
+  },
+  "abudhabi-2025/tvos-hdruhdcmaf-main": {
+   "channel": null,
+   "contentSubtype": "REPLAY",
+   "feed": "main",
+   "format": "hls",
+   "keys": [],
+   "kind": "tvos",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "YES",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "deu",
+     "name": "deu",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "fra",
+     "name": "fra",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "spa",
+     "name": "spa",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "nld",
+     "name": "nld",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "por",
+     "name": "por",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "fx",
+     "name": "fx",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "default": "YES",
+     "group": "subtitles",
+     "language": "fra",
+     "name": "fra_subtitle",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "NO",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "spa",
+     "name": "spa_subtitle",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "NO",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "eng",
+     "name": "eng_subtitle",
+     "type": "SUBTITLES"
+    }
+   ],
+   "streamType": "HDR_UHD_CMAF",
+   "variants": [
+    {
+     "audio": "audio_0",
+     "bandwidth": 18421438,
+     "codecs": "hvc1.2.4.L153.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "3840x2160",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 8223765,
+     "codecs": "hvc1.2.4.L123.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 794030,
+     "codecs": "hvc1.2.4.L93.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 6888356,
+     "codecs": "hvc1.1.6.L123.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 9923375,
+     "codecs": "hvc1.1.6.L150.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "2880x1620",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 696909,
+     "codecs": "hvc1.1.6.L93.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    }
+   ],
+   "year": "2025"
+  },
+  "abudhabi-2025/web-sdrhdcmaf-main": {
+   "channel": null,
+   "contentSubtype": "REPLAY",
+   "feed": "main",
+   "format": "hls",
+   "keys": [],
+   "kind": "web",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "YES",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "deu",
+     "name": "deu",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "fra",
+     "name": "fra",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "spa",
+     "name": "spa",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "nld",
+     "name": "nld",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "por",
+     "name": "por",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "fx",
+     "name": "fx",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "default": "YES",
+     "group": "subtitles",
+     "language": "fra",
+     "name": "fra_subtitle",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "NO",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "spa",
+     "name": "spa_subtitle",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "NO",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "eng",
+     "name": "eng_subtitle",
+     "type": "SUBTITLES"
+    }
+   ],
+   "streamType": "SDR_HD_CMAF",
+   "variants": [
+    {
+     "audio": "audio_0",
+     "bandwidth": 7495358,
+     "codecs": "avc1.4D402A,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 818309,
+     "codecs": "avc1.4D401E,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    }
+   ],
+   "year": "2025"
+  },
+  "bahrain-2020/web-hls-main": {
+   "channel": null,
+   "contentSubtype": "REPLAY",
+   "feed": "main",
+   "format": "hls",
+   "keys": [],
+   "kind": "web",
+   "media": [
+    {
+     "group": "cc",
+     "language": "en",
+     "name": "English",
+     "type": "CLOSED-CAPTIONS"
+    },
+    {
+     "group": "cc",
+     "language": "fr",
+     "name": "Francais",
+     "type": "CLOSED-CAPTIONS"
+    },
+    {
+     "group": "cc",
+     "language": "es",
+     "name": "Espanol",
+     "type": "CLOSED-CAPTIONS"
+    },
+    {
+     "autoselect": "YES",
+     "default": "YES",
+     "group": "Encoding_0",
+     "init": "ts",
+     "language": "eng",
+     "name": "English",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "group": "Encoding_0",
+     "init": "ts",
+     "language": "fre",
+     "name": "Francais",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "group": "Encoding_0",
+     "init": "ts",
+     "language": "ger",
+     "name": "Deutsch",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "group": "Encoding_0",
+     "init": "ts",
+     "language": "dut",
+     "name": "Nederlands",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "group": "Encoding_0",
+     "init": "ts",
+     "language": "spa",
+     "name": "Espanol",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "group": "Encoding_0",
+     "init": "ts",
+     "language": "und",
+     "name": "FX",
+     "type": "AUDIO"
+    }
+   ],
+   "streamType": "HLS",
+   "variants": [
+    {
+     "audio": "Encoding_0",
+     "bandwidth": 7015190,
+     "captions": "cc",
+     "codecs": "avc1.640028,mp4a.40.2",
+     "frameRate": "30",
+     "init": "ts",
+     "resolution": "1920x1080"
+    },
+    {
+     "audio": "Encoding_0",
+     "bandwidth": 191972,
+     "codecs": "mp4a.40.2",
+     "init": "ts"
+    }
+   ],
+   "year": "2020"
+  },
+  "f1a-feature-2026/tm-hdruhdcmaf-main": {
+   "channel": "1034",
+   "contentSubtype": "REPLAY",
+   "feed": "main",
+   "format": "hls",
+   "keys": [],
+   "kind": "tm",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "YES",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "deu",
+     "name": "deu",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "spa",
+     "name": "spa",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "nld",
+     "name": "nld",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "por",
+     "name": "por",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "jpn",
+     "name": "jpn",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "fx",
+     "name": "fx",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "default": "YES",
+     "group": "subtitles",
+     "language": "spa",
+     "name": "spa_subtitle",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "NO",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "eng",
+     "name": "eng_subtitle",
+     "type": "SUBTITLES"
+    }
+   ],
+   "streamType": "HDR_UHD_CMAF",
+   "variants": [
+    {
+     "audio": "audio_0",
+     "bandwidth": 18421330,
+     "codecs": "hvc1.2.4.L153.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "3840x2160",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 8223657,
+     "codecs": "hvc1.2.4.L123.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 793922,
+     "codecs": "hvc1.2.4.L63.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 6888248,
+     "codecs": "hvc1.1.6.L123.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 9923267,
+     "codecs": "hvc1.1.6.L150.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "2880x1620",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 696801,
+     "codecs": "hvc1.1.6.L63.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    }
+   ],
+   "year": "2026"
+  },
+  "f1a-feature-2026/web-sdrhdcmaf-main": {
+   "channel": null,
+   "contentSubtype": "REPLAY",
+   "feed": "main",
+   "format": "hls",
+   "keys": [],
+   "kind": "web",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "YES",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "deu",
+     "name": "deu",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "spa",
+     "name": "spa",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "nld",
+     "name": "nld",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "por",
+     "name": "por",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "jpn",
+     "name": "jpn",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "fx",
+     "name": "fx",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "default": "YES",
+     "group": "subtitles",
+     "language": "spa",
+     "name": "spa_subtitle",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "NO",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "eng",
+     "name": "eng_subtitle",
+     "type": "SUBTITLES"
+    }
+   ],
+   "streamType": "SDR_HD_CMAF",
+   "variants": [
+    {
+     "audio": "audio_0",
+     "bandwidth": 7495250,
+     "codecs": "avc1.4D402A,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 818202,
+     "codecs": "avc1.4D401E,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    }
+   ],
+   "year": "2026"
+  },
+  "highlights-2026/tvos-hls-main": {
+   "channel": null,
+   "contentSubtype": "RACE HIGHLIGHTS",
+   "feed": "main",
+   "format": "hls",
+   "keys": [],
+   "kind": "tvos",
+   "media": [
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "program_audio",
+     "language": "eng",
+     "name": "English",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "program_audio",
+     "language": "spa",
+     "name": "Espanol",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "program_audio",
+     "language": "fra",
+     "name": "Francais",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "program_audio",
+     "language": "deu",
+     "name": "Deutsche",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "program_audio",
+     "language": "nld",
+     "name": "Nederlands",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "YES",
+     "group": "program_audio",
+     "language": "cfx",
+     "name": "FX",
+     "type": "AUDIO"
+    }
+   ],
+   "streamType": "HLS",
+   "variants": [
+    {
+     "audio": "program_audio",
+     "bandwidth": 7416995,
+     "codecs": "avc1.4d402a,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "ts",
+     "range": "SDR",
+     "resolution": "1920x1080"
+    },
+    {
+     "audio": "program_audio",
+     "bandwidth": 466710,
+     "codecs": "avc1.77.30,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "ts",
+     "range": "SDR",
+     "resolution": "480x270"
+    }
+   ],
+   "year": "2026"
+  },
+  "highlights-2026/web-dash-main": {
+   "channel": null,
+   "contentSubtype": "RACE HIGHLIGHTS",
+   "feed": "main",
+   "format": "dash",
+   "kind": "web",
+   "sets": [
+    {
+     "codecs": [
+      "avc1.4d401e",
+      "avc1.4d402a"
+     ],
+     "contentType": "video/mp4",
+     "representations": 2
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio/mp4",
+     "lang": "eng",
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio/mp4",
+     "lang": "spa",
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio/mp4",
+     "lang": "fra",
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio/mp4",
+     "lang": "deu",
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio/mp4",
+     "lang": "nld",
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio/mp4",
+     "lang": "cfx",
+     "representations": 1
+    }
+   ],
+   "streamType": "DASH",
+   "type": "static",
+   "year": "2026"
+  },
+  "lasvegas-2024/web-hls-main": {
+   "channel": null,
+   "contentSubtype": "REPLAY",
+   "feed": "main",
+   "format": "hls",
+   "keys": [],
+   "kind": "web",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "YES",
+     "group": "audio_0",
+     "language": "eng",
+     "name": "English",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "deu",
+     "name": "Deutsch",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "fra",
+     "name": "Francais",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "spa",
+     "name": "Espanol",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "nld",
+     "name": "Nederlands",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "por",
+     "name": "Portugues",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "fx",
+     "name": "FX",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "default": "YES",
+     "group": "subtitles",
+     "language": "eng",
+     "name": "English",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "NO",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "fra",
+     "name": "French",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "NO",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "spa",
+     "name": "Spanish",
+     "type": "SUBTITLES"
+    }
+   ],
+   "streamType": "HLS",
+   "variants": [
+    {
+     "audio": "audio_0",
+     "bandwidth": 9011200,
+     "codecs": "avc1.4D402A,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "ts",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 586665,
+     "codecs": "avc1.4D401E,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "ts",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    }
+   ],
+   "year": "2024"
+  },
+  "lasvegas-2024/web-hls-obc": {
+   "channel": "1009",
+   "contentSubtype": "REPLAY",
+   "feed": "obc",
+   "format": "hls",
+   "keys": [],
+   "kind": "web",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "YES",
+     "group": "audio_0",
+     "language": "teamradio",
+     "name": "Team Radio",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "eng",
+     "name": "English",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "deu",
+     "name": "Deutsch",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "fra",
+     "name": "Francais",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "spa",
+     "name": "Espanol",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "nld",
+     "name": "Nederlands",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "por",
+     "name": "Portugues",
+     "type": "AUDIO"
+    }
+   ],
+   "streamType": "HLS",
+   "variants": [
+    {
+     "audio": "audio_0",
+     "bandwidth": 5344724,
+     "codecs": "avc1.4D4020,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "ts",
+     "resolution": "1280x720"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 586885,
+     "codecs": "avc1.4D401E,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "ts",
+     "resolution": "480x270"
+    }
+   ],
+   "year": "2024"
+  },
+  "lvq-2026/androidtv-sdrhddashwvsingle-main": {
+   "channel": null,
+   "contentSubtype": "REPLAY",
+   "feed": "main",
+   "format": "dash",
+   "kind": "androidtv",
+   "sets": [
+    {
+     "codecs": [
+      "avc1.4D401E",
+      "avc1.4D402A"
+     ],
+     "contentType": "video",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 2
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "eng",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "deu",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "fra",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "nld",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "por",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "jpn",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "fx",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "codecs": [
+      "stpp"
+     ],
+     "contentType": "application",
+     "lang": "fra",
+     "representations": 1
+    },
+    {
+     "codecs": [
+      "stpp"
+     ],
+     "contentType": "application",
+     "lang": "eng",
+     "representations": 1
+    }
+   ],
+   "streamType": "SDR_HD_DASHWV_SINGLE",
+   "type": "static",
+   "year": "2026"
+  },
+  "lvq-2026/chromecast-sdrhddashwvsinglecenc-main": {
+   "channel": null,
+   "contentSubtype": "REPLAY",
+   "feed": "main",
+   "format": "dash",
+   "kind": "chromecast",
+   "sets": [
+    {
+     "codecs": [
+      "avc1.4D401E",
+      "avc1.4D402A"
+     ],
+     "contentType": "video",
+     "protection": [
+      "cenc",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 2
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "eng",
+     "protection": [
+      "cenc",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "deu",
+     "protection": [
+      "cenc",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "fra",
+     "protection": [
+      "cenc",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "nld",
+     "protection": [
+      "cenc",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "por",
+     "protection": [
+      "cenc",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "jpn",
+     "protection": [
+      "cenc",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "fx",
+     "protection": [
+      "cenc",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "codecs": [
+      "stpp"
+     ],
+     "contentType": "application",
+     "lang": "fra",
+     "representations": 1
+    },
+    {
+     "codecs": [
+      "stpp"
+     ],
+     "contentType": "application",
+     "lang": "eng",
+     "representations": 1
+    }
+   ],
+   "streamType": "SDR_HD_DASHWV_SINGLE_CENC",
+   "type": "static",
+   "year": "2026"
+  },
+  "lvq-2026/tm-hdruhdhlsck-1003": {
+   "channel": "1003",
+   "contentSubtype": "REPLAY",
+   "feed": "1003",
+   "format": "hls",
+   "keys": [
+    {
+     "keyformat": "identity",
+     "method": "AES-128"
+    }
+   ],
+   "kind": "tm",
+   "media": [],
+   "streamType": "HDR_UHD_HLSCK",
+   "variants": [
+    {
+     "bandwidth": 7731609,
+     "codecs": "hev1.2.4.L123.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "HLG",
+     "resolution": "1920x1080"
+    },
+    {
+     "bandwidth": 562298,
+     "codecs": "hev1.2.4.L93.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "HLG",
+     "resolution": "480x270"
+    },
+    {
+     "bandwidth": 6443008,
+     "codecs": "hev1.1.6.L123.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "SDR",
+     "resolution": "1920x1080"
+    },
+    {
+     "bandwidth": 468582,
+     "codecs": "hev1.1.6.L93.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "SDR",
+     "resolution": "480x270"
+    }
+   ],
+   "year": "2026"
+  },
+  "lvq-2026/tm-hdruhdhlsck-1016": {
+   "channel": "1016",
+   "contentSubtype": "REPLAY",
+   "feed": "1016",
+   "format": "hls",
+   "keys": [
+    {
+     "keyformat": "identity",
+     "method": "AES-128"
+    }
+   ],
+   "kind": "tm",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "tea",
+     "name": "tea",
+     "type": "AUDIO"
+    }
+   ],
+   "streamType": "HDR_UHD_HLSCK",
+   "variants": [
+    {
+     "audio": "audio_0",
+     "bandwidth": 7942809,
+     "codecs": "mp4a.40.2,hev1.2.4.L123.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "HLG",
+     "resolution": "1920x1080"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 773498,
+     "codecs": "mp4a.40.2,hev1.2.4.L93.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "HLG",
+     "resolution": "480x270"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 6654208,
+     "codecs": "mp4a.40.2,hev1.1.6.L123.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "SDR",
+     "resolution": "1920x1080"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 679782,
+     "codecs": "mp4a.40.2,hev1.1.6.L93.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "SDR",
+     "resolution": "480x270"
+    }
+   ],
+   "year": "2026"
+  },
+  "lvq-2026/tm-hdruhdhlsck-1033": {
+   "channel": "1033",
+   "contentSubtype": "REPLAY",
+   "feed": "1033",
+   "format": "hls",
+   "keys": [
+    {
+     "keyformat": "identity",
+     "method": "AES-128"
+    }
+   ],
+   "kind": "tm",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "spa",
+     "name": "spa",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "6",
+     "default": "NO",
+     "group": "audio_1",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "6",
+     "default": "NO",
+     "group": "audio_1",
+     "language": "spa",
+     "name": "spa",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "eng",
+     "name": "eng_subtitle",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "YES",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "spa",
+     "name": "spa_subtitle",
+     "type": "SUBTITLES"
+    }
+   ],
+   "streamType": "HDR_UHD_HLSCK",
+   "variants": [
+    {
+     "audio": "audio_1",
+     "bandwidth": 17994240,
+     "codecs": "ac-3,hev1.2.4.L153.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "HLG",
+     "resolution": "3840x2160",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 17783040,
+     "codecs": "mp4a.40.2,hev1.2.4.L153.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "HLG",
+     "resolution": "3840x2160",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 8154009,
+     "codecs": "ac-3,hev1.2.4.L123.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "HLG",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 7942809,
+     "codecs": "mp4a.40.2,hev1.2.4.L123.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "HLG",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 984698,
+     "codecs": "ac-3,hev1.2.4.L93.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "HLG",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 773498,
+     "codecs": "mp4a.40.2,hev1.2.4.L93.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "HLG",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 6865408,
+     "codecs": "ac-3,hev1.1.6.L123.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "SDR",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 6654208,
+     "codecs": "mp4a.40.2,hev1.1.6.L123.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "SDR",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 9794048,
+     "codecs": "ac-3,hev1.1.6.L150.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "SDR",
+     "resolution": "2880x1620",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 9582848,
+     "codecs": "mp4a.40.2,hev1.1.6.L150.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "SDR",
+     "resolution": "2880x1620",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 890982,
+     "codecs": "ac-3,hev1.1.6.L93.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "SDR",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 679782,
+     "codecs": "mp4a.40.2,hev1.1.6.L93.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "SDR",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    }
+   ],
+   "year": "2026"
+  },
+  "lvq-2026/tm-hdruhdhlsck-main": {
+   "channel": "1025",
+   "contentSubtype": "REPLAY",
+   "feed": "main",
+   "format": "hls",
+   "keys": [
+    {
+     "keyformat": "identity",
+     "method": "AES-128"
+    }
+   ],
+   "kind": "tm",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "deu",
+     "name": "deu",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "fra",
+     "name": "fra",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "nld",
+     "name": "nld",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "por",
+     "name": "por",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "jpn",
+     "name": "jpn",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "language": "fx",
+     "name": "fx",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "fra",
+     "name": "fra_subtitle",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "YES",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "eng",
+     "name": "eng_subtitle",
+     "type": "SUBTITLES"
+    }
+   ],
+   "streamType": "HDR_UHD_HLSCK",
+   "variants": [
+    {
+     "audio": "audio_0",
+     "bandwidth": 17783040,
+     "codecs": "mp4a.40.2,hev1.2.4.L153.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "HLG",
+     "resolution": "3840x2160",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 7942809,
+     "codecs": "mp4a.40.2,hev1.2.4.L123.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "HLG",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 773498,
+     "codecs": "mp4a.40.2,hev1.2.4.L93.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "HLG",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 6654208,
+     "codecs": "mp4a.40.2,hev1.1.6.L123.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "SDR",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 9582848,
+     "codecs": "mp4a.40.2,hev1.1.6.L150.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "SDR",
+     "resolution": "2880x1620",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 679782,
+     "codecs": "mp4a.40.2,hev1.1.6.L93.B0",
+     "frameRate": "50.0",
+     "init": "ts",
+     "range": "SDR",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    }
+   ],
+   "year": "2026"
+  },
+  "lvq-2026/tvos-hdruhdcmaffp-main": {
+   "channel": null,
+   "contentSubtype": "REPLAY",
+   "feed": "main",
+   "format": "hls",
+   "keys": [
+    {
+     "keyformat": "com.apple.streamingkeydelivery",
+     "method": "SAMPLE-AES"
+    }
+   ],
+   "kind": "tvos",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "cbcs",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "cbcs",
+     "language": "deu",
+     "name": "deu",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "cbcs",
+     "language": "fra",
+     "name": "fra",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "cbcs",
+     "language": "nld",
+     "name": "nld",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "cbcs",
+     "language": "por",
+     "name": "por",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "cbcs",
+     "language": "jpn",
+     "name": "jpn",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "cbcs",
+     "language": "fx",
+     "name": "fx",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "fra",
+     "name": "fra_subtitle",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "YES",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "eng",
+     "name": "eng_subtitle",
+     "type": "SUBTITLES"
+    }
+   ],
+   "streamType": "HDR_UHD_CMAFFP",
+   "variants": [
+    {
+     "audio": "audio_0",
+     "bandwidth": 17783040,
+     "codecs": "mp4a.40.2,hev1.2.4.L153.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "HLG",
+     "resolution": "3840x2160",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 7942809,
+     "codecs": "mp4a.40.2,hev1.2.4.L123.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "HLG",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 773498,
+     "codecs": "mp4a.40.2,hev1.2.4.L93.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "HLG",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 6654208,
+     "codecs": "mp4a.40.2,hev1.1.6.L123.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "SDR",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 9582848,
+     "codecs": "mp4a.40.2,hev1.1.6.L150.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "SDR",
+     "resolution": "2880x1620",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 679782,
+     "codecs": "mp4a.40.2,hev1.1.6.L93.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "SDR",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    }
+   ],
+   "year": "2026"
+  },
+  "lvq-2026/tvos-hdruhdcmaffp-pres": {
+   "channel": "1033",
+   "contentSubtype": "REPLAY",
+   "feed": "pres",
+   "format": "hls",
+   "keys": [
+    {
+     "keyformat": "com.apple.streamingkeydelivery",
+     "method": "SAMPLE-AES"
+    }
+   ],
+   "kind": "tvos",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "cbcs",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "cbcs",
+     "language": "spa",
+     "name": "spa",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "6",
+     "default": "NO",
+     "group": "audio_1",
+     "init": "cbcs",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "6",
+     "default": "NO",
+     "group": "audio_1",
+     "init": "cbcs",
+     "language": "spa",
+     "name": "spa",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "eng",
+     "name": "eng_subtitle",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "YES",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "spa",
+     "name": "spa_subtitle",
+     "type": "SUBTITLES"
+    }
+   ],
+   "streamType": "HDR_UHD_CMAFFP",
+   "variants": [
+    {
+     "audio": "audio_1",
+     "bandwidth": 17994240,
+     "codecs": "ac-3,hev1.2.4.L153.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "HLG",
+     "resolution": "3840x2160",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 17783040,
+     "codecs": "mp4a.40.2,hev1.2.4.L153.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "HLG",
+     "resolution": "3840x2160",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 8154009,
+     "codecs": "ac-3,hev1.2.4.L123.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "HLG",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 7942809,
+     "codecs": "mp4a.40.2,hev1.2.4.L123.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "HLG",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 984698,
+     "codecs": "ac-3,hev1.2.4.L93.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "HLG",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 773498,
+     "codecs": "mp4a.40.2,hev1.2.4.L93.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "HLG",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 6865408,
+     "codecs": "ac-3,hev1.1.6.L123.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "SDR",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 6654208,
+     "codecs": "mp4a.40.2,hev1.1.6.L123.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "SDR",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 9794048,
+     "codecs": "ac-3,hev1.1.6.L150.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "SDR",
+     "resolution": "2880x1620",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 9582848,
+     "codecs": "mp4a.40.2,hev1.1.6.L150.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "SDR",
+     "resolution": "2880x1620",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 890982,
+     "codecs": "ac-3,hev1.1.6.L93.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "SDR",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 679782,
+     "codecs": "mp4a.40.2,hev1.1.6.L93.B0",
+     "frameRate": "50.0",
+     "init": "cbcs",
+     "range": "SDR",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    }
+   ],
+   "year": "2026"
+  },
+  "lvq-2026/web-sdrhddashwvsingle-obc": {
+   "channel": "1016",
+   "contentSubtype": "REPLAY",
+   "feed": "obc",
+   "format": "dash",
+   "kind": "web",
+   "sets": [
+    {
+     "codecs": [
+      "avc1.4D401E",
+      "avc1.4D402A"
+     ],
+     "contentType": "video",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 2
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "tea",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "eng",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "deu",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "fra",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "spa",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "nld",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "por",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "jpn",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    }
+   ],
+   "streamType": "SDR_HD_DASHWV_SINGLE",
+   "type": "static",
+   "year": "2026"
+  },
+  "lvq-2026/web-sdrhddashwvsingle-pres": {
+   "channel": "1033",
+   "contentSubtype": "REPLAY",
+   "feed": "pres",
+   "format": "dash",
+   "kind": "web",
+   "sets": [
+    {
+     "codecs": [
+      "avc1.4D401E",
+      "avc1.4D402A"
+     ],
+     "contentType": "video",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 2
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "eng",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio",
+     "lang": "spa",
+     "protection": [
+      "cbcs",
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+     ],
+     "representations": 1
+    },
+    {
+     "codecs": [
+      "stpp"
+     ],
+     "contentType": "application",
+     "lang": "eng",
+     "representations": 1
+    },
+    {
+     "codecs": [
+      "stpp"
+     ],
+     "contentType": "application",
+     "lang": "spa",
+     "representations": 1
+    }
+   ],
+   "streamType": "SDR_HD_DASHWV_SINGLE",
+   "type": "static",
+   "year": "2026"
+  },
+  "lvrace-2026/tvos-hdruhdcmaf-main": {
+   "channel": null,
+   "contentSubtype": "REPLAY",
+   "feed": "main",
+   "format": "hls",
+   "keys": [],
+   "kind": "tvos",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "YES",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "deu",
+     "name": "deu",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "fra",
+     "name": "fra",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "nld",
+     "name": "nld",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "por",
+     "name": "por",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "jpn",
+     "name": "jpn",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "fx",
+     "name": "fx",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "default": "YES",
+     "group": "subtitles",
+     "language": "fra",
+     "name": "fra_subtitle",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "NO",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "eng",
+     "name": "eng_subtitle",
+     "type": "SUBTITLES"
+    }
+   ],
+   "streamType": "HDR_UHD_CMAF",
+   "variants": [
+    {
+     "audio": "audio_0",
+     "bandwidth": 18421330,
+     "codecs": "hvc1.2.4.L153.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "3840x2160",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 8223657,
+     "codecs": "hvc1.2.4.L123.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 793922,
+     "codecs": "hvc1.2.4.L93.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 6888248,
+     "codecs": "hvc1.1.6.L123.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 9923267,
+     "codecs": "hvc1.1.6.L150.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "2880x1620",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 696801,
+     "codecs": "hvc1.1.6.L93.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    }
+   ],
+   "year": "2026"
+  },
+  "lvrace-2026/tvos-hdruhdcmaf-obc": {
+   "channel": "1016",
+   "contentSubtype": "REPLAY",
+   "feed": "obc",
+   "format": "hls",
+   "keys": [],
+   "kind": "tvos",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "YES",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "tea",
+     "name": "tea",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "deu",
+     "name": "deu",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "fra",
+     "name": "fra",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "spa",
+     "name": "spa",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "nld",
+     "name": "nld",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "por",
+     "name": "por",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "jpn",
+     "name": "jpn",
+     "type": "AUDIO"
+    }
+   ],
+   "streamType": "HDR_UHD_CMAF",
+   "variants": [
+    {
+     "audio": "audio_0",
+     "bandwidth": 8223820,
+     "codecs": "hvc1.2.4.L123.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "1920x1080"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 794085,
+     "codecs": "hvc1.2.4.L93.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "480x270"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 6888411,
+     "codecs": "hvc1.1.6.L123.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "1920x1080"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 696964,
+     "codecs": "hvc1.1.6.L93.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "480x270"
+    }
+   ],
+   "year": "2026"
+  },
+  "lvrace-2026/tvos-hdruhdcmaf-pres": {
+   "channel": "1033",
+   "contentSubtype": "REPLAY",
+   "feed": "pres",
+   "format": "hls",
+   "keys": [],
+   "kind": "tvos",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "YES",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "spa",
+     "name": "spa",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "6",
+     "default": "YES",
+     "group": "audio_1",
+     "init": "clear",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "6",
+     "default": "NO",
+     "group": "audio_1",
+     "init": "clear",
+     "language": "spa",
+     "name": "spa",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "default": "YES",
+     "group": "subtitles",
+     "language": "eng",
+     "name": "eng_subtitle",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "NO",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "spa",
+     "name": "spa_subtitle",
+     "type": "SUBTITLES"
+    }
+   ],
+   "streamType": "HDR_UHD_CMAF",
+   "variants": [
+    {
+     "audio": "audio_1",
+     "bandwidth": 18632530,
+     "codecs": "hvc1.2.4.L153.B0,ac-3",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "3840x2160",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 18421330,
+     "codecs": "hvc1.2.4.L153.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "3840x2160",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 8434857,
+     "codecs": "hvc1.2.4.L123.B0,ac-3",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 8223657,
+     "codecs": "hvc1.2.4.L123.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 1005122,
+     "codecs": "hvc1.2.4.L93.B0,ac-3",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 793922,
+     "codecs": "hvc1.2.4.L93.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 7099448,
+     "codecs": "hvc1.1.6.L123.B0,ac-3",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 6888248,
+     "codecs": "hvc1.1.6.L123.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 10134467,
+     "codecs": "hvc1.1.6.L150.B0,ac-3",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "2880x1620",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 9923267,
+     "codecs": "hvc1.1.6.L150.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "2880x1620",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 908001,
+     "codecs": "hvc1.1.6.L93.B0,ac-3",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 696801,
+     "codecs": "hvc1.1.6.L93.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    }
+   ],
+   "year": "2026"
+  },
+  "lvrace-2026/tvos-hdruhdcmaf-tracker": {
+   "channel": "1003",
+   "contentSubtype": "REPLAY",
+   "feed": "tracker",
+   "format": "hls",
+   "keys": [],
+   "kind": "tvos",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "YES",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "deu",
+     "name": "deu",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "fra",
+     "name": "fra",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "spa",
+     "name": "spa",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "nld",
+     "name": "nld",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "por",
+     "name": "por",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "NO",
+     "channels": "2",
+     "default": "NO",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "jpn",
+     "name": "jpn",
+     "type": "AUDIO"
+    }
+   ],
+   "streamType": "HDR_UHD_CMAF",
+   "variants": [
+    {
+     "audio": "audio_0",
+     "bandwidth": 8223706,
+     "codecs": "hvc1.2.4.L123.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "1920x1080"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 793972,
+     "codecs": "hvc1.2.4.L93.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "480x270"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 6888297,
+     "codecs": "hvc1.1.6.L123.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "1920x1080"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 696851,
+     "codecs": "hvc1.1.6.L93.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "480x270"
+    }
+   ],
+   "year": "2026"
+  },
+  "postq-show-2026/tvos-hdruhdcmaf-main": {
+   "channel": null,
+   "contentSubtype": "REPLAY",
+   "feed": "main",
+   "format": "hls",
+   "keys": [],
+   "kind": "tvos",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "YES",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "channels": "6",
+     "default": "YES",
+     "group": "audio_1",
+     "init": "clear",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "default": "YES",
+     "group": "subtitles",
+     "language": "eng",
+     "name": "eng_subtitle",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "NO",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "spa",
+     "name": "spa_subtitle",
+     "type": "SUBTITLES"
+    }
+   ],
+   "streamType": "HDR_UHD_CMAF",
+   "variants": [
+    {
+     "audio": "audio_1",
+     "bandwidth": 18632530,
+     "codecs": "hvc1.2.4.L153.B0,ac-3",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "3840x2160",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 18421330,
+     "codecs": "hvc1.2.4.L153.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "3840x2160",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 8434857,
+     "codecs": "hvc1.2.4.L123.B0,ac-3",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 8223657,
+     "codecs": "hvc1.2.4.L123.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 1005122,
+     "codecs": "hvc1.2.4.L63.B0,ac-3",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 793922,
+     "codecs": "hvc1.2.4.L63.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "HLG",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 7099448,
+     "codecs": "hvc1.1.6.L123.B0,ac-3",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 6888248,
+     "codecs": "hvc1.1.6.L123.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 10134467,
+     "codecs": "hvc1.1.6.L150.B0,ac-3",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "2880x1620",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 9923267,
+     "codecs": "hvc1.1.6.L150.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "2880x1620",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_1",
+     "bandwidth": 908001,
+     "codecs": "hvc1.1.6.L63.B0,ac-3",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 696801,
+     "codecs": "hvc1.1.6.L63.B0,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "range": "SDR",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    }
+   ],
+   "year": "2026"
+  },
+  "postq-show-2026/web-sdrhdcmaf-main": {
+   "channel": null,
+   "contentSubtype": "REPLAY",
+   "feed": "main",
+   "format": "hls",
+   "keys": [],
+   "kind": "web",
+   "media": [
+    {
+     "autoselect": "YES",
+     "channels": "2",
+     "default": "YES",
+     "group": "audio_0",
+     "init": "clear",
+     "language": "eng",
+     "name": "eng",
+     "type": "AUDIO"
+    },
+    {
+     "autoselect": "YES",
+     "default": "YES",
+     "group": "subtitles",
+     "language": "eng",
+     "name": "eng_subtitle",
+     "type": "SUBTITLES"
+    },
+    {
+     "autoselect": "NO",
+     "default": "NO",
+     "group": "subtitles",
+     "language": "spa",
+     "name": "spa_subtitle",
+     "type": "SUBTITLES"
+    }
+   ],
+   "streamType": "SDR_HD_CMAF",
+   "variants": [
+    {
+     "audio": "audio_0",
+     "bandwidth": 7495250,
+     "codecs": "avc1.4D402A,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "resolution": "1920x1080",
+     "subtitles": "subtitles"
+    },
+    {
+     "audio": "audio_0",
+     "bandwidth": 818202,
+     "codecs": "avc1.4D401E,mp4a.40.2",
+     "frameRate": "50.000",
+     "init": "clear",
+     "resolution": "480x270",
+     "subtitles": "subtitles"
+    }
+   ],
+   "year": "2026"
+  },
+  "presser-2026/web-dash-main": {
+   "channel": null,
+   "contentSubtype": "PRESS CONFERENCE",
+   "feed": "main",
+   "format": "dash",
+   "kind": "web",
+   "sets": [
+    {
+     "codecs": [
+      "avc1.4d401e",
+      "avc1.4d402a"
+     ],
+     "contentType": "video/mp4",
+     "representations": 2
+    },
+    {
+     "channels": [
+      "2"
+     ],
+     "codecs": [
+      "mp4a.40.2"
+     ],
+     "contentType": "audio/mp4",
+     "lang": "eng",
+     "representations": 1
+    }
+   ],
+   "streamType": "DASH",
+   "type": "static",
+   "year": "2026"
+  }
+ }
+}

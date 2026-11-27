@@ -318,8 +318,9 @@ async function boot(options = {}) {
     engineFor: (s) => (s && s.capsPath && context.Ways.engine(s.capsPath)) || (options.capsRouting ? (s.cenc && !s.cencAvplay ? 'shaka' : 'avplay') : player.kind),
     load(s, start) {
       player.current = s;
-      // As player.js: encrypted HDR reports the 5.1 commentaries it added (player.surround), unless asked for none.
-      if (s.hdrEncrypted) s.surround = s.noSurround ? 0 : (player.surround || 0);
+      // As player.js: encrypted HDR and 4K HDR multiviews report the 5.1 commentaries they added (player.surround),
+      // unless asked for none.
+      if (s.hdrEncrypted || (s.grid && s.hdr)) s.surround = s.noSurround ? 0 : (player.surround || 0);
       player.engine = player.engineFor(s);
       player.pos = start || 0;
       player.paused = false;
@@ -341,6 +342,7 @@ async function boot(options = {}) {
       if (player.engineFor(s) === 'avplay') return player.load(s, start);
       // Shaka: the old feed (its position and pause) stays current until the new one runs.
       const prev = player.current;
+      if (s.grid && s.hdr) s.surround = s.noSurround ? 0 : (player.surround || 0);   // (as load: a multiview's 5.1)
       player.current = s;
       player.loads.push({ url: s.url, start });
       return (player.hold ? player.hold.promise : Promise.resolve()).then(() => {
@@ -5419,3 +5421,74 @@ test('a sound change in a clear 4K HDR multiview asks the new sound feed\'s full
   assert.ok(!g.streams[g.slots.indexOf(g.audio)].fromTm, 'its own offer leads');
 });
 
+
+test('a clear 4K HDR multiview whose start with 5.1 fails tries the same multiview in stereo (and AVPlay learns it)', async () => {
+  const app = await premiumHdr({ play: clearHdrOffer });
+  app.player.kind = 'avplay';
+  app.player.surround = 2;
+  await play(app, 'Race');
+  await app.advance(1000);
+  app.player.hold = deferred();
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(3000);
+  const first = app.player.current;
+  assert.ok(first.grid && !first.hdrEncrypted && first.surround === 2, 'started with the 5.1: ' + JSON.stringify({ grid: !!first.grid, hdr: first.hdr, enc: first.hdrEncrypted, surround: first.surround, no: first.noSurround, path: first.capsPath }));
+  app.player.hold.reject(new Error('Could not open stream: PLAYER_ERROR_INVALID_PARAMETER'));
+  app.player.hold = null;
+  await app.advance(3000);
+  const again = app.player.current;
+  assert.ok(again.grid && again !== first, 'the multiview again');
+  assert.ok(again.noSurround && again.surround === 0, 'in stereo');
+  assert.equal(app.context.Caps.report().paths['avplay:ac3'].failed, 1);
+});
+
+/** Caps with AVPlay's grid ruled out (two failures in a row): clear multiviews play on Shaka. */
+const shakaGrids = (extra = {}) => JSON.stringify({ version: 1, firmware: 'unknown', browser: { cenc: true, cbcs: false }, appVersion: '1.0.0',
+  paths: Object.assign({ 'avplay:grid': { ok: 0, failed: 2, crashed: 0, last: NOW, streak: 2, badAt: NOW } }, extra) });
+
+test('a clear 4K HDR multiview on Shaka keeps its 5.1 though AVPlay learned not to play AC-3; a 5.1 failure there tries stereo, learning nothing', async () => {
+  const avplay51 = { 'avplay:ac3': { ok: 0, failed: 2, crashed: 0, last: NOW, streak: 2, badAt: NOW } };
+  const app = await premiumHdr({ play: clearHdrOffer, store: { 'f1tv.caps': shakaGrids(avplay51) } });
+  app.player.surround = 2;
+  await play(app, 'Race');
+  await app.advance(1000);
+  app.player.hold = deferred();
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(3000);
+  const first = app.player.current;
+  assert.ok(first.grid && first.grid.player === 'shaka' && first.capsPath === 'shaka:grid', JSON.stringify(first.grid && first.grid.player));
+  assert.ok(!first.noSurround && first.surround === 2, 'Shaka plays the 5.1: AVPlay\'s record says nothing about it');
+  const before = JSON.stringify(app.context.Caps.report().paths['avplay:ac3']);
+  app.player.hold.reject(new Error('Shaka: media decode'));
+  app.player.hold = null;
+  await app.advance(3000);
+  const again = app.player.current;
+  assert.ok(again.grid && again !== first && again.capsPath === 'shaka:grid', 'the same multiview on Shaka');
+  assert.ok(again.noSurround && again.surround === 0, 'in stereo');
+  assert.equal(JSON.stringify(app.context.Caps.report().paths['avplay:ac3']), before, 'AVPlay\'s 5.1 record untouched');
+  assert.ok(!(app.context.Caps.report().paths['shaka:grid'] || {}).failed, 'the grid not blamed for the 5.1');
+});
+
+test('a clear 4K HDR multiview playing 5.1 on Shaka doesn\'t count as AVPlay\'s 5.1 working', async () => {
+  const avplay51 = { 'avplay:ac3': { ok: 0, failed: 1, crashed: 0, last: NOW, streak: 1, badAt: NOW } };
+  const app = await premiumHdr({ play: clearHdrOffer, store: { 'f1tv.caps': shakaGrids(avplay51) } });
+  app.player.surround = 2;
+  app.player.channels = 6;
+  await play(app, 'Race');
+  await app.advance(1000);
+  await app.press('UP');
+  await app.pick(/^Multiview/, ['UP']);
+  await app.pick(/^Big \+ 2$/, ['RIGHT']);
+  await app.pick(/^Show multiview/, ['DOWN']);
+  await app.advance(3000);
+  assert.equal(app.player.current.capsPath, 'shaka:grid');
+  app.player.progress = true;
+  await app.advance(3000);
+  assert.equal(app.context.Caps.report().paths['avplay:ac3'].streak, 1, 'still one failure on AVPlay');
+});
