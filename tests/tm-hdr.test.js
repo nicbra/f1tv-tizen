@@ -37,7 +37,7 @@ function harness(opts = {}) {
   const routes = {};
   ['1025', '1033', '1003', '1009'].forEach((ch) => {
     routes[base(ch) + 'master.m3u8'] = masterOf(ch, ch !== '1003');
-    routes[base(ch) + 'v5/index.m3u8'] = playlistOf(ch, (opts.lengths || {})[ch] || 6, opts.keyUrl);
+    routes[base(ch) + 'v5/index.m3u8'] = opts.playlist ? opts.playlist(ch) : playlistOf(ch, (opts.lengths || {})[ch] || 6, opts.keyUrl);
   });
   const ctx = vm.createContext({ CmafDash, URL, Uint8Array, AbortController, setTimeout, clearTimeout, Date, navigator: { userAgent: 'TV' },
     btoa: (s) => Buffer.from(s, 'binary').toString('base64'), atob: (s) => Buffer.from(s, 'base64').toString('binary'),
@@ -98,4 +98,27 @@ test('tmGrid: a clock moment picks its segment; a key elsewhere, or replay feeds
   h = harness({ lengths: { 1009: 5 } });
   await assert.rejects(h.HdrStream.tmGrid(masters(['1025', '1033', '1003', '1009']), 'grid2x2hd', { id: 't4', keyHeaders: HEADERS }), /differ in length/);
   assert.equal(h.posts.length, 0);
+});
+
+/** FP2 Qatar 2026, live: one segment from before a 10 min pause, a discontinuity, the clock again, then the broadcast. */
+function liveAfterPause(clockAgain = true) {
+  const lines = ['#EXTM3U', '#EXT-X-VERSION:5', '#EXT-X-PLAYLIST-TYPE:EVENT', '#EXT-X-TARGETDURATION:6', '#EXT-X-MEDIA-SEQUENCE:100',
+    '#EXT-X-DISCONTINUITY-SEQUENCE:4', '#EXT-X-KEY:METHOD=AES-128,URI="' + KEY_URL + '",IV=' + IV + ',KEYFORMAT="identity"',
+    '#EXT-X-PROGRAM-DATE-TIME:2026-11-27T16:30:37.440Z', '#EXTINF:5.76,', 'segment__HDR-HD_HEVC_5_100.ts', '#EXT-X-DISCONTINUITY'];
+  if (clockAgain) lines.push('#EXT-X-PROGRAM-DATE-TIME:2026-11-27T16:40:42.240Z');
+  for (let k = 1; k <= 10; k++) lines.push('#EXTINF:5.76,', 'segment__HDR-HD_HEVC_5_' + (100 + k) + '.ts');
+  return lines.join('\n');
+}
+
+test('tmGrid live: feeds whose playlists break before a pause (FP2 Qatar 2026) play from after the break, by its clock', async () => {
+  let h = harness({ playlist: () => liveAfterPause() });
+  await h.HdrStream.tmGrid(masters(['1025', '1033', '1003', '1009']), 'grid2x2hd', { id: 't5', sound: [], keyHeaders: HEADERS });
+  assert.equal(h.posts[0].probe, 107, 'live: three segments before the newest');
+  h = harness({ playlist: () => liveAfterPause() });
+  await h.HdrStream.tmGrid(masters(['1025', '1033', '1003', '1009']), 'grid2x2hd',
+    { id: 't6', sound: [], wall: Date.parse('2026-11-27T16:40:45Z') / 1000, keyHeaders: HEADERS });
+  assert.equal(h.posts[0].probe, 101, 'by the clock after the break');
+  // Without the clock after the break: refused, as before (the usual multiview plays).
+  h = harness({ playlist: () => liveAfterPause(false) });
+  await assert.rejects(h.HdrStream.tmGrid(masters(['1025', '1033', '1003', '1009']), 'grid2x2hd', { id: 't7', keyHeaders: HEADERS }), /unsupported player_tm playlist/);
 });

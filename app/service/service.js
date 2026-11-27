@@ -664,6 +664,39 @@ function tmPlaylist(res, s) {
  * discontinuity (new timestamps, parameter sets) or byte ranges. The player then fails, and the app falls back.
  */
 function tmRewrite(text, iv) {
+  if (!/^#EXTM3U/.test(text) || /^#EXT-X-ENDLIST\s*$/m.test(text)) return tmRewriteWhole(text, iv);
+  return tmRewriteWhole(liveFromLastBreak(text), iv);
+}
+
+/**
+ * A live playlist from the segment after its last discontinuity on (FP2 Qatar 2026: every feed's playlist kept one
+ * segment from before a 10 min pause, then a discontinuity, for the whole session), when F1 states the clock again
+ * there (PROGRAM-DATE-TIME). Its numbers go on (media sequence, discontinuity sequence) and it is no longer an EVENT
+ * playlist (its start moved). Otherwise the text as it was (and the discontinuity is refused, as before).
+ */
+function liveFromLastBreak(text) {
+  var lines = text.split(/\r?\n/), last = -1, i;
+  for (i = 0; i < lines.length; i++) if (/^#EXT-X-DISCONTINUITY\s*$/.test(lines[i])) last = i;
+  if (last < 0) return text;
+  var after = lines.slice(last + 1), pdt = false;
+  for (i = 0; i < after.length && !(after[i] && after[i].charAt(0) !== '#'); i++) if (/^#EXT-X-PROGRAM-DATE-TIME:/.test(after[i])) pdt = true;
+  if (!pdt) return text;
+  var head = [], skipped = 0, breaks = 0, seq = 0, dseq = 0, inHead = true;
+  for (i = 0; i < last; i++) {
+    var line = lines[i], m;
+    if ((m = /^#EXT-X-MEDIA-SEQUENCE:(\d+)/.exec(line))) { seq = +m[1]; continue; }
+    if ((m = /^#EXT-X-DISCONTINUITY-SEQUENCE:(\d+)/.exec(line))) { dseq = +m[1]; continue; }
+    if (/^#EXT-X-PLAYLIST-TYPE:/.test(line)) continue;
+    if (/^#EXT-X-DISCONTINUITY\s*$/.test(line)) { breaks++; continue; }
+    if (/^#EXT(?:INF|-X-PROGRAM-DATE-TIME|-X-BYTERANGE|-X-GAP)\b/.test(line)) inHead = false;
+    if (line && line.charAt(0) !== '#') { skipped++; inHead = false; continue; }
+    // Header tags and the key stay; a segment's own tags before the cut go with it.
+    if (inHead || /^#EXT-X-KEY:/.test(line)) head.push(line);
+  }
+  return head.concat(['#EXT-X-MEDIA-SEQUENCE:' + (seq + skipped), '#EXT-X-DISCONTINUITY-SEQUENCE:' + (dseq + breaks + 1)], after).join('\n');
+}
+
+function tmRewriteWhole(text, iv) {
   var lines = text.split(/\r?\n/);
   if (!/^#EXTM3U/.test(lines[0] || '')) return null;
   if (/^#EXT-X-(?:DISCONTINUITY\s*$|BYTERANGE:|MAP:)/m.test(text)) return { why: 'a discontinuity or byte range' };

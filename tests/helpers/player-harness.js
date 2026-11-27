@@ -87,6 +87,7 @@ async function player(av, storage, shakaLoad, globals, manifest) {
     getManifest() { return { variants: [] }; }
     getVariantTracks() { return context.variants || []; }
     getStats() { return { estimatedBandwidth: context.bandwidth || NaN }; }
+    seekRange() { return context.seekRange || { start: 0, end: 0 }; }
     selectTextLanguage(l) { languages.push(['text', l]); }
     setTextTrackVisibility(on) { languages.push(['subtitles', on]); }
     addEventListener(type, fn) { (this.listeners = this.listeners || {})[type] = fn; }

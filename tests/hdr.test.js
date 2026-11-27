@@ -166,13 +166,20 @@ test('encrypted HDR hands the official subtitle segments to the app instead of A
 const livePlaylist=n=>`#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-MAP:URI="init.mp4"\n#EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.apple.streamingkeydelivery",URI="skd://${hdrKid}"\n`+
  [0,1,2,3,4].map(i=>`#EXTINF:5.76,\nseg_${n+i}.m4s?sig=keep&n=2`).join('\n')+'\n';
 const liveMpd=(start=311353500)=>`<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" availabilityStartTime="2024-01-01T00:00:00Z"><Period id="p" start="PT10H"><AdaptationSet contentType="video">${cp}<SegmentTemplate timescale="50000" presentationTimeOffset="89669000000000" startNumber="${start}" media="v_$Number$.mp4" initialization="i.mp4"><SegmentTimeline><S t="89669808288000" d="288000" r="100"/></SegmentTimeline></SegmentTemplate><Representation id="v" codecs="avc1.4d4029"/></AdaptationSet><AdaptationSet contentType="audio" lang="eng">${cp}<SegmentTemplate timescale="48000" media="a_$Number$.mp4" startNumber="${start}"><SegmentTimeline><S t="1" d="276480" r="100"/></SegmentTimeline></SegmentTemplate><Representation id="a"/></AdaptationSet><AdaptationSet contentType="application" codecs="stpp" lang="eng"><SegmentTemplate timescale="50000" presentationTimeOffset="89669000000000" media="t_$Number$.mp4" startNumber="${start}"><SegmentTimeline><S t="89669808288000" d="288000" r="100"/></SegmentTimeline></SegmentTemplate><Representation id="_SUBS_1" bandwidth="256"/></AdaptationSet></Period></MPD>`;
-function liveHarness(mpdText=liveMpd()){
+function liveHarness(mpdText=liveMpd(),playlistText){
  const ctx=vm.createContext({CmafDash,URL,Uint8Array,AbortController,setTimeout,clearTimeout,btoa:s=>Buffer.from(s,'binary').toString('base64'),atob:s=>Buffer.from(s,'base64').toString('binary'),fetch:async (url)=>{
-  const body=url.endsWith('master.m3u8')?master:url.endsWith('.mpd')?mpdText:url.includes('.m3u8')?livePlaylist(311353547):url.includes('init.mp4')?init:frag;
+  const body=url.endsWith('master.m3u8')?master:url.endsWith('.mpd')?mpdText:url.includes('.m3u8')?(playlistText||livePlaylist(311353547)):url.includes('init.mp4')?init:frag;
   return {ok:true,url,text:async()=>body,arrayBuffer:async()=>Uint8Array.from(body).buffer};}});
  vm.runInContext(fs.readFileSync('app/js/hdr.js','utf8'),ctx);
  return ()=>ctx.HdrStream.live({url:'https://video.formula1.com/live/master.m3u8',widevineManifestUrl:'https://video.formula1.com/livesdr/index.mpd'});
 }
+// FP2 Qatar 2026: a segment from before a 10 min pause, a discontinuity, the clock again, then the broadcast.
+const afterPause=(clock=true)=>livePlaylist(311353547).replace('#EXTINF:5.76,\nseg_311353547','#EXT-X-PROGRAM-DATE-TIME:2026-11-27T16:30:37.440Z\n#EXTINF:5.76,\nold_1.m4s\n#EXT-X-DISCONTINUITY\n'+(clock?'#EXT-X-PROGRAM-DATE-TIME:2026-11-27T16:40:42.240Z\n':'')+'#EXTINF:5.76,\nseg_311353547');
+test('live HDR plays a playlist that broke before a pause (FP2 Qatar 2026) from after the break; refused without its clock',async()=>{
+ const {adaptation}=await liveHarness(liveMpd(),afterPause())();
+ assert.equal((adaptation.match(/<Representation /g)||[]).length,2);
+ await assert.rejects(liveHarness(liveMpd(),afterPause(false))(),/unsupported live playlist/);
+});
 test('live HDR: the HLG ladder on the official live timeline, with the HDR key and open-ended subtitles',async()=>{
  const {adaptation,subtitles}=await liveHarness()();
  assert.equal((adaptation.match(/<Representation /g)||[]).length,2);
@@ -234,6 +241,46 @@ test('live HDR 5.1 is optional: another clock, another key, none asked or none o
  }
  const differs=await live51(liveAudioMpd(86086398965760-276480));
  assert.ok(differs.notes.some(([k,d])=>k==='hdr.surround_skipped'&&/timeline differs/.test(d.why)));
+});
+
+// Live multiview: the same 5.1 as a single live feed, from the sound feed's master, beside the helper's grid.
+function liveGrid51({mpdText=liveAudioMpd(),soundMaster=liveMaster51,otherMaster=master,a51=livePlaylist(311353547).replace('init.mp4','a51init.mp4').replaceAll('seg_','a51_')}={},langs,audio=0){
+ const notes=[],posts=[];
+ const ctx=vm.createContext({CmafDash,URL,Uint8Array,AbortController,setTimeout,clearTimeout,Date,navigator:{userAgent:'test'},Diag:{note:(k,d)=>notes.push([k,d])},
+  MultiviewLayouts:{layouts:{duo:{feeds:[2160,1080]}}},btoa:s=>Buffer.from(s,'binary').toString('base64'),atob:s=>Buffer.from(s,'base64').toString('binary'),fetch:async (url,opts={})=>{
+  if(/\/stitch\//.test(url)){posts.push(JSON.parse(opts.body));return {ok:true,status:201,url,text:async()=>JSON.stringify({width:3840,height:3264,codecs:'hev1.2.4.L153.B0'})};}
+  const body=url.endsWith('sound/master.m3u8')?soundMaster:url.endsWith('master.m3u8')?otherMaster:url.endsWith('.mpd')?mpdText:url.includes('eng51.m3u8')?a51:url.includes('.m3u8')?livePlaylist(311353547):url.includes('a51init.mp4')?init51:url.includes('a51_')?frag51:url.includes('init.mp4')?init:frag;
+  return {ok:true,url,text:async()=>body,arrayBuffer:async()=>Uint8Array.from(body).buffer};}});
+ vm.runInContext(fs.readFileSync('app/js/hdr.js','utf8'),ctx);
+ const sound={url:'https://video.formula1.com/live/sound/master.m3u8',widevineManifestUrl:'https://video.formula1.com/livesdr/index.mpd'};
+ const other={url:'https://video.formula1.com/live/obc/master.m3u8',widevineManifestUrl:'https://video.formula1.com/livesdr2/index.mpd'};
+ const streams=audio?[other,sound]:[sound,other];
+ return ctx.HdrStream.liveGrid(streams,'duo',{id:'mv1',langs:langs||{audio:'eng',text:''},audio}).then(r=>Object.assign(r,{notes,posts}));
+}
+test('live multiview 5.1: the sound feed\'s AC-3 after the grid, on the official audio clock and the grid\'s key',async()=>{
+ for(const audio of [0,1]){
+  const r=await liveGrid51({},undefined,audio);
+  assert.equal(r.surround,1,'sound feed at place '+audio);
+  const [video,sound]=r.adaptation.split('<!--audio-->');
+  assert.ok(video.includes('id="grid"')&&!video.includes('ac-3'));
+  assert.ok(sound.includes('codecs="ac-3"')&&sound.includes(`cenc:default_KID="${hdrKid}"`)&&sound.includes('lang="eng"'));
+  assert.ok(sound.includes('timescale="48000" presentationTimeOffset="0" startNumber="311353500"'));
+  assert.ok(sound.includes('/a51_$Number$.m4s'),'through the helper\'s audio route');
+  assert.equal(r.posts.length,1);
+ }
+});
+test('live multiview 5.1 with an official manifest read before the newest 5.1 segment (FP1 Qatar 2026): still 5.1',async()=>{
+ // The official audio timeline ends at 311353549; the AC-3 playlist (read later) already lists 311353550 and 551.
+ const r=await liveGrid51({mpdText:liveAudioMpd().replace('d="276480" r="100"','d="276480" r="49"')});
+ assert.equal(r.surround,1);
+ assert.ok(!r.notes.some(([k])=>k==='hdr.surround_skipped'));
+});
+test('live multiview 5.1 is optional: none asked, none in the sound feed, another clock or key leave the grid in stereo',async()=>{
+ const cases=[await liveGrid51({},{audio:'eng',text:'',surround:false}),await liveGrid51({soundMaster:master,otherMaster:liveMaster51}),
+  await liveGrid51({mpdText:liveAudioMpd(86086398965760-276480)}),
+  await liveGrid51({a51:livePlaylist(311353547).replace('init.mp4','a51init.mp4').replaceAll('seg_','a51_').replace(hdrKid,kid)})];
+ for(const r of cases){assert.equal(r.surround,0);assert.ok(!r.adaptation.includes('<!--audio-->')&&r.adaptation.includes('id="grid"'));}
+ assert.ok(cases[2].notes.some(([k,d])=>k==='hdr.surround_skipped'&&/timeline differs/.test(d.why)));
 });
 
 // Clear HDR (weeks-old races, F1's shows): no keys anywhere, the 5.1 group beside the stereo one.

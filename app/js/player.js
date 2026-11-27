@@ -548,6 +548,7 @@ var Player = (function () {
       slot.v.muted = false;
       slot.v.classList.remove('hidden');
       userPaused = false;
+      slot.moved = false;   // a seek or pause since this load (seekTo, pause): a frozen reload keeps that moment
       return slot.p.load(srcOf(stream), startTime == null ? null : startTime, mimeOf(stream)).then(function () {
         applyPrefs(slot.p, stream);
         relayCues(slot);
@@ -597,9 +598,12 @@ var Player = (function () {
       function reload() {
         done = true;
         reloadedAt = Date.now();
-        // From where it is now, which includes a seek made meanwhile.
-        var at = slot.v.currentTime > 0 ? slot.v.currentTime : startTime;
-        diag('player.frozen-reload', { hdr: !!stream.hdr, cenc: !!stream.cenc, readyState: slot.v.readyState, at: at });
+        // From where it is now, which includes a seek made meanwhile. A live start at the live point (no moment asked,
+        // not moved since) goes to the live point again: the frozen position is 7-15 s old by now (FP1 Qatar 2026: the
+        // reload at the old position played 17 s from the edge, ~10 s later than a start at LIVE, for the whole session).
+        var atLive = startTime == null && !slot.moved && !!(stream.info && stream.info.dynamic);
+        var at = atLive ? null : slot.v.currentTime > 0 ? slot.v.currentTime : startTime;
+        diag('player.frozen-reload', { hdr: !!stream.hdr, cenc: !!stream.cenc, readyState: slot.v.readyState, at: at, atLive: atLive });
         slot.p.load(srcOf(stream), at == null ? null : at, mimeOf(stream)).then(function () {
           if (gen !== generation) return;
           // A new load starts on the stream's default tracks (French subtitles on F1's replays).
@@ -1137,12 +1141,12 @@ var Player = (function () {
       decodedFrames: decodedFrames,
       reloadedAt: function () { return reloadedAt; },
       bufferedEnd: function () { var b = V().buffered; return b.length ? b.end(b.length - 1) : 0; },
-      seekTo: function (t, done) { V().currentTime = t; if (done) done(); },
+      seekTo: function (t, done) { slots[cur].moved = true; V().currentTime = t; if (done) done(); },
       // The viewer's pause counts even while showFrame plays a switched-to feed until it has a picture.
       paused: function () { return userPaused || V().paused; },
       viewerPaused: function () { return userPaused; },
       play: function () { userPaused = false; V().play(); },
-      pause: function () { userPaused = true; V().pause(); },
+      pause: function () { userPaused = true; slots[cur].moved = true; V().pause(); },
       snapshot: snapshot
     };
 
@@ -1202,6 +1206,9 @@ var Player = (function () {
      * progress, the clock, the answer to the seek before preparing) for PREPARE_SILENT_MS after it spoke at all is given
      * up as hung too, without waiting for the full time; one that never said anything waits for the full time (a
      * second hang closes AVPlay until restart: the early end is only for the silence seen in real hangs).
+     * Not for a live multiview: AVPlay waits without a word while the helper stitches the first live segments of every
+     * feed (FP1 Qatar 2026: 1.1 s of events, then 8.9 s silent, READY after ~14 s), so it gets the full single-feed time.
+     * A preparation given up that answers later leaves AVPlay prepared: the next open closes it first (closeLeftover).
      */
     var PREPARE_MS = { grid: 20000, other: 30000 }, PREPARE_SILENT_MS = 8000;
     var openGen = 0, stuck = null;
@@ -1320,7 +1327,7 @@ var Player = (function () {
       }
       var dynamic = s.info && s.info.dynamic, text = lang3(Settings.get('subtitles'));
       if (s.grid && s.grid.engine !== 'h264') {
-        return openPrepared(dynamic ? StreamProxy.gridLive(s, s.startDelay, { audio: audioPref(s), text: text }) :
+        return openPrepared(dynamic ? StreamProxy.gridLive(s, s.startDelay, { audio: audioPref(s), text: text, surround: !s.noSurround }) :
           StreamProxy.gridManifest(s.grid.streams, s.grid.layout, { audio: audioPref(s), text: text, surround: !s.noSurround },
             startTime, s.grid.audioPos || 0));
       }
@@ -1344,6 +1351,21 @@ var Player = (function () {
 
     var recentLines = {};   // subtitle text -> when AVPlay last sent it
 
+    /**
+     * A preparation given up as hung that answered after all leaves AVPlay prepared (READY), and opening over that is
+     * refused (PLAYER_ERROR_INVALID_STATE, FP1 Qatar 2026: counted against the way). Closed first when it has answered;
+     * one still preparing (`stuck`) is left alone, as unload() does.
+     */
+    function closeLeftover() {
+      if (stuck) return;
+      var state = null;
+      try { state = av.getState(); } catch (e) { return; }
+      if (state !== 'READY' && state !== 'PLAYING' && state !== 'PAUSED') return;
+      diagTrail('avplay.leftover', { state: state });
+      try { av.stop(); } catch (e) { /* not started */ }
+      try { av.close(); } catch (e) { /* already closed */ }
+    }
+
     function open(s, url) {
       clearTimeout(stallTimer);
       isPaused = false;
@@ -1355,6 +1377,7 @@ var Player = (function () {
       document.body.classList.add('avplay');
       var g = ++openGen;
       return new Promise(function (resolve, reject) {
+        closeLeftover();
         try { av.open(url); } catch (e) {
           // Over a stuck preparation, AVPlay may refuse to open again: only restarting the app helps then.
           if (!stuck) throw e;
@@ -1430,8 +1453,9 @@ var Player = (function () {
           e.code = 'PREPARE_TIMEOUT';
           reject(e);
         }
-        var timer = setTimeout(function () { hung(false); }, s.grid ? PREPARE_MS.grid : PREPARE_MS.other);
-        var quiet = setInterval(function () { if (spoke && Date.now() - heardAt >= PREPARE_SILENT_MS) hung(true); }, 1000);
+        var liveGrid = !!s.grid && !!(s.info ? s.info.dynamic : s.live);
+        var timer = setTimeout(function () { hung(false); }, s.grid && !liveGrid ? PREPARE_MS.grid : PREPARE_MS.other);
+        var quiet = setInterval(function () { if (!liveGrid && spoke && Date.now() - heardAt >= PREPARE_SILENT_MS) hung(true); }, 1000);
         function prepare() {
           if (finished) return answered();   // the seek answered after this open gave up: don't prepare now
           if (stream !== s) { answered(); finish(); return reject(new Error('cancelled')); }

@@ -139,7 +139,7 @@ var StreamProxy = (function () {
 
   /**
    * Live multiview (experiment): the official live manifest through the helper, as for live HDR, with the
-   * helper's grid as its video (HdrStream.liveGrid). Resolves { url, subtitles }.
+   * helper's grid as its video (HdrStream.liveGrid) and the sound feed's 5.1 where it fits. Resolves { url, subtitles, id, surround }.
    */
   function gridLive(stream, shift, langs) {
     var id = 'mv' + Date.now().toString(36) + '-' + (++vodSequence);
@@ -151,7 +151,11 @@ var StreamProxy = (function () {
         var url = manifest(stream.grid.streams[lead].widevineManifestUrl, shift, { audio: langs && langs.audio }) + '&hdr=' + id + '&notext=1';
         return fetch(url, { cache: 'no-store' }).then(function (check) {
           if (!check.ok) throw new Error('Multiview live manifest answered ' + check.status);
-          return { url: url, subtitles: built.subtitles, id: id };
+          return check.text().then(function (mpd) {
+            var served = (mpd.match(/<AdaptationSet\b[^>]*contentType="audio"[\s\S]*?<\/AdaptationSet>/g) || [])
+              .filter(function (set) { return /codecs="(?:ac-3|ec-3)"/.test(set); }).length;
+            return { url: url, subtitles: built.subtitles, id: id, surround: Math.min(built.surround || 0, served) };
+          });
         });
       });
     });

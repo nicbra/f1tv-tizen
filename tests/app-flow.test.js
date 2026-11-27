@@ -359,7 +359,7 @@ async function boot(options = {}) {
     position: () => (player.engine ? player.pos : 0),
     decodedFrames: () => (player.engine ? player.frames : null),
     // player.live: a live stream with an hour of DVR window up to its live edge (window positions 1000-4600).
-    range: () => (!player.engine ? { start: 0, end: 0 } : player.live ? { start: 1000, end: 4600 } : { start: 0, end: 7200 }),
+    range: () => (!player.engine ? { start: 0, end: 0 } : player.live ? { start: 1000, end: player.liveAhead != null ? player.pos + player.liveAhead : 4600 } : { start: 0, end: 7200 }),
     // player.buffered: seconds buffered ahead (10 by default; 0: no data arrived).
     bufferedEnd: () => player.pos + (player.buffered == null ? 10 : player.buffered),
     // player.reloadedMs: when the engine loaded a frozen start again (player.js reloadIfFrozen).
@@ -3640,6 +3640,73 @@ test('the LIVE button goes back to live from behind it', async () => {
   await app.advance(300);
   assert.equal(app.player.loads.length, 2);
   assert.equal(app.player.loads.at(-1).start, null);   // at live
+});
+
+test('a live stream whose own live point lies further back (player_tm multiview, ~17 s) counts as LIVE there', async () => {
+  const app = await boot();
+  await playLive(app);
+  // Started at its own live point, it plays ~17 s from its range's end (FP1 Qatar 2026; the fake range stands still).
+  app.player.pos = 4573;
+  app.player.frames = 0;
+  app.player.progress = true;
+  await app.advance(10000);   // learned 8 s after it played, from playback that ran all along
+  app.player.progress = false;
+  app.player.pos = 4583;
+  await app.advance(600);
+  assert.equal(app.$('osd-live').textContent, 'LIVE');
+  await app.press('UP');
+  assert.ok(!/^Go to live/.test(app.$('panel-list').children[0].textContent), 'no Go to live at its live point');
+  await app.press('BACK');
+  // Really behind it still offers the way back.
+  app.player.pos = 3000;
+  await app.advance(600);
+  assert.equal(app.$('osd-live').textContent, 'GO LIVE ▶▶');
+});
+
+test('a live start paused (or stalled) before its live point is learned teaches nothing: far behind stays behind', async () => {
+  const app = await boot();
+  await playLive(app);
+  app.player.pos = 4583;
+  app.player.frames = 0;
+  app.player.progress = true;
+  await app.advance(1000);
+  app.player.progress = false;   // stalled (or held by the app while hidden) for two minutes
+  await app.advance(120000);
+  app.player.pos = 4583 - 120;
+  await app.advance(600);
+  assert.equal(app.$('osd-live').textContent, 'GO LIVE ▶▶');
+});
+
+test('a live start playing two minutes behind its range\'s end is not taken for its live point', async () => {
+  const app = await boot();
+  await playLive(app);
+  app.player.pos = 4470;          // ~2 min behind, playing all along
+  app.player.frames = 0;
+  app.player.progress = true;
+  await app.advance(10000);
+  app.player.progress = false;
+  await app.advance(600);
+  assert.equal(app.$('osd-live').textContent, 'GO LIVE ▶▶');
+});
+
+test('a switch made at LIVE into a stream whose live point lies further back counts as LIVE there too', async () => {
+  const app = await boot();
+  await playLive(app);
+  app.player.pos = 4596;                       // at LIVE on the first feed
+  await app.advance(600);
+  assert.equal(app.$('osd-live').textContent, 'LIVE');
+  await app.press('UP');
+  await app.moveTo(/^F1 LIVE/, ['DOWN']);
+  await app.press('ENTER');                    // a switch at LIVE
+  await app.advance(500);
+  // The new feed plays 18 s from its range's end, which moves on with it (a player_tm multiview after a switch: 21-27 s).
+  app.player.liveAhead = 18;
+  app.player.frames = 0;
+  app.player.progress = true;
+  await app.advance(10000);
+  app.player.progress = false;
+  await app.advance(600);
+  assert.equal(app.$('osd-live').textContent, 'LIVE');
 });
 
 test('watch options offer Go to live while behind it', async () => {

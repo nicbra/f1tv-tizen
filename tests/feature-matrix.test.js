@@ -149,6 +149,8 @@ const NO_SURROUND_AT_F1 = {
 const ELSEWHERE = {
   'live 4K HDR single feed (hdr.js live)': ['no live capture in the fixture (live DASH and its segment timeline): hdr.test.js',
     ['live HDR 5.1: AC-3 sets after the video, on the audio clock, the HDR key and through the helper', 'live HDR 5.1 is optional']],
+  'live HEVC multiview (hdr.js liveGrid)': ['no live capture in the fixture: hdr.test.js',
+    ['AC-3 after the grid, on the official audio clock', 'live multiview 5.1 is optional']],
   'live player_tm single feed and player_tm multiview live': ['F1\'s live player_tm playlists (no ENDLIST): tm-grid.test.js', []],
   'H.264 multiview\'s small feeds (mvsoft, our decoder)': ['no sound of their own: the big feed plays its master on AVPlay', []],
   'SDR HEVC multiview (web offers: HDR off, Pro, a TV without HDR)': ['the library\'s web SDR copies kept only their H.264 variants (no HEVC structure to ' +
@@ -156,10 +158,7 @@ const ELSEWHERE = {
 };
 
 // Known gaps: kinds that don't carry 5.1 the source has, with why and what would close them. Keep this list short.
-const KNOWN_GAPS = {
-  'live HEVC multiview (hdr.js liveGrid)': 'only the HLG video is swapped into the official live DASH: its stereo commentary stays, the live 5.1 ' +
-    '(liveSurround, used by single-feed live HDR) is not added yet. Needs a live check (fake live from the stream library).'
-};
+const KNOWN_GAPS = {};
 
 // What F1 sends, written down apart from the fixture (checked on F1's offers, Nov 2026): 5.1 is AC-3, 6 channels, in
 // F1's UHD packages only, on the F1 LIVE feed of sessions (English and Spanish) and on F1's own shows (English); the main
@@ -263,8 +262,4 @@ test('matrix: kinds covered elsewhere say where, and those tests exist', () => {
 
 test('matrix: known gaps are named, with why', () => {
   for (const [kind, why] of Object.entries(KNOWN_GAPS)) assert.ok(why.length > 40, kind);
-  // The live multiview's gap is real: liveGrid doesn't add the 5.1 yet. When it does, move it to ROWS.
-  const src = fs.readFileSync(path.join(root, 'app/js/hdr.js'), 'utf8');
-  const liveGrid = src.slice(src.indexOf('function liveGrid'), src.indexOf('function tmGrid'));
-  assert.ok(liveGrid.length > 100 && !/liveSurround\(/.test(liveGrid), 'liveGrid adds 5.1 now: make it a ROWS row and drop the gap');
 });

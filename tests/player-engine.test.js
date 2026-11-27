@@ -444,6 +444,63 @@ test('a preparation AVPlay has gone silent on is given up after 8 s; one still r
   }
 });
 
+test('a live multiview AVPlay prepares in silence (the helper stitching) is not given up for it; a replay grid is', async () => {
+  for (const live of [true, false]) {
+    const av = fakeAvPlay();
+    av.prepareAsync = () => { av.calls.push(['prepareAsync']); };
+    let now = 1e12;
+    const ticks = [], timers = [];
+    class FakeDate extends Date { static now() { return now; } }
+    const P = await player(av, undefined, undefined, { Date: FakeDate, setTimeout: (fn, ms) => { timers.push({ fn, ms }); return 0; }, clearTimeout: () => {},
+      setInterval: (fn, ms) => { ticks.push({ fn, ms }); return ticks.length; }, clearInterval: (id) => { if (ticks[id - 1]) ticks[id - 1].off = true; } });
+    P.context.StreamProxy.gridLive = async () => ({ id: 'mv1', url: 'http://127.0.0.1:18765/hdr/mv1.mpd', subtitles: [], surround: 1 });
+    P.context.StreamProxy.gridManifest = async () => ({ id: 'mv1', url: 'http://127.0.0.1:18765/vod/mv1.mpd', subtitles: [], surround: 0 });
+    let failed = null;
+    const grid = { engine: 'hevc', player: 'avplay', layout: 'side2', streams: [] };
+    P.load(live ? Object.assign({}, LIVE, { hdr: true, hdrEncrypted: true, grid }) : { url: 'https://cdn/main/hdr.m3u8', hdr: true, licenseUrl: '', info: { dynamic: false }, grid }, null)
+      .catch((e) => { failed = e; });
+    for (let k = 0; k < 5; k++) await new Promise(setImmediate);
+    const watch = ticks.find((t) => t.ms === 1000);
+    av.listener.onevent('PLAYER_MSG_NONE');   // FP1 Qatar 2026: events for 1.1 s, then 8.9 s of silence, READY at ~14 s
+    for (let sec = 1; sec <= 12 && !watch.off; sec++) { now += 1000; watch.fn(); }
+    await new Promise(setImmediate);
+    if (live) {
+      assert.equal(failed, null, 'still preparing');
+      assert.ok(timers.some((t) => t.ms === 30000), 'the full single-feed time: ' + timers.map((t) => t.ms).join());
+    } else assert.equal(failed && failed.code, 'PREPARE_TIMEOUT');
+  }
+});
+
+test('a preparation given up that answers later leaves AVPlay prepared: the next open closes it first', async () => {
+  const av = fakeAvPlay();
+  const answers = [];
+  av.prepareAsync = (ok) => { av.calls.push(['prepareAsync']); if (answers.length) return setImmediate(ok); answers.push(ok); };
+  // As on the TV: a player that is not closed refuses to open again.
+  let state = 'NONE';
+  av.getState = () => state;
+  av.open = (url) => { if (state !== 'NONE' && state !== 'IDLE') { const e = new Error('PLAYER_ERROR_INVALID_STATE'); e.name = 'InvalidStateError'; throw e; } av.calls.push(['open', url]); state = 'IDLE'; };
+  av.close = () => { av.calls.push(['close']); state = 'NONE'; };
+  const prepare = av.prepareAsync;
+  av.prepareAsync = (ok) => prepare(() => { state = 'READY'; ok(); });
+  const timers = [];
+  const P = await player(av, undefined, undefined, { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; }, clearTimeout: () => {} });
+  // The retry's helper build (FP1: 7 s for the live grid) is when the old preparation answers: after the unload
+  // (which left the stuck player alone), before the open.
+  P.context.StreamProxy.gridLive = async () => { if (answers[0]) answers[0](); await new Promise(setImmediate); return { id: 'mv1', url: 'http://127.0.0.1:18765/hdr/mv1.mpd', subtitles: [], surround: 0 }; };
+  const grid = () => Object.assign({}, LIVE, { hdr: true, hdrEncrypted: true, grid: { engine: 'hevc', player: 'avplay', layout: 'side2', streams: [] } });
+  answers.push(null);   // the first build answers nothing
+  const first = P.load(grid(), null);
+  answers.length = 0;
+  for (let k = 0; k < 5; k++) await new Promise(setImmediate);
+  timers.find((t) => t.ms === 30000).fn();
+  await assert.rejects(first, (e) => e.code === 'PREPARE_TIMEOUT');
+  await P.unload();
+  await P.load(grid(), null);
+  const order = names(av);
+  assert.deepEqual(order.slice(order.lastIndexOf('open') - 2, order.lastIndexOf('open') + 1), ['stop', 'close', 'open']);
+  assert.equal(P.engineName(), 'avplay');
+});
+
 test('the silence watch: the seek before preparing counts as an answer; a player that never said anything waits the full time', async () => {
   // A slow seek (answered at 7.5 s), then a preparation that takes 2 s more: not hung.
   {
@@ -657,6 +714,26 @@ test('the frozen-HDR reload stands down after a stop, starts from a seek, and do
   t.release();
   await new Promise(setImmediate);
   assert.equal(t.plays(), before);
+});
+
+test('a frozen live start at the live point reloads at the live point; a named moment or a seek keeps where it is', async () => {
+  for (const [start, seek, want] of [[undefined, false, null], [600, false, 1018.9], [undefined, true, 500], [undefined, 'pause', 1018.9]]) {
+    const loads = [], timers = [];
+    const P = await player(fakeAvPlay(), undefined, (url, at) => { loads.push(at); return Promise.resolve(); },
+      { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return 0; }, seekRange: { start: 0, end: 1040 } });
+    P.forceEngine = 'shaka';
+    Object.assign(P.videos[0], { readyState: 4, currentTime: 0, play: () => Promise.resolve(), pause() {},
+      getVideoPlaybackQuality: () => ({ totalVideoFrames: 0 }) });
+    await P.load({ url: 'https://cdn/tm.m3u8', licenseUrl: '', multiFeed: true, hdr: true, live: true, info: { dynamic: true } }, start);
+    // Frozen where Shaka put it (FP1 Qatar 2026: 1018.9 s); the viewer may have moved meanwhile.
+    P.videos[0].currentTime = 1018.9;
+    if (seek === true) P.seekTo(500);
+    if (seek === 'pause') { P.togglePause(); P.togglePause(); }   // paused and played on (Codex review): not the live point
+    timers.find((t) => t.ms === 5000).fn();
+    await new Promise(setImmediate);
+    assert.equal(loads.length, 2);
+    assert.equal(loads[1], want);
+  }
 });
 
 test('subtitles F1 repeats in the next segment show once, and ones cut to 1 ms show until the next', async () => {

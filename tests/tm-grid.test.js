@@ -231,6 +231,31 @@ test('player_tm grids: a probe just after the 33-bit clock wrapped keeps the ear
   assert.ok(a > 0 && b > a && b - a < 2 * 518400, 'segment 0 at ' + a + ', segment 1 at ' + b);
 });
 
+test('player_tm grids live: the playlist from after its last discontinuity on (FP2 Qatar 2026), numbers going on', async () => {
+  const r = routes();
+  const live = ['#EXTM3U', '#EXT-X-VERSION:5', '#EXT-X-PLAYLIST-TYPE:EVENT', '#EXT-X-TARGETDURATION:6', '#EXT-X-MEDIA-SEQUENCE:6',
+    '#EXT-X-DISCONTINUITY-SEQUENCE:4',
+    '#EXT-X-KEY:METHOD=AES-128,URI="https://f1tv.formula1.com/2.0/R/ENG/BIGSCREEN_HLS/ALL/CONTENT/LA/ck?c=1",IV=' + IV + ',KEYFORMAT="identity"',
+    '#EXT-X-PROGRAM-DATE-TIME:2026-11-27T16:30:37.440Z', '#EXTINF:5.76,', CDN + 'f0/segment__HDR-HD_HEVC_3_6.ts', '#EXT-X-DISCONTINUITY',
+    '#EXT-X-PROGRAM-DATE-TIME:2026-11-27T16:40:42.240Z', '#EXTINF:0.32,', CDN + 'f0/segment__HDR-HD_HEVC_3_7.ts',
+    '#EXTINF:0.32,', CDN + 'f0/segment__HDR-HD_HEVC_3_8.ts'];
+  let text = live.join('\n');
+  r[PLAYLIST] = () => Buffer.from(text);
+  const { s } = helper(r);
+  assert.equal((await call(s, 'POST', '/stitch/t8', grid([0, 1, 2, 3]))).status, 201);
+  const got = await call(s, 'GET', '/stitch/t8/video.m3u8');
+  assert.equal(got.status, 200);
+  const list = String(got.body).split('\n');
+  assert.ok(list.includes('#EXT-X-MEDIA-SEQUENCE:7') && list.includes('#EXT-X-DISCONTINUITY-SEQUENCE:5'), list.join('|'));
+  assert.ok(!list.some((l) => /DISCONTINUITY\s*$|PLAYLIST-TYPE|_6\.ts|^6\.m4s$/.test(l)), list.join('|'));
+  assert.deepEqual(list.filter((l) => /\.m4s$/.test(l)), ['7.m4s', '8.m4s']);
+  assert.equal(list.filter((l) => /PROGRAM-DATE-TIME/.test(l))[0], '#EXT-X-PROGRAM-DATE-TIME:2026-11-27T16:40:42.240Z');
+  // A break without the clock after it is refused, as before.
+  await new Promise((res) => setTimeout(res, 1100));
+  text = live.filter((l) => !/16:40:42/.test(l)).join('\n');
+  assert.equal((await call(s, 'GET', '/stitch/t8/video.m3u8')).status, 502);
+});
+
 test('player_tm grids: a playlist that changed key or gained a discontinuity is refused, so the app falls back', async () => {
   const r = routes();
   let text = playlist(true);

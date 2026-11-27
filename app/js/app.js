@@ -2010,12 +2010,29 @@
     if (whole && !s.capsOk && !s.capsFailed && !Player.isPaused() && s.capsPosition != null && Player.position() > s.capsPosition + 0.5 &&
       Player.decodedFrames() !== 0) {
       s.capsOk = true;
+      s.okAt = Date.now();
+      s.okPos = Player.position();
       Caps.ok(s.capsPath);
       // It plays (after one more try, say): open again for this video, and a later transient failure gets its try.
       feedsCtx.recoveries = 0;
       if (feedsCtx.off) delete feedsCtx.off[s.capsPath];
       if (feedsCtx.again) delete feedsCtx.again[s.capsPath];
       if (s.surround && Player.audioChannels() > 2 && surroundOnAvplay(s)) Caps.ok(SURROUND);   // only when AVPlay's 5.1 is what plays
+    }
+    // Where its own live point lies, 8 s after it plays from there (the viewer hasn't moved it: seeks and pauses end
+    // ownLive): a player_tm multiview sits ~17 s from its range's end (FP1 Qatar 2026), a single feed 5-8 s.
+    // From 8 s of playback that ran all along: after a stall it measures again from there. A gap past LIVE_GAP_MAX is
+    // a viewer behind, never a stream's own live point (a pause of the app's own while hidden ends ownLive too:
+    // holdWhileAway; Codex review 2026-11-27).
+    if (s.ownLive && s.liveGap == null && s.okAt && Player.isLive() && !Player.isPaused()) {
+      var ran = Player.position() - s.okPos, since = (Date.now() - s.okAt) / 1000;
+      if (ran < since - 1.5) { s.okAt = Date.now(); s.okPos = Player.position(); }
+      else if (since > 8) {
+        var gap = Math.max(0, Player.range().end - Player.position());
+        if (gap > LIVE_GAP_MAX) s.ownLive = false;
+        else s.liveGap = gap;
+        diag('play.live_gap', { gap: Math.round(gap * 10) / 10, kept: gap <= LIVE_GAP_MAX, engine: Player.engineName(), grid: s.grid ? s.grid.engine : null }, 'info');
+      }
     }
     // A crash while the 5.1 plays counts against the 5.1 first (as a failed start does): the next start leaves it out.
     if (s.capsOk && !s.capsFailed && !s.capsEnded && Player.engineName() === 'avplay' && !Player.isPaused()) {
@@ -2715,6 +2732,10 @@
           if (from) from.kind = Player.switchKind(stream);
           var start = startPosition(stream.info, opts, from);
           stream.askedStart = start;   // a retry of a start that never played (AVPlay reports 0) asks for it again
+          // A live start at LIVE (the stream's own live point, or a switch made at LIVE, which starts where the old feed's
+          // live point was: FP2 Qatar 2026, into a player_tm multiview): how far that lies from the end of its range is
+          // learned once it plays (playbackProgress: liveGap), and counts as LIVE (nearLive).
+          stream.ownLive = (start == null || atLive) && !!(stream.info && stream.info.dynamic);
           // Where the lead decided the start (not a requested moment, a live point or the stream's own edge).
           var leadPlaced = !!from && !from.paused && !atLive && opts.startAt == null && !opts.liveAt && start != null;
           // Live (dynamic) streams on AVPlay can't seek at start-up; instead the local service
@@ -3147,9 +3168,14 @@
   }
 
   // The live player itself runs ~25-50 s behind real time; within this margin counts as live.
+  var LIVE_GAP_MAX = 30;   // a live point further back than this from the range's end is a viewer behind (nearLive)
   var LIVE_MARGIN = 12;   // live plays ~29 s behind real time: 4 s behind the edge (wall clock minus the 25 s delay)
   /** A live position "at LIVE": within LIVE_MARGIN of the window's end (`r`: the range, the player's by default). */
-  function nearLive(pos, r) { return (r || Player.range()).end - pos < LIVE_MARGIN; }
+  /** At LIVE: within LIVE_MARGIN of the live end, or of the stream's own live point where that lies further back (liveGap). */
+  function nearLive(pos, r) {
+    var s = Player.stream(), gap = s && s.liveGap > 0 ? s.liveGap + 4 : 0;
+    return (r || Player.range()).end - pos < Math.max(LIVE_MARGIN, gap);
+  }
 
   /** Label for a position: offset or behind-live time, plus the real clock time when known. */
   function posLabel(pos, r, live) {
@@ -3261,6 +3287,7 @@
     }
     pending = { pos: p, info: scrub.info, since: Date.now() };
     scrub = null;
+    if (Player.stream()) Player.stream().ownLive = false;   // moved by the viewer: not its own live point to learn
     var mine = pending;
     setTimeout(function () { if (pending === mine) $('spinner').classList.remove('hidden'); }, 450);
     Player.seekTo(p);
@@ -3447,7 +3474,11 @@
     if (!a.paused && Player.isPaused()) Player.togglePause();
   }
   /** While away: what plays (a load that finished meanwhile too) is paused; the viewer's own choice is kept in `away`. */
-  function holdWhileAway() { if (away && Player.engineName() && !Player.isPaused()) Player.togglePause(); }
+  function holdWhileAway() {
+    if (!away || !Player.engineName() || Player.isPaused()) return;
+    if (Player.stream()) Player.stream().ownLive = false;   // held here, it falls behind its live point
+    Player.togglePause();
+  }
   function backRecently() { return backAt > 0 && backCtx === feedsCtx && Date.now() - backAt < BACK_UNCLEAR_MS; }
 
   /** The playing feed (or multiview) loaded again where it is (at LIVE if it was there), not as a retry of a failure. */
@@ -3463,6 +3494,7 @@
     if (!Player.engineName()) return;
     // Paused before the app was away a long time: its session is loaded again instead (onVisibility).
     if (feedsCtx && feedsCtx.stale && Player.isPaused()) return reloadHere(feedsCtx.stale);
+    if (Player.stream()) Player.stream().ownLive = false;
     Player.togglePause();
     var feedback = $('playback-feedback');
     hidePlaybackFeedback();

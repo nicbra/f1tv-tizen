@@ -122,6 +122,16 @@ var HdrStream = (function () {
     }
     return null;
   }
+  /** A segment's length in the timeline's units, or null past its end (or before its start). */
+  function lengthOf(clock, number) {
+    var n = clock.startNumber;
+    for (var i = 0; i < clock.runs.length; i++) {
+      var run = clock.runs[i], count = run.r + 1;
+      if (number < n + count) return number >= n ? run.d : null;
+      n += count;
+    }
+    return null;
+  }
   function isoSeconds(d) {
     var m = /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?$/.exec(d || '');
     return m ? +(m[1] || 0) * 86400 + +(m[2] || 0) * 3600 + +(m[3] || 0) * 60 + +(m[4] || 0) : 0;
@@ -317,6 +327,15 @@ var HdrStream = (function () {
     }));
   }
 
+  /** The official live DASH audio's numbering and timeline (null when it isn't $Number$ with a SegmentTimeline). */
+  function officialAudioClock(sets) {
+    var audio = sets.filter(function (s) { return kind(s) === 'audio'; })[0];
+    var t = audio && /<SegmentTemplate\b([^>]*)>([\s\S]*?)<\/SegmentTemplate>/.exec(audio);
+    return t && /\$Number\$/.test(attr(t[1], 'media')) && /<SegmentTimeline>/.test(t[2]) ? {
+      timescale: +attr(t[1], 'timescale') || 1, offset: +attr(t[1], 'presentationTimeOffset') || 0,
+      startNumber: attr(t[1], 'startNumber') === '' ? 1 : +attr(t[1], 'startNumber'), runs: runsOf(t[2]) } : null;
+  }
+
   /**
    * Live 5.1: the HLS master's multichannel commentary (see surround) as audio AdaptationSets for the helper, which
    * gives them the official audio's SegmentTimeline on every manifest refresh. F1 numbers and times the HLS AC-3 and
@@ -340,7 +359,7 @@ var HdrStream = (function () {
     return io.deadline(Promise.all(list.map(function (a, i) {
       // Inside the promise: a bad address must leave stereo, not fail the video (new URL throws).
       return Promise.resolve().then(function () { return io.get(new URL(a.URI, masterUrl).toString()); }).then(function (response) {
-        var text = response.body, map = /^#EXT-X-MAP:.*URI="([^"]+)"/m.exec(text);
+        var text = liveFromLastBreak(response.body), map = /^#EXT-X-MAP:.*URI="([^"]+)"/m.exec(text);
         var uris = text.split(/\r?\n/).filter(function (l) { return l.trim() && l.charAt(0) !== '#'; })
           .map(function (l) { return new URL(l.trim(), response.url).toString(); });
         if (!/^#EXTM3U\s/.test(text) || !map || uris.length < 4 || /^#EXT-X-(?:DISCONTINUITY\s*$|BYTERANGE:)/m.test(text)) return fail('unsupported live surround playlist');
@@ -355,11 +374,13 @@ var HdrStream = (function () {
           var timing = CmafDash.timing(data[0], data[1]);
           if (timing.timescale !== clock.timescale || timing.baseTime !== timeOf(clock, pattern.startNumber)) return fail('surround timeline differs');
           // The same cadence too (the manifest gives the 5.1 the official audio's segment durations): the recent
-          // segments' lengths against the official timeline's, within an AC-3 frame (32 ms).
+          // segments' lengths against the official timeline's, within an AC-3 frame (32 ms). The playlist is read after
+          // the official manifest, so its newest segments can be past that timeline's end (FP1 Qatar 2026: every live
+          // multiview lost its 5.1 that way): those are left out; the first is in it (the start check above).
           var lengths = (text.match(/^#EXTINF:\s*([\d.]+)/gm) || []).map(function (l) { return parseFloat(l.slice(8)); }).slice(-4, -1);
           lengths.forEach(function (d, k) {
-            var t0 = timeOf(clock, pattern.startNumber + k), t1 = timeOf(clock, pattern.startNumber + k + 1);
-            if (t0 == null || t1 == null || Math.abs((t1 - t0) / clock.timescale - d) > 0.032) fail('surround segment lengths differ');
+            var own = lengthOf(clock, pattern.startNumber + k);
+            if (own != null && Math.abs(own / clock.timescale - d) > 0.032) fail('surround segment lengths differ');
           });
           return '<AdaptationSet xmlns:cenc="urn:mpeg:cenc:2013" contentType="audio" mimeType="audio/mp4" lang="' + xml(lang3(a.LANGUAGE) || 'und') +
             '" segmentAlignment="true" startWithSAP="1">' + protection +
@@ -392,11 +413,7 @@ var HdrStream = (function () {
       if (!template || !/\$Number\$/.test(attr(template[1], 'media')) || !/<SegmentTimeline>/.test(template[2])) return fail('unsupported live addressing');
       var clock = { timescale: +attr(template[1], 'timescale') || 1, offset: +attr(template[1], 'presentationTimeOffset') || 0,
         startNumber: attr(template[1], 'startNumber') === '' ? 1 : +attr(template[1], 'startNumber'), runs: runsOf(template[2]) };
-      var audio = sets.filter(function (s) { return kind(s) === 'audio'; })[0];
-      var audioTemplate = audio && /<SegmentTemplate\b([^>]*)>([\s\S]*?)<\/SegmentTemplate>/.exec(audio);
-      var audioClock = audioTemplate && /\$Number\$/.test(attr(audioTemplate[1], 'media')) && /<SegmentTimeline>/.test(audioTemplate[2]) ? {
-        timescale: +attr(audioTemplate[1], 'timescale') || 1, offset: +attr(audioTemplate[1], 'presentationTimeOffset') || 0,
-        startNumber: attr(audioTemplate[1], 'startNumber') === '' ? 1 : +attr(audioTemplate[1], 'startNumber'), runs: runsOf(audioTemplate[2]) } : null;
+      var audioClock = officialAudioClock(sets);
       var periodStart = isoSeconds(period ? attr(period[1], 'start') : '');
       var base = new URL('.', sources[1].url).toString();
       var subtitles = sets.filter(function (s) { return kind(s) === 'text'; }).map(function (s) { return subtitle(s, base); }).filter(Boolean).map(function (t) {
@@ -409,7 +426,9 @@ var HdrStream = (function () {
         var playlistUrl = new URL(v.uri, sources[0].url).toString();
         return io.get(playlistUrl).then(function (response) {
           playlistUrl = response.url;
-          var text = response.body, map = /^#EXT-X-MAP:.*URI="([^"]+)"/m.exec(text);
+          // From after a discontinuity F1 left in the live playlist (FP2 Qatar 2026, before a pause) on: only its newest
+          // segments are used, on the official DASH timeline.
+          var text = liveFromLastBreak(response.body), map = /^#EXT-X-MAP:.*URI="([^"]+)"/m.exec(text);
           var uris = text.split(/\r?\n/).filter(function (l) { return l.trim() && l.charAt(0) !== '#'; })
             .map(function (l) { return new URL(l.trim(), playlistUrl).toString(); });
           if (!/^#EXTM3U\s/.test(text) || !map || uris.length < 4 || /^#EXT-X-(?:DISCONTINUITY\s*$|BYTERANGE:)/m.test(text)) return fail('unsupported live playlist');
@@ -658,13 +677,15 @@ var HdrStream = (function () {
    * Live multiview (experiment): like `live`, a video AdaptationSet for the stream helper to put in place of
    * the official video on every refresh, but its segments come from the helper's grid (/stitch/<id>/<n>.m4s),
    * which tiles the feeds' segment n. F1 numbers the HLS segments of every feed like the DASH ones (Mexico
-   * 2026 race). Resolves { adaptation, subtitles }.
+   * 2026 race). With the sound feed's 5.1 after <!--audio--> (as `live`; opts.langs.surround false: none).
+   * Resolves { adaptation, subtitles, surround (count) }.
    */
   function liveGrid(streams, layout, opts) {
     opts = opts || {};
     var known = typeof MultiviewLayouts !== 'undefined' && MultiviewLayouts.layouts[layout], heights = known && known.feeds;
     if (!heights || heights.length !== streams.length) return Promise.reject(new Error('HDR: layout ' + layout + ' needs ' + (heights ? heights.length : '?') + ' feeds'));
-    var io = fetcher(20000), id = opts.id, first = streams[opts.audio || 0];
+    var io = fetcher(20000), id = opts.id, lead = opts.audio || 0, first = streams[lead];
+    var until = Date.now() + 16000, want51 = (opts.langs || {}).surround !== false;
     return io.deadline(io.get(first.widevineManifestUrl).then(function (dash) {
       var mpd = dash.body;
       if (!/<MPD\b[^>]*\btype="dynamic"/.test(mpd) || (mpd.match(/<Period\b/g) || []).length !== 1 || /<BaseURL\b/.test(mpd)) return fail('unsupported Widevine live layout');
@@ -677,7 +698,7 @@ var HdrStream = (function () {
       var clock = { timescale: +attr(template[1], 'timescale') || 1, offset: +attr(template[1], 'presentationTimeOffset') || 0,
         startNumber: attr(template[1], 'startNumber') === '' ? 1 : +attr(template[1], 'startNumber'), runs: runsOf(template[2]) };
       var period = /<Period\b([^>]*)>/.exec(mpd), periodStart = isoSeconds(period ? attr(period[1], 'start') : '');
-      var base = new URL('.', dash.url).toString();
+      var base = new URL('.', dash.url).toString(), audioClock = officialAudioClock(sets), soundMaster = null;
       var subtitles = sets.filter(function (s) { return kind(s) === 'text'; }).map(function (s) { return subtitle(s, base); }).filter(Boolean).map(function (t) {
         if (t.runs.length) t.runs[t.runs.length - 1].r = -1;
         t.offset -= periodStart * t.timescale;
@@ -686,6 +707,7 @@ var HdrStream = (function () {
       return Promise.all(streams.map(function (stream, n) {
         var height = heights[n];
         return io.get(stream.url).then(function (master) {
+          if (n === lead) soundMaster = master;
           var lines = master.body.split(/\r?\n/), uri = null, a = null;
           lines.forEach(function (line, i) {
             if (uri || !/^#EXT-X-STREAM-INF:/.test(line)) return;
@@ -694,7 +716,7 @@ var HdrStream = (function () {
           });
           if (!uri) return fail('no ' + height + 'p HLG variant');
           return io.get(new URL(uri, master.url).toString()).then(function (response) {
-            var text = response.body, map = /^#EXT-X-MAP:.*URI="([^"]+)"/m.exec(text);
+            var text = liveFromLastBreak(response.body), map = /^#EXT-X-MAP:.*URI="([^"]+)"/m.exec(text);
             var uris = text.split(/\r?\n/).filter(function (l) { return l.trim() && l.charAt(0) !== '#'; })
               .map(function (l) { return new URL(l.trim(), response.url).toString(); });
             if (!/^#EXTM3U\s/.test(text) || !map || uris.length < 4 || /^#EXT-X-(?:DISCONTINUITY\s*$|BYTERANGE:)/m.test(text)) return fail('unsupported live playlist');
@@ -721,13 +743,17 @@ var HdrStream = (function () {
               var rep = '<Representation id="grid" bandwidth="' + feeds.reduce(function (n, f) { return n + f.bandwidth; }, 0) + '" codecs="' + xml(info.codecs) +
                 '" width="' + info.width + '" height="' + info.height + '"><SegmentTemplate timescale="' + clock.timescale + '" presentationTimeOffset="' + clock.offset +
                 '" startNumber="' + clock.startNumber + '" initialization="' + xml(local + '/init.mp4') + '" media="' + xml(local + '/$Number$.m4s') + '"><!--timeline--></SegmentTemplate></Representation>';
-              return {
-                adaptation: '<AdaptationSet xmlns:cenc="urn:mpeg:cenc:2013" contentType="video" mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">' +
-                  '<ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cbcs" cenc:default_KID="' + protection.kid + '"/>' +
-                  '<ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"><cenc:pssh>' + xml(psshFor(source, protection.kid)) + '</cenc:pssh></ContentProtection>' +
-                  '<EssentialProperty schemeIdUri="urn:mpeg:mpegB:cicp:TransferCharacteristics" value="18"/>' + rep + '</AdaptationSet>',
-                subtitles: subtitles
-              };
+              var keyed = '<ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cbcs" cenc:default_KID="' + protection.kid + '"/>' +
+                '<ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"><cenc:pssh>' + xml(psshFor(source, protection.kid)) + '</cenc:pssh></ContentProtection>';
+              var adaptation = '<AdaptationSet xmlns:cenc="urn:mpeg:cenc:2013" contentType="video" mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">' +
+                keyed + '<EssentialProperty schemeIdUri="urn:mpeg:mpegB:cicp:TransferCharacteristics" value="18"/>' + rep + '</AdaptationSet>';
+              // The sound feed's 5.1, as for a single live feed (liveSurround: on the official audio's timeline and the
+              // grid's key; optional, stereo when anything doesn't fit).
+              if (!want51 || !soundMaster) return { adaptation: adaptation, subtitles: subtitles, surround: 0 };
+              if (!audioClock) { note('hdr.surround_skipped', { why: 'live grid audio addressing' }); return { adaptation: adaptation, subtitles: subtitles, surround: 0 }; }
+              return liveSurround(soundMaster.body, soundMaster.url, audioClock, protection.kid, keyed, until).then(function (more) {
+                return { adaptation: adaptation + (more.length ? '<!--audio-->' + more.join('') : ''), subtitles: subtitles, surround: more.length };
+              });
             });
           });
         });
@@ -746,6 +772,36 @@ var HdrStream = (function () {
    * Unix seconds), keyHeaders }.
    * Resolves { url, width, height, start } (start: where the replay's first prepared segment begins, seconds).
    */
+  /**
+   * A live playlist from the segment after its last discontinuity on, where F1 states the clock again there (FP2 Qatar
+   * 2026: every feed kept one segment from before a 10 min pause for the whole session); else the text as it was.
+   * For every live path (single feed, 5.1, multiviews); the helper serves player_tm grids' playlists the same way
+   * (service.js liveFromLastBreak).
+   */
+  function liveFromLastBreak(text) {
+    var lines = String(text).split(/\r?\n/), last = -1, i;
+    for (i = 0; i < lines.length; i++) if (/^#EXT-X-DISCONTINUITY\s*$/.test(lines[i])) last = i;
+    if (last < 0) return text;
+    var after = lines.slice(last + 1), pdt = false;
+    for (i = 0; i < after.length && !(after[i] && after[i].charAt(0) !== '#'); i++) if (/^#EXT-X-PROGRAM-DATE-TIME:/.test(after[i])) pdt = true;
+    if (!pdt) return text;
+    var newMap = after.some(function (l) { return /^#EXT-X-MAP:/.test(l); });
+    var head = [], skipped = 0, breaks = 0, seq = 0, dseq = 0, inHead = true;
+    for (i = 0; i < last; i++) {
+      var line = lines[i], m;
+      if ((m = /^#EXT-X-MEDIA-SEQUENCE:(\d+)/.exec(line))) { seq = +m[1]; continue; }
+      if ((m = /^#EXT-X-DISCONTINUITY-SEQUENCE:(\d+)/.exec(line))) { dseq = +m[1]; continue; }
+      if (/^#EXT-X-PLAYLIST-TYPE:/.test(line)) continue;
+      if (/^#EXT-X-DISCONTINUITY\s*$/.test(line)) { breaks++; continue; }
+      if (/^#EXT(?:INF|-X-PROGRAM-DATE-TIME|-X-BYTERANGE|-X-GAP)\b/.test(line)) inHead = false;
+      if (line && line.charAt(0) !== '#') { skipped++; inHead = false; continue; }
+      // The init too, unless F1 states another after the break (then that one is the stream's now).
+      if (/^#EXT-X-MAP:/.test(line) && newMap) continue;
+      if (inHead || /^#EXT-X-(?:KEY|MAP):/.test(line)) head.push(line);
+    }
+    return head.concat(['#EXT-X-MEDIA-SEQUENCE:' + (seq + skipped), '#EXT-X-DISCONTINUITY-SEQUENCE:' + (dseq + breaks + 1)], after).join('\n');
+  }
+
   function tmGrid(masters, layout, opts) {
     opts = opts || {};
     var known = typeof MultiviewLayouts !== 'undefined' && MultiviewLayouts.layouts[layout], heights = known && known.feeds;
@@ -777,7 +833,8 @@ var HdrStream = (function () {
         });
         if (!uri) return fail('no ' + height + 'p HLG variant in player_tm');
         return io.get(new URL(uri, master.url).toString()).then(function (response) {
-          var text = response.body;
+          // Live: from the segment after its last discontinuity on, as the helper serves it (service.js liveFromLastBreak).
+          var text = /^#EXT-X-ENDLIST\s*$/m.test(response.body) ? response.body : liveFromLastBreak(response.body);
           if (!/^#EXTM3U\s/.test(text) || /^#EXT-X-DISCONTINUITY\s*$/m.test(text) || /^#EXT-X-(?:BYTERANGE|MAP):/m.test(text)) return fail('unsupported player_tm playlist');
           var keyLines = text.match(/^#EXT-X-KEY:.*$/gm) || [], k = keyLines.length === 1 ? attrs(keyLines[0].slice(11)) : {};
           if (k.URI) k.URI = new URL(k.URI, response.url).toString();
