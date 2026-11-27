@@ -366,8 +366,7 @@ body.avplay #video, body.avplay #video2 { display: none; }
 .tyre-I { border-color: #43b02a; } .tyre-W { border-color: #0067ad; }
 
 /* Subtitles and seeker info */
-/* NRK TV's player styles, checked 2026-11-02:
- * https://tv.nrk.no/assets/player-DqU6RAAI.css
+/* NRK TV's player styles;
  * White on #000000a8, line-height 1.4, padding .1em .3em, radius .125em.
  * Use rgba for older Tizen browsers that don't support eight-digit hex colours.
  * Noto Sans Medium at 95% width provides an open alternative to NRK Sans.

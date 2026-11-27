@@ -5,7 +5,6 @@
 // Public domain.
 //
 // Implementation derived from TweetNaCl version 20140427.
-// See for details: http://tweetnacl.cr.yp.to/
 
 var gf = function(init) {
   var i, r = new Float64Array(16);
