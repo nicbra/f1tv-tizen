@@ -9,12 +9,12 @@ TAG="${1:-}"
 [[ -n "${GH_REPO:-}" ]] || die "GH_REPO must identify the release repository"
 [[ -s build/F1TV.wgt && -s build/F1TV.wgt.sha256 ]] || die "build the package and checksum first"
 
-ASSETS=(build/F1TV.wgt build/F1TV.wgt.sha256 build/F1TV-staging.wgt build/F1TV-staging.wgt.sha256 "build/bundle-${TAG#v}.tar" build/bundle.json build/bundle.json.sig)
+ASSETS=(build/F1TV.wgt build/F1TV.wgt.sha256 "build/bundle-${TAG#v}.tar" build/bundle.json build/bundle.json.sig)
 for asset in "${ASSETS[@]}"; do [[ -s "$asset" ]] || die "missing release asset: $asset"; done
 
 node scripts/verify-bundle.js build/bundle.json
 node -e 'if (require("./build/bundle.json").version !== process.argv[1]) process.exit(1)' "${TAG#v}" || die "manifest version does not match tag"
-(cd build && sha256sum --check F1TV.wgt.sha256 F1TV-staging.wgt.sha256)
+(cd build && sha256sum --check F1TV.wgt.sha256)
 
 if state="$(gh release view "$TAG" --repo "$GH_REPO" --json isDraft --jq .isDraft)"; then
   [[ "$state" == true ]] || die "$TAG is already published; refusing to replace its assets"

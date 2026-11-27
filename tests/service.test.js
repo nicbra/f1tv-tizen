@@ -542,3 +542,16 @@ test('POST /updates/check is only for the app\'s own pages, like the shell\'s la
   assert.equal((await call('null')).status, 404, 'file:// pages reach the route (404: no launcher in this harness)');
   assert.equal((await call()).status, 404, 'and so do requests without an Origin header');
 });
+
+test('POST /updates/channel (test versions) is only for the app\'s own pages and only takes stable or prerelease', async () => {
+  const { s } = service();
+  const call = (url, origin) => new Promise((resolve) => {
+    const req = new EventEmitter();
+    req.url = url; req.method = 'POST';
+    if (origin !== undefined) req.headers = { origin };
+    const res = { writeHead(status) { this.status = status; }, end(body) { resolve({ status: this.status, body: String(body) }); } };
+    s.handle(req, res);
+  });
+  assert.deepEqual(await call('/updates/channel?name=prerelease', 'https://evil.test'), { status: 403, body: 'local page required' });
+  assert.equal((await call('/updates/channel?name=prerelease', 'null')).status, 404, 'no launcher in this harness');
+});

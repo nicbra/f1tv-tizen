@@ -15,7 +15,7 @@ const NOW = Date.UTC(2026, 10, 18, 20);
 // The TV's own device ID (Samsung's DUID) and the unit the app derives from it.
 const DUID = 'OTDTZMVKX4HAW';
 const unitOf = (duid) => crypto.createHash('sha256').update('f1tv-tizen unit v1:' + duid).digest('hex').slice(0, 32);
-function load({ store = {}, settings = { diagnostics: 'off' }, answer, launcher, caps, now = NOW, f1, refuse, build = { record: false, server: BASE }, duid = DUID } = {}) {
+function load({ store = {}, settings = { diagnostics: 'off' }, answer, launcher, caps, now = NOW, f1, refuse, build = { record: false, server: BASE }, duid = DUID, updates } = {}) {
   const sent = [], uses = [], timers = [], win = {};
   const clock = { now };
   const context = vm.createContext({
@@ -44,6 +44,7 @@ function load({ store = {}, settings = { diagnostics: 'off' }, answer, launcher,
     },
     ...(launcher ? { Launcher: launcher } : {}),
     ...(caps ? { Caps: caps } : {}),
+    ...(updates ? { Updates: updates } : {}),
     ...(f1 ? { F1Api: f1 } : {}),
     webapis: { productinfo: { getRealModel: () => 'QE55Q77AATXXC', getFirmware: () => 'T-NKM2DEUC-2310.0',
       getDuid: () => { if (duid == null) throw new Error('no DUID'); return duid; } } },
@@ -495,18 +496,22 @@ test('the server comes from the build: any build with a valid URL; without one n
   }
 });
 
-test('an app open 15 minutes counts once, anonymously: the version and whether diagnostics are on, nothing else', async () => {
+test('an app open 15 minutes counts once, anonymously: the version, whether diagnostics are on and the install source, nothing else', async () => {
   const t = load({ answer: ok, settings: { diagnostics: 'off', diagnosticsAsked: true } });
   await t.run(14 * 60000);
   assert.deepEqual(t.uses, [], 'not before 15 minutes (an app closed again counts nothing)');
   await t.run(2 * 60000);
   assert.equal(t.uses.length, 1);
   assert.equal(t.uses[0].url, BASE + '/starts');
-  assert.deepEqual(t.uses[0].body, { schema_version: 1, version: '1.4.0', diagnostics: false });
+  assert.deepEqual(t.uses[0].body, { schema_version: 1, version: '1.4.0', diagnostics: false, install_source: 'unknown' });
   assert.equal(t.uses[0].headers.Authorization, undefined, 'no secret');
   assert.deepEqual(t.sent, [], 'and nothing else with diagnostics off');
   await t.run(3 * 3600000);
   assert.equal(t.uses.length, 1, 'once per run');
+  // Set up by the install script (its marker): said so; anything else stays unknown.
+  const scripted = load({ answer: ok, settings: { diagnostics: 'off', diagnosticsAsked: true }, updates: { installedBy: () => 'installer' } });
+  await scripted.run(16 * 60000);
+  assert.deepEqual(scripted.uses[0].body, { schema_version: 1, version: '1.4.0', diagnostics: false, install_source: 'installer' });
 });
 
 test('the app-use count waits for the answer to the diagnostics question, says when it is yes, and skips personal builds', async () => {

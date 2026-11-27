@@ -1085,7 +1085,8 @@ function bundleRig(t, download, opts = {}) {
     status: () => svc.bundleStatus(),
     verify: (raw, sig) => { const m = svc.verify(raw, sig); svc.save(); return { version: m.version, minShell: m.minShell, revokes: m.revokes, archive: m.archive, notes: m.notes || '' }; },
     install: (raw, sig, archive) => { installs.push(archive ? 'archive' : 'manifest'); return { version: svc.install(raw, sig, archive).version }; },
-    checked: (r) => { reports.push(r); svc.checked(r); }
+    checked: (r) => { reports.push(r); svc.checked(r); },
+    discard: (v) => svc.discard(v)
   };
   const updates = bundleUpdates.create(launcher, { download, now: () => now });
   return { svc, updates, reports, installs, clock: { get: () => now, set: (v) => { now = v; } } };
@@ -1217,6 +1218,123 @@ test('bundle downloader: revokes count before the playback decision; a failed ar
   assert.match(String(await runCheck(broken.updates)), /HTTP 503/);
   assert.equal(broken.reports.at(-1).ok, false); assert.equal(broken.svc.state.checkFailed, true);
 });
+
+test('bundle downloader: test versions chosen in the app win over the package\'s channel, on the unchanged shell', async (t) => {
+  const pre = fixture('1.3.0'), stable = fixture('1.2.0');
+  const list = [{ ...release('1.3.0'), prerelease: true }, release('1.2.0')];
+  for (const [built, chosen, want] of [['stable', 'prerelease', '1.3.0'], ['prerelease', 'stable', '1.2.0'],
+    ['stable', null, '1.2.0'], ['prerelease', null, '1.3.0']]) {
+    const rig = bundleRig(t, (u, limit, cb) => {
+      if (u.includes('api.github')) return cb(null, Buffer.from(JSON.stringify(list)));
+      const f = u.includes('/v1.3.0/') ? pre : stable;
+      cb(null, u.endsWith('.sig') ? Buffer.from(f.sig) : u.endsWith('.json') ? Buffer.from(f.raw) : f.archive);
+    }, { service: { build: { updates: true, channel: built } } });
+    if (chosen) rig.updates.setChannel(chosen);
+    assert.equal(await runCheck(rig.updates), null);
+    // The shell installs it and starts the newest it holds: no shell change needed.
+    assert.equal(rig.svc.bundleStatus().newest, want, built + ' package, ' + chosen + ' chosen');
+  }
+});
+
+test('bundle downloader: test versions turned off while one downloads: it isn\'t installed', async (t) => {
+  const pre = fixture('1.3.0');
+  let deliver;
+  const rig = bundleRig(t, (u, limit, cb) => {
+    if (u.includes('api.github')) return cb(null, Buffer.from(JSON.stringify([{ ...release('1.3.0'), prerelease: true }])));
+    if (u.endsWith('.tar')) { deliver = () => cb(null, pre.archive); return; }
+    cb(null, u.endsWith('.sig') ? Buffer.from(pre.sig) : Buffer.from(pre.raw));
+  }, { service: { build: { updates: true, channel: 'stable' } } });
+  rig.updates.setChannel('prerelease');   // its own check starts (none for an hour)
+  await new Promise(setImmediate);
+  const done = runCheck(rig.updates);      // busy: refused, the first one goes on
+  rig.updates.setChannel('stable');        // turned off before the archive arrives
+  deliver();
+  await done;
+  await new Promise(setImmediate);
+  assert.equal(rig.svc.bundleStatus().newest, '1.0.0', 'not installed');
+});
+
+test('bundle downloader: test versions on: a check of its own when it hasn\'t looked for an hour, not more', async (t) => {
+  let lists = 0;
+  const rig = bundleRig(t, (u, limit, cb) => {
+    if (u.includes('api.github')) { lists++; return cb(null, Buffer.from(JSON.stringify([release('1.0.0')]))); }
+    cb(new Error('none'));
+  }, { service: { build: { updates: true, channel: 'stable' } } });
+  rig.updates.setChannel('prerelease');
+  await new Promise(setImmediate);
+  assert.equal(lists, 1, 'checked at once');
+  rig.updates.setChannel('prerelease');
+  await new Promise(setImmediate);
+  assert.equal(lists, 1, 'not again within the hour');
+  rig.clock.set(rig.clock.get() + 3600000);
+  rig.updates.setChannel('prerelease');
+  await new Promise(setImmediate);
+  assert.equal(lists, 2, 'again an hour later');
+  rig.clock.set(rig.clock.get() + 3600000);
+  rig.updates.setChannel('stable');
+  await new Promise(setImmediate);
+  assert.equal(lists, 2, 'turned off: only the usual hourly checks (nothing held is deleted)');
+});
+
+test('bundle downloader: turned off, a test version already downloaded stays (nothing held is deleted)', async (t) => {
+  const pre = fixture('1.3.0');
+  const rig = bundleRig(t, (u, limit, cb) => {
+    if (u.includes('api.github')) return cb(null, Buffer.from(JSON.stringify([{ ...release('1.3.0'), prerelease: true }])));
+    cb(null, u.endsWith('.sig') ? Buffer.from(pre.sig) : u.endsWith('.json') ? Buffer.from(pre.raw) : pre.archive);
+  }, { service: { build: { updates: true, channel: 'stable' } } });
+  rig.updates.setChannel('prerelease');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(rig.svc.bundleStatus().newest, '1.3.0');
+  rig.updates.setChannel('stable');
+  await runCheck(rig.updates);   // only a test version listed: "No releases" for this TV now
+  assert.equal(rig.svc.bundleStatus().newest, '1.3.0', 'stays until a newer release');
+});
+
+test('bundle downloader: turned off while a test version\'s manifest comes, its archive isn\'t fetched', async (t) => {
+  const pre = fixture('1.3.0'), urls = [];
+  const rig = bundleRig(t, (u, limit, cb) => {
+    urls.push(u);
+    if (u.includes('api.github')) return cb(null, Buffer.from(JSON.stringify([{ ...release('1.3.0'), prerelease: true }])));
+    if (u.endsWith('.sig')) rig.updates.setChannel('stable');   // turned off before the archive request
+    cb(null, u.endsWith('.sig') ? Buffer.from(pre.sig) : u.endsWith('.json') ? Buffer.from(pre.raw) : pre.archive);
+  }, { service: { build: { updates: true, channel: 'stable' } } });
+  rig.updates.setChannel('prerelease');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(!urls.some((u) => u.endsWith('.tar')), 'no archive download: ' + urls.join(' '));
+  assert.equal(rig.svc.bundleStatus().newest, '1.0.0');
+});
+
+test('bundle downloader: a check asked for while one runs waits for it and gets its result', async (t) => {
+  let deliver;
+  const rig = bundleRig(t, (u, limit, cb) => {
+    if (u.includes('api.github')) { deliver = () => cb(null, Buffer.from(JSON.stringify([release('1.0.0')]))); return; }
+    cb(new Error('none'));
+  });
+  const first = runCheck(rig.updates), second = runCheck(rig.updates);
+  deliver();
+  assert.deepEqual([await first, await second], [null, null], 'the second waited (no "already running" failure)');
+  // Stopped meanwhile (its version switched off): every waiting caller still gets an answer.
+  let later;
+  const stopped = bundleRig(t, (u, limit, cb) => { if (u.includes('api.github')) { later = () => cb(null, Buffer.from('[]')); return; } cb(new Error('none')); });
+  const a = runCheck(stopped.updates), b = runCheck(stopped.updates);
+  stopped.updates.stop(); later();
+  assert.deepEqual([String(await a), String(await b)], ['Error: Stopped', 'Error: Stopped']);
+});
+
+test('bundle downloader: turned off during a check, the remaining test versions aren\'t even fetched', async (t) => {
+  const urls = [];
+  const rig = bundleRig(t, (u, limit, cb) => {
+    urls.push(u);
+    if (u.includes('api.github')) return cb(null, Buffer.from(JSON.stringify([
+      { ...release('1.5.0'), prerelease: true }, { ...release('1.4.0'), prerelease: true }, release('1.0.0')])));
+    rig.updates.setChannel('stable');   // turned off while the first one's manifest comes
+    cb(new Error('gone'));
+  }, { service: { build: { updates: true, channel: 'stable' } } });
+  rig.updates.setChannel('prerelease');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(!urls.some((u) => u.includes('/v1.4.0/')), 'not fetched: ' + urls.join(' '));
+});
+
 
 test('bundle downloader: once stopped (its version switched off), late download results change nothing', async (t) => {
   const f = fixture('1.2.0'); let release1;

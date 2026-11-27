@@ -3,6 +3,11 @@ var Updates = (function () {
   var REPO = 'nicbra/f1tv-tizen';
   var KEY = 'f1tv.update';
   var INSTALL_KEY = 'f1tv.install';
+  // Test versions (prereleases) on this TV: 'prerelease' or 'stable', chosen on the Version page. Kept here (it survives
+  // bundle updates) and told to the bundle's downloader (app/service/updates.js) at each check: no shell change, so
+  // every launcher TV can use it after a normal update. Unset: the package's channel. A package built for prereleases
+  // (F1TV-staging.wgt, until v1.2.1) takes them whatever is chosen: its shell checks for them at every start  (fixed()).
+  var CHANNEL_KEY = 'f1tv.channel', HELPER = 'http://127.0.0.1:18765';
   var HOUR = 3600000;
   var pending = null;
 
@@ -34,6 +39,8 @@ var Updates = (function () {
         try {
           var marker = JSON.parse(xhr.responseText);
           if (xhr.status === 200 && marker && marker.installedBy === 'installer' && marker.version === installedVersion() && installedVersion()) {
+            // A label only: any app on the TV can write this shared file, so nothing it says changes what the TV runs
+            // (test versions are only turned on on the Version page).
             localStorage.setItem(INSTALL_KEY, JSON.stringify({ by: 'installer', version: marker.version }));
           }
         } catch (e) { /* missing or malformed marker, or storage disabled */ }
@@ -76,7 +83,36 @@ var Updates = (function () {
     }).sort(function (a, b) { return newer(a.version, b.version) ? -1 : newer(b.version, a.version) ? 1 : 0; });
     var downloaded = c.downloaded && newer(c.downloaded, current()) ? c.downloaded : null;
     return { current: current(), latest: plain(c.latest), available: available, page: 'https://github.com/' + REPO,
-      releases: releases, needsReinstall: c.needsReinstall, downloaded: downloaded };
+      releases: releases, needsReinstall: c.needsReinstall, downloaded: downloaded, channel: channel(), channelFixed: fixed() };
+  }
+
+  /** Whether the package itself takes test versions (F1TV-staging.wgt): then they can't be turned off here. */
+  function fixed() { return typeof Launcher !== 'undefined' && Launcher.channel === 'prerelease'; }
+
+  /** The releases this TV takes: the choice made here, else its package's (F1TV-staging.wgt installs: prerelease). */
+  function channel() {
+    if (fixed()) return 'prerelease';
+    var chosen = null;
+    try { chosen = localStorage.getItem(CHANNEL_KEY); } catch (e) { /* storage disabled */ }
+    if (chosen === 'prerelease' || chosen === 'stable') return chosen;
+    return typeof Launcher !== 'undefined' && Launcher.channel === 'prerelease' ? 'prerelease' : 'stable';
+  }
+
+  /** Tells the bundle's downloader which releases to take. Never rejects (the next check tells it again). */
+  function tellDownloader() {
+    if (typeof Launcher === 'undefined') return Promise.resolve();
+    try {
+      return fetch(HELPER + '/updates/channel?name=' + channel(), { method: 'POST' }).then(function () {}, function () {});
+    } catch (e) { return Promise.resolve(); }
+  }
+
+  /** Test versions on ('prerelease') or off ('stable'): kept, told to the downloader, and the next check asks again. */
+  function setChannel(name) {
+    try { localStorage.setItem(CHANNEL_KEY, name === 'prerelease' ? 'prerelease' : 'stable'); } catch (e) { /* storage disabled */ }
+    var c = load();
+    delete c.at;
+    save(c);
+    return tellDownloader();
   }
 
   function releasesPage(page) {
@@ -108,9 +144,10 @@ var Updates = (function () {
     // then says what is known (releases, downloads), without going online itself.
     // A manual check whose downloader failed (or couldn't be reached) is a failure, even when the shell still has
     // an older good answer.
-    var helper = 'http://127.0.0.1:18765', manualFailed = false;
-    var request = usingLauncher ? (force ? fetch(helper + '/updates/check', { method: 'POST' })
-      .then(function (r) { if (!r.ok) manualFailed = true; }, function () { manualFailed = true; }) : Promise.resolve())
+    var helper = HELPER, manualFailed = false;
+    // The downloader first learns this TV's channel (a restarted helper forgets it).
+    var request = usingLauncher ? tellDownloader().then(function () { return force ? fetch(helper + '/updates/check', { method: 'POST' })
+      .then(function (r) { if (!r.ok) manualFailed = true; }, function () { manualFailed = true; }) : null; })
       .then(function () { return fetch(helper + '/launcher/check?cached=1', { method: 'POST' }); })
       .then(function (r) { if (!r.ok) throw new Error('Launcher check failed'); return r.json(); })
       .then(function (r) {
@@ -166,5 +203,5 @@ var Updates = (function () {
   }
 
   readInstallSource();
-  return { check: check, status: status, installedBy: installedBy, newer: newer, once: once, attemptApply: attemptApply };
+  return { check: check, status: status, installedBy: installedBy, newer: newer, once: once, attemptApply: attemptApply, setChannel: setChannel };
 })();

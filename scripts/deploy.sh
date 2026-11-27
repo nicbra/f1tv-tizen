@@ -85,16 +85,7 @@ JS
   mkdir -p "$source/package"
   "$TIZEN" package -t wgt -s "$PROFILE" -o "$source/package" -- "$ROOT/build/src"
   mv "$source/package/"*.wgt "$ROOT/build/F1TV.wgt"
-  if [[ "${RELEASE:-}" == 1 ]]; then
-    # Reuse the assembled bundle verbatim; only the root channel override changes.
-    node - "$ROOT/build/src/launcher-build.js" <<'JS'
-const fs = require('fs'), file = process.argv[2];
-fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace("channel: 'stable'", "channel: 'prerelease'"));
-JS
-    "$TIZEN" package -t wgt -s "$PROFILE" -o "$source/package" -- "$ROOT/build/src"
-    mv "$source/package/"*.wgt "$ROOT/build/F1TV-staging.wgt"
-    cp "${SHELL_SRC:-$ROOT/shell}/launcher-build.js" "$ROOT/build/src/launcher-build.js"
-  fi
+  # One package for everyone: test versions are a setting on the TV (the Version page), not a second package.
   rm -rf "$source"
   echo "Built $ROOT/build/F1TV.wgt"
 }

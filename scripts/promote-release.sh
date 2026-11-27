@@ -13,8 +13,7 @@ import json, sys
 r = json.load(sys.stdin)
 if r.get("isDraft") is not False or r.get("isPrerelease") is not True:
     sys.exit("Release must be a published prerelease before promotion")
-expected = {"F1TV.wgt", "F1TV.wgt.sha256", "F1TV-staging.wgt", "F1TV-staging.wgt.sha256",
-            "bundle-" + sys.argv[1] + ".tar", "bundle.json", "bundle.json.sig"}
+expected = {"F1TV.wgt", "F1TV.wgt.sha256", "bundle-" + sys.argv[1] + ".tar", "bundle.json", "bundle.json.sig"}
 missing = expected - {a["name"] for a in r.get("assets", [])}
 if missing:
     sys.exit("Missing release assets: " + ", ".join(sorted(missing)))

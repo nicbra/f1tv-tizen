@@ -129,6 +129,27 @@ test('a matching marker remembers the installer after the TV temp file disappear
   assert.equal(checker(null, null, { store, markerStatus: 404 }).updates.installedBy(), 'installer');
 });
 
+test('the installer marker is a label only: whatever it says, it never turns test versions on', () => {
+  const posts = [];
+  const fetch = async (url, opts) => { posts.push([opts && opts.method, url]); return { ok: true, json: async () => ({}) }; };
+  // Any app on the TV can write that shared file (Codex/DeepSeek review): it must not change what the TV runs.
+  const marker = JSON.stringify({ installedBy: 'installer', version: '0.1.0', channel: 'prerelease' });
+  const { updates, store } = checker(fetch, null, { launcher: { channel: 'stable' }, marker });
+  assert.equal(updates.installedBy(), 'installer');
+  assert.equal(store['f1tv.channel'], undefined);
+  assert.equal(updates.status().channel, 'stable');
+  assert.deepEqual(posts, []);
+});
+
+test('the channel: chosen on this TV, else the package\'s; a test-version package always takes them', () => {
+  assert.equal(checker(null, null, { launcher: { channel: 'stable' } }).updates.status().channel, 'stable');
+  assert.equal(checker(null, null, { launcher: { channel: 'stable' }, store: { 'f1tv.channel': 'prerelease' } }).updates.status().channel, 'prerelease');
+  // F1TV-staging.wgt: its frozen shell checks for test versions at every start, so turning them off here can't work.
+  const staging = checker(null, null, { launcher: { channel: 'prerelease' }, store: { 'f1tv.channel': 'stable' } }).updates.status();
+  assert.equal(staging.channel, 'prerelease');
+  assert.equal(staging.channelFixed, true);
+});
+
 test('a different marker or remembered version defaults to Apps2Samsung', () => {
   for (const marker of [JSON.stringify({ installedBy: 'installer', version: '0.2.0' }),
     JSON.stringify({ installedBy: 'apps2samsung', version: '0.1.0' })]) {
@@ -219,7 +240,9 @@ test('a manual check runs the bundle downloader first, then reads what the shell
   }, null, { launcher: { version: '1.0.0', updates: true } });
   const result = await updates.check(true);
   assert.equal(result.downloaded, '1.1.0'); assert.equal(JSON.parse(store['f1tv.update']).downloaded, '1.1.0');
-  assert.deepEqual(requests, [['http://127.0.0.1:18765/updates/check', 'POST'], ['http://127.0.0.1:18765/launcher/check?cached=1', 'POST']]);
+  // The downloader first learns this TV's channel (test versions on or off), then checks.
+  assert.deepEqual(requests, [['http://127.0.0.1:18765/updates/channel?name=stable', 'POST'],
+    ['http://127.0.0.1:18765/updates/check', 'POST'], ['http://127.0.0.1:18765/launcher/check?cached=1', 'POST']]);
 });
 
 test('a manual check whose downloader is unreachable is a failure, and still reads the shell', async () => {
@@ -230,7 +253,7 @@ test('a manual check whose downloader is unreachable is a failure, and still rea
     return { ok: true, json: async () => ({ releases: [{ version: '1.0.0' }] }) };
   }, null, { launcher: { version: '1.0.0', updates: true } });
   const result = await updates.check(true);
-  assert.equal(result.error, true, 'a manual check whose downloader is down failed'); assert.equal(requests.length, 2, 'the shell is still read');
+  assert.equal(result.error, true, 'a manual check whose downloader is down failed'); assert.equal(requests.length, 3, 'the shell is still read');
 });
 
 test('automatic page checks always ask the helper, which decides whether to go online (cached=1)', async () => {
@@ -240,7 +263,8 @@ test('automatic page checks always ask the helper, which decides whether to go o
     return { ok: true, json: async () => ({ releases: [{ version: '1.0.0' }] }) };
   }, null, { launcher: { version: '1.0.0', updates: true } });
   await updates.check(); await updates.check();
-  assert.deepEqual(requests, ['http://127.0.0.1:18765/launcher/check?cached=1', 'http://127.0.0.1:18765/launcher/check?cached=1']);
+  const channel = 'http://127.0.0.1:18765/updates/channel?name=stable', cached = 'http://127.0.0.1:18765/launcher/check?cached=1';
+  assert.deepEqual(requests, [channel, cached, channel, cached]);
 });
 
 test('a helper check that fails reports an error, keeps the last known release and lets a manual retry ask again', async () => {

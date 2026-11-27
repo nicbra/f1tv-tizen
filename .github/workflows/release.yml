@@ -133,7 +133,7 @@ jobs:
           "$TIZEN_HOME/tools/ide/bin/tizen" security-profiles add \
             -n f1tv -a "$certificate" -p "$TIZEN_AUTHOR_PASSWORD"
           RELEASE_COMMIT="${{ needs.test.outputs.commit }}" bash scripts/build-release.sh "$RELEASE_TAG"
-          (cd build && sha256sum --check F1TV.wgt.sha256 F1TV-staging.wgt.sha256)
+          (cd build && sha256sum --check F1TV.wgt.sha256)
           SIGN
 
       - name: Pass packages and unsigned bundle to signing

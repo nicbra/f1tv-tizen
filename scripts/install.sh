@@ -7,7 +7,8 @@
 #   TV address  skip the network search (TV: Settings > General > Network > Network Status)
 #   --force     reinstall even if the TV already has this version
 #   --check     only check the TV and download, don't install
-#   --staging   follow releases including prereleases
+#   --staging   install the newest release including test versions (prereleases); to keep getting them, turn on
+#               Test versions in the app (type 1 2 3 4 5 on its Version page)
 #   --wgt FILE  install this package instead of the latest GitHub release
 #
 # Enable Developer Mode with this computer as Host PC IP (see README).
@@ -189,7 +190,7 @@ wgt_version() {
 }
 
 # Extract release objects without jq/Python, including compact JSON and braces in notes.
-# GitHub returns newest first. Stop at the first non-draft containing the staging WGT.
+# GitHub returns newest first. Stop at the first non-draft containing the package (prereleases included).
 staging_release() {
   awk '
     { for (i = 1; i <= length($0); i++) {
@@ -204,7 +205,7 @@ staging_release() {
       else if (c == "}") {
         depth--
         if (!depth && obj ~ /"draft"[[:space:]]*:[[:space:]]*false/ &&
-            obj ~ /"browser_download_url"[[:space:]]*:[[:space:]]*"[^" ]*\/F1TV-staging\.wgt"/) {
+            obj ~ /"browser_download_url"[[:space:]]*:[[:space:]]*"[^" ]*\/F1TV\.wgt"/) {
           print obj; exit
         }
       }
@@ -222,7 +223,7 @@ get_wgt() {
   step "Looking up the latest release of $REPO"
   local api url sumurl want endpoint asset
   endpoint="releases/latest" asset="F1TV.wgt"
-  if [ "$STAGING" = 1 ]; then endpoint="releases?per_page=20"; asset="F1TV-staging.wgt"; fi
+  if [ "$STAGING" = 1 ]; then endpoint="releases?per_page=20"; fi
   api="$("${CURL_API[@]}" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/$endpoint")" ||
     die "Couldn't get the latest release from GitHub ($REPO)."
   if [ "$STAGING" = 1 ]; then
@@ -290,6 +291,9 @@ install_app() {
   printf '{"installedBy":"installer","version":"%s"}\n' "$VERSION" > "$marker" &&
     "$SDB" -s "$SERIAL" push "$marker" "${remote%/*}/f1tv-installed.json" >/dev/null 2>&1 || true
   rm -f "$marker" || true
+  if [ "$STAGING" = 1 ]; then
+    say "To keep getting test versions: in F1 TV open your account, Version, type 1 2 3 4 5 and turn on Test versions."
+  fi
 }
 
 launch() {

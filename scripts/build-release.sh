@@ -54,8 +54,6 @@ fi
 APP_SRC="$STAGE/app" SHELL_SRC="$STAGE/shell" BUILD_SCRIPT="$STAGE/scripts/build-bundle.js" RELEASE=1 bash scripts/deploy.sh build
 (
   cd build
-  for package in F1TV.wgt F1TV-staging.wgt; do
-    if command -v sha256sum >/dev/null; then sha256sum "$package"; else shasum -a 256 "$package"; fi > "$package.sha256"
-  done
+  if command -v sha256sum >/dev/null; then sha256sum F1TV.wgt; else shasum -a 256 F1TV.wgt; fi > F1TV.wgt.sha256
 )
-printf 'Built stable/staging packages, checksums and unsigned bundle assets from %s.\n' "$TAG"
+printf 'Built the package, its checksum and unsigned bundle assets from %s.\n' "$TAG"

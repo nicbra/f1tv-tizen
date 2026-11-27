@@ -167,7 +167,7 @@ with zipfile.ZipFile(out, 'w') as package:
 
     def test_publish_rejects_either_bad_package_checksum_before_any_github_call(self):
         self.publish_assets()
-        for name in ['F1TV.wgt', 'F1TV-staging.wgt']:
+        for name in ['F1TV.wgt']:
             package = self.repo / 'build' / name
             original = package.read_bytes()
             package.write_bytes(original + b'corrupt')
@@ -233,8 +233,9 @@ if sys.argv[1:3] == ['release', 'view']:
         self.assertIn('--verify-tag', create)
         self.assertIn('build/F1TV.wgt', create)
         self.assertIn('build/F1TV.wgt.sha256', create)
-        for asset in ['F1TV-staging.wgt', 'F1TV-staging.wgt.sha256', 'bundle-0.1.0.tar', 'bundle.json', 'bundle.json.sig']:
+        for asset in ['bundle-0.1.0.tar', 'bundle.json', 'bundle.json.sig']:
             self.assertIn('build/' + asset, create)
+        self.assertFalse(any('staging' in a for a in create), 'one package only: test versions are a setting on the TV')
 
         self.assert_publish_transition()
 
@@ -257,19 +258,16 @@ if sys.argv[1:3] == ['release', 'view']:
         self.assertEqual(len(self.gh_calls()), 1)
 
 
-    def test_staging_package_only_changes_channel_and_shares_bundle(self):
+    def test_release_build_makes_one_stable_package_with_its_checksum(self):
         self.tag()
         result = self.script('build-release.sh', 'v0.1.0')
         self.assertEqual(result.returncode, 0, result.stderr)
-        with zipfile.ZipFile(self.repo / 'build/F1TV.wgt') as stable, zipfile.ZipFile(self.repo / 'build/F1TV-staging.wgt') as staging:
-            self.assertEqual(stable.namelist(), staging.namelist())
-            differences = [name for name in stable.namelist() if stable.read(name) != staging.read(name)]
-            self.assertEqual(differences, ['launcher-build.js'])
-            self.assertEqual(stable.read('launcher-build.js').replace(b"channel: 'stable'", b"channel: 'prerelease'"), staging.read('launcher-build.js'))
-            self.assertEqual(stable.read('launcher/builtin.json'), staging.read('launcher/builtin.json'))
-        package = self.repo / 'build/F1TV-staging.wgt'
-        self.assertEqual((self.repo / 'build/F1TV-staging.wgt.sha256').read_text().split(),
-                         [hashlib.sha256(package.read_bytes()).hexdigest(), 'F1TV-staging.wgt'])
+        self.assertFalse((self.repo / 'build/F1TV-staging.wgt').exists(), 'test versions are a setting on the TV, not a package')
+        with zipfile.ZipFile(self.repo / 'build/F1TV.wgt') as stable:
+            self.assertIn(b"channel: 'stable'", stable.read('launcher-build.js'))
+        package = self.repo / 'build/F1TV.wgt'
+        self.assertEqual((self.repo / 'build/F1TV.wgt.sha256').read_text().split(),
+                         [hashlib.sha256(package.read_bytes()).hexdigest(), 'F1TV.wgt'])
         self.assertFalse((self.repo / 'build/bundle.json.sig').exists(), 'build must not sign, even with a secret in the environment')
         signed = self.run_command('node', 'scripts/sign-bundle.js', 'build/bundle.json')
         self.assertEqual(signed.returncode, 0, signed.stderr)
@@ -306,14 +304,13 @@ if sys.argv[1:3] == ['release', 'view']:
         self.assertIn('UPDATES must be', result.stderr)
 
     def test_publish_refuses_missing_asset(self):
-        result = self.publish('true', missing='F1TV-staging.wgt.sha256')
+        result = self.publish('true', missing='bundle.json.sig')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('missing release asset', result.stderr)
         self.assertFalse((self.repo / 'gh-calls.jsonl').exists())
 
     def test_promote_reuses_complete_published_prerelease(self):
-        assets = ['F1TV.wgt', 'F1TV.wgt.sha256', 'F1TV-staging.wgt', 'F1TV-staging.wgt.sha256',
-                  'bundle-0.1.0.tar', 'bundle.json', 'bundle.json.sig']
+        assets = ['F1TV.wgt', 'F1TV.wgt.sha256', 'bundle-0.1.0.tar', 'bundle.json', 'bundle.json.sig']
         state = json.dumps(dict(isDraft=False, isPrerelease=True, assets=[dict(name=a) for a in assets]))
         result = self.github_script('promote-release.sh', state)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -322,8 +319,7 @@ if sys.argv[1:3] == ['release', 'view']:
         self.assertEqual(len(self.gh_calls()), 2)
 
     def test_promote_refuses_missing_draft_full_and_incomplete_releases(self):
-        assets = ['F1TV.wgt', 'F1TV.wgt.sha256', 'F1TV-staging.wgt', 'F1TV-staging.wgt.sha256',
-                  'bundle-0.1.0.tar', 'bundle.json', 'bundle.json.sig']
+        assets = ['F1TV.wgt', 'F1TV.wgt.sha256', 'bundle-0.1.0.tar', 'bundle.json', 'bundle.json.sig']
         states = ['missing', json.dumps(dict(isDraft=True, isPrerelease=True)),
                   json.dumps(dict(isDraft=False, isPrerelease=False))]
         states += [json.dumps(dict(isDraft=False, isPrerelease=True, assets=[dict(name=a) for a in assets if a != missing]))
@@ -369,7 +365,7 @@ else:
 ''')
         curl.chmod(0o755)
 
-    def release(self, version, asset='F1TV-staging.wgt', draft=False, prerelease=True):
+    def release(self, version, asset='F1TV.wgt', draft=False, prerelease=True):
         return dict(tag_name='v' + version, draft=draft, prerelease=prerelease,
                     body='Notes with {braces} and "quotes" and \\slashes', assets=[
                         dict(name=name, browser_download_url='https://example.invalid/v' + version + '/' + name)
@@ -385,17 +381,17 @@ else:
                                   'BAD_CHECKSUM': '1' if bad_checksum else ''})
 
     def test_staging_selects_first_non_draft_with_asset_in_pretty_and_compact_json(self):
-        releases = [self.release('4.0.0', draft=True), self.release('3.0.0', asset='F1TV.wgt'),
+        releases = [self.release('4.0.0', draft=True), self.release('3.0.0', asset='Other.wgt'),
                     self.release('2.0.0'), self.release('1.0.0', prerelease=False)]
         for compact in [False, True]:
             result = self.install(releases, staging=True, compact=compact)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual((self.root / 'cache/f1tv-tizen/F1TV-staging-2.0.0.wgt').read_bytes(), self.payload)
+            self.assertEqual((self.root / 'cache/f1tv-tizen/F1TV-2.0.0.wgt').read_bytes(), self.payload)
         urls = (self.root / 'curl.log').read_text()
         self.assertIn('/releases?per_page=20', urls)
         self.assertNotIn('/releases/latest', urls)
         self.assertNotIn('/v4.0.0/', urls)
-        self.assertIn('/v2.0.0/F1TV-staging.wgt.sha256', urls)
+        self.assertIn('/v2.0.0/F1TV.wgt.sha256', urls)
 
     def test_default_still_uses_latest_stable_and_separate_cache_name(self):
         result = self.install(self.release('1.0.0', asset='F1TV.wgt', prerelease=False))
@@ -412,7 +408,7 @@ else:
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_staging_refuses_missing_asset_and_missing_checksum(self):
-        for releases in [[], [self.release('1.0.0', asset='F1TV.wgt')]]:
+        for releases in [[], [self.release('1.0.0', asset='Other.wgt')]]:
             result = self.install(releases, staging=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('No published release', result.stderr)
@@ -420,15 +416,44 @@ else:
         release['assets'].pop()
         result = self.install([release], staging=True)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('has no F1TV-staging.wgt', result.stderr)
+        self.assertIn('has no F1TV.wgt', result.stderr)
 
     def test_powershell_uses_staging_switch_selection_checksum_and_separate_cache(self):
         script = (ROOT / 'scripts/install.ps1').read_text()
         for text in ['[switch]$Staging', "'releases?per_page=20'", "'releases/latest'",
-                     "'F1TV-staging.wgt'", '-not $_.draft', 'Select-Object -First 1',
+                     "$assetName = 'F1TV.wgt'", 'Write-StagingHint', 'type 1 2 3 4 5', '-not $_.draft', 'Select-Object -First 1',
                      '$_.name -eq "$assetName.sha256"', 'Get-Sha256 $part',
                      "$($assetName -replace '\\.wgt$', '')-$($script:Version).wgt"]:
             self.assertIn(text, script)
+
+
+    def test_staging_marker_stays_a_label_and_the_installer_explains_test_versions(self):
+        # install_app with a fake sdb: what the installer leaves on the TV for the app (f1tv-installed.json).
+        pushed = self.root / 'pushed'
+        pushed.mkdir()
+        sdb = self.root / 'sdb'
+        sdb.write_text("""#!/usr/bin/env bash
+shift 2
+case "$1" in
+  capability) echo 'sdk_toolpath:/tv/sdk_tools' ;;
+  push) cp "$2" "$PUSHED/$(basename "$3")" ;;
+  shell) echo 'install completed' ;;
+esac
+""")
+        sdb.chmod(0o755)
+        wgt = self.root / 'F1TV.wgt'
+        wgt.write_bytes(self.payload)
+        # A label only (any app can write that shared file): --staging adds nothing to it, and says how to keep test versions.
+        for staging, want in [(1, {'installedBy': 'installer', 'version': '1.3.0'}),
+                              (0, {'installedBy': 'installer', 'version': '1.3.0'})]:
+            script = self.root / ('install-%d.sh' % staging)
+            script.write_text((ROOT / 'scripts/install.sh').read_text().rsplit('\nmain\n', 1)[0] +
+                              '\nSDB="%s"; SERIAL=tv; WGT="%s"; VERSION=1.3.0; STAGING=%d\ninstall_app\n' % (sdb, wgt, staging))
+            result = subprocess.run(['bash', str(script)], text=True, capture_output=True,
+                                    env={**os.environ, 'PUSHED': str(pushed)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads((pushed / 'f1tv-installed.json').read_text()), want)
+            self.assertEqual('type 1 2 3 4 5' in result.stdout + result.stderr, bool(staging))
 
 
 class WorkflowTests(unittest.TestCase):

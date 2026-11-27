@@ -1239,16 +1239,55 @@
       });
   }
 
+  /*
+   * Test versions (prereleases) on this TV: a row on the Version page, hidden until the remote's number keys type
+   * TEST_CODE there, and shown while test versions are on. Wherever the launcher updates this app: the choice is the
+   * bundle's own (js/updates.js, app/service/updates.js), so no shell is too old for it.
+   */
+  var TEST_CODE = '12345', typed = '', typedAt = 0, testRow = false;
+  function testVersionsOffered() { return typeof Launcher !== 'undefined' && !!Launcher.updates && !!Updates.setChannel; }
+  function versionDigit(key) {
+    if (key < K.DIGIT0 || key > K.DIGIT0 + 9) return false;
+    if (Date.now() - typedAt > 3000) typed = '';
+    typedAt = Date.now();
+    typed = (typed + String(key - K.DIGIT0)).slice(-TEST_CODE.length);
+    if (typed === TEST_CODE && testVersionsOffered() && !testRow) {
+      typed = '';
+      testRow = true;
+      openVersion(grid ? grid.r : 0);
+    }
+    return true;
+  }
+  function setTestVersions(on, idx) {
+    if (Updates.status().channelFixed) {
+      return ask('Test versions', 'This TV was installed with the test-version package, so it always gets test versions. ' +
+        'To stop, install F1 TV again with the normal installer (without --staging).', [{ label: 'OK', value: true }], 'notes');
+    }
+    Updates.setChannel(on ? 'prerelease' : 'stable');
+    testRow = true;   // still shown on this visit (switched off: gone on the next)
+    if (screen === 'list' && grid === versionGrid) openVersion(idx);
+    toast(on ? 'Test versions on: this TV also gets versions before their release.' :
+      'Test versions off. A test version already on this TV stays until the next release.', 6000);
+    if (on) checkForUpdateNow();
+  }
+
   function openVersion(focus) {
     var u = Updates.status();
     var instruction = updateInstruction(u);
+    var testing = (u.channel || (typeof Launcher !== 'undefined' && Launcher.channel)) === 'prerelease';   // (stubs without a channel)
+    // Shown while on (also with updates off, so it can always be turned off), or once the code was typed on this visit
+    // to the page; switched off, it hides on the next visit.
+    var showTest = (testing && typeof Launcher !== 'undefined' && !!Updates.setChannel) || (testVersionsOffered() && testRow);
     renderList({
-      title: 'F1 TV ' + (u.current || '?') + (typeof Launcher !== 'undefined' && Launcher.channel && Launcher.channel !== 'stable' ? ' · Staging' : ''),
+      title: 'F1 TV ' + (u.current || '?') + (testing ? ' · Test versions' : ''),
       sub: u.available ? 'Update available: v' + u.latest + ' · ' + instruction : 'Up to date',
       rows: [
-        { what: checkingUpdate ? 'Checking for updates…' : 'Check for updates now', run: checkForUpdateNow },
+        { what: checkingUpdate ? 'Checking for updates…' : 'Check for updates now', run: checkForUpdateNow }
+      ].concat(showTest ? [{ what: 'Test versions', sub: 'Get new versions before they are released to everyone.',
+        badge: u.channelFixed ? 'Always' : testing ? 'On' : 'Off', badgeCls: testing ? 'live' : '',
+        run: function (idx) { setTestVersions(!testing, idx); } }] : []).concat([
         { day: 'Release notes' }
-      ].concat((u.releases || []).map(function (release) {
+      ]).concat((u.releases || []).map(function (release) {
         return { what: 'v' + release.version,
           sub: release.minShell && typeof Launcher !== 'undefined' && release.minShell > Launcher.shellLevel ? 'Needs reinstall' :
             release.version === u.downloaded ? 'Downloaded' : release.version === u.current ? 'Installed' : Updates.newer(release.version, u.current) ? 'New' : '',
@@ -1293,6 +1332,7 @@
           sub: u.available ? 'Update is available to v' + u.latest : (u.latest ? 'Up to date · ' : '') + site,
           run: function (idx) {
             backStack.push(function () { openAccount(idx); });
+            testRow = false;   // a fresh visit: the test versions row only while they are on, or once typed again
             openVersion();
           } },
         { what: 'Updates', sub: 'Automatic update checks and installation preferences.',
@@ -4407,6 +4447,7 @@
       return goBack();
     }
     if (key === K.EXIT) return exitApp();
+    if (screen === 'list' && grid === versionGrid && versionDigit(key)) { e.preventDefault(); return; }
     if (grid && grid.handle(key)) e.preventDefault();
   }
 

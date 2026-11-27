@@ -295,6 +295,9 @@ async function boot(options = {}) {
       return { ok: true, json: async () => options.releases };
     }
     if (/127\.0\.0\.1:18765\/ping/.test(url)) return { ok: true, status: 200, text: async () => 'ok' };   // the stream helper
+    // options.fetch(url): an answer of the test's own, or null.
+    const own = options.fetch && options.fetch(url);
+    if (own) return Object.assign({ ok: true, status: 200, url }, own);
     if (/livetiming.*\/2025\/Index\.json$/.test(url)) return { ok: true, status: 200, text: async () => JSON.stringify(TIMING_INDEX) };
     return { ok: false, status: 404, text: async () => '' };
   };
@@ -530,7 +533,7 @@ async function boot(options = {}) {
     advance: (ms) => clock.advance(ms),
     async press(...names) {
       for (const name of names) {
-        document.listeners.keydown.forEach((fn) => fn({ keyCode: KEYS[name], preventDefault() {} }));
+        document.listeners.keydown.forEach((fn) => fn({ keyCode: typeof name === 'number' ? name : KEYS[name], preventDefault() {} }));
         await clock.advance(50);
       }
     },
@@ -4115,8 +4118,87 @@ test('version screen labels the staging channel and leaves stable unlabelled', a
     const app = await boot({ launcher: { version: '1.0.0', channel, updates: false, ready() {} } });
     await app.press('UP'); await app.pick(/^Nicholas$/, ['RIGHT']);
     await app.pick(/^Version 1\.0\.0/, ['DOWN']);
-    assert.equal(app.$('list-title').textContent, 'F1 TV 1.0.0' + (channel === 'prerelease' ? ' · Staging' : ''));
+    assert.equal(app.$('list-title').textContent, 'F1 TV 1.0.0' + (channel === 'prerelease' ? ' · Test versions' : ''));
   }
+});
+
+/** The channels the app told its helper's downloader (POST /updates/channel), in order. */
+function channelFetch(calls) {
+  return (url) => {
+    const m = /127\.0\.0\.1:18765\/updates\/channel\?name=(\w+)$/.exec(url);
+    if (!m) return null;
+    calls.push(m[1]);
+    return { text: async () => '{"ok":true}', json: async () => ({ ok: true }) };
+  };
+}
+const launcherFor = (channel, updates = true) => ({ version: '1.0.0', channel, updates, ready() {} });
+const openVersionPage = async (app) => {
+  await app.press('UP'); await app.pick(/^Nicholas$/, ['RIGHT']);
+  await app.pick(/^Version 1\.0\.0/, ['DOWN']);
+};
+const rows = (app) => app.$('list-inner').textContent;
+const DIGITS = (code) => code.split('').map((d) => 48 + +d);
+
+test('test versions: hidden until 1 2 3 4 5 on the Version page; on, the downloader takes them; off, hidden on the next visit', async () => {
+  const calls = [];
+  const app = await boot({ launcher: launcherFor('stable'), fetch: channelFetch(calls), launcherResult: { releases: [{ version: '1.0.0' }] } });
+  await app.advance(1000);
+  await openVersionPage(app);
+  assert.ok(!/Test versions/.test(rows(app)), 'hidden at first');
+  await app.press(...DIGITS('1234'));
+  assert.ok(!/Test versions/.test(rows(app)), 'not before the whole code');
+  await app.press(...DIGITS('5'));
+  assert.match(rows(app), /Test versions.*Off/);
+  await app.moveTo(/^Test versions/, ['DOWN']);
+  await app.press('ENTER');
+  await app.advance(500);
+  assert.equal(calls[calls.length - 1], 'prerelease', 'the downloader takes test versions: ' + calls.join());
+  assert.match(rows(app), /Test versions.*On/);
+  assert.equal(app.$('list-title').textContent, 'F1 TV 1.0.0 · Test versions');
+  // On: shown on every visit, so it can be turned off.
+  await app.press('BACK');
+  await app.pick(/^Version 1\.0\.0/, ['DOWN']);
+  assert.match(rows(app), /Test versions.*On/);
+  await app.moveTo(/^Test versions/, ['DOWN']);
+  await app.press('ENTER');
+  await app.advance(500);
+  assert.equal(calls[calls.length - 1], 'stable');
+  // Off: still here on this visit, gone on the next.
+  assert.match(rows(app), /Test versions.*Off/);
+  await app.press('BACK');
+  await app.pick(/^Version 1\.0\.0/, ['DOWN']);
+  assert.ok(!/Test versions/.test(rows(app)));
+});
+
+test('test versions: not offered where the app doesn\'t update itself; slow typing doesn\'t count', async () => {
+  const app = await boot({ launcher: launcherFor('stable', false), launcherResult: { releases: [{ version: '1.0.0' }] } });
+  await app.advance(1000);
+  await openVersionPage(app);
+  await app.press(...DIGITS('12345'));
+  assert.ok(!/Test versions/.test(rows(app)), 'updates off in this build: never offered');
+  const two = await boot({ launcher: launcherFor('stable'), fetch: channelFetch([]), launcherResult: { releases: [{ version: '1.0.0' }] } });
+  await two.advance(1000);
+  await openVersionPage(two);
+  await two.press(...DIGITS('12'));
+  await two.advance(4000);
+  await two.press(...DIGITS('345'));
+  assert.ok(!/Test versions/.test(rows(two)), 'more than 3 s between keys starts over');
+});
+
+test('test versions: a test-version package always takes them (the row says so); on with updates off: still there', async () => {
+  const app = await boot({ launcher: launcherFor('prerelease'), fetch: channelFetch([]), launcherResult: { releases: [{ version: '1.0.0' }] } });
+  await app.advance(1000);
+  await openVersionPage(app);
+  assert.match(rows(app), /Test versions.*Always/);
+  await app.moveTo(/^Test versions/, ['DOWN']);
+  await app.press('ENTER');
+  await app.advance(300);
+  assert.match(app.$('dialog-text').textContent, /normal installer/);
+  // Turned on, then automatic updates turned off: the row stays, so test versions can still be turned off.
+  const two = await boot({ launcher: launcherFor('stable', false), store: { 'f1tv.channel': 'prerelease' }, launcherResult: { releases: [{ version: '1.0.0' }] } });
+  await two.advance(1000);
+  await openVersionPage(two);
+  assert.match(rows(two), /Test versions.*On/);
 });
 
 test('About opens the version submenu with all releases, install instructions and BACK focus', async () => {

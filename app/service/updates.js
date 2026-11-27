@@ -69,10 +69,17 @@ function compare(a, b) {
 function create(launcher, deps) {
   deps = deps || {};
   var fetch = deps.download || download, now = deps.now || Date.now, busy = false, timer = null, stopped = false;
+  // Test versions (prereleases) on this TV: the app's choice (its Version page, or install.sh --staging), told to this
+  // downloader at each check; until then the shell's own channel. The shell installs whatever signed version it is
+  // handed and starts the newest, so this needs no shell change.
+  var channel = null, lastTestCheck = 0, waiting = [];
+  /** The channel in force: the app's choice, else the shell's. */
+  function wanted() { return channel || launcher.status().channel; }
 
   function check(cb) {
     cb = cb || function () {};
-    if (busy) return cb(new Error('Update check already running'));
+    // One at a time: asked while one runs (the app's own after setChannel started one), it waits for that one's result.
+    if (busy) { waiting.push(cb); return; }
     var st = launcher.status();
     if (!st.enabled) return cb(null);
     busy = true;
@@ -82,12 +89,13 @@ function create(launcher, deps) {
     var releases = [], skipped = [], deferred = false, notesUnverified = false, ended = false, failure = null, installed = false;
     function finish(err) {
       if (ended) return; ended = true; busy = false;
-      if (stopped) return cb(new Error('Stopped'));
+      var all = [cb].concat(waiting.splice(0));
+      if (stopped) return all.forEach(function (f) { try { f(new Error('Stopped')); } catch (e) { /* a caller's own failure */ } });
       if (!err && failure && !installed) err = failure;
       try {
         launcher.checked(err ? { ok: false, error: String(err.message || err) } : { ok: true, releases: releases, skipped: skipped, deferred: deferred });
       } catch (e) { /* the shell keeps its own state */ }
-      cb(err || null);
+      all.forEach(function (f) { try { f(err || null); } catch (e) { /* a caller's own failure */ } });
     }
     function get(u, limit, done) {
       try { fetch(u, limit, function (err, body, unverified) { if (stopped) return finish(); try { done(err, body, !!unverified); } catch (e) { finish(e); } }, !!st.source); }
@@ -101,6 +109,8 @@ function create(launcher, deps) {
       function skip(reason) { skipped.push({ version: r.version, reason: String(reason.message || reason) }); walk(list, i + 1); }
       function failed(e) { if (!failure) failure = e; skip(e); }
       if (!r.base) return skip('Missing bundle assets');
+      // Test versions turned off during this check: the rest of them aren't even fetched (Codex review).
+      if (r.prerelease && wanted() !== 'prerelease') return skip('Test versions turned off');
       get(r.base + '/bundle.json', 1048576, function (err, raw) {
         if (err) return failed(err);
         get(r.base + '/bundle.json.sig', 1024, function (err, sig) {
@@ -112,8 +122,11 @@ function create(launcher, deps) {
           if (m.minShell > st.shellLevel) return walk(list, i + 1);   // the shell shows "needs reinstall"
           if (launcher.status().blocked.indexOf(r.version) >= 0) return skip('Bad or revoked version');
           if (launcher.status().playing) { deferred = true; return finish(); }
+          if (r.prerelease && wanted() !== 'prerelease') return skip('Test versions turned off');   // before the archive too
           get(r.base + '/' + m.archive.name, m.archive.size, function (err, archive) {
             if (err) return failed(err);
+            // Test versions turned off while this one downloaded: not installed (Codex review 2026-11-27).
+            if (r.prerelease && wanted() !== 'prerelease') return skip('Test versions turned off');
             try { launcher.install(raw, sig, archive); } catch (e) { return failed(e); }
             installed = true;
             finish();
@@ -142,12 +155,13 @@ function create(launcher, deps) {
         if (!Array.isArray(got)) return finish(new Error('Invalid releases'));
         all = all.concat(got);
         if (got.length >= PAGE && n < MAX_PAGES) return page(n + 1, all);
+        var testing = wanted() === 'prerelease';
         var list = all.filter(function (r) {
-          return r && !r.draft && (st.channel === 'prerelease' || r.prerelease === false) && version(String(r.tag_name || '').replace(/^v/, ''));
+          return r && !r.draft && (testing || r.prerelease === false) && version(String(r.tag_name || '').replace(/^v/, ''));
         }).map(function (r) {
           var v = String(r.tag_name).replace(/^v/, ''), names = (r.assets || []).map(function (a) { return a && a.name; });
           var complete = ['bundle.json', 'bundle.json.sig', 'bundle-' + v + '.tar'].every(function (x) { return names.indexOf(x) >= 0; });
-          return { version: v, base: complete ? 'https://github.com/' + REPO + '/releases/download/' + r.tag_name : null,
+          return { version: v, prerelease: r.prerelease !== false, base: complete ? 'https://github.com/' + REPO + '/releases/download/' + r.tag_name : null,
             // GitHub's text, not signed: dropped when the connection couldn't be verified.
             notes: notesUnverified ? '' : String(r.body || '').slice(0, 16000) };
         }).sort(function (a, b) { return compare(b.version, a.version); });
@@ -167,6 +181,21 @@ function create(launcher, deps) {
   }
   return {
     check: check, tick: tick,
+    /*
+     * The app's choice, told at each of its checks (a restarted helper forgets it). With test versions on, a check of
+     * its own when this downloader hasn't looked for an hour: the shell's start-of-app check is stable-only and resets
+     * the shared hourly clock, so short sessions would otherwise never fetch a test version (Codex/DeepSeek review).
+     * Turned off, only future test versions stop: one already downloaded or running stays until a newer release
+     * (deleting held versions risked the shell's rollback copy and a version being started: Codex review).
+     */
+    setChannel: function (name) {
+      channel = name === 'prerelease' || name === 'stable' ? name : null;
+      var st = launcher.status();
+      if (channel === 'prerelease' && st.updates && !st.playing && !busy && now() - lastTestCheck >= HOUR) {
+        lastTestCheck = now();
+        check();
+      }
+    },
     start: function () { if (!timer) timer = setInterval(function () { try { tick(); } catch (e) { /* next tick */ } }, TICK); },
     // A stopped downloader (this version was switched off) ignores whatever its running downloads bring.
     stop: function () { stopped = true; clearInterval(timer); timer = null; }

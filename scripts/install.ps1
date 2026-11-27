@@ -6,7 +6,8 @@
 #   -Tv     skip the network search (TV: Settings > General > Network > Network Status)
 #   -Force  reinstall even if the TV already has this version
 #   -Check  only check the TV and download, don't install
-#   -Staging follow releases including prereleases
+#   -Staging install the newest release including test versions (prereleases); to keep getting them, turn on Test
+#            versions in the app (type 1 2 3 4 5 on its Version page)
 #   -Wgt    install this package instead of the latest GitHub release
 #
 # Enable Developer Mode with this computer as Host PC IP (see README).
@@ -146,7 +147,7 @@ function Get-Wgt {
   }
   Step "Looking up the latest release of $Repo"
   $endpoint = if ($Staging) { 'releases?per_page=20' } else { 'releases/latest' }
-  $assetName = if ($Staging) { 'F1TV-staging.wgt' } else { 'F1TV.wgt' }
+  $assetName = 'F1TV.wgt'
   try {
     $release = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/$endpoint" -Headers @{ Accept = 'application/vnd.github+json' } -TimeoutSec 60
   } catch { Fail "Couldn't get the latest release from GitHub ($Repo)." }
@@ -202,6 +203,10 @@ function Get-InstalledVersion {
   return ''
 }
 
+function Write-StagingHint {
+  if ($Staging) { Write-Host 'To keep getting test versions: in F1 TV open your account, Version, type 1 2 3 4 5 and turn on Test versions.' }
+}
+
 function Write-InstallMarker([string]$Dir) {
   $marker = $null
   try {
@@ -226,7 +231,7 @@ function Install-App {
   $push = Invoke-Sdb -s $script:Serial push $script:Wgt $remote
   if ($script:SdbExit -ne 0) { Fail "Copying the app to the TV failed:`n$push" }
   $out = Invoke-Sdb -s $script:Serial shell 0 vd_appinstall $AppId $remote
-  if ($out -match 'install completed') { Write-Host 'Installed.'; Write-InstallMarker $dir; return }
+  if ($out -match 'install completed') { Write-Host 'Installed.'; Write-InstallMarker $dir; Write-StagingHint; return }
   if ($out -match '[Cc]ertificate.*chain|118, -12') {
     Fail "This TV only accepts apps signed with a Samsung certificate made for it (newer models do).`nBuild and sign the app yourself instead; see 'Building it yourself' in the README.`n`nThe TV said: $out"
   }
@@ -236,7 +241,7 @@ function Install-App {
     if ($answer -notmatch '^[yY]') { Fail 'Nothing changed.' }
     Invoke-Sdb -s $script:Serial shell 0 vd_appuninstall $AppId | Out-Null
     $out = Invoke-Sdb -s $script:Serial shell 0 vd_appinstall $AppId $remote
-    if ($out -match 'install completed') { Write-Host 'Installed.'; Write-InstallMarker $dir; return }
+    if ($out -match 'install completed') { Write-Host 'Installed.'; Write-InstallMarker $dir; Write-StagingHint; return }
   }
   Fail "The TV refused the app:`n$out"
 }

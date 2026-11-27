@@ -911,7 +911,8 @@ var DiagUpload = (function () {
   /**
    * How many use the app, and the share with diagnostics on: once the viewer has answered the diagnostics question (new
    * viewers who haven't been asked would skew the share), an app kept open USE_AFTER counts once (POST /starts) with
-   * only the app version and whether diagnostics are on. No ID or unit, nothing from the TV; the server counts per day.
+   * only the app version, whether diagnostics are on and whether the install script set it up (install_source:
+   * 'installer' or 'unknown', as in app()). No ID or unit, nothing from the TV; the server counts per day.
    * Not from personal builds (DIAG_BUILD.label: the developer's TVs).
    */
   var USE_AFTER = 15 * 60000;
@@ -921,8 +922,9 @@ var DiagUpload = (function () {
       setTimeout(function () {
         try {
           if (typeof Settings === 'undefined' || !Settings.get('diagnosticsAsked')) return;
-          var v = app().version;
-          var body = JSON.stringify({ schema_version: 1, version: /^[0-9]+\.[0-9]+\.[0-9]+$/.test(v) ? v : 'unknown', diagnostics: enabled() });
+          var a = app(), v = a.version;
+          var body = JSON.stringify({ schema_version: 1, version: /^[0-9]+\.[0-9]+\.[0-9]+$/.test(v) ? v : 'unknown', diagnostics: enabled(),
+            install_source: a.install_source === 'installer' ? 'installer' : 'unknown' });
           request('POST', '/starts', body, null, null, false).then(function () {}, function () {});
         } catch (e) { /* never in the way */ }
       }, USE_AFTER);

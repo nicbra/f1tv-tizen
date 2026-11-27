@@ -309,6 +309,16 @@ function handle(req, res) {
   if (u.pathname === '/log') return send(res, 200, toBuf(JSON.stringify(recent)), 'application/json');
   // "Check for updates now": this bundle's downloader (the page then reads the result from the shell). Like the shell's
   // own /launcher/ routes, only the app's own pages may ask: it goes online (a caller could burn GitHub's rate limit).
+  // Test versions on or off (the app's choice), for this bundle's downloader: only the app's own pages may set it.
+  if (u.pathname === '/updates/channel' && req.method === 'POST') {
+    var from = req.headers && req.headers.origin;
+    if (from && from !== 'null' && from !== 'file://') return send(res, 403, toBuf('local page required'));
+    if (!bundleUpdates) return send(res, 404, toBuf('no launcher'));
+    var name = u.query && u.query.name;
+    if (name !== 'stable' && name !== 'prerelease') return send(res, 400, toBuf('invalid channel'));
+    bundleUpdates.setChannel(name);
+    return send(res, 200, toBuf(JSON.stringify({ ok: true, channel: name })), 'application/json');
+  }
   if (u.pathname === '/updates/check' && req.method === 'POST') {
     var origin = req.headers && req.headers.origin;
     if (origin && origin !== 'null' && origin !== 'file://') return send(res, 403, toBuf('local page required'));

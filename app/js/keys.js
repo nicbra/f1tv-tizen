@@ -6,14 +6,17 @@ var Keys = (function () {
     PLAY: 415, PAUSE: 19, PLAY_PAUSE: 10252, STOP: 413,
     FF: 417, RW: 412, NEXT: 10233, PREV: 10232,
     RED: 403, GREEN: 404, YELLOW: 405, BLUE: 406,
-    CH_UP: 427, CH_DOWN: 428
+    CH_UP: 427, CH_DOWN: 428,
+    // Number keys (remotes with digits, the Smart Remote's on-screen 123 pad): 0-9 are 48-57.
+    DIGIT0: 48
   };
 
   var toRegister = [
     'MediaPlay', 'MediaPause', 'MediaPlayPause', 'MediaStop',
     'MediaFastForward', 'MediaRewind', 'MediaTrackNext', 'MediaTrackPrevious',
     'ColorF0Red', 'ColorF1Green', 'ColorF2Yellow', 'ColorF3Blue',
-    'ChannelUp', 'ChannelDown'
+    'ChannelUp', 'ChannelDown',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'
   ];
 
   function register() {
